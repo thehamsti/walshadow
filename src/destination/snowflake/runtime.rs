@@ -764,7 +764,8 @@ impl SnowflakeRuntime {
             }
         }
         let tables: Vec<_> = self.landed.lock().unwrap().drain().collect();
-        let receipts: std::collections::BTreeSet<_> = tables.iter().map(|(_, r)| r.clone()).collect();
+        let receipts: std::collections::BTreeSet<_> =
+            tables.iter().map(|(_, r)| r.clone()).collect();
         for (landing, receipts_table) in &tables {
             let sql = format!(
                 "DELETE FROM {landing} l USING {receipts_table} r WHERE l._WS_BATCH_ID = r.BATCH_ID"

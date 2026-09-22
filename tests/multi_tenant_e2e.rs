@@ -27,6 +27,12 @@ use walshadow::shadow::{Shadow, ShadowConfig};
 
 const TENANT_DBS: [&str; 3] = ["app_a", "app_b", "app_c"];
 
+#[derive(Clone, Copy)]
+enum Registry {
+    Config,
+    Sql,
+}
+
 struct Harness {
     tmp: tempfile::TempDir,
     source: Shadow,
@@ -44,6 +50,10 @@ struct Harness {
 
 impl Harness {
     async fn up(ports: &fx::Ports) -> Result<Self> {
+        Self::up_with(ports, Registry::Config).await
+    }
+
+    async fn up_with(ports: &fx::Ports, registry: Registry) -> Result<Self> {
         let tmp = tempfile::tempdir().unwrap();
         let mut scfg = ShadowConfig::new(
             tmp.path().join("source-data"),
@@ -80,11 +90,23 @@ impl Harness {
         let config_path = tmp.path().join("walshadow.toml");
         fs::write(
             &config_path,
-            "[tenants]\nstall_timeout_secs = 120\nbridge_workers = 1\ncapacity = 8\n",
+            match registry {
+                Registry::Config => {
+                    "[tenants]\nstall_timeout_secs = 120\nbridge_workers = 1\ncapacity = 8\n"
+                }
+                Registry::Sql => {
+                    "[tenants]\nstall_timeout_secs = 120\nbridge_workers = 1\ncapacity = 8\n\
+                     registry = \"sql\"\nregistry_schema = \"walshadow\"\nregistry_poll_secs = 1\n"
+                }
+            },
         )?;
         let frag_dir = config_path.with_extension("d");
         fs::create_dir_all(&frag_dir)?;
-        for (id, db) in [("a", "app_a"), ("b", "app_b")] {
+        let initial: &[(&str, &str)] = match registry {
+            Registry::Config => &[("a", "app_a"), ("b", "app_b")],
+            Registry::Sql => &[],
+        };
+        for &(id, db) in initial {
             fs::write(
                 frag_dir.join(format!("60-tenant-{id}.toml")),
                 tenant_fragment(id, db, ports.ch_tcp, "active"),
@@ -371,7 +393,9 @@ async fn tenants_share_one_slot_attach_live_detach_and_resume() {
     assert_eq!(start.len(), 1, "{b_state:?}");
     assert_eq!(start[0]["initial_load"].as_str(), Some("copy"));
     assert!(
-        !h.stderr().lines().any(|l| l.contains("tenant=b") && l.contains("ensure CH dest")),
+        !h.stderr()
+            .lines()
+            .any(|l| l.contains("tenant=b") && l.contains("ensure CH dest")),
         "explicit tables stay out of scope while priming"
     );
 
@@ -488,6 +512,92 @@ async fn tenants_share_one_slot_attach_live_detach_and_resume() {
         !h.stderr().contains("tenant attached; priming")
             || h.stderr().matches("tenant attached; priming").count() == 3,
         "restart must resume active tenants rather than re-attach them"
+    );
+    h.stop().unwrap();
+}
+
+/// Tenant spec without the `[tenant.<id>]` prefix, for `ctl tenant add`
+fn spec_of(id: &str, db: &str, ch_port: u16) -> String {
+    tenant_fragment(id, db, ch_port, "active")
+        .lines()
+        .filter(|l| {
+            !l.starts_with(&format!("[tenant.{id}]"))
+                && !l.starts_with("dbname")
+                && !l.starts_with("state")
+        })
+        .map(|l| l.replace(&format!("[tenant.{id}."), "["))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_registry_manages_tenants_and_a_broken_tenant_stays_isolated() {
+    if !fx::requirements_available() {
+        return;
+    }
+    let ports = fx::Ports::alloc();
+    let mut h = Harness::up_with(&ports, Registry::Sql)
+        .await
+        .expect("harness");
+    let t = Duration::from_secs(120);
+
+    // Tenants arrive as registry rows through ctl
+    h.ctl(
+        &["tenant", "add", "a", "--dbname", "app_a", "--spec", "-"],
+        &spec_of("a", "app_a", h.ch_tcp),
+    )
+    .unwrap();
+    let rows = h
+        .source
+        .psql_one(
+            "SELECT string_agg(id || ':' || dbname || ':' || state, ',') FROM walshadow.tenant",
+        )
+        .unwrap();
+    assert_eq!(rows, "a:app_a:active");
+    h.wait_phase("a", "active", t).await.unwrap();
+    h.wait_rows("a", "app_a", 50, t).await.unwrap();
+
+    // A tenant whose destination is unreachable fails alone
+    let broken =
+        spec_of("c", "app_c", h.ch_tcp).replace(&format!("port = {}", h.ch_tcp), "port = 1");
+    h.ctl(
+        &["tenant", "add", "c", "--dbname", "app_c", "--spec", "-"],
+        &broken,
+    )
+    .unwrap();
+    let state = h.wait_phase("c", "detached", t).await.unwrap();
+    assert!(
+        state["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("attach failed"),
+        "{state:?}"
+    );
+    let a = connect(&h.source, "app_a").await.unwrap();
+    a.batch_execute("INSERT INTO app.orders VALUES (51, 'app_a-beside-broken')")
+        .await
+        .unwrap();
+    h.wait_rows("a", "app_a", 51, t).await.unwrap();
+
+    // Rows edited straight in SQL take effect within a poll
+    h.source
+        .psql_one("UPDATE walshadow.tenant SET state = 'detached' WHERE id = 'a'")
+        .unwrap();
+    h.wait_phase("a", "detached", t).await.unwrap();
+    a.batch_execute("INSERT INTO app.orders VALUES (52, 'app_a-after-detach')")
+        .await
+        .unwrap();
+    h.wait_rows("a", "app_a", 51, Duration::from_secs(2))
+        .await
+        .unwrap();
+    // Re-attaching resyncs every table, catching the row written meanwhile
+    h.source
+        .psql_one("UPDATE walshadow.tenant SET state = 'active' WHERE id = 'a'")
+        .unwrap();
+    h.wait_rows("a", "app_a", 52, t).await.unwrap();
+    assert!(
+        h.frag_dir.join("70-registry.toml").exists(),
+        "registry mirrored into config"
     );
     h.stop().unwrap();
 }
