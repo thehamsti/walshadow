@@ -704,3 +704,13 @@ async fn toast_gc_keeps_only_what_reads_above_the_floor_can_see() {
     // Byte accounting and indexes still verify on reopen
     StateStore::open(dir.path(), identity(), 1 << 20).unwrap();
 }
+
+#[test]
+fn durable_sequences_survive_reopen_without_an_enqueue() {
+    let dir = tempdir().unwrap();
+    let state = StateStore::open(dir.path(), identity(), 1024).unwrap();
+    assert_eq!(state.allocate_durable_sequence("snapshot-attempt/7").unwrap(), 1);
+    drop(state);
+    let state = StateStore::open(dir.path(), identity(), 1024).unwrap();
+    assert_eq!(state.allocate_durable_sequence("snapshot-attempt/7").unwrap(), 2);
+}

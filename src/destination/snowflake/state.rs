@@ -457,8 +457,29 @@ impl StateStore {
         self.transition(id, BatchPhase::Verified, BatchPhase::Applied)
     }
 
-    /// Reserve a durable, monotonically increasing channel sequence. A crash
+    /// Reserve a sequence that survives restart even when nothing is ever
+    /// enqueued under it, for identifiers minted outside batch channels
+    /// (snapshot attempts): a reused one would collide with its own history
+    pub fn allocate_durable_sequence(&self, channel: &str) -> anyhow::Result<u64> {
+        let _guard = self.mutation.lock().unwrap();
+        anyhow::ensure!(!channel.is_empty(), "empty sequence channel");
+        let mut heads = self.heads.lock().unwrap();
+        let head = match heads.get(channel) {
+            Some(head) => *head,
+            None => self.sequence_head(channel)?,
+        };
+        let next = head
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("channel sequence overflow"))?;
+        self.put_sync(sequence_head_key(channel)?, next.to_le_bytes().to_vec())?;
+        heads.insert(channel.to_owned(), next);
+        Ok(next)
+    }
+
+    /// Reserve a monotonically increasing batch-channel sequence. A crash
     /// may leave a gap; callers must never infer delivery from sequence alone.
+    /// Only for batch channels: the head persists with the enqueue that uses
+    /// it, so an allocation that never reached an enqueue may repeat
     pub fn allocate_sequence(&self, channel: &str) -> anyhow::Result<u64> {
         anyhow::ensure!(!channel.is_empty(), "empty batch channel");
         let mut heads = self.heads.lock().unwrap();
