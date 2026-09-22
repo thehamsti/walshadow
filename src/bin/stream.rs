@@ -1569,7 +1569,6 @@ async fn run_session(
         }
     }
     let config_resolver = tenants.first().and_then(|t| t.config_resolver.clone());
-    let copy_backfiller = tenants.first().and_then(|t| t.copy_backfiller.clone());
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
         decoder_xact: router,
@@ -1596,7 +1595,6 @@ async fn run_session(
     // Metrics endpoint + control socket + SIGHUP are process-lifetime (bound in
     // `run`); the session only writes into the shared registry.
     let metrics_resolver = config_resolver.clone().or(cluster_resolver.clone());
-    let metrics_backfiller = copy_backfiller.clone();
 
     // Retention sweeper writes shadow's `pg_last_wal_replay_lsn` here;
     // status loop reads it for the cursor's `shadow_replay_lsn` slot + the
@@ -2638,8 +2636,10 @@ async fn run_session(
                 &t.boundary_hold_stats,
                 &t.capture_stats,
                 &t.desc_log,
-                metrics_resolver.as_deref(),
-                metrics_backfiller.as_deref(),
+                t.config_resolver
+                    .as_deref()
+                    .or(metrics_resolver.as_deref()),
+                t.copy_backfiller.as_deref(),
                 StageCounters {
                     emitter: emitter_stats,
                     oracle: [oracle_stats, bootstrap_metrics.as_ref().map(|b| &*b.oracle)],
