@@ -39,6 +39,7 @@ struct Harness {
     metrics_addr: SocketAddr,
     stderr_path: PathBuf,
     ch_tcp: u16,
+    control_socket: PathBuf,
 }
 
 impl Harness {
@@ -164,10 +165,32 @@ impl Harness {
             metrics_addr,
             stderr_path,
             ch_tcp: ports.ch_tcp,
+            control_socket,
         };
         fx::wait_for_listen(h.metrics_addr, Duration::from_secs(120))
             .with_context(|| format!("daemon metrics endpoint never came up\n{}", h.stderr()))?;
         Ok(h)
+    }
+
+    fn ctl(&self, words: &[&str], stdin: &str) -> Result<String> {
+        use std::io::Write;
+        let mut child = Command::new(&self.bin)
+            .arg("ctl")
+            .arg("--socket")
+            .arg(&self.control_socket)
+            .args(words)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(stdin.as_bytes())?;
+        let out = child.wait_with_output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "ctl {words:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
     fn stderr(&self) -> String {
@@ -359,14 +382,22 @@ async fn tenants_share_one_slot_attach_live_detach_and_resume() {
         .unwrap();
     assert_eq!(slots, "1", "one physical slot serves every tenant");
 
-    // A third tenant attaches while the others keep streaming
+    // A third tenant attaches through ctl while the others keep streaming
     let c = connect(&h.source, "app_c").await.unwrap();
-    fs::write(
-        h.frag_dir.join("60-tenant-c.toml"),
-        tenant_fragment("c", "app_c", h.ch_tcp, "active"),
+    let spec = tenant_fragment("c", "app_c", h.ch_tcp, "active")
+        .lines()
+        .filter(|l| {
+            !l.starts_with("[tenant.c]") && !l.starts_with("dbname") && !l.starts_with("state")
+        })
+        .map(|l| l.replace("[tenant.c.", "["))
+        .collect::<Vec<_>>()
+        .join("\n");
+    h.ctl(
+        &["tenant", "add", "c", "--dbname", "app_c", "--spec", "-"],
+        &spec,
     )
     .unwrap();
-    h.sighup().unwrap();
+    assert!(h.frag_dir.join("60-tenant-c.toml").exists());
     a.batch_execute("INSERT INTO app.orders VALUES (81, 'app_a-during-attach')")
         .await
         .unwrap();
@@ -377,13 +408,24 @@ async fn tenants_share_one_slot_attach_live_detach_and_resume() {
     h.wait_rows("c", "app_c", 51, t).await.unwrap();
     h.wait_rows("a", "app_a", 71, t).await.unwrap();
 
-    // Detach b by config: it stops receiving and stops holding WAL
-    fs::write(
-        h.frag_dir.join("60-tenant-b.toml"),
-        tenant_fragment("b", "app_b", h.ch_tcp, "detached"),
-    )
-    .unwrap();
-    h.sighup().unwrap();
+    let listed = h.ctl(&["tenant", "list"], "").unwrap();
+    for id in ["a", "b", "c"] {
+        assert!(listed.lines().any(|l| l.starts_with(id)), "{listed}");
+    }
+    let metrics = fx::http_get(h.metrics_addr, "/metrics").unwrap();
+    assert!(
+        metrics.contains("walshadow_tenant_info{tenant=\"a\",dbname=\"app_a\",phase=\"active\"} 1"),
+        "{metrics}"
+    );
+    // A spec that fails validation is refused and changes nothing
+    assert!(
+        h.ctl(&["tenant", "add", "bad", "--dbname", "app_a"], "")
+            .is_err(),
+        "two tenants may not follow one database"
+    );
+
+    // Detach b through ctl: it stops receiving and stops holding WAL
+    h.ctl(&["tenant", "detach", "b"], "").unwrap();
     let detached = h.wait_phase("b", "detached", t).await.unwrap();
     assert_eq!(
         detached.get("reason").and_then(|v| v.as_str()),
@@ -399,6 +441,12 @@ async fn tenants_share_one_slot_attach_live_detach_and_resume() {
     h.wait_rows("b", "app_b", 60, Duration::from_secs(1))
         .await
         .unwrap();
+    // A reload with nothing changed reconciles to the same tenant set
+    h.sighup().unwrap();
+    c.batch_execute("INSERT INTO app.orders VALUES (53, 'app_c-after-reload')")
+        .await
+        .unwrap();
+    h.wait_rows("c", "app_c", 53, t).await.unwrap();
 
     // Restart: active tenants resume from their state, nothing re-primes
     h.stop().unwrap();
@@ -410,7 +458,7 @@ async fn tenants_share_one_slot_attach_live_detach_and_resume() {
         .unwrap();
     h.start().unwrap();
     h.wait_rows("a", "app_a", 72, t).await.unwrap();
-    h.wait_rows("c", "app_c", 52, t).await.unwrap();
+    h.wait_rows("c", "app_c", 53, t).await.unwrap();
     let note =
         h.ch.query("SELECT note FROM tenant_c.orders FINAL WHERE _is_deleted = 0 AND id = 1")
             .unwrap();

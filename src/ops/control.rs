@@ -179,7 +179,7 @@ pub fn ok_with(body: &str) -> String {
 pub fn err(msg: impl std::fmt::Display) -> String {
     format!("ERR {msg}\n")
 }
-fn ok_toml(t: &Table) -> String {
+pub(crate) fn ok_toml(t: &Table) -> String {
     ok_with(&toml::to_string(t).unwrap_or_default())
 }
 
@@ -243,8 +243,13 @@ async fn dispatch(buf: &[u8], ctx: &SharedCtx) -> String {
         "show" => config_show(ctx).await,
         "status" => stream_status(ctx).await,
         "tables" => tables_list(ctx, &req).await,
-        "schemas" => schemas_list(ctx).await,
+        "schemas" => schemas_list(ctx, &req).await,
         "columns" => columns_list(ctx, &req).await,
+        "tenants" => crate::ops::tenant_ctl::list(ctx).await,
+        "tenant-show" => crate::ops::tenant_ctl::show(ctx, &req.config).await,
+        "tenant-put" => crate::ops::tenant_ctl::put(ctx, &req.config).await,
+        "tenant-remove" => crate::ops::tenant_ctl::remove(ctx, &req.config).await,
+        "tenant-state" => crate::ops::tenant_ctl::set_state(ctx, &req.config).await,
         other => Err(anyhow::anyhow!("unknown command {other}")),
     };
     res.unwrap_or_else(|e| err(format!("{e:#}")))
@@ -308,7 +313,20 @@ async fn validate(ctx: &SharedCtx) -> Result<()> {
     let merged = get_config(ctx).await?;
     crate::ch_emitter::EmitterConfig::from_table(&merged)
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    crate::ops::tenant_ctl::validate(&merged)
+}
+
+/// A request naming `tenant = "<id>"` reads through that tenant's view:
+/// its database, its destination, its table rules
+fn scoped(root: Table, req: &Request<'_>) -> Result<Table> {
+    let Some(id) = req.config.get("tenant").and_then(Value::as_str) else {
+        return Ok(root);
+    };
+    let tenants =
+        crate::tenants::TenantsConfig::from_table(&root)?.context("no tenants configured")?;
+    let decl = tenants.get(id).with_context(|| format!("no tenant {id}"))?;
+    Ok(decl.effective_table(&root))
 }
 
 fn frag_path(ch_config: &Path) -> PathBuf {
@@ -320,7 +338,7 @@ async fn get_config(ctx: &SharedCtx) -> Result<Table> {
 }
 
 async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
-    let root = get_config(ctx).await?;
+    let root = scoped(get_config(ctx).await?, req)?;
     let client = pg_connect(&root).await?;
     let ns = req.config.get("namespace").and_then(Value::as_str);
     let listed = introspect::tables(&client, ns)
@@ -348,8 +366,8 @@ async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
     Ok(ok_toml(&out))
 }
 
-async fn schemas_list(ctx: &SharedCtx) -> Result<String> {
-    let root = get_config(ctx).await?;
+async fn schemas_list(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
+    let root = scoped(get_config(ctx).await?, req)?;
     let client = pg_connect(&root).await?;
     let names: Vec<Value> = introspect::schemas(&client)
         .await
@@ -369,7 +387,7 @@ async fn columns_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> 
     ) else {
         bail!("usage: columns list with [config] `namespace = \"..\"`, `relname = \"..\"`");
     };
-    let root = get_config(ctx).await?;
+    let root = scoped(get_config(ctx).await?, req)?;
     let client = pg_connect(&root).await?;
     let arr = introspect::columns(&client, &RelName::new(ns, rel))
         .await
@@ -568,15 +586,23 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
 }
 
 async fn config_show(ctx: &SharedCtx) -> Result<String> {
-    let mut root = get_config(ctx).await?;
-    for s in ["source", "ch"] {
-        if let Some(Value::Table(sec)) = root.get_mut(s)
-            && let Some(p) = sec.get_mut("password")
-        {
-            *p = Value::String("***".into());
+    let root = masked(get_config(ctx).await?);
+    Ok(ok_with(&toml::to_string(&root).unwrap_or_default()))
+}
+
+/// Every `password` at any depth masked: tenants nest `[ch]` sections
+pub(crate) fn masked(mut root: Table) -> Table {
+    fn walk(t: &mut Table) {
+        for (k, v) in t.iter_mut() {
+            match v {
+                Value::Table(sub) => walk(sub),
+                _ if k == "password" => *v = Value::String("***".into()),
+                _ => {}
+            }
         }
     }
-    Ok(ok_with(&toml::to_string(&root).unwrap_or_default()))
+    walk(&mut root);
+    root
 }
 
 // ---- TOML file + postgres helpers -----------------------------------------
@@ -604,7 +630,7 @@ async fn save(path: &Path, root: &Table) -> Result<()> {
 }
 
 // TODO: use daemon catalog rather than a second connection per request
-async fn pg_connect(root: &Table) -> Result<Client> {
+pub(crate) async fn pg_connect(root: &Table) -> Result<Client> {
     let conn = SourceConn::from_table(root).map_err(|e| anyhow::anyhow!("[source] {e}"))?;
     if conn.host.is_empty() {
         bail!("source host not set");

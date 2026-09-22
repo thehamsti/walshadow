@@ -1624,3 +1624,102 @@ pub(super) async fn wait_shadow_replay(
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+impl Supervisor {
+    pub fn is_priming(&self, id: &str) -> bool {
+        self.priming.contains_key(id)
+    }
+}
+
+/// Every declared tenant as the metrics endpoint and `ctl tenant list` see it
+pub(super) async fn metrics_view(
+    tenants: &[Tenant],
+    config: &walshadow::tenants::TenantsConfig,
+    supervisor: &Supervisor,
+    router: &walshadow::tenant_router::TenantRouter,
+) -> Vec<walshadow::metrics::TenantMetrics> {
+    let head = router.last_record_end();
+    let mut out = Vec::with_capacity(config.decls.len());
+    for decl in &config.decls {
+        let Some(t) = tenants.iter().find(|t| t.id == decl.id) else {
+            out.push(walshadow::metrics::TenantMetrics {
+                id: decl.id.clone(),
+                dbname: decl.dbname.clone(),
+                phase: match decl.desired {
+                    walshadow::tenants::Desired::Detached => "detached",
+                    walshadow::tenants::Desired::Active => "pending",
+                },
+                ..Default::default()
+            });
+            continue;
+        };
+        let (xacts_active, resume_safe) = {
+            let mut b = t.xact_buffer.lock().await;
+            let safe = b.resume_safe_lsn(t.emitter_ack.get()).get();
+            (b.stats().xacts_active, safe)
+        };
+        let emitted = t.emitter_stats.as_ref().map_or((0, 0), |s| {
+            (
+                s.rows_emitted.load(Ordering::Relaxed),
+                s.backfill_copy_rows.load(Ordering::Relaxed),
+            )
+        });
+        let queue_depth = router
+            .tenants()
+            .iter()
+            .find(|r| r.id == t.id)
+            .map_or(0, |r| r.sink.in_flight());
+        out.push(walshadow::metrics::TenantMetrics {
+            id: t.id.clone(),
+            dbname: t.dbname.clone(),
+            phase: if supervisor.is_priming(&t.id) {
+                "priming"
+            } else {
+                "active"
+            },
+            ack_lsn: t.emitter_ack.get().get(),
+            resume_safe_lsn: resume_safe,
+            lag_bytes: head.saturating_sub(resume_safe),
+            queue_depth,
+            xacts_active,
+            rows_emitted: emitted.0,
+            backfill_copy_rows: emitted.1,
+        });
+    }
+    out
+}
+
+/// Mirror the SQL registry into its config fragment every poll, reloading
+/// when rows changed, so a row written straight into the table takes effect
+pub(super) fn spawn_registry_poller(
+    config: PathBuf,
+    cli_base: toml::Table,
+    schema: String,
+    poll: Duration,
+    reloader: Arc<walshadow::control::Reloader>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let pass = async {
+                let root = walshadow::ch_emitter::load_effective(&config, cli_base.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                walshadow::ops::tenant_ctl::mirror_registry(&config, &root, &schema).await
+            };
+            match pass.await {
+                Ok(true) => {
+                    if let Err(e) = reloader.reload().await {
+                        tracing::warn!(target: "walshadow::tenant", error = %format!("{e:#}"), "reload after registry change failed");
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    target: "walshadow::tenant",
+                    error = %format!("{e:#}"),
+                    "tenant registry poll failed; keeping the last mirror",
+                ),
+            }
+            tokio::time::sleep(poll).await;
+        }
+    })
+}

@@ -1402,16 +1402,18 @@ impl DurableToastStore {
                 .ok()
                 .and_then(|h| u32::from_str_radix(h, 16).ok())
                 .ok_or_else(|| toast_error("corrupt TOAST truncate key"))?;
-            if lsn <= floor {
-                if let Some(prev) = truncate_floor.insert(relid, lsn) {
-                    dead_markers.push(format!("toast-truncate/{relid:08x}/{prev:016x}"));
-                }
+            if lsn <= floor
+                && let Some(prev) = truncate_floor.insert(relid, lsn)
+            {
+                dead_markers.push(format!("toast-truncate/{relid:08x}/{prev:016x}"));
             }
         }
-        let mut deletions: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = Vec::new();
-        let mut group: Vec<(Vec<u8>, StoredToastHeader, u64)> = Vec::new();
-        let flush = |group: &mut Vec<(Vec<u8>, StoredToastHeader, u64)>,
-                     out: &mut Vec<(Vec<u8>, Option<Vec<u8>>, u64)>| {
+        // (row key, value-index key, accounted bytes)
+        type Deletion = (Vec<u8>, Option<Vec<u8>>, u64);
+        type Version = (Vec<u8>, StoredToastHeader, u64);
+        let mut deletions: Vec<Deletion> = Vec::new();
+        let mut group: Vec<Version> = Vec::new();
+        let flush = |group: &mut Vec<Version>, out: &mut Vec<Deletion>| {
             // Keys sort by lsn within one TID
             let visible = group.iter().rposition(|(_, h, _)| h.lsn <= floor);
             for (i, (key, h, size)) in group.drain(..).enumerate() {

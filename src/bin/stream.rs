@@ -1469,6 +1469,7 @@ async fn run_session(
     // Cluster knobs (pause, source endpoint) with tenants: a destination-less
     // resolver over the cluster sections, which the control socket reloads
     let mut cluster_resolver: Option<Arc<ConfigResolver>> = None;
+    let mut registry_poller: Option<tokio::task::JoinHandle<()>> = None;
     match &tenants_cfg {
         None => {
             let mut boot = shared.boot(
@@ -1513,6 +1514,17 @@ async fn run_session(
             );
             reloader.set_resolver(Some(resolver.clone())).await;
             cluster_resolver = Some(resolver);
+            if let (walshadow::tenants::Registry::Sql { schema, poll }, Some(path)) =
+                (&tcfg.registry, args.ch_config.clone())
+            {
+                registry_poller = Some(tenant::spawn_registry_poller(
+                    path,
+                    cli_base(args),
+                    schema.clone(),
+                    *poll,
+                    reloader.clone(),
+                ));
+            }
             let active: Vec<_> = tcfg
                 .decls
                 .iter()
@@ -2639,6 +2651,11 @@ async fn run_session(
             )
             .await;
         }
+        if let Some(tcfg) = &tenants_cfg {
+            let view =
+                tenant::metrics_view(&tenants, tcfg, &supervisor, &record_sink.decoder_xact).await;
+            metrics.update(|snap| snap.tenants = view).await;
+        }
         if advanced {
             let new_segs = (now_dispatched - prev_dispatched) / WAL_SEG_SIZE;
             segments_shipped += new_segs;
@@ -2742,6 +2759,9 @@ async fn run_session(
         anyhow::bail!("segment fsync failed: {msg}");
     }
     drop(gc_floor);
+    if let Some(task) = registry_poller.take() {
+        task.abort();
+    }
     // Drain every tenant: queueing worker so enqueued-but-undispatched
     // records run through decoder + xact_drain, then the pipeline cascade
     // (decoders → batcher force-flush → inserters to EndOfStream → ack
