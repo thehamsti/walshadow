@@ -223,7 +223,6 @@ pub(super) struct Tenant {
     pub db_oid: u32,
     pub dir: PathBuf,
     /// Shadow catalog session in the tenant's database
-    #[allow(dead_code)]
     pub catalog: Arc<Mutex<ShadowCatalog>>,
     pub bridge: Arc<walshadow::bridge::Bridge>,
     pub oracle: Option<Arc<walshadow::oracle::Oracle>>,
@@ -238,7 +237,6 @@ pub(super) struct Tenant {
     pub ack_probe: watch::Receiver<AckSnapshot>,
     pub config_resolver: Option<Arc<ConfigResolver>>,
     pub copy_backfiller: Option<Arc<walshadow::copy_backfill::CopyBackfiller>>,
-    #[allow(dead_code)]
     pub snowflake: Option<Arc<walshadow::destination::snowflake::runtime::SnowflakeRuntime>>,
     pub span_registry: Option<walshadow::trace::TxnSpanRegistry>,
     /// Pruners' floor: the session joins every persisted resume floor
@@ -1377,6 +1375,7 @@ pub(super) async fn activate(
         }
         tables.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
     }
+    prewarm_start_tables(t, &tables).await;
     let mut state = TenantState::load(&t.dir)
         .await?
         .unwrap_or_else(|| TenantState::new(&t.id, &t.dbname, t.db_oid));
@@ -1722,4 +1721,63 @@ pub(super) fn spawn_registry_poller(
             tokio::time::sleep(poll).await;
         }
     })
+}
+
+/// Snowflake storage setup is metadata round trips; do it for every start
+/// table concurrently rather than one per opt-in inside the coordinator. A
+/// table loading its rows keeps its view unpublished until the load lands
+async fn prepare_start_table(
+    runtime: &walshadow::destination::snowflake::runtime::SnowflakeRuntime,
+    desc: &walshadow::schema::RelDescriptor,
+    initial_load: &str,
+) -> Result<()> {
+    if initial_load != "none" {
+        runtime.defer_publication(desc)?;
+    }
+    runtime.ensure_table(desc).await
+}
+
+async fn prewarm_start_tables(t: &Tenant, tables: &[walshadow::tenants::StartTable]) {
+    use futures::StreamExt;
+    let Some(runtime) = t.snowflake.clone() else {
+        return;
+    };
+    let started = Instant::now();
+    let mut descs = Vec::with_capacity(tables.len());
+    for table in tables {
+        let rel = RelName::new(&table.namespace, &table.name);
+        if let Ok(Some(desc)) = t.catalog.lock().await.descriptor_by_name(&rel).await {
+            descs.push((desc, table.initial_load.clone()));
+        }
+    }
+    let total = descs.len();
+    let failed = futures::stream::iter(descs)
+        .map(|(desc, mode)| {
+            let runtime = runtime.clone();
+            async move {
+                prepare_start_table(&runtime, &desc, &mode)
+                    .await
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            target: "walshadow::tenant",
+                            table = %desc.rel_name,
+                            error = %format!("{e:#}"),
+                            "start table prewarm failed; its opt-in retries",
+                        )
+                    })
+                    .is_err()
+            }
+        })
+        .buffer_unordered(runtime.config.metadata_concurrency)
+        .filter(|failed| std::future::ready(*failed))
+        .count()
+        .await;
+    tracing::info!(
+        target: "walshadow::tenant",
+        tenant = %t.id,
+        tables = total,
+        failed,
+        elapsed_secs = started.elapsed().as_secs_f64(),
+        "start tables prewarmed",
+    );
 }
