@@ -66,6 +66,66 @@ pub async fn apply_table_opt_in(
     row: &TableRow,
     opt_in_lsn: u64,
 ) -> Result<(), EmitterError> {
+    let mut deferred = DeferredBackfills::default();
+    apply_table_opt_in_deferred(
+        resolver,
+        applicator,
+        catalog,
+        backfiller.is_some(),
+        rel,
+        row,
+        opt_in_lsn,
+        &mut deferred,
+    )
+    .await?;
+    deferred.start(backfiller).await;
+    Ok(())
+}
+
+/// Backfills opt-ins requested, started only once every mapping of a batch
+/// of opt-ins is published: a running backfill guards the mapping while it
+/// prepares and publishes, so starting each one as its opt-in lands would
+/// make every later opt-in wait on the earlier loads
+#[derive(Default)]
+pub struct DeferredBackfills {
+    starts: Vec<(Arc<RelDescriptor>, InitialLoadMode, u64)>,
+    opt_outs: Vec<RelName>,
+}
+
+impl DeferredBackfills {
+    pub fn len(&self) -> usize {
+        self.starts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.starts.is_empty() && self.opt_outs.is_empty()
+    }
+
+    pub async fn start(self, backfiller: Option<&Arc<dyn Backfiller>>) {
+        let Some(b) = backfiller else {
+            return;
+        };
+        for rel in &self.opt_outs {
+            b.note_opt_out(rel).await;
+        }
+        for (desc, mode, lsn) in self.starts {
+            b.clone().note_opt_in(desc, mode, lsn).await;
+        }
+    }
+}
+
+/// [`apply_table_opt_in`] that queues the backfill into `deferred`
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_table_opt_in_deferred(
+    resolver: &ConfigResolver,
+    applicator: &mut DdlApplicator,
+    catalog: &Arc<Mutex<ShadowCatalog>>,
+    has_backfiller: bool,
+    rel: &RelName,
+    row: &TableRow,
+    opt_in_lsn: u64,
+    deferred: &mut DeferredBackfills,
+) -> Result<(), EmitterError> {
     match row.replicate {
         Some(true) => {
             let desc = catalog
@@ -77,8 +137,16 @@ pub async fn apply_table_opt_in(
             match desc {
                 Some(desc) => {
                     if shadow_serves_toast(resolver, catalog, &desc).await? {
-                        opt_in_known(resolver, applicator, backfiller, &desc, row, opt_in_lsn)
-                            .await?;
+                        opt_in_known(
+                            resolver,
+                            applicator,
+                            has_backfiller,
+                            &desc,
+                            row,
+                            opt_in_lsn,
+                            deferred,
+                        )
+                        .await?;
                     }
                 }
                 None => {
@@ -92,10 +160,10 @@ pub async fn apply_table_opt_in(
             }
         }
         Some(false) => {
+            // Opt-outs apply at once; the caller's backfiller notes them
             resolver.exclude_table(rel).await;
-            if let Some(b) = backfiller {
-                b.note_opt_out(rel).await;
-            }
+            deferred.starts.retain(|(desc, _, _)| desc.rel_name != *rel);
+            deferred.opt_outs.push(rel.clone());
         }
         None => {}
     }
@@ -138,7 +206,8 @@ pub async fn materialize_pending_on_added(
                 "forward-declared opt-in: initial_load unnecessary (rel born after the declaration)",
             );
         }
-        opt_in_known(resolver, applicator, None, desc, &row, 0).await?;
+        let mut none = DeferredBackfills::default();
+        opt_in_known(resolver, applicator, false, desc, &row, 0, &mut none).await?;
     }
     Ok(())
 }
@@ -148,10 +217,11 @@ pub async fn materialize_pending_on_added(
 async fn opt_in_known(
     resolver: &ConfigResolver,
     applicator: &mut DdlApplicator,
-    backfiller: Option<&Arc<dyn Backfiller>>,
+    has_backfiller: bool,
     desc: &Arc<RelDescriptor>,
     row: &TableRow,
     opt_in_lsn: u64,
+    deferred: &mut DeferredBackfills,
 ) -> Result<(), EmitterError> {
     let snowflake_mapping = applicator
         .snowflake_opt_in_mapping(
@@ -181,13 +251,9 @@ async fn opt_in_known(
     if let Some(mode) = row.initial_load.as_deref() {
         match mode.parse() {
             Ok(InitialLoadMode::None) => {}
-            Ok(parsed) => match backfiller {
-                Some(b) => {
-                    b.clone()
-                        .note_opt_in(desc.clone(), parsed, opt_in_lsn)
-                        .await
-                }
-                None => tracing::info!(
+            Ok(parsed) => match has_backfiller {
+                true => deferred.starts.push((desc.clone(), parsed, opt_in_lsn)),
+                false => tracing::info!(
                     target: "walshadow::config",
                     qname = %desc.rel_name,
                     mode,

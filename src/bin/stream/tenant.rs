@@ -773,16 +773,18 @@ pub(super) async fn open_tenant(boot: TenantBoot<'_>) -> Result<(Tenant, Boundar
                 .chain(emitter_cfg.table_opt_ins.iter()),
         )
         .await;
+        let mut deferred = walshadow::opt_in::DeferredBackfills::default();
         for (rel, row) in &seeded_table_rows {
             if row.replicate.is_some() && !row.is_pattern() {
-                walshadow::opt_in::apply_table_opt_in(
+                walshadow::opt_in::apply_table_opt_in_deferred(
                     &resolver,
                     &mut applicator,
                     &catalog,
-                    backfiller_effects.as_ref(),
+                    backfiller_effects.is_some(),
                     rel,
                     row,
                     raw_start.get(),
+                    &mut deferred,
                 )
                 .await
                 .with_context(|| format!("seed opt-in for {rel}"))?;
@@ -790,14 +792,15 @@ pub(super) async fn open_tenant(boot: TenantBoot<'_>) -> Result<(Tenant, Boundar
         }
         for (rel, row) in &emitter_cfg.table_opt_ins {
             if row.replicate.is_some() {
-                walshadow::opt_in::apply_table_opt_in(
+                walshadow::opt_in::apply_table_opt_in_deferred(
                     &resolver,
                     &mut applicator,
                     &catalog,
-                    backfiller_effects.as_ref(),
+                    backfiller_effects.is_some(),
                     rel,
                     row,
                     raw_start.get(),
+                    &mut deferred,
                 )
                 .await
                 .with_context(|| format!("config opt-in for {rel}"))?;
@@ -812,18 +815,22 @@ pub(super) async fn open_tenant(boot: TenantBoot<'_>) -> Result<(Tenant, Boundar
             )
         };
         for (rel, row) in &pattern_scoped {
-            walshadow::opt_in::apply_table_opt_in(
+            walshadow::opt_in::apply_table_opt_in_deferred(
                 &resolver,
                 &mut applicator,
                 &catalog,
-                backfiller_effects.as_ref(),
+                backfiller_effects.is_some(),
                 rel,
                 row,
                 raw_start.get(),
+                &mut deferred,
             )
             .await
             .with_context(|| format!("pattern opt-in for {rel}"))?;
         }
+        // Every mapping is in place: start the loads without each waiting on
+        // the next opt-in's mapping publication
+        deferred.start(backfiller_effects.as_ref()).await;
         let sql_scoped_tables: HashSet<RelName> = seeded_table_rows
             .iter()
             .filter(|(_, row)| row.replicate.is_some() && !row.is_pattern())

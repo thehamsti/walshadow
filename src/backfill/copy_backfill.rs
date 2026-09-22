@@ -103,6 +103,8 @@ pub const COPY_SLAB_BYTES: usize = 1 << 20;
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 const LEDGER_FILENAME: &str = "backfills.toml";
+/// COPY initial loads in flight when `[bootstrap] copy_concurrency` is unset
+const DEFAULT_COPY_CONCURRENCY: usize = 8;
 const LEDGER_VERSION: u32 = 1;
 
 /// Backup-mode opt-ins wait this long for siblings before the pass fires, so
@@ -659,6 +661,8 @@ pub struct CopyBackfiller {
     /// Per-mode split of `pending`: copy / base_backup / object_store.
     pending_by_mode: [AtomicU64; 3],
     coalesce_window: Duration,
+    /// COPY initial loads in flight, bounded by `[bootstrap] copy_concurrency`
+    copy_slots: tokio::sync::Semaphore,
 }
 
 impl CopyBackfiller {
@@ -678,6 +682,7 @@ impl CopyBackfiller {
         source_major: u32,
     ) -> Self {
         let ledger = Ledger::load(spill_dir).await;
+        let emitter_copy_concurrency = emitter.bootstrap.copy_concurrency.map(|n| n.get());
         let emitter = Arc::new(emitter);
         let pending = AtomicU64::new(ledger.pending_count());
         let pending_by_mode = [
@@ -708,6 +713,9 @@ impl CopyBackfiller {
             pending,
             pending_by_mode,
             coalesce_window: BACKUP_COALESCE_WINDOW,
+            copy_slots: tokio::sync::Semaphore::new(
+                emitter_copy_concurrency.unwrap_or(DEFAULT_COPY_CONCURRENCY),
+            ),
         }
     }
 
@@ -1435,7 +1443,10 @@ impl CopyBackfiller {
     }
 
     async fn run(self: Arc<Self>, desc: Arc<RelDescriptor>, s_lsn: Pos<Snapshot>) {
-        let res = self.copy_once(&desc, s_lsn).await;
+        let res = match self.copy_slots.acquire().await {
+            Ok(_slot) => self.copy_once(&desc, s_lsn).await,
+            Err(e) => Err(anyhow::anyhow!("COPY slots closed: {e}")),
+        };
         let mut inner = self.inner.lock().await;
         inner.active.remove(&desc.rel_name);
         match res {

@@ -284,6 +284,10 @@ pub struct BootstrapSettings {
     /// at most one chunk. `None` uses
     /// [`COPY_CHUNK_BLOCKS`](crate::backfill::copy_backfill::COPY_CHUNK_BLOCKS)
     pub copy_chunk_blocks: Option<NonZeroU32>,
+    /// `copy_concurrency`: COPY initial loads running at once, each one
+    /// source session. Default 8; a tenant attaching with hundreds of tables
+    /// would otherwise open a connection per table at once
+    pub copy_concurrency: Option<NonZeroUsize>,
 }
 
 /// Where external TOAST values live.

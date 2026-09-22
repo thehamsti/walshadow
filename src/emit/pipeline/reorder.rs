@@ -319,6 +319,7 @@ impl ReorderSink {
             .iter()
             .map(|(rel, row)| (rel.clone(), row.clone()))
             .collect();
+        let mut deferred = crate::backfill::opt_in::DeferredBackfills::default();
         for (rel, row) in candidates {
             let known = self
                 .catalog
@@ -336,20 +337,22 @@ impl ReorderSink {
                 );
                 continue;
             }
-            crate::backfill::opt_in::apply_table_opt_in(
+            crate::backfill::opt_in::apply_table_opt_in_deferred(
                 &resolver,
                 applicator,
                 &self.catalog,
-                self.backfiller.as_ref(),
+                self.backfiller.is_some(),
                 &rel,
                 &row,
                 commit_lsn,
+                &mut deferred,
             )
             .await
             .map_err(|e| SinkError::Other(format!("reload opt-in: {e}")))?;
             self.pending_opt_ins.remove(&rel);
             self.applied_opt_ins.insert(rel);
         }
+        deferred.start(self.backfiller.as_ref()).await;
         Ok(())
     }
 
