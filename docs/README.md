@@ -9,6 +9,7 @@ Start with path matching your environment:
 
 Use remaining guides as needed:
 
+- [Snowflake destination](snowflake.md), configuration, recovery, and qualification
 - [Configuration](configuration.md), connection settings and live control
 - [Table selection](table-selection.md), replication scope and initial load
 - [Destination tables](destination-tables.md), generated ClickHouse schema and

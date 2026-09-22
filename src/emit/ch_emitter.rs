@@ -92,6 +92,8 @@ pub(crate) const DEFAULT_DECODE_CHUNK_ROWS: usize = 1024;
 /// per-relation mapping; parse via [`EmitterConfig::from_toml_str`].
 #[derive(Debug, Clone)]
 pub struct EmitterConfig {
+    pub snowflake: Option<Arc<crate::destination::snowflake::runtime::SnowflakeRuntime>>,
+    pub snowflake_snapshots: Arc<HashMap<RelName, String>>,
     pub host: String,
     pub port: u16,
     pub database: String,
@@ -341,6 +343,8 @@ impl Default for RetryConfig {
 impl Default for EmitterConfig {
     fn default() -> Self {
         Self {
+            snowflake: None,
+            snowflake_snapshots: Arc::new(HashMap::default()),
             host: "localhost".into(),
             port: 9000,
             database: "default".into(),

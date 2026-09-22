@@ -1156,7 +1156,10 @@ async fn opt_in_row_pins_order_by_and_primary_key() {
         .query("SHOW CREATE TABLE walshadow_test.keyed")
         .expect("show create");
     assert!(ddl.contains("ORDER BY (tenant, id)"), "{ddl}");
-    assert!(ddl.contains("PRIMARY KEY (tenant)"), "{ddl}");
+    assert!(
+        ddl.contains("PRIMARY KEY tenant") || ddl.contains("PRIMARY KEY (tenant)"),
+        "{ddl}"
+    );
 
     let n = ch
         .query("SELECT count() FROM walshadow_test.keyed FINAL WHERE _is_deleted = 0")

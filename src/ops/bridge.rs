@@ -21,7 +21,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
 /// Catalog column plans. Must equal `WS_PROJECTION_VERSION`
 pub const PROJECTION_VERSION: u32 = 1;
 
@@ -46,9 +46,16 @@ pub enum Op {
     EncodeNative = 0x02,
     Scan = 0x03,
     ReplayLsn = 0x04,
+    RenderText = 0x05,
 }
 
-pub const OP_LABELS: [&str; 4] = ["hello", "encode_native", "scan", "replay_lsn"];
+pub const OP_LABELS: [&str; 5] = [
+    "hello",
+    "encode_native",
+    "scan",
+    "replay_lsn",
+    "render_text",
+];
 pub const OP_COUNT: usize = OP_LABELS.len();
 
 impl Op {
@@ -389,6 +396,11 @@ impl Bridge {
             .native_bytes
             .fetch_add((frame.len() - 1) as u64, Ordering::Relaxed);
         Ok(NativeResponse { frame })
+    }
+
+    /// Neutral text rendering for source Datums. The caller validates response framing.
+    pub async fn render_text(&self, frame: Vec<u8>) -> Result<Response<'_>, BridgeError> {
+        self.call(Op::RenderText, frame).await
     }
 
     /// Read `cat` as transaction `top_xid` sees it, or the committed view when

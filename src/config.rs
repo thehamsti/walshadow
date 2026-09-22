@@ -417,6 +417,22 @@ impl ConfigResolver {
         self.republish(&inner).await;
     }
 
+    /// Install a destination-validated opt-in mapping. Snowflake callers
+    /// prepare this from source identity and neutral types before remote DDL,
+    /// then publish it through the same resolver layer as CH opt-ins.
+    pub async fn materialize_prepared_opt_in(&self, desc: &RelDescriptor, mapping: TableMapping) {
+        let mut inner = self.inner.lock().await;
+        let rel = desc.rel_name.clone();
+        inner.opt_in.mappings.insert(rel.clone(), mapping);
+        inner.opt_in.derived.remove(&rel);
+        inner.opt_in.excluded.remove(&rel);
+        inner.opt_in.pending_decl.remove(&rel);
+        self.pending_decl
+            .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
+        self.opt_in_total.fetch_add(1, Ordering::Relaxed);
+        self.republish(&inner).await;
+    }
+
     /// Take a rel out of scope (`replicate=false` / `TableRemoved`): drop its
     /// mapping + any pending decl, record the exclusion so republish keeps it
     /// out even when TOML-mapped, republish. In-flight
@@ -466,6 +482,25 @@ impl ConfigResolver {
     pub async fn register_derived_mapping(&self, rel: &RelName, mapping: TableMapping) {
         let mut inner = self.inner.lock().await;
         inner.opt_in.derived.insert(rel.clone(), mapping);
+        self.republish(&inner).await;
+    }
+
+    /// Move a Snowflake relation's source name at a fenced DDL barrier.
+    /// Suppress the old configured name so a later republish cannot restore
+    /// a stale route to the renamed warehouse view.
+    pub async fn rename_snowflake_mapping(
+        &self,
+        old: &RelName,
+        new: &RelName,
+        mapping: TableMapping,
+    ) {
+        let mut inner = self.inner.lock().await;
+        inner.opt_in.mappings.remove(old);
+        inner.opt_in.derived.remove(old);
+        inner.opt_in.pending_decl.remove(old);
+        inner.opt_in.excluded.insert(old.clone());
+        inner.opt_in.excluded.remove(new);
+        inner.opt_in.derived.insert(new.clone(), mapping);
         self.republish(&inner).await;
     }
 
@@ -794,8 +829,35 @@ impl ConfigResolver {
             return Ok(());
         };
         let merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
-        let base = EmitterConfig::from_table(&merged)?;
+        let selection = crate::destination::config::DestinationConfig::from_table(&merged)
+            .map_err(|e| EmitterError::Config(e.to_string()))?;
+        let mut base = EmitterConfig::from_table(&merged)?;
         let mut inner = self.inner.lock().await;
+        match (&inner.base.snowflake, selection.snowflake) {
+            (Some(runtime), Some(config)) => {
+                if runtime.config != config || base.source.dbname != inner.base.source.dbname {
+                    return Err(EmitterError::Config("Snowflake settings and source database are bound for the session; restart with matching durable state to change them".into()));
+                }
+                if !base.column_entries.is_empty() || !base.tables.is_empty() {
+                    return Err(EmitterError::Config(
+                        "Snowflake requires source-shaped tables without explicit column mappings"
+                            .into(),
+                    ));
+                }
+                base.row_budget = config.batch_rows;
+                base.byte_budget = config.batch_bytes;
+                base.flush_timeout = Duration::from_millis(config.flush_interval_ms);
+                base.snowflake = Some(runtime.clone());
+                base.snowflake_snapshots = inner.base.snowflake_snapshots.clone();
+            }
+            (None, None) => {}
+            _ => {
+                return Err(EmitterError::Config(
+                    "changing the destination requires a daemon restart and separate durable state"
+                        .into(),
+                ));
+            }
+        }
         inner.base = base;
         self.republish(&inner).await;
         Ok(())
@@ -1484,6 +1546,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snowflake_rename_moves_mapping_and_suppresses_old_name_on_republish() {
+        let base = base_with("retain");
+        let mapping = dummy_handles();
+        let (resolver, _rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            mapping.clone(),
+        );
+        let old = RelName::new("public", "before");
+        let new = RelName::new("public", "after");
+        resolver
+            .register_derived_mapping(
+                &old,
+                TableMapping {
+                    target: TableTarget::new("default", "before"),
+                    columns: Vec::new(),
+                },
+            )
+            .await;
+        resolver
+            .rename_snowflake_mapping(
+                &old,
+                &new,
+                TableMapping {
+                    target: TableTarget::new("default", "after"),
+                    columns: Vec::new(),
+                },
+            )
+            .await;
+        assert!(!mapping.with(|m| m.contains_key(&old)).await);
+        assert!(mapping.with(|m| m.contains_key(&new)).await);
+        resolver
+            .apply_config_event(ConfigEvent::GlobalCleared)
+            .await;
+        assert!(!mapping.with(|m| m.contains_key(&old)).await);
+        assert!(mapping.with(|m| m.contains_key(&new)).await);
+    }
+
+    #[tokio::test]
     async fn forget_reparks_opt_in_row_as_pending_decl() {
         let base = base_with("drop");
         let mapping = dummy_handles();
@@ -1967,6 +2070,32 @@ mod tests {
             &ColumnRules::default(),
         );
         assert_eq!(r.source.slot.as_deref(), Some("pinned"));
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_destination_change_without_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let base = EmitterConfig::default();
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            Some(path.clone()),
+            toml::Table::new(),
+            dummy_handles(),
+        );
+        tokio::fs::write(&path, include_str!("../config/snowflake.toml"))
+            .await
+            .unwrap();
+        assert!(
+            resolver
+                .reload()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("destination requires")
+        );
+        assert!(!rx.has_changed().unwrap());
     }
 
     #[tokio::test]

@@ -250,6 +250,7 @@ impl PipelineConfig {
             stats: stats.clone(),
             resolver: resolver.clone(),
             chunk_rows: emitter.decode_chunk_rows,
+            snowflake: emitter.snowflake.is_some(),
         };
         let ack_probe = ack.probe();
         let decoders = decode::spawn_pool(m, ctx, jobs_rx, ack.clone(), fatal.clone());

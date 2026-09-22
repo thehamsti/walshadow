@@ -134,12 +134,31 @@ async fn opt_in_known(
     row: &TableRow,
     opt_in_lsn: u64,
 ) -> Result<(), EmitterError> {
+    let snowflake_mapping = applicator
+        .snowflake_opt_in_mapping(
+            desc,
+            row.target_database.as_deref(),
+            row.target_table.as_deref(),
+        )
+        .await?;
+    if snowflake_mapping.is_some()
+        && row
+            .initial_load
+            .as_deref()
+            .is_some_and(|mode| mode != "none")
+    {
+        applicator.defer_snowflake_publication(desc)?;
+    }
     if !applicator.ensure_ch_table(desc).await? {
         return Ok(());
     }
-    resolver
-        .materialize_opt_in(desc, row.target_database.clone(), row.target_table.clone())
-        .await;
+    if let Some(mapping) = snowflake_mapping {
+        resolver.materialize_prepared_opt_in(desc, mapping).await;
+    } else {
+        resolver
+            .materialize_opt_in(desc, row.target_database.clone(), row.target_table.clone())
+            .await;
+    }
     if let Some(mode) = row.initial_load.as_deref() {
         match mode.parse() {
             Ok(InitialLoadMode::None) => {}

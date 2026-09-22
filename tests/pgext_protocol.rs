@@ -276,3 +276,72 @@ fn native_looks_through_target_wrappers() {
     );
     hello(&mut sock);
 }
+
+#[test]
+fn render_text_is_type_native_and_rejects_bad_cells() {
+    if !pgext::pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (pg, mut sock) = open(tmp.path());
+    let int4: u32 = pg.sql("SELECT 'int4'::regtype::oid::text").parse().unwrap();
+    let mut request = vec![0x05];
+    request.extend_from_slice(&1u32.to_be_bytes());
+    request.extend_from_slice(&int4.to_be_bytes());
+    request.extend_from_slice(&(-1i32).to_be_bytes());
+    request.push(CELL_DISK_RAW);
+    lenstr(&mut request, &42i32.to_le_bytes());
+    let body = pgext::request(&mut sock, &request);
+    assert_eq!(body[0], 0);
+    assert_eq!(&body[1..5], &1u32.to_be_bytes());
+    assert_eq!(&body[5..9], &2u32.to_be_bytes());
+    assert_eq!(&body[9..], b"42");
+
+    let mut bad = request.clone();
+    bad[13] = CELL_DEFAULT;
+    let msg = error_of(&mut sock, &bad);
+    assert!(msg.contains("invalid oid or tag"), "{msg}");
+    hello(&mut sock);
+}
+
+#[test]
+fn render_text_handles_array_and_domain_input() {
+    if !pgext::pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (pg, mut sock) = open(tmp.path());
+    pg.sql("CREATE DOMAIN ws_positive AS int4 CHECK (VALUE > 0)");
+    let array_oid: u32 = pg
+        .sql("SELECT 'int4[]'::regtype::oid::text")
+        .parse()
+        .unwrap();
+    let domain_oid: u32 = pg
+        .sql("SELECT 'ws_positive'::regtype::oid::text")
+        .parse()
+        .unwrap();
+    let mut request = vec![0x05];
+    request.extend_from_slice(&2u32.to_be_bytes());
+    for (oid, value) in [
+        (array_oid, b"{1,2}".as_slice()),
+        (domain_oid, b"42".as_slice()),
+    ] {
+        request.extend_from_slice(&oid.to_be_bytes());
+        request.extend_from_slice(&(-1i32).to_be_bytes());
+        request.push(0x02);
+        lenstr(&mut request, value);
+    }
+    let body = pgext::request(&mut sock, &request);
+    assert_eq!(body[0], 0);
+    assert_eq!(&body[1..5], &2u32.to_be_bytes());
+    let mut at = 5;
+    for expected in [b"{1,2}".as_slice(), b"42".as_slice()] {
+        let len = u32::from_be_bytes(body[at..at + 4].try_into().unwrap()) as usize;
+        at += 4;
+        assert_eq!(&body[at..at + len], expected);
+        at += len;
+    }
+    assert_eq!(at, body.len());
+}

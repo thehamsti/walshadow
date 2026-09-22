@@ -26,6 +26,7 @@ pub mod ch;
 pub mod column_rules;
 pub mod config;
 pub mod decode;
+pub mod destination;
 pub mod dsn;
 pub mod emit;
 pub mod filter;

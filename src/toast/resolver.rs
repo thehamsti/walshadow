@@ -398,6 +398,12 @@ pub trait ChunkStore: Send + Sync {
     /// Owner TRUNCATE orders destination wipe after replayed fills. DROP callers
     /// wait until persisted replay floor passes dropping commit
     async fn truncate_mirror(&self, toast_relid: u32) -> Result<(), ChunkStoreError>;
+    async fn truncate_at(&self, toast_relid: u32, _record_lsn: u64) -> Result<(), ChunkStoreError> {
+        self.truncate_mirror(toast_relid).await
+    }
+    async fn retire_at(&self, toast_relid: u32, _commit_lsn: u64) -> Result<(), ChunkStoreError> {
+        self.truncate_mirror(toast_relid).await
+    }
     /// Rewrite-generation residual deaths `O - B`: tombstone at `commit_lsn`
     /// every TID live as of `marker_lsn` (generation's `XLOG_SMGR_CREATE`)
     /// with no row past it. Caller puts the generation's births first.
@@ -1022,7 +1028,10 @@ impl ToastResolver {
 
     pub fn from_config(emitter: &EmitterConfig, stats: Arc<EmitterStats>) -> Self {
         Self {
-            store: Some(Arc::new(ClickHouseChunkStore::new(emitter.clone()))),
+            store: Some(match &emitter.snowflake {
+                Some(snowflake) => Arc::new(snowflake.state.toast_store()),
+                None => Arc::new(ClickHouseChunkStore::new(emitter.clone())),
+            }),
             stats,
             put_batch_rows: emitter
                 .toast
@@ -1230,10 +1239,38 @@ impl ToastResolver {
             .await
     }
 
+    pub async fn truncate_mirror_at(
+        &self,
+        toast_relid: u32,
+        record_lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
+        if let Some(store) = &self.store {
+            store.truncate_at(toast_relid, record_lsn).await?;
+            self.stats
+                .toast_mirror_truncates
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     /// Empty retired mirror without dropping it, no-op without store
     pub async fn retire_mirror(&self, toast_relid: u32) -> Result<(), ChunkStoreError> {
         self.clear_mirror(toast_relid, &self.stats.toast_mirror_retires)
             .await
+    }
+
+    pub async fn retire_mirror_at(
+        &self,
+        toast_relid: u32,
+        commit_lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
+        if let Some(store) = &self.store {
+            store.retire_at(toast_relid, commit_lsn).await?;
+            self.stats
+                .toast_mirror_retires
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Residual `O - B` tombstones after a rewrite generation's births are

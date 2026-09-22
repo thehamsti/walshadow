@@ -295,6 +295,27 @@ fn should_drop_entry(seg: &[&str], excluded: &std::collections::HashSet<&str>) -
 }
 
 /// Include every mapped relation, window WAL also emits snapshot opt-outs
+pub fn snowflake_needs_oracle(catalog: &CatalogMap, tables: &MappingSnapshot) -> bool {
+    use crate::decode::heap_decoder::{ColumnValue, local_matrix_covers, missing_value_for};
+    // Snowflake SQL types are not ClickHouse planner types. Only unresolved
+    // PostgreSQL values require the helper's typinput/typoutput functions.
+    catalog.descriptors().any(|desc| {
+        tables.contains_key(&desc.rel_name)
+            && desc
+                .attributes
+                .iter()
+                .filter(|attr| !attr.dropped)
+                .any(|attr| {
+                    !local_matrix_covers(attr.type_oid, attr.type_len)
+                        || matches!(
+                            missing_value_for(attr),
+                            ColumnValue::PgPending { .. } | ColumnValue::PgPendingText { .. }
+                        )
+                })
+    })
+}
+
+/// Include every mapped relation, window WAL also emits snapshot opt-outs
 pub fn needs_oracle(
     catalog: &CatalogMap,
     tables: &MappingSnapshot,
@@ -419,6 +440,58 @@ mod tests {
             &rules,
         );
         assert!(!needs_oracle(&catalog, &tables, &rules));
+    }
+
+    #[test]
+    fn snowflake_sql_types_do_not_trigger_a_clickhouse_oracle() {
+        let (catalog, mut tables) = bridged(
+            rel(vec![
+                attr(1, "id", crate::schema::INT8OID, "int8", 8),
+                attr(
+                    2,
+                    "created",
+                    crate::schema::TIMESTAMPTZOID,
+                    "timestamptz",
+                    8,
+                ),
+                attr(3, "doc", JSONBOID, "jsonb", -1),
+            ]),
+            &ColumnRules::default(),
+        );
+        let mapping = Arc::make_mut(&mut tables).values_mut().next().unwrap();
+        for (column, sql_type) in
+            mapping
+                .columns
+                .iter_mut()
+                .zip(["NUMBER(19,0)", "TIMESTAMP_TZ(6)", "VARCHAR"])
+        {
+            column.target_type = sql_type.into();
+        }
+        assert!(!snowflake_needs_oracle(&catalog, &tables));
+    }
+
+    #[test]
+    fn snowflake_oracle_includes_pending_defaults_and_only_mapped_types() {
+        let (catalog, tables) = bridged(
+            rel(vec![attr(1, "custom", 99999, "custom", -1)]),
+            &ColumnRules::default(),
+        );
+        assert!(snowflake_needs_oracle(&catalog, &tables));
+        assert!(!snowflake_needs_oracle(&catalog, &Arc::default()));
+        let mut created = attr(
+            1,
+            "created",
+            crate::schema::TIMESTAMPTZOID,
+            "timestamptz",
+            8,
+        );
+        created.missing_default = Some("2026-09-22 00:00:00+00".into());
+        let (catalog, tables) = bridged(rel(vec![created]), &ColumnRules::default());
+        assert!(snowflake_needs_oracle(&catalog, &tables));
+        let mut boolean = attr(1, "flag", crate::schema::BOOLOID, "bool", 1);
+        boolean.missing_default = Some("false".into());
+        let (catalog, tables) = bridged(rel(vec![boolean]), &ColumnRules::default());
+        assert!(!snowflake_needs_oracle(&catalog, &tables));
     }
 
     #[test]

@@ -28,9 +28,11 @@ use crate::ch::quote_ident;
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::ColumnValue;
 use crate::decode::visibility::{PendingXids, PgXactView, XidStatus};
+use crate::destination::snowflake::types::SnowflakeRow;
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
+use crate::emit::route::RouteSnapshot;
 use crate::mapping::{ColumnMapping, MappingSnapshot, TableMapping, TableTarget};
 use crate::ops::oracle::Oracle;
 use crate::pos::{Pos, Snapshot};
@@ -202,6 +204,7 @@ impl PendingSpool {
 #[derive(Debug, Clone)]
 pub struct PendingManifest {
     pub rel: PendingRel,
+    pub relation_oid: u32,
     pub start_lsn: u64,
     pub xids: Vec<u32>,
     pub rows: u64,
@@ -219,6 +222,18 @@ pub async fn ship(
     oracle: Option<Arc<Oracle>>,
     scratch_dir: &Path,
 ) -> Result<Vec<PendingManifest>, String> {
+    if let Some(runtime) = &emitter.snowflake {
+        return ship_snowflake(
+            pending,
+            live,
+            runtime,
+            stats,
+            resolver,
+            oracle,
+            emitter.row_policy(),
+        )
+        .await;
+    }
     let PendingSpool {
         spool,
         catalog,
@@ -256,6 +271,7 @@ pub async fn ship(
         routes.insert(desc.rel_name.clone(), pending_table_mapping(m, desc, &rel));
         manifests.push(PendingManifest {
             rel,
+            relation_oid: desc.oid,
             start_lsn: counted.start_lsn,
             xids: counted.xids.iter().copied().collect(),
             rows: counted.rows,
@@ -292,6 +308,7 @@ pub async fn ship(
         emitter.row_policy(),
         config,
         HashSet::new(),
+        emitter.snowflake.is_some(),
     ));
 
     let replayed = replay(spool, &tx).await;
@@ -309,6 +326,151 @@ pub async fn ship(
 
     let rows: u64 = manifests.iter().map(|m| m.rows).sum();
     stats.pending_rows.fetch_add(rows, Ordering::Relaxed);
+    stats
+        .pending_tables
+        .fetch_add(manifests.len() as u64, Ordering::Relaxed);
+    Ok(manifests)
+}
+
+/// Capture source-shaped, fully decoded rows before any visibility decision.
+/// The RocksDB record survives a failed or repeated snapshot pass.
+async fn ship_snowflake(
+    pending: PendingSpool,
+    live: &MappingSnapshot,
+    runtime: &Arc<crate::destination::snowflake::runtime::SnowflakeRuntime>,
+    stats: Arc<EmitterStats>,
+    resolver: ToastResolver,
+    oracle: Option<Arc<Oracle>>,
+    policy: crate::emit::route::RowPolicy,
+) -> Result<Vec<PendingManifest>, String> {
+    use sha2::{Digest, Sha256};
+    let PendingSpool {
+        spool,
+        catalog,
+        tally,
+    } = pending;
+    if spool.records() == 0 {
+        spool.discard().await;
+        return Ok(Vec::new());
+    }
+    let mut manifests = Vec::new();
+    let mut routes = HashMap::new();
+    for desc in catalog.descriptors() {
+        let Some(counted) = tally.get(&desc.rel_name) else {
+            continue;
+        };
+        let Some(mapping) = live.get(&desc.rel_name) else {
+            return Err(format!(
+                "Snowflake pending relation {} has no route",
+                desc.rel_name
+            ));
+        };
+        let route =
+            RouteSnapshot::freeze(Arc::new(mapping.clone()), Arc::default(), policy.clone());
+        let schema = runtime
+            .schema_for(desc, &route)
+            .await
+            .map_err(|e| e.to_string())?;
+        routes.insert(desc.rel_name.clone(), (route, schema));
+        manifests.push(PendingManifest {
+            rel: PendingRel {
+                rel: desc.rel_name.clone(),
+                database: mapping.target.database.clone(),
+                table: mapping.target.table.clone(),
+            },
+            relation_oid: desc.oid,
+            start_lsn: counted.start_lsn,
+            xids: counted.xids.iter().copied().collect(),
+            rows: counted.rows,
+        });
+    }
+    let mut reader = spool
+        .into_reader()
+        .await
+        .map_err(|e| format!("pending visibility: spool seal: {e}"))?;
+    let mut captured = 0u64;
+    while let Some(mut tuple) = reader
+        .next()
+        .await
+        .map_err(|e| format!("pending visibility: spool replay: {e}"))?
+    {
+        let desc = catalog
+            .get(tuple.rfn.db_node, tuple.rfn.rel_node)
+            .ok_or_else(|| "Snowflake pending relation disappeared from catalog".to_string())?;
+        let (route, schema) = routes.get(&desc.rel_name).ok_or_else(|| {
+            format!(
+                "Snowflake pending relation {} has no captured route",
+                desc.rel_name
+            )
+        })?;
+        let base = metadata_base(&desc);
+        let xmin = match tuple.columns.get(base).and_then(Option::as_ref) {
+            Some(ColumnValue::Oid(x)) => *x,
+            _ => return Err("Snowflake pending xmin metadata missing".into()),
+        };
+        let xmax = match tuple.columns.get(base + 1).and_then(Option::as_ref) {
+            Some(ColumnValue::Oid(x)) => *x,
+            _ => return Err("Snowflake pending xmax metadata missing".into()),
+        };
+        tuple.columns.truncate(base);
+        if tuple.has_mapped_external(&route.mapping) {
+            if !resolver.stores_chunks() {
+                return Err("Snowflake pending row has unresolved external TOAST".into());
+            }
+            let _permit =
+                bootstrap::resolve_or_fill_toast(&mut tuple, &desc, &route.mapping, &resolver)
+                    .await?;
+        }
+        let (incarnation, _) = runtime.lineage(&desc).await.map_err(|e| e.to_string())?;
+        let captured_generation = runtime
+            .pending_capture_generation(desc.oid)
+            .map_err(|e| e.to_string())?;
+        let id_input = serde_json::to_vec(&(
+            runtime.source_identity.as_str(),
+            desc.oid,
+            captured_generation,
+            tuple.rfn.rel_node,
+            tuple.blkno,
+            tuple.offnum,
+            xmin,
+            xmax,
+            tuple.source_lsn,
+        ))
+        .map_err(|e| e.to_string())?;
+        let id = hex::encode(Sha256::digest(id_input));
+        let ordinal = u32::from(tuple.offnum);
+        let mut committed = tuple.into_committed_insert();
+        if let Some(oracle) = &oracle {
+            oracle
+                .render_text_columns(&mut committed, &desc)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let mut row = SnowflakeRow::from_committed_with_lineage(
+            schema,
+            &committed,
+            ordinal,
+            false,
+            &runtime.source_identity,
+            incarnation,
+            captured_generation,
+        )?;
+        row.event_id = id.clone();
+        runtime
+            .capture_pending(
+                &desc.rel_name.namespace,
+                &desc.rel_name.name,
+                schema.clone(),
+                row,
+                id,
+                xmin,
+                xmax,
+                captured_generation,
+            )
+            .map_err(|e| e.to_string())?;
+        captured += 1;
+    }
+    stats.pending_rows.fetch_add(captured, Ordering::Relaxed);
     stats
         .pending_tables
         .fetch_add(manifests.len() as u64, Ordering::Relaxed);
@@ -399,6 +561,8 @@ struct PendingFile {
 /// Durable state for one pending table
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingEntry {
+    #[serde(default)]
+    pub relation_oid: u32,
     pub namespace: String,
     pub relname: String,
     pub database: String,
@@ -464,6 +628,55 @@ pub fn ledger_path(spill_dir: &Path) -> PathBuf {
 }
 
 impl PendingLedger {
+    /// Rebuild any carry records durably captured before a crash interrupted
+    /// the manifest handoff. Never erase transaction decisions already learned.
+    pub async fn reconcile_snowflake(
+        &mut self,
+        runtime: &crate::destination::snowflake::runtime::SnowflakeRuntime,
+    ) -> Result<(), String> {
+        for manifest in runtime.pending_manifests().map_err(|e| e.to_string())? {
+            if let Some(entry) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.relation_oid == manifest.relation_oid)
+            {
+                if entry.namespace != manifest.source_namespace
+                    || entry.relname != manifest.source_relname
+                    || entry.database != manifest.database
+                    || entry.table != manifest.table
+                {
+                    return Err("Snowflake pending relation metadata conflicts with ledger".into());
+                }
+                entry.start_lsn = entry.start_lsn.min(manifest.start_lsn.into());
+                for xid in manifest.xids {
+                    if !entry.outstanding.contains(&xid)
+                        && !entry.committed.contains(&xid)
+                        && !entry.aborted.contains(&xid)
+                    {
+                        entry.outstanding.push(xid);
+                    }
+                }
+            } else {
+                self.entries.push(PendingEntry {
+                    relation_oid: manifest.relation_oid,
+                    namespace: manifest.source_namespace,
+                    relname: manifest.source_relname,
+                    database: manifest.database,
+                    table: manifest.table,
+                    start_lsn: manifest.start_lsn.into(),
+                    outstanding: manifest.xids,
+                    committed: Vec::new(),
+                    aborted: Vec::new(),
+                    fresh_committed: Vec::new(),
+                    fresh_aborted: Vec::new(),
+                });
+            }
+        }
+        self.persist()
+            .await
+            .map_err(|e| format!("Snowflake pending manifest persist: {e}"))
+    }
+
     /// Treat missing file as empty; reject corrupt state
     pub async fn load(spill_dir: &Path) -> Result<Self, PendingLedgerError> {
         let mut ledger = Self {
@@ -525,6 +738,7 @@ impl PendingLedger {
         let mut xids = manifest.xids.clone();
         xids.sort_unstable();
         let entry = PendingEntry {
+            relation_oid: manifest.relation_oid,
             namespace: manifest.rel.rel.namespace.to_string(),
             relname: manifest.rel.rel.name.to_string(),
             database: manifest.rel.database.clone(),
@@ -594,6 +808,47 @@ pub async fn settle(
     sess: &mut StagingSession,
     stats: &EmitterStats,
 ) -> Result<(), String> {
+    if let Some(runtime) = sess.snowflake_runtime().cloned() {
+        ledger.reconcile_snowflake(&runtime).await?;
+        // Persist learned xid outcomes before any remote effect. A crash after
+        // delivery can then replay settlement from the durable decisions.
+        ledger
+            .persist()
+            .await
+            .map_err(|e| format!("Snowflake pending decision persist: {e}"))?;
+        let mut done = Vec::new();
+        for (i, entry) in ledger.entries.iter_mut().enumerate() {
+            if entry.relation_oid == 0 {
+                return Err("Snowflake pending ledger lacks relation OID".into());
+            }
+            runtime
+                .settle_pending_relation(entry.relation_oid, &entry.committed, &entry.aborted)
+                .await
+                .map_err(|e| format!("Snowflake pending settlement: {e}"))?;
+            let records = runtime
+                .state
+                .pending_for_relation(entry.relation_oid)
+                .map_err(|e| format!("Snowflake pending state read: {e}"))?;
+            if records
+                .iter()
+                .all(|r| r.phase == crate::destination::snowflake::state::PendingPhase::Retired)
+            {
+                done.push(i);
+            }
+            entry.fresh_committed.clear();
+            entry.fresh_aborted.clear();
+        }
+        for i in done.into_iter().rev() {
+            ledger.entries.remove(i);
+        }
+        stats
+            .pending_outstanding_xids
+            .store(ledger.outstanding().len() as u64, Ordering::Relaxed);
+        return ledger
+            .persist()
+            .await
+            .map_err(|e| format!("Snowflake pending ledger persist: {e}"));
+    }
     let mut done = Vec::new();
     for (i, e) in ledger.entries.iter_mut().enumerate() {
         let rel = e.rel();
@@ -734,6 +989,7 @@ mod tests {
                 database: "db".into(),
                 table: rel.into(),
             },
+            relation_oid: 42,
             start_lsn: 0x5000,
             xids,
             rows: 3,

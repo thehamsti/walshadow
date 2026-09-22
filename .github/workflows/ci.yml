@@ -69,7 +69,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential liblz4-dev libzstd-dev curl gnupg lsb-release \
+            build-essential libclang-dev cmake liblz4-dev libzstd-dev curl gnupg lsb-release \
             gcovr
 
       # The runner's preinstalled postgresql-common ships only one major
@@ -351,7 +351,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential liblz4-dev libzstd-dev
+            build-essential libclang-dev cmake liblz4-dev libzstd-dev
 
       - name: cargo fmt
         working-directory: walshadow

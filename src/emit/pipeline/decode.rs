@@ -59,6 +59,7 @@ pub struct DecodeCtx {
     pub resolver: ToastResolver,
     /// Row cap before a mid-loop chunk route; defaults to emitter configuration.
     pub chunk_rows: usize,
+    pub snowflake: bool,
 }
 
 /// Byte half of dual trigger with configured row cap. Bounds channel item for
@@ -111,7 +112,10 @@ pub async fn decode_and_route(
         };
         // No delete-marker column: a DELETE would land as a phantom insert of
         // the old image, so drop it (append-only destination)
-        if route.drops_deletes() && matches!(envelope.described.decoded.op, HeapOp::Delete) {
+        if !ctx.snowflake
+            && route.drops_deletes()
+            && matches!(envelope.described.decoded.op, HeapOp::Delete)
+        {
             ctx.stats.deletes_discarded.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -127,11 +131,13 @@ pub async fn decode_and_route(
             commit_lsn,
         };
         // PostGIS WKT differs from typoutput HEXEWKB
-        if let Some(t) = committed.decoded.new.as_mut() {
-            crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
-        }
-        if let Some(t) = committed.decoded.old.as_mut() {
-            crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
+        if !ctx.snowflake {
+            if let Some(t) = committed.decoded.new.as_mut() {
+                crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
+            }
+            if let Some(t) = committed.decoded.old.as_mut() {
+                crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
+            }
         }
         buf_bytes += committed.decoded.approx_bytes();
         buf.push(RoutedRow {
@@ -297,6 +303,7 @@ mod tests {
             stats: stats.clone(),
             resolver: ToastResolver::disabled(),
             chunk_rows: 8,
+            snowflake: false,
         };
         let no_marker = route(SystemColumns {
             is_deleted: None,
@@ -338,5 +345,45 @@ mod tests {
         .expect("decode");
         assert_eq!(routed, 1);
         assert_eq!(stats.deletes_discarded.load(Ordering::Relaxed), 1);
+    }
+    #[tokio::test]
+    async fn snowflake_preserves_delete_and_pending_geometry() {
+        let (msg_tx, mut msg_rx) = mpsc::channel(8);
+        let ctx = DecodeCtx {
+            msg_tx,
+            stats: Arc::new(EmitterStats::default()),
+            resolver: ToastResolver::disabled(),
+            chunk_rows: 8,
+            snowflake: true,
+        };
+        let no_marker = route(SystemColumns {
+            is_deleted: None,
+            ..SystemColumns::default()
+        });
+        let mut row = heap(HeapOp::Delete, no_marker);
+        Arc::make_mut(&mut row.described.descriptor).attributes[0].type_name = "geometry".into();
+        row.described.decoded.old.as_mut().unwrap().columns[0] = Some(ColumnValue::PgPending {
+            type_oid: 23,
+            raw: vec![0; 24],
+        });
+        assert_eq!(
+            decode_and_route(&ctx, 0, 0, 0x2000, vec![row], Vec::new(), None)
+                .await
+                .unwrap(),
+            1
+        );
+        let Some(BatcherMsg::Rows(chunk)) = msg_rx.recv().await else {
+            panic!("missing Snowflake row")
+        };
+        assert!(matches!(
+            chunk.rows[0]
+                .committed
+                .decoded
+                .old
+                .as_ref()
+                .unwrap()
+                .columns[0],
+            Some(ColumnValue::PgPending { .. })
+        ));
     }
 }

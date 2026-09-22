@@ -3,15 +3,12 @@
 # source Postgres / ClickHouse / standby) instead of from a workstation where
 # the WAN round trip caps insert throughput.
 #
-# The bench lives in its own `walshadow-bench` crate (bench/), which is
-# self-contained — it talks to Postgres over tokio-postgres and to ClickHouse
-# over a hand-rolled HTTP client, so it pulls in none of walshadow's WAL/native
-# (clickhouse-c-rs) dependencies. That means no lz4/zstd C toolchain at build
-# time and no codec .so at runtime. The sibling crate manifests are still copied
-# so Cargo can resolve the workspace; only `walshadow-bench` is compiled.
+# Snowflake uses walshadow's authenticated SQL client; build its native
+# dependencies alongside the benchmark engine.
 FROM rust:1-alpine AS builder
-RUN apk add --no-cache build-base
+RUN apk add --no-cache build-base clang-dev cmake lz4-dev zstd-dev
 ENV RUSTFLAGS="-C target-feature=-crt-static"
+ENV CFLAGS="-Dunreachable()=__builtin_unreachable()"
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -25,7 +22,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp /src/target/release/walshadow-ec2-bench /usr/local/bin/walshadow-ec2-bench
 
 FROM alpine:3.24 AS runtime
-# libgcc for the (dynamically-linked musl) Rust binary; no codec libs needed.
-RUN apk add --no-cache libgcc openssh-client
+RUN apk add --no-cache ca-certificates libgcc libstdc++ lz4-libs zstd-libs openssh-client
 COPY --from=builder /usr/local/bin/walshadow-ec2-bench /usr/local/bin/walshadow-ec2-bench
 ENTRYPOINT ["walshadow-ec2-bench"]

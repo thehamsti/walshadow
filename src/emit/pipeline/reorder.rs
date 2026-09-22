@@ -488,7 +488,7 @@ impl ReorderSink {
             return Ok(());
         };
         applicator
-            .apply(event)
+            .apply_at(event, commit_lsn)
             .await
             .map_err(|e| SinkError::Other(format!("ddl apply: {e}")))?;
         // A `CREATE TABLE` for a forward-declared opt-in materialises here, in
@@ -553,7 +553,7 @@ impl ReorderSink {
         let cut = self.resume_floor.get();
         for (oid, commit_lsn) in self.retires.due(cut) {
             self.resolver
-                .retire_mirror(oid)
+                .retire_mirror_at(oid, commit_lsn.get())
                 .await
                 .map_err(|e| SinkError::Other(format!("toast mirror retire: {e}")))?;
             self.retires
@@ -603,6 +603,12 @@ impl ReorderSink {
         &mut self,
         shadow_data_dir: Option<&std::path::Path>,
     ) -> Result<(), SinkError> {
+        if let Some(runtime) = &self.emitter.snowflake {
+            self.pending_rows
+                .reconcile_snowflake(runtime)
+                .await
+                .map_err(SinkError::Other)?;
+        }
         if self.pending_rows.is_empty() {
             return Ok(());
         }
@@ -672,15 +678,15 @@ impl ReorderSink {
         // predecessor walk here
         let rel = &heap.descriptor;
         applicator
-            .truncate(&rel.rel_name)
+            .truncate_at(rel, heap.decoded.source_lsn)
             .await
-            .map_err(|e| SinkError::Other(format!("ch truncate: {e}")))?;
+            .map_err(|e| SinkError::Other(format!("truncate: {e}")))?;
         self.stats.truncates_emitted.fetch_add(1, Ordering::Relaxed);
         // PG swaps TOAST relfilenode without listing it in `xl_heap_truncate`;
         // the descriptor carries the owner's toast oid
         if self.resolver.stores_chunks() && rel.toast_oid != 0 {
             self.resolver
-                .truncate_mirror(rel.toast_oid)
+                .truncate_mirror_at(rel.toast_oid, heap.decoded.source_lsn)
                 .await
                 .map_err(|e| SinkError::Other(format!("toast mirror truncate: {e}")))?;
         }
@@ -1127,8 +1133,8 @@ impl PlanRouteView for ReorderRouteView<'_> {
         let Some(app) = self.applicator.as_deref_mut() else {
             return Ok(());
         };
-        if let Some((rel, m)) = app
-            .predict_route_mapping(ev, &mapping, config.as_deref())
+        for (rel, m) in app
+            .predict_route_effects(ev, &mapping, config.as_deref())
             .await
             .map_err(|e| e.to_string())?
         {

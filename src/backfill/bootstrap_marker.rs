@@ -18,6 +18,8 @@ pub struct BootstrapMarker {
     pub attempts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_lsn: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -78,6 +80,16 @@ impl ExtractedCheckpoint {
 }
 
 impl BootstrapMarker {
+    /// Pin the Snowflake generation floor before any page row can ship.
+    pub async fn pin_snapshot_lsn(&mut self, dir: &Path, sampled: u64) -> Result<u64> {
+        let floor = self.snapshot_lsn.unwrap_or(sampled);
+        anyhow::ensure!(floor != 0, "Snowflake bootstrap snapshot floor is zero");
+        if self.snapshot_lsn.is_none() {
+            self.snapshot_lsn = Some(floor);
+            self.write(dir).await?;
+        }
+        Ok(floor)
+    }
     /// Only absence is a clean answer: an unreadable or unparseable marker
     /// still says a bootstrap was interrupted, so it stops startup rather
     /// than reading as a fresh data dir
@@ -116,6 +128,7 @@ impl BootstrapMarker {
         Self {
             attempts: self.attempts + 1,
             backup_name: self.backup_name.clone(),
+            snapshot_lsn: self.snapshot_lsn,
         }
     }
 
@@ -262,6 +275,7 @@ async fn first_attempt(data_dir: &Path, pin: Option<String>) -> Result<Bootstrap
     let marker = BootstrapMarker {
         attempts: 1,
         backup_name: pin,
+        snapshot_lsn: None,
     };
     marker.write(data_dir).await?;
     Ok(marker)
@@ -341,6 +355,12 @@ async fn discard_partial(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A Snowflake retry starts a fresh physical generation, so it must reread
+/// every page rather than use the ClickHouse extracted-checkpoint shortcut.
+pub async fn restart_extraction(data_dir: &Path) -> Result<()> {
+    discard_partial(data_dir).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -351,6 +371,7 @@ mod tests {
         BootstrapMarker {
             attempts,
             backup_name: Some("base_original".into()),
+            snapshot_lsn: None,
         }
     }
 
@@ -365,6 +386,31 @@ mod tests {
         assert_eq!(BootstrapMarker::read(dir).unwrap(), Some(pinned(2)));
         BootstrapMarker::clear(dir).await.unwrap();
         assert_eq!(BootstrapMarker::read(dir).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn snowflake_snapshot_floor_survives_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("shadow");
+        let mut marker = begin_attempt(&dir, None, Some("base_original".into()))
+            .await
+            .unwrap();
+        assert_eq!(marker.pin_snapshot_lsn(&dir, 0x100).await.unwrap(), 0x100);
+        let mut retry = begin_attempt(&dir, Some(marker), Some("base_original".into()))
+            .await
+            .unwrap();
+        assert_eq!(retry.pin_snapshot_lsn(&dir, 0x200).await.unwrap(), 0x100);
+        assert_eq!(
+            BootstrapMarker::read(&dir).unwrap().unwrap().snapshot_lsn,
+            Some(0x100)
+        );
+    }
+
+    #[test]
+    fn legacy_marker_has_no_snapshot_floor() {
+        let marker: BootstrapMarker =
+            toml::from_str("attempts = 1\nbackup_name = 'base_original'\n").unwrap();
+        assert_eq!(marker.snapshot_lsn, None);
     }
 
     #[test]
@@ -420,6 +466,7 @@ mod tests {
             BootstrapMarker {
                 attempts: 1,
                 backup_name,
+                snapshot_lsn: None,
             }
             .write(tmp.path())
             .await
@@ -559,6 +606,7 @@ mod tests {
             let unpinned = BootstrapMarker {
                 attempts: 1,
                 backup_name: None,
+                snapshot_lsn: None,
             };
             assert!(
                 resolve_backup(&storage, configured, Some(&unpinned))

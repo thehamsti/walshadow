@@ -409,3 +409,73 @@ ws_handle_encode_native(StringInfo req, StringInfo resp)
 	if (chc_block_write(&rio.io, pgch_writer_build(w), &opts, &err) != CHC_OK)
 		pgch_raise(&err, ERRCODE_FDW_ERROR, "block write: ", NULL);
 }
+
+/* Neutral source-type text for destinations other than ClickHouse.
+ * Request: u32 count; repeated oid:u32, typmod:i32, tag:u8, len:u32, bytes.
+ * Reply: status:u8, count:u32, repeated len:u32, UTF-8 bytes. No defaults:
+ * callers send only materialized source values, never an absent tuple field. */
+void
+ws_handle_render_text(StringInfo req, StringInfo resp)
+{
+	uint32 n_cells = pq_getmsgint(req, 4);
+	MemoryContext cellctx;
+	MemoryContext oldctx;
+
+	if (n_cells == 0 || (uint64) n_cells * 13 > (uint64) (req->len - req->cursor))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("walshadow render_text invalid cell count %u", n_cells)));
+	pq_sendbyte(resp, WS_STATUS_OK);
+	pq_sendint32(resp, n_cells);
+	cellctx = AllocSetContextCreate(CurrentMemoryContext, "walshadow text cell",
+								   ALLOCSET_DEFAULT_SIZES);
+	for (uint32 i = 0; i < n_cells; i++)
+	{
+		WsNativeCol col = {0};
+		uint8 tag;
+		uint32 len;
+		const char *body;
+		Datum datum;
+		Oid outfunc;
+		bool isvarlena;
+		char *text;
+		size_t textlen;
+
+		col.source_oid = (Oid) pq_getmsgint(req, 4);
+		col.source_typmod = (int32) pq_getmsgint(req, 4);
+		tag = pq_getmsgbyte(req);
+		if (!OidIsValid(col.source_oid) ||
+			(tag != WS_CELL_DISK_RAW && tag != WS_CELL_TEXT))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("walshadow render_text cell %u has invalid oid or tag", i)));
+		len = pq_getmsgint(req, 4);
+		if (len > (uint32) (req->len - req->cursor))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("walshadow render_text cell %u length past frame", i)));
+		body = pq_getmsgbytes(req, (int) len);
+		if (tag == WS_CELL_TEXT && memchr(body, '\0', len) != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("walshadow render_text cell %u contains NUL", i)));
+		oldctx = MemoryContextSwitchTo(cellctx);
+		get_typlenbyval(col.source_oid, &col.typlen, &col.typbyval);
+		datum = tag == WS_CELL_DISK_RAW
+			? ws_reconstruct_datum(&col, body, len)
+			: ws_input_datum(&col, body, len);
+		getTypeOutputInfo(col.source_oid, &outfunc, &isvarlena);
+		text = OidOutputFunctionCall(outfunc, datum);
+		textlen = strlen(text);
+		MemoryContextSwitchTo(oldctx);
+		if (resp->len > WS_MAX_RESPONSE_BYTES - 4 ||
+			textlen > (size_t) (WS_MAX_RESPONSE_BYTES - resp->len - 4))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("walshadow render_text exceeds response cap")));
+		pq_sendint32(resp, (uint32) textlen);
+		pq_sendbytes(resp, text, (int) textlen);
+		MemoryContextReset(cellctx);
+	}
+	MemoryContextDelete(cellctx);
+}

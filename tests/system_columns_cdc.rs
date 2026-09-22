@@ -122,7 +122,10 @@ async fn renamed_system_columns_and_operator_keys() {
         .expect("show create");
     assert!(ddl.contains("ReplacingMergeTree(_peerdb_version)"), "{ddl}");
     assert!(ddl.contains("ORDER BY (tenant, id)"), "{ddl}");
-    assert!(ddl.contains("PRIMARY KEY (tenant)"), "{ddl}");
+    assert!(
+        ddl.contains("PRIMARY KEY tenant") || ddl.contains("PRIMARY KEY (tenant)"),
+        "{ddl}"
+    );
 
     let cols = ch
         .query(

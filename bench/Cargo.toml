@@ -5,9 +5,7 @@ edition = "2024"
 description = "Replication-latency benchmarks (Postgres → ClickHouse / PG standby), engine + CLIs"
 license = "AGPL-3.0-only"
 
-# The shared benchmark engine. Self-contained: talks to Postgres over
-# tokio-postgres and to ClickHouse over a hand-rolled HTTP client, so it pulls
-# in none of walshadow's WAL/native dependencies.
+# The shared engine reuses walshadow's authenticated Snowflake SQL transport.
 [lib]
 name = "walshadow_bench"
 path = "src/lib.rs"
@@ -26,7 +24,13 @@ path = "src/bin/ec2_bench.rs"
 name = "walshadow-bench-plot"
 path = "src/bin/plot.rs"
 
+[[bin]]
+name = "walshadow-snowflake-qualify"
+path = "src/bin/snowflake_qualify.rs"
+
 [dependencies]
+walshadow = { path = ".." }
+uuid = { version = "1", features = ["v4"] }
 ab_glyph = "0.2.32"
 anyhow = "1"
 async-trait = "0.1"

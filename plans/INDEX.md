@@ -26,6 +26,7 @@ writes. A documented limitation does not imply code rejects it
 | [Catalog completeness](catalog.md) | Stop when a surviving relation has lost buffered payload |
 | [Bootstrap visibility](bootstrap.md) | Preserve tuples whose transaction outcome is still unknown |
 | [Verification](verification.md) | Enforce CI prerequisites and prove outage, restart, and WAL-version behavior |
+| [Snowflake](snowflake.md) | Run live correctness, restart and matched throughput/cost qualification; see [implementation evidence](snowflake-progress.md) |
 | [100% line coverage](coverage100.md) | Close fixture, live-system, CLI, and fault-path gaps, then enforce 100% |
 
 ## Further work

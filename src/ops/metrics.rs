@@ -331,21 +331,21 @@ snapshot! {
         "1 while the pgext bridge worker answered the last request over its socket.",
     /// Per-op, rendered `op=` labelled; order matches
     /// [`OP_LABELS`].
-    counter bridge_requests_by_op: [u64; 4] ["op" = OP_LABELS] =
+    counter bridge_requests_by_op: [u64; 5] ["op" = OP_LABELS] =
         "Requests sent to the pgext bridge worker.",
-    counter bridge_errors_by_op: [u64; 4] ["op" = OP_LABELS] =
+    counter bridge_errors_by_op: [u64; 5] ["op" = OP_LABELS] =
         "Bridge requests that failed, transport or worker-side.",
-    counter bridge_request_seconds_by_op: [f64; 4] ["op" = OP_LABELS] =
+    counter bridge_request_seconds_by_op: [f64; 5] ["op" = OP_LABELS] =
         "Wall time spent in bridge round trips.",
     /// Queued behind another caller on the single bridge socket
-    counter bridge_lock_wait_seconds_by_op: [f64; 4] ["op" = OP_LABELS] =
+    counter bridge_lock_wait_seconds_by_op: [f64; 5] ["op" = OP_LABELS] =
         "Wall time bridge callers spent queued for the socket. Against bridge_service_seconds this says whether the worker or the funnel in front of it is the limiter.",
     /// Wire time with the socket held
-    counter bridge_service_seconds_by_op: [f64; 4] ["op" = OP_LABELS] =
+    counter bridge_service_seconds_by_op: [f64; 5] ["op" = OP_LABELS] =
         "Wall time on the wire with the bridge socket held: worker conversion plus transfer.",
-    counter bridge_request_bytes_by_op: [u64; 4] ["op" = OP_LABELS] =
+    counter bridge_request_bytes_by_op: [u64; 5] ["op" = OP_LABELS] =
         "Request frame bytes written to the bridge socket.",
-    counter bridge_response_bytes_by_op: [u64; 4] ["op" = OP_LABELS] =
+    counter bridge_response_bytes_by_op: [u64; 5] ["op" = OP_LABELS] =
         "Response frame bytes read back off the bridge socket.",
     counter bridge_reconnects_total: u64 =
         "Bridge sockets redialled after a worker exit or transport error.",

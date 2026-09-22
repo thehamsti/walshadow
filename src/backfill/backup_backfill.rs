@@ -355,6 +355,7 @@ async fn walk_and_ship(
         ctx.emitter.row_policy(),
         ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
         HashSet::new(),
+        ctx.emitter.snowflake.is_some(),
     ));
 
     // Success signal before the joins: gate resolves deferred tuples only

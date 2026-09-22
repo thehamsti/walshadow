@@ -262,6 +262,7 @@ impl GreenfieldSink {
                 self.emitter.row_policy(),
                 Some(self.config.clone()),
                 self.skip_initial.clone(),
+                self.emitter.snowflake.is_some(),
             ));
             senders.push(tx);
         }
@@ -282,6 +283,7 @@ impl GreenfieldSink {
             let resolver = self.resolver.clone();
             let config = self.config.clone();
             let row_policy = self.emitter.row_policy();
+            let neutral_values = self.emitter.snowflake.is_some();
             async move {
                 bootstrap::drain_deferred(
                     lane.spool,
@@ -294,6 +296,7 @@ impl GreenfieldSink {
                     &row_policy,
                     Some(&config),
                     lane.first_seq,
+                    neutral_values,
                 )
                 .await
             }

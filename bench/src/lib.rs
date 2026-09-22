@@ -22,6 +22,8 @@
 
 pub mod initial_load;
 pub mod plot;
+pub mod qualification;
+pub mod snowflake;
 pub mod suite;
 
 use std::sync::Arc;
@@ -55,6 +57,8 @@ pub enum DestKind {
     Clickhouse,
     /// A standby Postgres (PG→PG physical streaming replication).
     Postgres,
+    /// Snowflake typed current-state view over the SQL API.
+    Snowflake,
 }
 
 /// Source Postgres connection + target table.
@@ -81,6 +85,7 @@ pub enum DestSpec {
     Clickhouse(ChConfig),
     /// Standby Postgres connection (read-only replica of the source).
     Postgres(PgConfig),
+    Snowflake(Box<snowflake::SnowflakeDest>),
 }
 
 /// Parameters for the single-row latency distribution.
@@ -173,6 +178,13 @@ pub struct CommonArgs {
     /// Destination kind to poll for visibility.
     #[arg(long, value_enum, default_value_t = DestKind::Clickhouse)]
     pub dest: DestKind,
+
+    /// Daemon TOML containing Snowflake connection and external auth paths.
+    #[arg(long)]
+    pub snowflake_config: Option<std::path::PathBuf>,
+    /// Three-part, case-sensitive public view name: database.schema.table.
+    #[arg(long)]
+    pub snowflake_table: Option<String>,
 
     // ---- source Postgres ------------------------------------------------
     /// Source host. If unset, the binary supplies its own default.
@@ -295,6 +307,16 @@ pub async fn dispatch(c: &CommonArgs, pg_host: String, dest_host: String) -> Res
         .await;
     }
     let dest_spec = match c.dest {
+        DestKind::Snowflake => {
+            DestSpec::Snowflake(Box::new(snowflake::SnowflakeDest::from_config(
+                c.snowflake_config
+                    .as_deref()
+                    .context("--snowflake-config is required")?,
+                c.snowflake_table
+                    .as_deref()
+                    .context("--snowflake-table is required")?,
+            )?))
+        }
         DestKind::Clickhouse => DestSpec::Clickhouse(ChConfig {
             host: dest_host,
             http_port: c.ch_http_port,
@@ -359,6 +381,7 @@ pub async fn run(
             .context("connect source Postgres")?,
     );
     let dest: Arc<dyn Destination> = match dest_spec {
+        DestSpec::Snowflake(destination) => Arc::new(*destination),
         DestSpec::Clickhouse(c) => Arc::new(ChHttp::new(c.host, c.http_port, c.table)),
         DestSpec::Postgres(c) => Arc::new(
             PgDest::connect(&c)

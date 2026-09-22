@@ -17,7 +17,7 @@ use walshadow_bench::CommonArgs;
 #[derive(Parser, Debug)]
 #[command(
     name = "walshadow-local-bench",
-    about = "Measure source-Postgres → ClickHouse replication latency on local endpoints",
+    about = "Measure PostgreSQL replication latency to ClickHouse, Snowflake, or a standby",
     // CommonArgs leaves --bench optional for ec2_bench's whole-suite mode; this
     // binary has no suite, so demand it at parse time.
     group(ArgGroup::new("what").args(["bench"]).required(true)),

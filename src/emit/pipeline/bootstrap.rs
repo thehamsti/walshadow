@@ -137,6 +137,7 @@ pub async fn drain(
     row_policy: RowPolicy,
     config: Option<Arc<ResolvedConfig>>,
     skip_initial: HashSet<RelName>,
+    neutral_values: bool,
 ) -> Result<BootstrapDrainOutcome, String> {
     let (mut deferred, handback) = match deferral {
         Deferral::Rejected => (None, false),
@@ -217,7 +218,9 @@ pub async fn drain(
                     .await?
                     .map(Arc::new);
             }
-            render_ext_columns(&rel.attributes, &mut tuple.columns);
+            if !neutral_values {
+                render_ext_columns(&rel.attributes, &mut tuple.columns);
+            }
             out.push(&msg_tx, seq, rel, route, tuple, permit).await?;
             bump(&mut open, &mut rows_routed);
         }
@@ -243,7 +246,15 @@ pub async fn drain(
         Some(spool) => {
             footprint.hand_off();
             let resolved = resolve_spooled(
-                spool, &routes, &catalog, &msg_tx, &ack, &stats, &resolver, next_seq,
+                spool,
+                &routes,
+                &catalog,
+                &msg_tx,
+                &ack,
+                &stats,
+                &resolver,
+                next_seq,
+                neutral_values,
             )
             .await?;
             Ok(BootstrapDrainOutcome {
@@ -277,10 +288,19 @@ pub async fn drain_deferred(
     row_policy: &RowPolicy,
     config: Option<&ResolvedConfig>,
     first_seq: u64,
+    neutral_values: bool,
 ) -> Result<BootstrapDrainOutcome, String> {
     let routes = freeze_routes(mapping, config, row_policy);
     resolve_spooled(
-        spool, &routes, catalog, msg_tx, ack, stats, resolver, first_seq,
+        spool,
+        &routes,
+        catalog,
+        msg_tx,
+        ack,
+        stats,
+        resolver,
+        first_seq,
+        neutral_values,
     )
     .await
 }
@@ -297,6 +317,7 @@ async fn resolve_spooled(
     stats: &EmitterStats,
     resolver: &ToastResolver,
     first_seq: u64,
+    neutral_values: bool,
 ) -> Result<BootstrapDrainOutcome, String> {
     tracing::info!(
         target: "walshadow::bootstrap",
@@ -326,7 +347,8 @@ async fn resolve_spooled(
                 ack,
                 first_seq,
                 &mut seq,
-                &mut placed
+                &mut placed,
+                neutral_values,
             ),
         );
         routed?;
@@ -490,6 +512,7 @@ async fn prepare_batch(
 }
 
 /// Route a resolved batch's rows, each under the replay's trailing seq
+#[allow(clippy::too_many_arguments)]
 async fn route_batch(
     batch: ResolvedReplayBatch,
     out: &mut RowBuf,
@@ -498,6 +521,7 @@ async fn route_batch(
     first_seq: u64,
     seq: &mut Option<u64>,
     placed: &mut u64,
+    neutral_values: bool,
 ) -> Result<(), String> {
     let ResolvedReplayBatch { rows, permit } = batch;
     for row in rows {
@@ -506,7 +530,9 @@ async fn route_batch(
             ack.register(first_seq, tuple.source_lsn);
             first_seq
         });
-        render_ext_columns(&row.rel.attributes, &mut tuple.columns);
+        if !neutral_values {
+            render_ext_columns(&row.rel.attributes, &mut tuple.columns);
+        }
         out.push(msg_tx, at, row.rel, row.route, tuple, permit.clone())
             .await?;
         *placed += 1;
@@ -690,7 +716,7 @@ fn apply_fetched(
 /// Resolve mapped TOAST pointers or fill in disabled mode. Value cap
 /// checked before any fetch; the returned leaf permit is shrunk to the
 /// retained decoded bytes and rides the routed row to insert ack
-async fn resolve_or_fill_toast(
+pub(crate) async fn resolve_or_fill_toast(
     tuple: &mut BackfillTuple,
     rel: &RelDescriptor,
     mapping: &TableMapping,
@@ -993,6 +1019,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            false,
         )
         .await
         .unwrap_err();
@@ -1038,6 +1065,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            false,
         ));
 
         let mut by_seq: HashMap<u64, u64> = HashMap::new();
@@ -1091,6 +1119,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            false,
         ));
 
         let seqs: Vec<u64> = collect_rows(&mut msg_rx)
@@ -1142,6 +1171,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            false,
         ));
 
         let rows = collect_rows(&mut msg_rx).await;
@@ -1208,6 +1238,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            false,
         ));
 
         let rows = collect_rows(&mut msg_rx).await;
@@ -1262,6 +1293,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            false,
         )
         .await
         .unwrap();
@@ -1285,6 +1317,7 @@ mod tests {
             &Default::default(),
             None,
             outcome.next_seq,
+            false,
         )
         .await
         .unwrap();
@@ -1343,6 +1376,7 @@ mod tests {
                 Default::default(),
                 None,
                 HashSet::new(),
+                false,
             )
             .await
             .unwrap();
@@ -1371,6 +1405,7 @@ mod tests {
                 &Default::default(),
                 None,
                 first_seq,
+                false,
             )
             .await
             .unwrap();
@@ -1423,6 +1458,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            false,
         ));
         drop(tup_tx);
 
@@ -1488,6 +1524,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            false,
         ));
 
         let routed = collect_rows(&mut msg_rx).await;
@@ -1581,6 +1618,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            false,
         ));
 
         let rows = collect_rows(&mut msg_rx).await;

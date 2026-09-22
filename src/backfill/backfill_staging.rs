@@ -21,13 +21,19 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clickhouse_c::{Block, Event};
+use futures::{StreamExt, TryStreamExt};
 
 use crate::backfill::backfill_types::BackupRequest;
 use crate::ch::{ChConn, EmitterError, exec_drain, quote_ident, with_timeout};
+use crate::config::ResolvedConfig;
+use crate::destination::snowflake::runtime::SnowflakeRuntime;
+use crate::destination::snowflake::state::GenerationPhase;
 use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
-use crate::mapping::{MappingHandle, TableMapping, TableTarget};
-use crate::schema::RelName;
-use ahash::{HashMap, HashMapExt, HashSet};
+use crate::emit::route::RouteSnapshot;
+use crate::mapping::{MappingHandle, MappingSnapshot, TableMapping, TableTarget};
+use crate::runtime_config::InitialLoadMode;
+use crate::schema::{RelDescriptor, RelName};
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 /// `orders` loads into `orders__wsstg`; deterministic so a retry or boot
 /// recovery finds the prior attempt's table
@@ -71,6 +77,159 @@ impl StagingRel {
 pub struct StagingPlan {
     pub mapping: MappingHandle,
     pub rels: Vec<StagingRel>,
+}
+
+/// One backup-walk snapshot generation. `Replayed` means a prior successful
+/// attempt was recovered and its relation must not be reread into this pass.
+#[derive(Clone)]
+pub struct SnowflakeSnapshotRel {
+    pub desc: Arc<RelDescriptor>,
+    pub operation_id: String,
+    pub phase: GenerationPhase,
+}
+
+/// Frozen source-shaped routes and journaled generation targets for a pass.
+pub struct SnowflakeSnapshotPlan {
+    pub mapping: MappingHandle,
+    pub source_mapping: MappingSnapshot,
+    pub rels: Vec<SnowflakeSnapshotRel>,
+    pub operations: HashMap<RelName, String>,
+}
+
+pub(crate) fn route_config_matches(
+    expected: &ResolvedConfig,
+    current: &ResolvedConfig,
+    desc: &RelDescriptor,
+) -> bool {
+    let rel = &desc.rel_name;
+    expected.tables.get(rel) == current.tables.get(rel)
+        && expected.table_opt_ins.get(rel) == current.table_opt_ins.get(rel)
+        && expected.rules.settings(rel) == current.rules.settings(rel)
+        && desc.attributes.iter().filter(|a| !a.dropped).all(|a| {
+            expected.column_rules.settings(rel, &a.name)
+                == current.column_rules.settings(rel, &a.name)
+                && expected.column_rules.accepted_type(rel, &a.name)
+                    == current.column_rules.accepted_type(rel, &a.name)
+        })
+}
+
+pub async fn prepare_snowflake(
+    runtime: &SnowflakeRuntime,
+    emitter: &EmitterConfig,
+    live: &MappingHandle,
+    reqs: &[BackupRequest],
+    mode: InitialLoadMode,
+    config: Option<&Arc<ResolvedConfig>>,
+    config_rx: Option<&tokio::sync::watch::Receiver<Arc<ResolvedConfig>>>,
+) -> Result<SnowflakeSnapshotPlan> {
+    prepare_snowflake_with_kind(
+        runtime,
+        emitter,
+        live,
+        reqs,
+        mode.as_str(),
+        config.map(Arc::as_ref),
+        config.zip(config_rx),
+    )
+    .await
+}
+
+pub async fn prepare_snowflake_with_kind(
+    runtime: &SnowflakeRuntime,
+    emitter: &EmitterConfig,
+    live: &MappingHandle,
+    reqs: &[BackupRequest],
+    kind: &str,
+    config: Option<&ResolvedConfig>,
+    current_config: Option<(
+        &Arc<ResolvedConfig>,
+        &tokio::sync::watch::Receiver<Arc<ResolvedConfig>>,
+    )>,
+) -> Result<SnowflakeSnapshotPlan> {
+    let mut relation_oids = HashSet::with_capacity(reqs.len());
+    anyhow::ensure!(
+        reqs.iter().all(|req| relation_oids.insert(req.desc.oid)),
+        "Snowflake snapshot pass contains duplicate relations"
+    );
+    let live_map = live.snapshot().await;
+    // begin_snapshot_attempt can finish a previously loaded generation, so
+    // the route must remain current during setup as well as final publication.
+    let selected = reqs
+        .iter()
+        .map(|r| r.desc.rel_name.clone())
+        .collect::<Vec<_>>();
+    let _mapping_guard = live
+        .guard_matches(&live_map, &selected)
+        .await
+        .context("Snowflake snapshot mapping changed before preparation")?;
+    if let Some((expected, rx)) = current_config {
+        let current = rx.borrow();
+        anyhow::ensure!(
+            reqs.iter()
+                .all(|r| route_config_matches(expected, &current, &r.desc)),
+            "Snowflake snapshot routing config changed before preparation"
+        );
+    }
+    let mut walk_map = HashMap::with_capacity(reqs.len());
+    let mut rels = Vec::with_capacity(reqs.len());
+    let mut operations = HashMap::with_capacity(reqs.len());
+    let prepared = futures::stream::iter(reqs.to_vec())
+        .map(|req| {
+            let live_map = &live_map;
+            async move {
+                let name = &req.desc.rel_name;
+                let Some(mapping) = live_map.get(name) else {
+                    tracing::warn!(target: "walshadow::backfill_staging", qname = %name,
+                "Snowflake snapshot relation unmapped at pass start");
+                    return Ok::<_, anyhow::Error>(None);
+                };
+                let route = RouteSnapshot::freeze(
+                    Arc::new(mapping.clone()),
+                    config.map_or_else(Arc::default, |c| c.column_rules.clone()),
+                    emitter.row_policy().for_rel(config, name),
+                );
+                runtime.defer_publication(&req.desc)?;
+                runtime.schema_for(&req.desc, &route).await?;
+                let logical_id = super::copy_backfill::snowflake_snapshot_logical_id(
+                    kind,
+                    &runtime.source_identity,
+                    &req.desc,
+                    req.s_lsn,
+                );
+                let generation = runtime
+                    .begin_snapshot_attempt(&req.desc, req.s_lsn, &logical_id)
+                    .await?;
+                if generation.phase != GenerationPhase::Replayed {
+                    anyhow::ensure!(
+                        generation.phase == GenerationPhase::Prepared,
+                        "Snowflake snapshot generation is not prepared for {name}"
+                    );
+                }
+                Ok(Some((req, mapping.clone(), generation)))
+            }
+        })
+        .buffered(runtime.config.metadata_concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+    for (req, mapping, generation) in prepared.into_iter().flatten() {
+        if generation.phase != GenerationPhase::Replayed {
+            operations.insert(req.desc.rel_name.clone(), generation.operation_id.clone());
+            walk_map.insert(req.desc.rel_name.clone(), mapping);
+        }
+        rels.push(SnowflakeSnapshotRel {
+            desc: req.desc.clone(),
+            operation_id: generation.operation_id,
+            phase: generation.phase,
+        });
+    }
+    tracing::info!(target: "walshadow::backfill_staging", tables = rels.len(),
+        "Snowflake snapshot generations prepared");
+    Ok(SnowflakeSnapshotPlan {
+        mapping: crate::mapping::mapping_handle(walk_map),
+        source_mapping: live_map,
+        rels,
+        operations,
+    })
 }
 
 /// Rebuild one staging table per mapped rel (`DROP` + `CREATE .. AS` clones
@@ -122,7 +281,7 @@ pub async fn prepare(
 /// One CH control connection for staging DDL + swap statements, with the
 /// inserter pool's bounded per-attempt timeout.
 pub struct StagingSession {
-    client: ChConn,
+    client: Option<ChConn>,
     /// Kept whole for reconnect; shared with the pass that opened the session
     conn: Arc<EmitterConfig>,
     /// Per-relation destination rules, for the promote's `_lsn` predicate when
@@ -134,16 +293,29 @@ pub struct StagingSession {
 
 impl StagingSession {
     pub async fn connect(emitter: Arc<EmitterConfig>) -> Result<Self> {
+        if emitter.snowflake.is_some() {
+            return Ok(Self {
+                client: None,
+                retry: emitter.retry.clone(),
+                timeout: emitter.insert_timeout,
+                conn: emitter,
+                rules: None,
+            });
+        }
         let client = ChConn::connect(&*emitter)
             .await
             .map_err(|e| anyhow::anyhow!("backfill_staging: connect: {e}"))?;
         Ok(Self {
-            client,
+            client: Some(client),
             retry: emitter.retry.clone(),
             timeout: emitter.insert_timeout,
             conn: emitter,
             rules: None,
         })
+    }
+
+    pub fn snowflake_runtime(&self) -> Option<&Arc<SnowflakeRuntime>> {
+        self.conn.snowflake.as_ref()
     }
 
     pub fn with_rules(mut self, rules: Option<Arc<crate::table_rules::TableRules>>) -> Self {
@@ -165,7 +337,14 @@ impl StagingSession {
 
     async fn attempt_write(&mut self, sql: &str) -> Result<(), EmitterError> {
         let timeout = self.timeout;
-        let client = self.client.ready(&*self.conn).await?;
+        let client = self
+            .client
+            .as_mut()
+            .ok_or_else(|| {
+                EmitterError::Config("ClickHouse staging SQL is unavailable for Snowflake".into())
+            })?
+            .ready(&*self.conn)
+            .await?;
         exec_drain(client, sql, timeout).await
     }
 
@@ -174,6 +353,8 @@ impl StagingSession {
     pub(crate) async fn exec_retry(&mut self, sql: &str) -> Result<()> {
         let timeout = self.timeout;
         self.client
+            .as_mut()
+            .context("ClickHouse staging SQL is unavailable for Snowflake")?
             .retry(
                 &*self.conn,
                 self.retry.backoff(),
@@ -206,6 +387,8 @@ impl StagingSession {
         let timeout = self.timeout;
         let client = self
             .client
+            .as_mut()
+            .context("ClickHouse staging SQL is unavailable for Snowflake")?
             .ready(&*self.conn)
             .await
             .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))?;
@@ -370,6 +553,42 @@ pub(crate) fn sql_str(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_config_fence_ignores_unrelated_tables_but_rejects_own_opt_out() {
+        let rel = RelName::new("public", "orders");
+        let other = RelName::new("public", "customers");
+        let desc = RelDescriptor {
+            rfn: Default::default(),
+            oid: 1,
+            toast_oid: 0,
+            namespace_oid: 1,
+            rel_name: rel.clone(),
+            kind: 'r',
+            persistence: 'p',
+            replident: crate::schema::ReplIdent::Nothing,
+            attributes: vec![],
+        };
+        let mut expected = ResolvedConfig::default();
+        expected.tables.insert(
+            rel.clone(),
+            TableMapping {
+                target: TableTarget::new("db", "orders"),
+                columns: vec![],
+            },
+        );
+        let mut current = expected.clone();
+        current.tables.insert(
+            other,
+            TableMapping {
+                target: TableTarget::new("db", "customers"),
+                columns: vec![],
+            },
+        );
+        assert!(route_config_matches(&expected, &current, &desc));
+        current.tables.remove(&rel);
+        assert!(!route_config_matches(&expected, &current, &desc));
+    }
 
     #[tokio::test]
     async fn staging_retry_includes_failed_reconnect() {

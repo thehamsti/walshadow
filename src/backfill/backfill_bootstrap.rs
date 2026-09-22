@@ -32,6 +32,8 @@ use tokio::task::JoinHandle;
 use tokio_postgres::Client;
 use walrus::pg::walparser::{Oid, RelFileNode};
 
+use crate::backfill::backfill_staging::{self, SnowflakeSnapshotPlan, SnowflakeSnapshotRel};
+use crate::backfill::backfill_types::BackupRequest;
 use crate::backfill::backup_page_walk::{
     BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, PageWalkSink, PageWalkStats,
 };
@@ -39,8 +41,14 @@ use crate::backfill::backup_sink::{
     CatalogFilenodes, DiskLanderSink, DiskLanderStats, MultiplexSink,
 };
 use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, PumpStats, StartInfo};
+use crate::config::ResolvedConfig;
 use crate::decode::decoder_sink::TupleObserver;
+use crate::destination::snowflake::runtime::SnowflakeRuntime;
+use crate::destination::snowflake::state::GenerationPhase;
+use crate::emit::ch_emitter::EmitterConfig;
+use crate::mapping::MappingHandle;
 use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
+use ahash::HashSet;
 
 /// Live counter handles, readable while the pump runs. The pump publishes
 /// into these, so a caller ticks `/metrics` off them instead of waiting for
@@ -63,6 +71,9 @@ pub struct BootstrapConfig {
     /// Filenodes worth decoding: mapped relations plus their TOAST heaps.
     /// `None` taps every seeded relation
     pub tap_filenodes: Option<Arc<ahash::HashSet<(Oid, Oid)>>>,
+    /// Snowflake generation floor sampled before backup and covered by the
+    /// concurrent WAL window. Page rows must not outrank window mutations.
+    pub snapshot_lsn: Option<u64>,
     pub progress: BootstrapProgress,
 }
 
@@ -72,6 +83,7 @@ impl BootstrapConfig {
             shadow_data_dir,
             catalog_filenodes: CatalogFilenodes::new(),
             tap_filenodes: None,
+            snapshot_lsn: None,
             progress: BootstrapProgress::default(),
         }
     }
@@ -87,6 +99,11 @@ impl BootstrapConfig {
         self.tap_filenodes = Some(set);
         self
     }
+
+    pub fn with_snapshot_lsn(mut self, lsn: u64) -> Self {
+        self.snapshot_lsn = Some(lsn);
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +113,89 @@ pub struct BootstrapOutcome {
     pub disk: Arc<DiskLanderStats>,
     pub page_walk: Arc<PageWalkStats>,
     pub pump: Arc<PumpStats>,
+}
+
+pub async fn prepare_greenfield_snapshots(
+    runtime: &SnowflakeRuntime,
+    emitter: &EmitterConfig,
+    mapping: &MappingHandle,
+    catalog: &CatalogMap,
+    skip_initial: &HashSet<RelName>,
+    config: &ResolvedConfig,
+    snapshot_lsn: u64,
+) -> Result<SnowflakeSnapshotPlan> {
+    let routes = mapping.snapshot().await;
+    let reqs: Vec<BackupRequest> = catalog
+        .descriptors()
+        .filter(|desc| {
+            !catalog.is_toast(desc.rfn.db_node, desc.rfn.rel_node)
+                && routes.contains_key(&desc.rel_name)
+                && !skip_initial.contains(&desc.rel_name)
+        })
+        .map(|desc| BackupRequest {
+            desc: desc.clone(),
+            s_lsn: snapshot_lsn,
+        })
+        .collect();
+    backfill_staging::prepare_snowflake_with_kind(
+        runtime,
+        emitter,
+        mapping,
+        &reqs,
+        "greenfield",
+        Some(config),
+        None,
+    )
+    .await
+}
+
+pub async fn publish_greenfield_snapshots(
+    runtime: &SnowflakeRuntime,
+    plan: &SnowflakeSnapshotPlan,
+    live: &MappingHandle,
+) -> Result<()> {
+    let selected = plan
+        .rels
+        .iter()
+        .map(|r| r.desc.rel_name.clone())
+        .collect::<Vec<_>>();
+    let _mapping_guard = live
+        .guard_matches(&plan.source_mapping, &selected)
+        .await
+        .context("Snowflake greenfield mapping changed before publication")?;
+    publish_snapshot_rels(runtime, &plan.rels).await
+}
+
+/// Seal and publish every unpublished relation of a snapshot plan. Each
+/// relation publishes under its own table lock and journal; the stage is
+/// metadata round trips, so bound it without serializing it.
+pub async fn publish_snapshot_rels(
+    runtime: &SnowflakeRuntime,
+    rels: &[SnowflakeSnapshotRel],
+) -> Result<()> {
+    use futures::{StreamExt, TryStreamExt};
+    // Owned items: borrowed stream items trip higher-ranked Send inference
+    // when a caller spawns this future
+    let pending = rels
+        .iter()
+        .filter(|rel| rel.phase != GenerationPhase::Replayed)
+        .cloned()
+        .collect::<Vec<_>>();
+    futures::stream::iter(pending)
+        .map(|rel| async move {
+            let ids = runtime.registered_snapshot_batch_ids(&rel.operation_id)?;
+            runtime
+                .mark_snapshot_loaded(&rel.desc, &rel.operation_id, &ids, ids.is_empty())
+                .await?;
+            runtime
+                .publish_snapshot(&rel.desc, &rel.operation_id)
+                .await
+                .with_context(|| format!("publish Snowflake snapshot {}", rel.desc.rel_name))
+        })
+        .buffer_unordered(runtime.config.metadata_concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(())
 }
 
 /// Filenodes worth page-walking: main files of relations `walked` accepts,
@@ -194,8 +294,17 @@ pub fn spawn_greenfield_bootstrap(
 
         let lander = DiskLanderSink::new(cfg.catalog_filenodes);
         let disk = lander.stats.clone();
+        let overrides = cfg.snapshot_lsn.map(|lsn| {
+            catalog_map
+                .descriptors()
+                .map(|d| ((d.rfn.db_node, d.rfn.rel_node), lsn))
+                .collect()
+        });
         let mut page_walk = PageWalkSink::new(catalog_map, tx, store_toast)
             .with_stats(cfg.progress.page_walk.clone());
+        if let Some(overrides) = overrides {
+            page_walk = page_walk.with_lsn_overrides(overrides);
+        }
         if let Some(set) = cfg.tap_filenodes.clone() {
             page_walk = page_walk.with_tap_filenodes(set);
         }
@@ -454,6 +563,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = BootstrapConfig::new(tmp.path().to_path_buf());
         assert!(cfg.catalog_filenodes.is_empty());
+        assert_eq!(cfg.snapshot_lsn, None);
         let cfg = cfg.with_catalog_filenodes([(5, 50000), (0, 99999)]);
         assert_eq!(cfg.catalog_filenodes.len(), 2);
         assert!(cfg.catalog_filenodes.is_catalog(5, 50000));
@@ -542,6 +652,11 @@ mod tests {
                 timeline: 1,
             },
         };
+        let snapshot_source = MockSource {
+            files: source.files.clone(),
+            start: source.start.clone(),
+            end: source.end.clone(),
+        };
 
         let mut catalog = CatalogMap::new();
         catalog.insert(Arc::new(make_rel()));
@@ -562,6 +677,22 @@ mod tests {
         assert_eq!(tuples.len(), 1, "exactly one synthetic tuple expected");
         let tuple = &tuples[0];
         assert_eq!(tuple.source_lsn, 0xDEAD_BEEF);
+        let mut snapshot_catalog = CatalogMap::new();
+        snapshot_catalog.insert(Arc::new(make_rel()));
+        let snapshot_dir = tmp.path().join("snapshot");
+        let snapshot_cfg = BootstrapConfig::new(snapshot_dir).with_snapshot_lsn(0xCAFE);
+        let (_, snapshot_rows) = run_greenfield_bootstrap(
+            snapshot_cfg,
+            Box::new(snapshot_source),
+            snapshot_catalog,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_rows[0].source_lsn, 0xCAFE,
+            "page rows must rank below WAL mutations between sampled S and backup start B"
+        );
         assert_eq!(tuple.xid, 99);
         assert_eq!(tuple.columns.len(), 1);
         assert!(matches!(

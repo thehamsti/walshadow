@@ -142,13 +142,18 @@ async fn main() -> Result<()> {
     let dest_state = match args.common.dest {
         DestKind::Clickhouse => args.state_dir.join("ec2-clickhouse/state.env"),
         DestKind::Postgres => args.state_dir.join("ec2-pg-standby/state.env"),
+        DestKind::Snowflake => std::path::PathBuf::new(),
     };
-    let dest_host = resolve_host(
-        args.common.ch_host.clone(),
-        &dest_state,
-        args.network,
-        "PRIVATE_IP",
-    )?;
+    let dest_host = if args.common.dest == DestKind::Snowflake {
+        String::new()
+    } else {
+        resolve_host(
+            args.common.ch_host.clone(),
+            &dest_state,
+            args.network,
+            "PRIVATE_IP",
+        )?
+    };
 
     if let Some(name) = &args.suite {
         // Children get the already-resolved hosts, so the whole suite keeps the
@@ -193,7 +198,7 @@ async fn main() -> Result<()> {
 /// `--pg-password` is not forwarded — the harness's source Postgres uses `trust`
 /// auth and the ClickHouse HTTP probe is unauthenticated.
 fn suite_child_flags(c: &CommonArgs, pg_host: &str, dest_host: &str) -> Vec<String> {
-    [
+    let mut flags: Vec<String> = [
         (
             "--dest",
             c.dest
@@ -214,7 +219,17 @@ fn suite_child_flags(c: &CommonArgs, pg_host: &str, dest_host: &str) -> Vec<Stri
     ]
     .into_iter()
     .flat_map(|(flag, value)| [flag.to_string(), value])
-    .collect()
+    .collect();
+    if let Some(path) = &c.snowflake_config {
+        flags.extend([
+            "--snowflake-config".into(),
+            path.to_string_lossy().into_owned(),
+        ]);
+    }
+    if let Some(table) = &c.snowflake_table {
+        flags.extend(["--snowflake-table".into(), table.clone()]);
+    }
+    flags
 }
 
 #[cfg(test)]
@@ -222,6 +237,33 @@ mod tests {
     use super::*;
 
     use std::fs;
+
+    #[test]
+    fn snowflake_suite_preserves_config_and_public_view() {
+        let args = Args::try_parse_from([
+            "bench",
+            "--suite",
+            "r",
+            "--dest",
+            "snowflake",
+            "--snowflake-config",
+            "/run/config.toml",
+            "--snowflake-table",
+            "DB.public.users",
+        ])
+        .unwrap();
+        let flags = suite_child_flags(&args.common, "127.0.0.1", "");
+        assert!(
+            flags
+                .windows(2)
+                .any(|v| v == ["--snowflake-config", "/run/config.toml"])
+        );
+        assert!(
+            flags
+                .windows(2)
+                .any(|v| v == ["--snowflake-table", "DB.public.users"])
+        );
+    }
 
     /// Write `content` to a uniquely-named temp file and return its path.
     fn temp_state(name: &str, content: &str) -> PathBuf {

@@ -8,7 +8,7 @@
 
 /* Bumped when a request or response layout changes, or when an op's reading
  * of an unchanged layout changes */
-#define WS_PROTO_VERSION		3
+#define WS_PROTO_VERSION		4
 /* Bumped when any catalog projection changes shape */
 #define WS_PROJECTION_VERSION	1
 
@@ -17,6 +17,7 @@
 #define WS_OP_ENCODE_NATIVE		0x02
 #define WS_OP_SCAN				0x03
 #define WS_OP_REPLAY_LSN		0x04
+#define WS_OP_RENDER_TEXT		0x05
 
 /* response status byte */
 #define WS_STATUS_OK		0x00
@@ -46,6 +47,7 @@ typedef enum WsCatalog
 } WsCatalog;
 
 extern void ws_handle_encode_native(StringInfo req, StringInfo resp);
+extern void ws_handle_render_text(StringInfo req, StringInfo resp);
 
 /* overlay.c */
 typedef struct WsScanStats
