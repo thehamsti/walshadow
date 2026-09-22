@@ -141,9 +141,16 @@ async fn toast_and_outbound_payloads_share_the_budget() {
         lsn: 100,
     };
     toast.put(std::slice::from_ref(&row)).await.unwrap();
+    // An empty outbox always admits one batch, else nothing could ever
+    // release space; a second one waits for the first to apply
     let mut outbound = batch();
     outbound.payload = vec![0; 512];
-    assert!(state.enqueue(&outbound).is_err());
+    state.enqueue(&outbound).unwrap();
+    let mut second = batch();
+    second.id = "b-2".into();
+    second.sequence += 1;
+    let err = state.enqueue(&second).unwrap_err();
+    assert!(err.is::<BudgetExceeded>(), "{err}");
     let mut large = row.clone();
     large.lsn = 101;
     large.chunk_data = Bytes::from(vec![1; 512]);
@@ -208,15 +215,18 @@ fn restart_finishes_manifested_temporary_payload_publication() {
 }
 
 #[test]
-fn temporary_orphan_is_cleaned_but_final_orphan_blocks_open() {
+fn orphan_payloads_without_manifests_are_crashed_enqueues() {
     let dir = tempdir().unwrap();
     let state = StateStore::open(dir.path(), identity(), 1024).unwrap();
     drop(state);
     fs::write(dir.path().join("payloads/attempt.tmp"), b"partial").unwrap();
     StateStore::open(dir.path(), identity(), 1024).unwrap();
     assert!(!dir.path().join("payloads/attempt.tmp").exists());
+    // The manifest is the commit point: a final payload without one never
+    // reached Snowflake or acknowledged anything
     fs::write(dir.path().join("payloads/unpublished.bin"), b"durable").unwrap();
-    assert!(StateStore::open(dir.path(), identity(), 1024).is_err());
+    StateStore::open(dir.path(), identity(), 1024).unwrap();
+    assert!(!dir.path().join("payloads/unpublished.bin").exists());
 }
 
 #[test]
@@ -240,6 +250,12 @@ fn sequence_reservation_and_metadata_survive_reopen() {
     let state = StateStore::open(dir.path(), identity(), 1024).unwrap();
     assert_eq!(state.allocate_sequence("wal").unwrap(), 1);
     assert_eq!(state.allocate_sequence("wal").unwrap(), 2);
+    // Only an enqueue persists the head: the allocations above reached
+    // nothing durable, so reusing them after a crash is harmless
+    let mut enqueued = batch();
+    enqueued.channel = "wal".into();
+    enqueued.sequence = 2;
+    state.enqueue(&enqueued).unwrap();
     state.put_metadata("request-1", b"stable-uuid").unwrap();
     drop(state);
     let state = StateStore::open(dir.path(), identity(), 1024).unwrap();
@@ -571,4 +587,102 @@ async fn rewrite_barrier_keeps_pre_barrier_as_of_value() {
     assert!(
         matches!(state.toast_store().fetch(4, 9, 20, 3).await.unwrap(), FetchedValue::Assembled(v) if v == b"abc")
     );
+}
+
+#[test]
+fn applied_manifests_are_collected_after_one_grace_pass() {
+    let dir = tempdir().unwrap();
+    let state = StateStore::open(dir.path(), identity(), 1024).unwrap();
+    state.enqueue(&batch()).unwrap();
+    state.mark_verified("b-1").unwrap();
+    state.mark_applied("b-1").unwrap();
+    // First pass only notes it, so a late idempotent transition still works
+    assert_eq!(state.gc_applied().unwrap(), 0);
+    state.mark_applied("b-1").unwrap();
+    assert_eq!(state.gc_applied().unwrap(), 1);
+    assert_eq!(state.phase("b-1").unwrap(), None);
+    // The head survives: later allocations never reuse the sequence
+    assert!(state.allocate_sequence("wal").unwrap() > batch().sequence);
+    drop(state);
+    StateStore::open(dir.path(), identity(), 1024).unwrap();
+}
+
+#[test]
+fn candidate_scan_starts_at_the_oldest_outstanding_sequence() {
+    let dir = tempdir().unwrap();
+    let state = StateStore::open(dir.path(), identity(), 4096).unwrap();
+    for (id, seq) in [("a", 1), ("b", 2), ("c", 3)] {
+        state
+            .enqueue(&DurableBatch {
+                id: id.into(),
+                channel: "wal".into(),
+                sequence: seq,
+                expected_rows: 1,
+                payload: id.as_bytes().to_vec(),
+            })
+            .unwrap();
+        state.mark_verified(id).unwrap();
+    }
+    state.mark_applied("a").unwrap();
+    let ids: Vec<_> = state
+        .verified_candidates("wal", 0, 1 << 20)
+        .unwrap()
+        .into_iter()
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(ids, ["b", "c"]);
+    state.mark_applied("b").unwrap();
+    state.mark_applied("c").unwrap();
+    assert!(state.verified_candidates("wal", 0, 1 << 20).unwrap().is_empty());
+    // Rebuilt from manifests on reopen
+    drop(state);
+    let state = StateStore::open(dir.path(), identity(), 4096).unwrap();
+    assert!(state.verified_candidates("wal", 0, 1 << 20).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn toast_gc_keeps_only_what_reads_above_the_floor_can_see() {
+    let dir = tempdir().unwrap();
+    let state = StateStore::open(dir.path(), identity(), 1 << 20).unwrap();
+    let toast = state.toast_store();
+    let chunk = |lsn: u64, chunk_id: u32, data: &'static [u8]| ToastRow {
+        toast_relid: 3,
+        blkno: 1,
+        offnum: 1,
+        chunk_id,
+        chunk_seq: 0,
+        chunk_data: Bytes::from_static(data),
+        lsn,
+    };
+    toast
+        .put(&[chunk(100, 7, b"old"), chunk(200, 8, b"mid"), chunk(300, 9, b"new")])
+        .await
+        .unwrap();
+    // Another TID whose newest version at or below the floor is a tombstone
+    let mut gone = chunk(100, 5, b"gone");
+    gone.blkno = 2;
+    let mut tomb = gone.clone();
+    tomb.chunk_id = 0;
+    tomb.chunk_data = Bytes::new();
+    tomb.lsn = 150;
+    toast.put(&[gone, tomb]).await.unwrap();
+
+    assert_eq!(toast.gc_below(250).unwrap(), 3, "old, gone and its tombstone");
+    // Reads at or above the floor are unchanged
+    assert!(matches!(
+        toast.fetch(3, 8, 250, 3).await.unwrap(),
+        crate::toast::FetchedValue::Assembled(ref v) if v == b"mid"
+    ));
+    assert!(matches!(
+        toast.fetch(3, 9, 300, 3).await.unwrap(),
+        crate::toast::FetchedValue::Assembled(ref v) if v == b"new"
+    ));
+    assert!(!matches!(
+        toast.fetch(3, 5, 250, 4).await.unwrap(),
+        crate::toast::FetchedValue::Assembled(_)
+    ));
+    assert_eq!(toast.gc_below(250).unwrap(), 0, "idempotent");
+    drop((state, toast));
+    // Byte accounting and indexes still verify on reopen
+    StateStore::open(dir.path(), identity(), 1 << 20).unwrap();
 }

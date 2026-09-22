@@ -146,6 +146,8 @@ pub struct BoundaryInfo {
     /// replay waits. Save an empty batch for restart, since evidence that
     /// only statistics changed is lost on restart
     pub stats_only: bool,
+    /// Followed database the boundary belongs to, whose tenant captures it
+    pub db_oid: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +193,8 @@ pub struct Record<'a> {
     /// commit-time capture publishes the layout this tuple was written
     /// under
     pub defer_catalog_decode: bool,
+    /// Database named by a commit or abort record's dbinfo
+    pub xact_db: Option<u32>,
 }
 
 pub trait RecordSink {
@@ -281,6 +285,7 @@ impl RecordSink for CollectingRecordSink {
                 boundary_info: record.boundary_info.clone(),
                 aborted_tree: record.aborted_tree.clone(),
                 defer_catalog_decode: record.defer_catalog_decode,
+                xact_db: record.xact_db,
             });
             Ok(())
         })

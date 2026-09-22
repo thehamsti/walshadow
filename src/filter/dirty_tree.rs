@@ -30,6 +30,9 @@ pub(crate) struct DirtyState {
     /// carry shared `dbId == 0` scope). Lets the commit fail closed when
     /// its `xl_xact_dbinfo.dbId` contradicts that proof
     pub(crate) direct_write: bool,
+    /// Database whose catalog the tree wrote or whose invalidations it
+    /// logged; 0 until one is proven. A transaction writes one database
+    pub(crate) db: u32,
 }
 
 impl DirtyState {
@@ -39,6 +42,7 @@ impl DirtyState {
             oids: HashMap::new(),
             unenumerated: false,
             direct_write: false,
+            db: 0,
         }
     }
 
@@ -46,6 +50,9 @@ impl DirtyState {
         self.first_touch = self.first_touch.min(other.first_touch);
         self.unenumerated |= other.unenumerated;
         self.direct_write |= other.direct_write;
+        if self.db == 0 {
+            self.db = other.db;
+        }
         for (oid, lsn) in other.oids {
             self.oids
                 .entry(oid)
@@ -99,6 +106,13 @@ impl DirtyTree {
                 e.insert(DirtyState::new(lsn))
             }
         }
+    }
+
+    /// Dirty state `xid` wrote, else its tree root's
+    pub(crate) fn state(&self, xid: u32) -> Option<&DirtyState> {
+        self.state_by_xid
+            .get(&xid)
+            .or_else(|| self.state_by_xid.get(&self.root(xid)))
     }
 
     /// Any member of `xid`'s known tree wrote catalog state still pending

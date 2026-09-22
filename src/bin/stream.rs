@@ -1354,16 +1354,18 @@ async fn run_session(
     // START_REPLICATION. Closes the "source rotated a mapped catalog above
     // 16384 pre-attach" hole the < 16384 bootstrap rule misses. Idempotent.
     {
+        let source_cfg = feed.pg_config().clone();
         let sql_client = feed
             .sql_client()
             .await
             .context("open sidecar sql client for seed_from_source")?;
-        let added = stream
-            .filter_mut()
-            .tracker_mut()
-            .seed_from_source(sql_client)
-            .await
-            .context("seed_from_source")?;
+        let added = walshadow::source_feed::seed_all_databases(
+            stream.filter_mut().tracker_mut(),
+            sql_client,
+            &source_cfg,
+        )
+        .await
+        .context("seed_from_source")?;
         let observed_from = stream
             .filter_mut()
             .seed_observed_from_source(sql_client)
@@ -1693,6 +1695,7 @@ async fn run_session(
     // TOML-pinned initial loads.
     let mut copy_backfiller: Option<Arc<walshadow::copy_backfill::CopyBackfiller>> = None;
 
+    let snowflake_maintained = ch_config.as_ref().and_then(|c| c.snowflake.clone());
     let pcfg = if let Some(mut emitter_cfg) = ch_config {
         let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
         // Live routing map shared by DDL applicator + route planning. The
@@ -2076,6 +2079,8 @@ async fn run_session(
     // task the session is done
     let gc_floor = Monotone::<Floor>::default();
     let gc_task = spawn_desc_log_gc(desc_log.clone(), gc_floor.watch(), gc_fatal.clone());
+    let snowflake_maintenance =
+        snowflake_maintained.map(|runtime| spawn_snowflake_maintenance(runtime, gc_floor.watch()));
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
     // Metrics endpoint + control socket + SIGHUP are process-lifetime (bound in
@@ -3036,6 +3041,9 @@ async fn run_session(
     // after the session returns
     drop(gc_floor);
     gc_task.await.ok();
+    if let Some(task) = snowflake_maintenance {
+        task.abort();
+    }
     if let Some(msg) = gc_fatal.message() {
         anyhow::bail!("{msg}");
     }
@@ -3395,6 +3403,34 @@ fn spawn_segment_fsync(
 /// answered. Boundary capture still shares the log's writer mutex, so a
 /// boundary landing mid-compaction blocks its hold — this removes the stall
 /// for boundary-free stretches, which is the common case.
+/// Reclaim Snowflake state below each persisted resume floor, at most once
+/// per [`SNOWFLAKE_MAINTENANCE_INTERVAL`]. Failures only delay reclamation
+fn spawn_snowflake_maintenance(
+    runtime: Arc<walshadow::destination::snowflake::runtime::SnowflakeRuntime>,
+    floor: Gate<Floor>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut cut = floor.current();
+        loop {
+            tokio::time::sleep(SNOWFLAKE_MAINTENANCE_INTERVAL).await;
+            let Ok(next) = floor.advance(cut).await else {
+                return;
+            };
+            cut = next;
+            if let Err(e) = runtime.maintain(cut.get()).await {
+                tracing::warn!(
+                    target: "walshadow::snowflake",
+                    floor = %cut,
+                    error = %format!("{e:#}"),
+                    "Snowflake state maintenance failed; retrying next interval",
+                );
+            }
+        }
+    })
+}
+
+const SNOWFLAKE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+
 fn spawn_desc_log_gc(
     desc_log: Arc<walshadow::desc_log::DescriptorLog>,
     floor: Gate<Floor>,
@@ -4732,6 +4768,7 @@ async fn run_bootstrap(
     // Seed catalog map inside a REPEATABLE READ snapshot. DDL between the
     // seed COMMIT and BASE_BACKUP's checkpoint window is operator-quiesced
     // per the bootstrap out-of-scope contract.
+    let source_cfg = feed.pg_config().clone();
     let sql_client = feed
         .sql_client()
         .await
@@ -4742,8 +4779,7 @@ async fn run_bootstrap(
     // The landing and `filter_landed_wal` must agree on what counts as
     // catalog, or redo re-creates a file the landing skipped
     let mut landing_tracker = walshadow::catalog_tracker::CatalogTracker::new();
-    landing_tracker
-        .seed_from_source(sql_client)
+    walshadow::source_feed::seed_all_databases(&mut landing_tracker, sql_client, &source_cfg)
         .await
         .context("bootstrap: seed catalog filenodes")?;
     let catalog_filenodes: Vec<_> = landing_tracker.nodes().collect();

@@ -116,7 +116,24 @@ pub struct StateStore {
     max_bytes: u64,
     _lock: Arc<File>,
     mutation: Arc<Mutex<()>>,
+    /// Next sequence per channel. Allocation is in memory: a sequence only
+    /// reaches Snowflake after its enqueue persisted the head at or past it,
+    /// so a crash between allocation and enqueue can reuse it harmlessly
+    heads: Mutex<HashMap<String, u64>>,
+    /// Unapplied sequences per channel, so candidate scans start at the
+    /// oldest outstanding batch instead of the channel's first sequence
+    outstanding: Mutex<HashMap<String, std::collections::BTreeSet<u64>>>,
+    /// Applied manifests seen by the previous [`gc_applied`](Self::gc_applied),
+    /// removed on the next call so a late idempotent transition still finds them
+    gc_grace: Mutex<HashSet<String>>,
+    /// Signalled whenever outbound or pending bytes are released
+    space: Arc<tokio::sync::Notify>,
 }
+
+/// Outbound payloads cannot fit until applied batches release space
+#[derive(Debug, thiserror::Error)]
+#[error("Snowflake state byte budget exceeded")]
+pub struct BudgetExceeded;
 
 impl StateStore {
     pub fn open(
@@ -160,6 +177,10 @@ impl StateStore {
             max_bytes,
             _lock: Arc::new(lock),
             mutation: Arc::new(Mutex::new(())),
+            heads: Mutex::new(HashMap::new()),
+            outstanding: Mutex::new(HashMap::new()),
+            gc_grace: Mutex::new(HashSet::new()),
+            space: Arc::new(tokio::sync::Notify::new()),
         };
         match store.db.get(b"identity")? {
             Some(prior) => {
@@ -221,23 +242,26 @@ impl StateStore {
         );
         let total = self.occupied()?;
         let pending_total = read_u64(&self.db, b"pending/occupied")?;
-        anyhow::ensure!(
-            total
-                .checked_add(pending_total)
-                .and_then(
-                    |n| n.checked_add(read_u64(&self.db, b"toast/occupied").unwrap_or(u64::MAX))
-                )
-                .and_then(|n| n.checked_add(batch.payload.len() as u64))
-                .is_some_and(|n| n <= self.max_bytes),
-            "Snowflake state byte budget exceeded"
-        );
-        let tmp = self.root.join("payloads").join(format!("{}.tmp", batch.id));
+        let fits = total
+            .checked_add(pending_total)
+            .and_then(|n| n.checked_add(read_u64(&self.db, b"toast/occupied").unwrap_or(u64::MAX)))
+            .and_then(|n| n.checked_add(batch.payload.len() as u64))
+            .is_some_and(|n| n <= self.max_bytes);
+        // An empty outbox must still admit one batch, else nothing could
+        // ever release space; TOAST is bounded by its own check
+        if !fits && (total > 0 || pending_total > 0) {
+            return Err(BudgetExceeded.into());
+        }
+        // The manifest is the commit point: a final payload without one is
+        // a crashed enqueue that restart deletes, so no rename is needed
         let result = (|| -> anyhow::Result<()> {
-            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)?;
             f.write_all(&batch.payload)?;
             f.sync_all()?;
-            // Persist the temporary filename before publishing its manifest.
-            // Restart can complete the final rename using the synced manifest.
             sync_dir(&self.root.join("payloads"))?;
             let m = Manifest {
                 id: batch.id.clone(),
@@ -259,14 +283,29 @@ impl StateStore {
                 (total + batch.payload.len() as u64).to_le_bytes(),
             );
             self.write_sync(wb)?;
-            fs::rename(&tmp, &path)?;
-            sync_dir(&self.root.join("payloads"))?;
             Ok(())
         })();
         if result.is_err() && self.manifest(&batch.id)?.is_none() {
-            let _ = fs::remove_file(tmp);
+            let _ = fs::remove_file(&path);
+            return result;
         }
+        self.outstanding
+            .lock()
+            .unwrap()
+            .entry(batch.channel.clone())
+            .or_default()
+            .insert(batch.sequence);
         result
+    }
+
+    /// Resolves once space may have been released; callers retry
+    /// [`enqueue`](Self::enqueue) after it. Wakes periodically as a backstop
+    pub async fn space_released(&self) {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            self.space.notified(),
+        )
+        .await;
     }
 
     pub fn pending(&self) -> anyhow::Result<Vec<DurableBatch>> {
@@ -347,6 +386,16 @@ impl StateStore {
             !channel.is_empty() && max_bytes > 0,
             "invalid verified candidate budget"
         );
+        let Some(oldest) = self
+            .outstanding
+            .lock()
+            .unwrap()
+            .get(channel)
+            .and_then(|seqs| seqs.first().copied())
+        else {
+            return Ok((Vec::new(), false));
+        };
+        let min_sequence = min_sequence.max(oldest);
         let mut prefix = sequence_key(channel, 0)?;
         prefix.truncate(prefix.len() - 8);
         let mut out = Vec::new();
@@ -411,13 +460,16 @@ impl StateStore {
     /// Reserve a durable, monotonically increasing channel sequence. A crash
     /// may leave a gap; callers must never infer delivery from sequence alone.
     pub fn allocate_sequence(&self, channel: &str) -> anyhow::Result<u64> {
-        let _guard = self.mutation.lock().unwrap();
         anyhow::ensure!(!channel.is_empty(), "empty batch channel");
-        let next = self
-            .sequence_head(channel)?
+        let mut heads = self.heads.lock().unwrap();
+        let head = match heads.get(channel) {
+            Some(head) => *head,
+            None => self.sequence_head(channel)?,
+        };
+        let next = head
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("channel sequence overflow"))?;
-        self.put_sync(sequence_head_key(channel)?, next.to_le_bytes().to_vec())?;
+        heads.insert(channel.to_owned(), next);
         Ok(next)
     }
 
@@ -494,6 +546,24 @@ impl StateStore {
         wb.put(b"generation/head", generation_id.to_le_bytes());
         self.write_sync(wb)?;
         Ok(record)
+    }
+
+    /// Whether any initial-load generation is still being written
+    pub fn generation_loading(&self) -> anyhow::Result<bool> {
+        for item in self.db.prefix_iterator(b"generation/") {
+            let (key, value) = item?;
+            if !key.starts_with(b"generation/") {
+                break;
+            }
+            if key.as_ref() == b"generation/head" {
+                continue;
+            }
+            let record: GenerationRecord = serde_json::from_slice(&value)?;
+            if record.phase == GenerationPhase::Prepared {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn generation(&self, operation_id: &str) -> anyhow::Result<Option<GenerationRecord>> {
@@ -575,16 +645,14 @@ impl StateStore {
         let occupied = self.occupied()?;
         let pending_occupied = read_u64(&self.db, b"pending/occupied")?;
         let new_bytes = row.payload.len() as u64;
-        anyhow::ensure!(
-            occupied
-                .checked_add(pending_occupied)
-                .and_then(
-                    |n| n.checked_add(read_u64(&self.db, b"toast/occupied").unwrap_or(u64::MAX))
-                )
-                .and_then(|n| n.checked_add(new_bytes))
-                .is_some_and(|n| n <= self.max_bytes),
-            "Snowflake state byte budget exceeded"
-        );
+        let fits = occupied
+            .checked_add(pending_occupied)
+            .and_then(|n| n.checked_add(read_u64(&self.db, b"toast/occupied").unwrap_or(u64::MAX)))
+            .and_then(|n| n.checked_add(new_bytes))
+            .is_some_and(|n| n <= self.max_bytes);
+        if !fits && (occupied > 0 || pending_occupied > 0) {
+            return Err(BudgetExceeded.into());
+        }
         let stored = StoredPending {
             id: row.id.clone(),
             relation_oid: row.relation_oid,
@@ -749,7 +817,11 @@ impl StateStore {
             wb.put(b"pending/occupied", remaining.to_le_bytes());
         }
         wb.put(key, serde_json::to_vec(&old)?);
-        self.write_sync(wb)
+        self.write_sync(wb)?;
+        if to == PendingPhase::Retired {
+            self.space.notify_waiters();
+        }
+        Ok(())
     }
 
     pub fn toast_store(&self) -> DurableToastStore {
@@ -789,11 +861,46 @@ impl StateStore {
                 self.put_sync(manifest_key(id), serde_json::to_vec(&m)?)?;
             }
         }
-        if to == BatchPhase::Applied && path.exists() {
-            fs::remove_file(&path)?;
-            sync_dir(&self.root.join("payloads"))?;
+        if to == BatchPhase::Applied {
+            if let Some(seqs) = self.outstanding.lock().unwrap().get_mut(&m.channel) {
+                seqs.remove(&m.sequence);
+            }
+            if path.exists() {
+                fs::remove_file(&path)?;
+                sync_dir(&self.root.join("payloads"))?;
+            }
+            self.space.notify_waiters();
         }
         Ok(())
+    }
+
+    /// Drop applied manifests and their sequence index entries. A manifest
+    /// is removed only on the call after the one that first saw it applied,
+    /// so an in-flight idempotent re-transition still resolves it; the
+    /// channel head survives, keeping later allocations monotonic
+    pub fn gc_applied(&self) -> anyhow::Result<usize> {
+        let _guard = self.mutation.lock().unwrap();
+        let mut grace = self.gc_grace.lock().unwrap();
+        let mut seen = HashSet::new();
+        let mut wb = WriteBatch::default();
+        let mut removed = 0usize;
+        for m in self.manifests()? {
+            if m.phase != BatchPhase::Applied {
+                continue;
+            }
+            if grace.contains(&m.id) {
+                wb.delete(manifest_key(&m.id));
+                wb.delete(sequence_key(&m.channel, m.sequence)?);
+                removed += 1;
+            } else {
+                seen.insert(m.id);
+            }
+        }
+        if removed > 0 {
+            self.write_sync(wb)?;
+        }
+        *grace = seen;
+        Ok(removed)
     }
 
     fn manifest(&self, id: &str) -> anyhow::Result<Option<Manifest>> {
@@ -968,22 +1075,29 @@ impl StateStore {
                 "generation journal corrupt"
             );
         }
-        // Only clean our own uniquely named temporary files. Unknown final
-        // payloads are evidence of an interrupted publication and stay put.
+        // A final payload without a manifest is an enqueue that crashed
+        // before its commit point; nothing was sent or acknowledged for it
         for entry in fs::read_dir(self.root.join("payloads"))? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(id) = name.strip_suffix(".tmp") {
-                if validate_id(id).is_ok() && entry.file_type()?.is_file() {
-                    fs::remove_file(entry.path())?;
-                }
-            } else if let Some(id) = name.strip_suffix(".bin") {
-                anyhow::ensure!(
-                    names.contains(id),
-                    "orphan final batch payload {name}; inspect before recovery"
-                );
+            let id = name
+                .strip_suffix(".tmp")
+                .or_else(|| name.strip_suffix(".bin").filter(|id| !names.contains(*id)));
+            if let Some(id) = id
+                && validate_id(id).is_ok()
+                && entry.file_type()?.is_file()
+            {
+                fs::remove_file(entry.path())?;
             }
         }
+        let mut outstanding = self.outstanding.lock().unwrap();
+        for m in manifests.iter().filter(|m| m.phase != BatchPhase::Applied) {
+            outstanding
+                .entry(m.channel.clone())
+                .or_default()
+                .insert(m.sequence);
+        }
+        drop(outstanding);
         for m in &manifests {
             if m.phase == BatchPhase::Applied {
                 let path = self.payload_path(&m.id);
@@ -1257,16 +1371,119 @@ impl DurableToastStore {
         let next = prior
             .checked_add(added)
             .ok_or_else(|| toast_error("TOAST byte accounting overflow"))?;
-        let total = next
-            .checked_add(read_u64(&self.db, b"occupied").map_err(toast_error)?)
-            .and_then(|n| {
-                n.checked_add(read_u64(&self.db, b"pending/occupied").unwrap_or(u64::MAX))
-            });
-        if !total.is_some_and(|n| n <= self.max_bytes) {
-            return Err(toast_error("Snowflake state byte budget exceeded"));
+        // History is bounded on its own: outbound batches drain and wait for
+        // space, but a TOAST write that waited on them could deadlock the
+        // pipeline that releases it. Garbage collection keeps history small
+        if next > self.max_bytes {
+            return Err(toast_error(
+                "Snowflake TOAST history exceeds the state byte budget",
+            ));
         }
         batch.put(b"toast/occupied", next.to_le_bytes());
         self.write(batch)
+    }
+
+    /// Remove history no read at or above `floor` can observe. Every later
+    /// fetch passes `max_lsn >= floor`, so per TID only the newest version at
+    /// or below `floor` stays visible, and none if that version is a
+    /// tombstone. Rows below a TRUNCATE at or below `floor` are invisible to
+    /// all such reads, as are older TRUNCATE markers. Writes arriving while
+    /// this runs are above `floor`, so decisions from a snapshot stay valid.
+    /// Returns the rows removed
+    pub fn gc_below(&self, floor: u64) -> Result<u64, ChunkStoreError> {
+        use std::collections::BTreeMap as Map;
+        // relid -> newest TRUNCATE at or below floor, plus markers under it
+        let mut truncate_floor = Map::<u32, u64>::new();
+        let mut dead_markers = Vec::new();
+        for item in self.db.prefix_iterator(b"toast-truncate/") {
+            let (key, value) = item.map_err(toast_error)?;
+            if !key.starts_with(b"toast-truncate/") {
+                break;
+            }
+            let lsn = u64::from_le_bytes(value.as_ref().try_into().map_err(toast_error)?);
+            let relid = std::str::from_utf8(&key[15..23])
+                .ok()
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .ok_or_else(|| toast_error("corrupt TOAST truncate key"))?;
+            if lsn <= floor {
+                if let Some(prev) = truncate_floor.insert(relid, lsn) {
+                    dead_markers.push(format!("toast-truncate/{relid:08x}/{prev:016x}"));
+                }
+            }
+        }
+        let mut deletions: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = Vec::new();
+        let mut group: Vec<(Vec<u8>, StoredToastHeader, u64)> = Vec::new();
+        let flush = |group: &mut Vec<(Vec<u8>, StoredToastHeader, u64)>,
+                     out: &mut Vec<(Vec<u8>, Option<Vec<u8>>, u64)>| {
+            // Keys sort by lsn within one TID
+            let visible = group.iter().rposition(|(_, h, _)| h.lsn <= floor);
+            for (i, (key, h, size)) in group.drain(..).enumerate() {
+                let truncated = truncate_floor
+                    .get(&h.toast_relid)
+                    .is_some_and(|&t| h.lsn < t);
+                let superseded = visible.is_some_and(|v| i < v);
+                let dead_tomb = visible == Some(i) && h.chunk_id == 0;
+                if truncated || superseded || dead_tomb {
+                    let index = (h.chunk_id != 0).then(|| h.value_index());
+                    out.push((key, index, size));
+                }
+            }
+        };
+        for item in self.db.prefix_iterator(b"toast/") {
+            let (key, value) = item.map_err(toast_error)?;
+            if !key.starts_with(b"toast/") {
+                break;
+            }
+            if key.as_ref() == b"toast/occupied" {
+                continue;
+            }
+            let header: StoredToastHeader = serde_json::from_slice(&value).map_err(toast_error)?;
+            let tid = (header.toast_relid, header.blkno, header.offnum);
+            if group
+                .last()
+                .is_some_and(|(_, h, _)| (h.toast_relid, h.blkno, h.offnum) != tid)
+            {
+                flush(&mut group, &mut deletions);
+            }
+            let mut size = (key.len() + value.len()) as u64;
+            if header.chunk_id != 0 {
+                size += (header.value_index().len() + key.len()) as u64;
+            }
+            group.push((key.to_vec(), header, size));
+        }
+        flush(&mut group, &mut deletions);
+        if deletions.is_empty() && dead_markers.is_empty() {
+            return Ok(0);
+        }
+        let removed = deletions.len() as u64;
+        // Bounded write batches keep the owner lock hold short
+        for chunk in deletions.chunks(4096) {
+            let _guard = self.mutation.lock().unwrap();
+            let mut batch = WriteBatch::default();
+            let mut bytes = 0u64;
+            for (key, index, size) in chunk {
+                batch.delete(key);
+                if let Some(index) = index {
+                    batch.delete(index);
+                }
+                bytes += size;
+            }
+            let prior = read_u64(&self.db, b"toast/occupied").map_err(toast_error)?;
+            let remaining = prior
+                .checked_sub(bytes)
+                .ok_or_else(|| toast_error("TOAST byte accounting underflow"))?;
+            batch.put(b"toast/occupied", remaining.to_le_bytes());
+            self.write(batch)?;
+        }
+        if !dead_markers.is_empty() {
+            let _guard = self.mutation.lock().unwrap();
+            let mut batch = WriteBatch::default();
+            for key in dead_markers {
+                batch.delete(key);
+            }
+            self.write(batch)?;
+        }
+        Ok(removed)
     }
 
     fn rows(&self, relid: u32) -> Result<Option<Vec<StoredToastRow>>, ChunkStoreError> {

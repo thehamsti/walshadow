@@ -647,7 +647,7 @@ impl SnowflakeRuntime {
                 == Some(plan.view_marker.as_str()),
             "schema view marker missing after replacement"
         );
-        Ok(())
+        self.record_published_view(&record.new, &plan.view_switch_sql)
     }
 
     fn advance_schema_active(&self, record: &SchemaChangeRecord, next: u64) -> Result<()> {

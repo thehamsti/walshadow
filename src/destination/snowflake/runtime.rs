@@ -47,7 +47,9 @@ pub struct SnowflakeRuntime {
     http: SnowflakeHttp,
     stage: OnceCell<StageWriter>,
     tables: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    channels: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Per Named Channel lock, holding the continuation token of the last
+    /// append this process made while every earlier append on it committed
+    channels: Mutex<HashMap<String, Arc<Mutex<Option<String>>>>>,
     ready: Mutex<HashMap<String, Vec<u8>>>,
     /// Idempotent DDL shared by many tables (schemas, receipts), run once.
     shared_ddl: Mutex<std::collections::HashSet<String>>,
@@ -87,7 +89,7 @@ impl SnowflakeRuntime {
         let http = SnowflakeHttp::new(config.http_config()?)?;
         let runtime = Arc::new(Self {
             in_flight: Semaphore::new(config.max_in_flight),
-            merge_in_flight: Semaphore::new(4),
+            merge_in_flight: Semaphore::new(config.merge_concurrency),
             merge_notifies: Mutex::new(HashMap::new()),
             config,
             state,
@@ -231,6 +233,10 @@ impl SnowflakeRuntime {
         }
         let lock = self.table_lock(schema).await;
         let _guard = lock.lock().await;
+        let verified_key = format!("table-verified/{key}");
+        let schema_digest = Sha256::digest(&bytes).to_vec();
+        let storage_verified =
+            self.state.get_metadata(&verified_key)?.as_deref() == Some(schema_digest.as_slice());
         // Persist before remote effects; a changed schema on restart is rejected.
         self.state
             .put_metadata(&format!("table-schema/{key}"), &bytes)?;
@@ -258,21 +264,25 @@ impl SnowflakeRuntime {
                     Uuid::new_v4(),
                 )
                 .await?;
-            let foreign = self
-                .http
-                .execute_sql(
-                    &format!(
-                        "SELECT COUNT(*) FROM {} WHERE _WS_SOURCE_IDENTITY <> {}",
-                        plan.state_table,
-                        super::sql::quote_literal(&self.source_identity)
-                    ),
-                    Uuid::new_v4(),
-                )
-                .await?;
-            ensure!(
-                receipt_exists(&foreign.rows, 0)?,
-                "Snowflake state storage belongs to another PostgreSQL source"
-            );
+            // The ownership scan reads the whole state table; once proven for
+            // this schema it holds, since only this source writes there
+            if !storage_verified {
+                let foreign = self
+                    .http
+                    .execute_sql(
+                        &format!(
+                            "SELECT COUNT(*) FROM {} WHERE _WS_SOURCE_IDENTITY <> {}",
+                            plan.state_table,
+                            super::sql::quote_literal(&self.source_identity)
+                        ),
+                        Uuid::new_v4(),
+                    )
+                    .await?;
+                ensure!(
+                    receipt_exists(&foreign.rows, 0)?,
+                    "Snowflake state storage belongs to another PostgreSQL source"
+                );
+            }
             Ok(())
         };
         let views = async {
@@ -306,12 +316,14 @@ impl SnowflakeRuntime {
         };
         let names = result_column(&views.row_type, "name")?;
         let comments = result_column(&views.row_type, "comment")?;
+        let mut view_present = false;
         for row in &views.rows {
             if row.get(names).and_then(serde_json::Value::as_str) == Some(&schema.table) {
                 ensure!(
                     row.get(comments).and_then(serde_json::Value::as_str) == Some(&owner),
                     "refusing to replace a Snowflake view owned by another source or application"
                 );
+                view_present = true;
             }
         }
         if active != 0
@@ -320,11 +332,35 @@ impl SnowflakeRuntime {
                 .get_metadata(&format!("publication-pending/{}", schema.relation_oid))?
                 .is_none()
         {
+            // Replacing a view resets its change tracking and stales
+            // downstream streams, so replace only when its text changed
             let view = self.publication_view(schema).await?;
-            self.http.execute_sql(&view, Uuid::new_v4()).await?;
+            let digest = Sha256::digest(view.as_bytes());
+            if !view_present
+                || self
+                    .state
+                    .get_metadata(&format!("view-published/{key}"))?
+                    .as_deref()
+                    != Some(&digest[..])
+            {
+                self.http.execute_sql(&view, Uuid::new_v4()).await?;
+                self.record_published_view(schema, &view)?;
+            }
+        }
+        if !storage_verified {
+            self.state.put_metadata(&verified_key, &schema_digest)?;
         }
         self.ready.lock().await.insert(key, bytes);
         Ok(())
+    }
+
+    /// Remember the view text now live, so a restart does not replace an
+    /// unchanged view and reset its change tracking
+    fn record_published_view(&self, schema: &TableSchema, view_sql: &str) -> Result<()> {
+        self.state.put_metadata(
+            &format!("view-published/{}", table_key(schema)),
+            &Sha256::digest(view_sql.as_bytes()),
+        )
     }
 
     async fn shared_ddl(&self, sql: String) -> Result<()> {
@@ -455,30 +491,126 @@ impl SnowflakeRuntime {
             expected_rows: payload.rows.len() as u64,
             payload: bytes,
         };
-        self.state.enqueue(&batch)?;
+        self.enqueue_durable(&batch).await?;
         if let Some(snapshot) = &payload.snapshot {
             self.register_snapshot_batch(&snapshot.operation_id, &batch.id)
                 .await?;
         }
-        self.apply(&batch, &payload).await?;
+        self.apply_retrying(&batch, &payload, true).await?;
         Ok(batch.id)
     }
 
+    /// Persist off the async workers (several fsyncs), waiting for applied
+    /// batches to release budget instead of failing when the outbox is full
+    async fn enqueue_durable(&self, batch: &DurableBatch) -> Result<()> {
+        let mut waited = std::time::Instant::now();
+        loop {
+            let state = self.state.clone();
+            let attempt = batch.clone();
+            let result = tokio::task::spawn_blocking(move || state.enqueue(&attempt))
+                .await
+                .context("Snowflake enqueue task")?;
+            match result {
+                Err(e) if e.is::<super::state::BudgetExceeded>() => {
+                    if waited.elapsed() >= Duration::from_secs(30) {
+                        tracing::warn!(
+                            target: "walshadow::snowflake",
+                            bytes = batch.payload.len(),
+                            "outbox at its byte budget; delivery waits for applied batches",
+                        );
+                        waited = std::time::Instant::now();
+                    }
+                    self.state.space_released().await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Periodic housekeeping below `floor`, the durable resume floor: no
+    /// restart re-decodes WAL under it. Drops applied manifests and TOAST
+    /// history no later read can observe. Skipped while an initial load is
+    /// preparing, since backup rows read TOAST as of their older snapshot
+    pub async fn maintain(self: &Arc<Self>, floor: u64) -> Result<()> {
+        if floor == 0 || self.state.generation_loading()? {
+            return Ok(());
+        }
+        let state = self.state.clone();
+        let (manifests, toast) = tokio::task::spawn_blocking(move || -> Result<(usize, u64)> {
+            let manifests = state.gc_applied()?;
+            let toast = state
+                .toast_store()
+                .gc_below(floor)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((manifests, toast))
+        })
+        .await
+        .context("Snowflake maintenance task")??;
+        if manifests > 0 || toast > 0 {
+            tracing::debug!(
+                target: "walshadow::snowflake",
+                manifests,
+                toast_rows = toast,
+                floor,
+                "reclaimed Snowflake state",
+            );
+        }
+        Ok(())
+    }
+
+    /// Apply, retrying transient transport failures. Every step is
+    /// idempotent against the durable batch: a retry checks the apply
+    /// receipt first and replays the channel from its committed offset
+    async fn apply_retrying(
+        &self,
+        batch: &DurableBatch,
+        payload: &Payload,
+        fresh: bool,
+    ) -> Result<()> {
+        let mut attempt = 0u32;
+        loop {
+            match self.apply_once(batch, payload, fresh && attempt == 0).await {
+                Err(e) if attempt < APPLY_RETRIES && transient(&e) => {
+                    attempt += 1;
+                    let delay = Duration::from_millis(500u64 << attempt.min(6));
+                    tracing::warn!(
+                        target: "walshadow::snowflake",
+                        batch = %batch.id,
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %format!("{e:#}"),
+                        "transient Snowflake failure; retrying batch",
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
     async fn apply(&self, batch: &DurableBatch, payload: &Payload) -> Result<()> {
+        self.apply_retrying(batch, payload, false).await
+    }
+
+    /// `fresh`: enqueued by this process and never sent, so no earlier
+    /// attempt can have landed or applied it and the receipt probe is skipped
+    async fn apply_once(&self, batch: &DurableBatch, payload: &Payload, fresh: bool) -> Result<()> {
         if self.state.phase(&batch.id)? == Some(super::state::BatchPhase::Applied) {
             return Ok(());
         }
         let _permit = self.in_flight.acquire().await?;
         let plan = TableSqlPlan::new(&payload.schema, &self.config.internal_schema)
             .map_err(anyhow::Error::msg)?;
-        let receipt = self
-            .http
-            .execute_sql(&plan.receipt_sql(&batch.id), Uuid::new_v4())
-            .await?;
-        if receipt_exists(&receipt.rows, batch.expected_rows)? {
-            self.mark_verified_or_applied(&batch.id)?;
-            self.state.mark_applied(&batch.id)?;
-            return Ok(());
+        if !fresh {
+            let receipt = self
+                .http
+                .execute_sql(&plan.receipt_sql(&batch.id), Uuid::new_v4())
+                .await?;
+            if receipt_exists(&receipt.rows, batch.expected_rows)? {
+                self.mark_verified_or_applied(&batch.id)?;
+                self.state.mark_applied(&batch.id)?;
+                return Ok(());
+            }
         }
         let values = payload
             .rows
@@ -533,29 +665,42 @@ impl SnowflakeRuntime {
                 .entry(format!("{}/{}", channel.pipe, channel.channel))
                 .or_default()
                 .clone();
-            let _channel_guard = channel_lock.lock().await;
-            // Every row remains in the fsynced outbox until its apply receipt.
-            // Discarding an uncertain uncommitted channel tail is safe because
-            // the exact immutable batch is replayed and checked below.
-            let opened = self
-                .http
-                .reopen_channel_with_durable_replay(&channel, None)
-                .await?;
-            ensure!(
-                opened.status.rows_errors == 0,
-                "Snowflake channel has rejected rows"
-            );
-            if opened.status.last_committed_offset_token.as_deref() != Some(batch.id.as_str()) {
-                self.http
-                    .append_rows(
-                        &channel,
-                        &opened.continuation_token,
-                        &batch.id,
-                        &batch.id,
-                        &values,
-                        request_id(&batch.id, "append"),
-                    )
-                    .await?;
+            let mut continuation = channel_lock.lock().await;
+            // A cached continuation means every earlier append this process
+            // made on the channel committed, so nothing uncertain needs
+            // discarding. Otherwise reopen: every row remains in the fsynced
+            // outbox until its apply receipt, so discarding an uncertain
+            // uncommitted tail is safe; the exact batch is replayed below
+            let token = match (fresh, continuation.take()) {
+                (true, Some(token)) => Some(token),
+                _ => {
+                    let opened = self
+                        .http
+                        .reopen_channel_with_durable_replay(&channel, None)
+                        .await?;
+                    ensure!(
+                        opened.status.rows_errors == 0,
+                        "Snowflake channel has rejected rows"
+                    );
+                    (opened.status.last_committed_offset_token.as_deref()
+                        != Some(batch.id.as_str()))
+                    .then_some(opened.continuation_token)
+                }
+            };
+            let mut next_token = None;
+            if let Some(token) = token {
+                next_token = Some(
+                    self.http
+                        .append_rows(
+                            &channel,
+                            &token,
+                            &batch.id,
+                            &batch.id,
+                            &values,
+                            request_id(&batch.id, "append"),
+                        )
+                        .await?,
+                );
             }
             let mut committed = false;
             for _ in 0..120 {
@@ -574,6 +719,9 @@ impl SnowflakeRuntime {
                 committed,
                 "Snowflake channel did not commit batch before timeout"
             );
+            // Kept only on success: any error above leaves it empty, forcing
+            // the next append on this channel to reopen and reconcile
+            *continuation = next_token;
         }
         drop(_permit);
         if payload.snapshot.is_none() && payload.pending_generation.is_none() {
@@ -868,6 +1016,32 @@ fn result_column(row_type: &serde_json::Value, name: &str) -> Result<usize> {
         })
         .with_context(|| format!("Snowflake result is missing column {name}"))
 }
+const APPLY_RETRIES: u32 = 8;
+
+/// Failures a later attempt can clear: throttling, server errors, timeouts
+/// and dropped connections. Rejected rows and state mismatches are not
+fn transient(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(e) = cause.downcast_ref::<reqwest::Error>() {
+            return e.is_timeout() || e.is_connect() || e.is_request() || e.is_body();
+        }
+        let msg = cause.to_string();
+        [
+            "HTTP 429",
+            "HTTP 500",
+            "HTTP 502",
+            "HTTP 503",
+            "HTTP 504",
+            "attempts exhausted",
+            "did not commit batch before timeout",
+            "streaming append failed: 5",
+            "streaming append failed: 429",
+        ]
+        .iter()
+        .any(|needle| msg.contains(needle))
+    })
+}
+
 fn table_key(schema: &TableSchema) -> String {
     let bytes = serde_json::to_vec(&(schema.relation_oid, &schema.database, &schema.table))
         .expect("serializable table identity");

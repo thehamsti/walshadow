@@ -32,6 +32,9 @@
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "nodes/pg_list.h"
+#include "utils/builtins.h"
+#include "utils/varlena.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
@@ -83,10 +86,22 @@ typedef struct WsConn
 }			WsConn;
 
 PGDLLEXPORT void ws_worker_main(Datum main_arg);
+PGDLLEXPORT void ws_tenant_worker_main(Datum main_arg);
+PGDLLEXPORT void ws_launcher_main(Datum main_arg);
 
 static char *ws_socket_path = NULL;
 static char *ws_database = NULL;
 static int	ws_bridge_workers = 1;
+/*
+ * Tenant databases: every database a multi-tenant daemon follows gets its own
+ * pool of dynamic bridge workers, started and stopped by the launcher as this
+ * list changes on reload. Catalog reads, TOAST fetches and native encoding
+ * resolve in the connected database, and a backend cannot switch databases.
+ */
+static char *ws_tenant_databases = NULL;
+static int	ws_tenant_bridge_workers = 2;
+
+#define WS_MAX_TENANTS		256
 static int	ws_io_timeout_ms = 30000;
 static int	ws_lock_timeout_ms = 1000;
 
@@ -736,19 +751,71 @@ ws_serve_loop(pgsocket listen_fd)
 	closesocket(listen_fd);
 }
 
+/*
+ * FNV-1a over the database name: tenant socket names stay short and free of
+ * characters a path cannot carry. The daemon computes the same suffix
+ */
+static uint32
+ws_name_hash(const char *name)
+{
+	uint32		h = 2166136261u;
+
+	for (; *name; name++)
+	{
+		h ^= (unsigned char) *name;
+		h *= 16777619u;
+	}
+	return h;
+}
+
+static void ws_bridge_run(const char *dbname, const char *path);
+
 void
 ws_worker_main(Datum main_arg)
 {
 	int			idx = DatumGetInt32(main_arg);
+	char		path[MAXPGPATH];
+
+	if (idx == 0)
+		strlcpy(path, ws_socket_path, sizeof(path));
+	else
+		snprintf(path, sizeof(path), "%s.%d", ws_socket_path, idx);
+	ws_bridge_run(ws_database, path);
+}
+
+/*
+ * One tenant pool member: the database rides in bgw_extra, the worker index
+ * in main_arg. Worker 0 listens on socket_path.t<hash>, worker i on
+ * socket_path.t<hash>.i, mirroring the static pool's layout
+ */
+void
+ws_tenant_worker_main(Datum main_arg)
+{
+	int			idx = DatumGetInt32(main_arg);
+	char		dbname[BGW_EXTRALEN];
+	char		path[MAXPGPATH];
+
+	strlcpy(dbname, MyBgworkerEntry->bgw_extra, sizeof(dbname));
+	if (idx == 0)
+		snprintf(path, sizeof(path), "%s.t%08x", ws_socket_path,
+				 ws_name_hash(dbname));
+	else
+		snprintf(path, sizeof(path), "%s.t%08x.%d", ws_socket_path,
+				 ws_name_hash(dbname), idx);
+	ws_bridge_run(dbname, path);
+}
+
+static void
+ws_bridge_run(const char *dbname, const char *path)
+{
 	pgsocket	listen_fd;
 	char		buf[32];
-	char		path[MAXPGPATH];
 
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
 
-	BackgroundWorkerInitializeConnection(ws_database, NULL, 0);
+	BackgroundWorkerInitializeConnection(dbname, NULL, 0);
 
 	/*
 	 * The replaying transaction holds AccessExclusiveLock on its own
@@ -775,14 +842,10 @@ ws_worker_main(Datum main_arg)
 										   "walshadow request",
 										   ALLOCSET_DEFAULT_SIZES);
 
-	if (idx == 0)
-		strlcpy(path, ws_socket_path, sizeof(path));
-	else
-		snprintf(path, sizeof(path), "%s.%d", ws_socket_path, idx);
 	listen_fd = ws_listen(path);
 	ereport(LOG,
-			(errmsg("walshadow bridge listening on \"%s\" (proto %d)",
-					path, WS_PROTO_VERSION)));
+			(errmsg("walshadow bridge listening on \"%s\" for \"%s\" (proto %d)",
+					path, dbname, WS_PROTO_VERSION)));
 
 	ws_serve_loop(listen_fd);
 
@@ -793,6 +856,154 @@ ws_worker_main(Datum main_arg)
 	 * neither should cost the bridge until the next cluster restart. Nothing
 	 * restarts during postmaster shutdown, so this only costs a LOG line there.
 	 */
+	proc_exit(1);
+}
+
+/* -------------------------------------------------------------------------
+ * tenant launcher
+ * ------------------------------------------------------------------------- */
+
+typedef struct WsTenant
+{
+	char		dbname[NAMEDATALEN];
+	BackgroundWorkerHandle *handles[WS_MAX_WORKERS];
+	int			nhandles;
+	bool		wanted;
+}			WsTenant;
+
+static WsTenant ws_tenants[WS_MAX_TENANTS];
+static int	ws_ntenants = 0;
+
+static void
+ws_start_tenant(WsTenant *t)
+{
+	int			i;
+
+	for (i = t->nhandles; i < ws_tenant_bridge_workers; i++)
+	{
+		BackgroundWorker worker;
+
+		memset(&worker, 0, sizeof(worker));
+		worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+		worker.bgw_start_time = BgWorkerStart_ConsistentState;
+		worker.bgw_restart_time = 5;
+		worker.bgw_main_arg = Int32GetDatum(i);
+		worker.bgw_notify_pid = MyProcPid;
+		strlcpy(worker.bgw_library_name, "walshadow", BGW_MAXLEN);
+		strlcpy(worker.bgw_function_name, "ws_tenant_worker_main", BGW_MAXLEN);
+		snprintf(worker.bgw_name, BGW_MAXLEN, "walshadow bridge %s %d",
+				 t->dbname, i);
+		strlcpy(worker.bgw_type, "walshadow tenant bridge", BGW_MAXLEN);
+		strlcpy(worker.bgw_extra, t->dbname, BGW_EXTRALEN);
+		if (!RegisterDynamicBackgroundWorker(&worker, &t->handles[i]))
+		{
+			/* out of max_worker_processes slots: retried next poll */
+			ereport(WARNING,
+					(errmsg("walshadow: no worker slot for tenant \"%s\" bridge %d",
+							t->dbname, i)));
+			break;
+		}
+		t->nhandles = i + 1;
+	}
+}
+
+static void
+ws_stop_tenant(WsTenant *t)
+{
+	int			i;
+
+	for (i = 0; i < t->nhandles; i++)
+	{
+		TerminateBackgroundWorker(t->handles[i]);
+		pfree(t->handles[i]);
+	}
+	t->nhandles = 0;
+}
+
+/*
+ * Diff the configured list against running pools: start new databases, top
+ * up pools a worker-slot shortage left short, stop removed ones
+ */
+static void
+ws_reconcile_tenants(void)
+{
+	char	   *raw;
+	List	   *names = NIL;
+	ListCell   *lc;
+	int			i;
+
+	for (i = 0; i < ws_ntenants; i++)
+		ws_tenants[i].wanted = false;
+	raw = pstrdup(ws_tenant_databases ? ws_tenant_databases : "");
+	if (!SplitGUCList(raw, ',', &names))
+	{
+		ereport(WARNING,
+				(errmsg("walshadow: invalid walshadow.tenant_databases \"%s\"",
+						ws_tenant_databases)));
+		return;
+	}
+	foreach(lc, names)
+	{
+		const char *name = (const char *) lfirst(lc);
+		WsTenant   *t = NULL;
+
+		for (i = 0; i < ws_ntenants; i++)
+			if (strcmp(ws_tenants[i].dbname, name) == 0)
+				t = &ws_tenants[i];
+		if (t == NULL)
+		{
+			if (ws_ntenants >= WS_MAX_TENANTS || strlen(name) >= NAMEDATALEN)
+			{
+				ereport(WARNING,
+						(errmsg("walshadow: cannot serve tenant \"%s\"", name)));
+				continue;
+			}
+			t = &ws_tenants[ws_ntenants++];
+			memset(t, 0, sizeof(*t));
+			strlcpy(t->dbname, name, sizeof(t->dbname));
+		}
+		t->wanted = true;
+		ws_start_tenant(t);
+	}
+	for (i = 0; i < ws_ntenants;)
+	{
+		if (!ws_tenants[i].wanted)
+		{
+			ereport(LOG,
+					(errmsg("walshadow: stopping bridges for removed tenant \"%s\"",
+							ws_tenants[i].dbname)));
+			ws_stop_tenant(&ws_tenants[i]);
+			ws_tenants[i] = ws_tenants[--ws_ntenants];
+		}
+		else
+			i++;
+	}
+	list_free(names);
+	pfree(raw);
+}
+
+void
+ws_launcher_main(Datum main_arg)
+{
+	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	BackgroundWorkerUnblockSignals();
+
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (ShutdownRequestPending)
+			break;
+		if (ConfigReloadPending)
+		{
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+		ws_reconcile_tenants();
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 WS_IDLE_POLL_MS, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+	}
 	proc_exit(1);
 }
 
@@ -846,6 +1057,21 @@ _PG_init(void)
 							1, 1, WS_MAX_WORKERS,
 							PGC_POSTMASTER, 0,
 							NULL, NULL, NULL);
+	DefineCustomStringVariable("walshadow.tenant_databases",
+							   "Databases that each get a pool of tenant bridge workers.",
+							   "Comma-separated; reload to add or remove. Worker i "
+							   "for database d listens on socket_path.t<hash(d)>[.i].",
+							   &ws_tenant_databases,
+							   "",
+							   PGC_SIGHUP, 0,
+							   NULL, NULL, NULL);
+	DefineCustomIntVariable("walshadow.tenant_bridge_workers",
+							"Bridge workers per tenant database.",
+							NULL,
+							&ws_tenant_bridge_workers,
+							2, 1, WS_MAX_WORKERS,
+							PGC_POSTMASTER, 0,
+							NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("walshadow");
 
@@ -866,4 +1092,14 @@ _PG_init(void)
 		strlcpy(worker.bgw_type, "walshadow bridge", BGW_MAXLEN);
 		RegisterBackgroundWorker(&worker);
 	}
+
+	memset(&worker, 0, sizeof(worker));
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	worker.bgw_start_time = BgWorkerStart_ConsistentState;
+	worker.bgw_restart_time = 5;
+	strlcpy(worker.bgw_library_name, "walshadow", BGW_MAXLEN);
+	strlcpy(worker.bgw_function_name, "ws_launcher_main", BGW_MAXLEN);
+	strlcpy(worker.bgw_name, "walshadow tenant launcher", BGW_MAXLEN);
+	strlcpy(worker.bgw_type, "walshadow tenant launcher", BGW_MAXLEN);
+	RegisterBackgroundWorker(&worker);
 }

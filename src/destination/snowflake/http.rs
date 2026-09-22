@@ -11,7 +11,9 @@ use std::{
 use uuid::Uuid;
 
 const MAX_NDJSON: usize = 4 * 1024 * 1024;
-const MAX_ATTEMPTS: usize = 5;
+const MAX_ATTEMPTS: usize = 8;
+/// Refresh cached credentials this long before they would expire
+const CREDENTIAL_LIFETIME: Duration = Duration::from_secs(45 * 60);
 
 #[derive(Clone)]
 pub enum AuthConfig {
@@ -46,12 +48,24 @@ pub struct HttpConfig {
     pub schema: Option<String>,
     pub warehouse: Option<String>,
     pub role: Option<String>,
+    /// Longest a statement may stay running before its caller fails
+    pub statement_timeout: Duration,
 }
 
 #[derive(Clone)]
 pub struct SnowflakeHttp {
     client: Client,
     config: HttpConfig,
+    cache: std::sync::Arc<CredentialCache>,
+}
+
+/// Signed JWTs and ingest scoped tokens are valid for about an hour; each
+/// request re-signing or re-exchanging them cost extra round trips and a key
+/// file read. OAuth token files are still re-read, so rotation stays live
+#[derive(Default)]
+struct CredentialCache {
+    jwt: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+    ingest: tokio::sync::Mutex<Option<(String, String, std::time::Instant)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,7 +116,11 @@ impl SnowflakeHttp {
             .redirect(Policy::none())
             .timeout(Duration::from_secs(60))
             .build()?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            cache: Default::default(),
+        })
     }
 
     #[cfg(test)]
@@ -112,7 +130,11 @@ impl SnowflakeHttp {
             .redirect(Policy::none())
             .timeout(Duration::from_secs(5))
             .build()?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            cache: Default::default(),
+        })
     }
 
     async fn token(&self) -> Result<(String, &'static str)> {
@@ -134,6 +156,11 @@ impl SnowflakeHttp {
                 private_key_path,
                 public_key_fingerprint,
             } => {
+                if let Some((token, at)) = self.cache.jwt.lock().unwrap().as_ref()
+                    && at.elapsed() < CREDENTIAL_LIFETIME
+                {
+                    return Ok((token.clone(), "KEYPAIR_JWT"));
+                }
                 ensure!(
                     !account.is_empty()
                         && !user.is_empty()
@@ -153,10 +180,9 @@ impl SnowflakeHttp {
                     iat: now,
                     exp: now + 59 * 60,
                 };
-                Ok((
-                    encode(&Header::new(Algorithm::RS256), &claims, &key)?,
-                    "KEYPAIR_JWT",
-                ))
+                let token = encode(&Header::new(Algorithm::RS256), &claims, &key)?;
+                *self.cache.jwt.lock().unwrap() = Some((token.clone(), std::time::Instant::now()));
+                Ok((token, "KEYPAIR_JWT"))
             }
         }
     }
@@ -344,22 +370,26 @@ impl SnowflakeHttp {
             Uuid::parse_str(&handle).is_ok(),
             "invalid Snowflake statement handle"
         );
-        for attempt in 0..60 {
-            if status == StatusCode::OK {
-                break;
-            }
+        let deadline = std::time::Instant::now() + self.config.statement_timeout;
+        let mut token = token;
+        let mut attempt = 0;
+        while status != StatusCode::OK {
             ensure!(
                 status == StatusCode::ACCEPTED,
                 "unexpected SQL status {status}"
             );
-            tokio::time::sleep(backoff(attempt.min(4))).await;
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "Snowflake SQL still running after {:?}",
+                self.config.statement_timeout
+            );
+            tokio::time::sleep(backoff(attempt)).await;
+            attempt += 1;
+            // A statement can outlive the credential it was submitted with
+            token = self.token().await?.0;
             let url = self.url(&format!("/api/v2/statements/{handle}"))?;
             (status, body) = self.sql_get(url, &token, kind).await?;
         }
-        ensure!(
-            status == StatusCode::OK,
-            "Snowflake SQL did not finish in polling window"
-        );
         Ok((handle, body, token, kind))
     }
 
@@ -386,21 +416,27 @@ impl SnowflakeHttp {
         let body = match initial {
             Some(body) => body,
             None => {
-                let mut complete = None;
-                for attempt in 0..60 {
+                let deadline = std::time::Instant::now() + self.config.statement_timeout;
+                let mut attempt = 0;
+                loop {
+                    let token = self.token().await?.0;
                     let url = self.url(&format!("/api/v2/statements/{handle}"))?;
-                    let (status, body) = self.sql_get(url, token, kind).await?;
+                    let (status, body) = self.sql_get(url, &token, kind).await?;
                     if status == StatusCode::OK {
-                        complete = Some(body);
-                        break;
+                        break body;
                     }
                     ensure!(
                         status == StatusCode::ACCEPTED,
                         "unexpected SQL status {status}"
                     );
-                    tokio::time::sleep(backoff(attempt.min(4))).await;
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "individual SQL statement still running after {:?}",
+                        self.config.statement_timeout
+                    );
+                    tokio::time::sleep(backoff(attempt)).await;
+                    attempt += 1;
                 }
-                complete.context("individual SQL statement did not finish")?
             }
         };
         ensure!(
@@ -494,23 +530,57 @@ impl SnowflakeHttp {
         Ok(url.join(path)?)
     }
 
-    async fn ingest(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+    /// Ingest host and scoped token, cached until near expiry
+    async fn ingest_credentials(&self) -> Result<(String, String)> {
+        let mut cached = self.cache.ingest.lock().await;
+        if let Some((host, token, at)) = cached.as_ref()
+            && at.elapsed() < CREDENTIAL_LIFETIME
+        {
+            return Ok((host.clone(), token.clone()));
+        }
         let host = self.discover_ingest_host().await?;
         let scoped = self.scoped_token(&host).await?;
-        let (status, value) = self
-            .send(
-                method,
-                self.ingest_url(&host, path)?,
-                body,
-                Some(&scoped),
-                None,
-            )
-            .await?;
-        ensure!(
-            status == StatusCode::OK,
-            "unexpected streaming status {status}"
-        );
-        Ok(value)
+        *cached = Some((host.clone(), scoped.clone(), std::time::Instant::now()));
+        Ok((host, scoped))
+    }
+
+    /// Forget cached ingest credentials after an authorization failure
+    async fn invalidate_ingest(&self) {
+        *self.cache.ingest.lock().await = None;
+    }
+
+    async fn ingest(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        let mut attempt = 0;
+        loop {
+            let (host, scoped) = self.ingest_credentials().await?;
+            match self
+                .send(
+                    method.clone(),
+                    self.ingest_url(&host, path)?,
+                    body.clone(),
+                    Some(&scoped),
+                    None,
+                )
+                .await
+            {
+                Ok((status, value)) => {
+                    ensure!(
+                        status == StatusCode::OK,
+                        "unexpected streaming status {status}"
+                    );
+                    return Ok(value);
+                }
+                Err(e) if attempt + 1 < MAX_ATTEMPTS && e.to_string().contains("HTTP 401") => {
+                    self.invalidate_ingest().await;
+                }
+                // Channel open and status reads are idempotent
+                Err(e) if attempt + 1 < MAX_ATTEMPTS && retryable(&e) => {
+                    tokio::time::sleep(backoff(attempt)).await;
+                }
+                Err(e) => return Err(e),
+            }
+            attempt += 1;
+        }
     }
 
     pub async fn open_channel(
@@ -583,8 +653,7 @@ impl SnowflakeHttp {
             ndjson.len() <= MAX_NDJSON,
             "Snowflake streaming payload exceeds 4 MB"
         );
-        let host = self.discover_ingest_host().await?;
-        let scoped = self.scoped_token(&host).await?;
+        let (host, scoped) = self.ingest_credentials().await?;
         let mut url = self.ingest_url(
             &host,
             &channel
@@ -611,6 +680,9 @@ impl SnowflakeHttp {
             request = request.header("X-Snowflake-Role", role);
         }
         let response = request.send().await?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            self.invalidate_ingest().await;
+        }
         ensure!(
             !response.status().is_redirection(),
             "Snowflake streaming append redirected"
@@ -725,7 +797,7 @@ fn retryable(error: &anyhow::Error) -> bool {
         .any(|code| msg.contains(code))
 }
 fn backoff(attempt: usize) -> Duration {
-    Duration::from_millis((200u64 << attempt.min(4)).min(3000))
+    Duration::from_millis((200u64 << attempt.min(6)).min(10_000))
 }
 fn validate_endpoint(url: &Url, test_http: bool) -> Result<()> {
     ensure!(

@@ -709,7 +709,7 @@ impl SnowflakeRuntime {
             self.view_comment(schema, plan).await?.as_deref() == Some(plan.view_marker.as_str()),
             "Snowflake view marker missing after publication"
         );
-        Ok(())
+        self.record_published_view(schema, &plan.view_switch_sql)
     }
 
     /// Caller holds the table lock and has already observed the generation
