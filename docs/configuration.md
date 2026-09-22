@@ -420,6 +420,11 @@ same `_lsn = S` and collapse.
 to 131072 (1 GiB, PostgreSQL's segment size). A table smaller than one chunk
 issues exactly the single unqualified COPY it always did.
 
+`[bootstrap] copy_concurrency` bounds how many tables COPY at once, each on its
+own source session (default 8). Opt-ins that arrive together, such as a
+tenant attaching with hundreds of tables, publish every mapping first and then
+queue their loads behind this limit.
+
 The cursor is paired with the relation's filenode. `VACUUM FULL`, `CLUSTER`,
 `TRUNCATE` and rewriting `ALTER TABLE` relocate rows, so a filenode change
 between chunks restarts the table rather than resuming into pages that no
