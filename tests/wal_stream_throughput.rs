@@ -327,6 +327,7 @@ async fn pump_throughput_breakdown() {
                         boundary_info: r.boundary_info.clone(),
                         aborted_tree: r.aborted_tree.clone(),
                         defer_catalog_decode: r.defer_catalog_decode,
+                        xact_db: r.xact_db,
                     };
                     // Push then immediately pop to drop, so we measure
                     // clone+drop without growing memory unboundedly.

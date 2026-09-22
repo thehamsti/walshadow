@@ -329,6 +329,7 @@ impl RecordSink for SharedCollectingSink {
                 boundary_info: r.boundary_info.clone(),
                 aborted_tree: r.aborted_tree.clone(),
                 defer_catalog_decode: r.defer_catalog_decode,
+                xact_db: r.xact_db,
             });
             Ok(())
         })

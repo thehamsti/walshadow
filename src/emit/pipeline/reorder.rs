@@ -1191,6 +1191,10 @@ impl RecordSink for ReorderSink {
                 self.ack.trailing(lsn);
                 buf.advance_idle(lsn);
             }
+            // A quiet database never reaches a commit barrier, so apply
+            // reloaded opt-ins here: with nothing buffered, the idle position
+            // bounds their backfill exactly as a commit would
+            self.maybe_apply_reload(lsn).await?;
             // Quiescent source never re-enters on_commit; retire due drops
             // here so the flush doesn't wait for a later commit
             self.flush_due_retires().await

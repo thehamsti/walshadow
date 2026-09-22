@@ -396,6 +396,7 @@ async fn defer_catalog_decode_stashes_raw_and_commit_fences() {
         boundary_info: None,
         aborted_tree: None,
         defer_catalog_decode: true,
+        xact_db: None,
     };
     sink.on_record(&record).await.unwrap();
     let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);

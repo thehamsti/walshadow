@@ -633,11 +633,21 @@ fn candidate_scan_starts_at_the_oldest_outstanding_sequence() {
     assert_eq!(ids, ["b", "c"]);
     state.mark_applied("b").unwrap();
     state.mark_applied("c").unwrap();
-    assert!(state.verified_candidates("wal", 0, 1 << 20).unwrap().is_empty());
+    assert!(
+        state
+            .verified_candidates("wal", 0, 1 << 20)
+            .unwrap()
+            .is_empty()
+    );
     // Rebuilt from manifests on reopen
     drop(state);
     let state = StateStore::open(dir.path(), identity(), 4096).unwrap();
-    assert!(state.verified_candidates("wal", 0, 1 << 20).unwrap().is_empty());
+    assert!(
+        state
+            .verified_candidates("wal", 0, 1 << 20)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -655,7 +665,11 @@ async fn toast_gc_keeps_only_what_reads_above_the_floor_can_see() {
         lsn,
     };
     toast
-        .put(&[chunk(100, 7, b"old"), chunk(200, 8, b"mid"), chunk(300, 9, b"new")])
+        .put(&[
+            chunk(100, 7, b"old"),
+            chunk(200, 8, b"mid"),
+            chunk(300, 9, b"new"),
+        ])
         .await
         .unwrap();
     // Another TID whose newest version at or below the floor is a tombstone
@@ -667,7 +681,11 @@ async fn toast_gc_keeps_only_what_reads_above_the_floor_can_see() {
     tomb.lsn = 150;
     toast.put(&[gone, tomb]).await.unwrap();
 
-    assert_eq!(toast.gc_below(250).unwrap(), 3, "old, gone and its tombstone");
+    assert_eq!(
+        toast.gc_below(250).unwrap(),
+        3,
+        "old, gone and its tombstone"
+    );
     // Reads at or above the floor are unchanged
     assert!(matches!(
         toast.fetch(3, 8, 250, 3).await.unwrap(),

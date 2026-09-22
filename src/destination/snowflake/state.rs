@@ -301,11 +301,8 @@ impl StateStore {
     /// Resolves once space may have been released; callers retry
     /// [`enqueue`](Self::enqueue) after it. Wakes periodically as a backstop
     pub async fn space_released(&self) {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            self.space.notified(),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), self.space.notified()).await;
     }
 
     pub fn pending(&self) -> anyhow::Result<Vec<DurableBatch>> {

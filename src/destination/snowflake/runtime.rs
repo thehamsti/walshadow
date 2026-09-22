@@ -107,6 +107,30 @@ impl SnowflakeRuntime {
         Ok(runtime)
     }
 
+    /// Apply a reloaded `[snowflake]` table. Role, warehouse, user and
+    /// credential files swap into the transport; batch and flush sizes flow
+    /// through the emitter config. What durable state is bound to (account,
+    /// database, schemas, stage, mapping) and sized resources (channels,
+    /// in-flight and merge pools, state directory and budget) are refused
+    pub fn update_settings(&self, next: &SnowflakeConfig) -> Result<()> {
+        next.validate()?;
+        ensure!(
+            next.fingerprint() == self.config.fingerprint(),
+            "Snowflake account, database, internal schema, stage and schema mapping are              bound to durable state; detach and re-attach the tenant to change them"
+        );
+        let current = &self.config;
+        ensure!(
+            next.channels_per_table == current.channels_per_table
+                && next.max_in_flight == current.max_in_flight
+                && next.merge_concurrency == current.merge_concurrency
+                && next.metadata_concurrency == current.metadata_concurrency
+                && next.state == current.state
+                && next.merge_interval_ms == current.merge_interval_ms,
+            "Snowflake channel, pool, merge-interval and state settings take effect on restart"
+        );
+        self.http.update_config(next.http_config()?)
+    }
+
     pub async fn preflight(&self) -> Result<()> {
         self.http
             .execute_sql(

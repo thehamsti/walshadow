@@ -22,12 +22,18 @@ use crate::metrics::MetricsRegistry;
 use crate::schema::RelName;
 use crate::source_feed::open_sql_client;
 
-/// Holds the running session's resolver so the control socket + SIGHUP can
+/// Holds the running session's resolvers so the control socket + SIGHUP can
 /// trigger a live `reload()`. The daemon streams one session; there is no
 /// start/stop/restart lifecycle — pause is a config flag applied by reload.
+///
+/// With tenants, the session resolver carries cluster-wide knobs (pause, the
+/// source endpoint) and each tenant has its own. Every reload also flags the
+/// session to reconcile its tenant set against the new config
 #[derive(Default)]
 pub struct Reloader {
     resolver: Mutex<Option<Arc<crate::config::ConfigResolver>>>,
+    tenants: Mutex<std::collections::BTreeMap<String, Arc<crate::config::ConfigResolver>>>,
+    reconcile: std::sync::atomic::AtomicBool,
 }
 
 impl Reloader {
@@ -48,15 +54,64 @@ impl Reloader {
         }
     }
 
-    /// Live reconfigure: re-read the merged config + republish. No restart.
-    pub async fn reload(&self) -> anyhow::Result<()> {
-        let r = self.resolver.lock().await.clone();
-        if let Some(r) = r {
-            r.reload()
-                .await
-                .map_err(|e| anyhow::anyhow!("reload: {e}"))?;
+    /// Register or drop a tenant's resolver
+    pub async fn set_tenant_resolver(
+        &self,
+        id: &str,
+        r: Option<Arc<crate::config::ConfigResolver>>,
+    ) {
+        let mut tenants = self.tenants.lock().await;
+        match r {
+            Some(r) => {
+                tenants.insert(id.to_string(), r);
+            }
+            None => {
+                tenants.remove(id);
+            }
         }
-        Ok(())
+    }
+
+    /// Whether a reload happened since the last call
+    pub fn take_reconcile(&self) -> bool {
+        self.reconcile
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Live reconfigure: re-read the merged config + republish. No restart.
+    /// A tenant whose reload fails keeps its last snapshot; the first error
+    /// is reported after every resolver had its turn
+    pub async fn reload(&self) -> anyhow::Result<()> {
+        self.reconcile
+            .store(true, std::sync::atomic::Ordering::Release);
+        let r = self.resolver.lock().await.clone();
+        let mut first_err = None;
+        if let Some(r) = r
+            && let Err(e) = r.reload().await
+        {
+            first_err = Some(anyhow::anyhow!("reload: {e}"));
+        }
+        let tenants: Vec<_> = self
+            .tenants
+            .lock()
+            .await
+            .iter()
+            .map(|(id, r)| (id.clone(), r.clone()))
+            .collect();
+        for (id, r) in tenants {
+            if let Err(e) = r.reload().await {
+                tracing::warn!(
+                    target: "walshadow::control",
+                    tenant = %id,
+                    error = %e,
+                    "tenant reload failed; its last config stays in effect",
+                );
+                first_err.get_or_insert(anyhow::anyhow!("reload tenant {id}: {e}"));
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 

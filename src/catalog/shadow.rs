@@ -126,7 +126,9 @@ impl BridgeConf {
         let per_tenant = self
             .tenant_workers
             .clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS);
-        (self.workers.clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS)
+        (self
+            .workers
+            .clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS)
             + 1
             + self.tenant_capacity * per_tenant) as u32
     }
@@ -396,7 +398,11 @@ impl Shadow {
             // PG only logs excess workers and drops them, so a bridge pool over
             // the default leaves sockets the daemon never finds
             max_worker_processes = SourceGucFloor::default().max_worker_processes
-                + self.config.bridge.as_ref().map_or(0, BridgeConf::worker_slots),
+                + self
+                    .config
+                    .bridge
+                    .as_ref()
+                    .map_or(0, BridgeConf::worker_slots),
         );
         let mut f = fs::OpenOptions::new().append(true).open(&conf_path)?;
         f.write_all(body.as_bytes())?;
@@ -446,7 +452,11 @@ impl Shadow {
             max_connections = floor.max_connections,
             // PG only logs excess workers and drops their registration
             max_worker_processes = floor.max_worker_processes
-                + self.config.bridge.as_ref().map_or(0, BridgeConf::worker_slots),
+                + self
+                    .config
+                    .bridge
+                    .as_ref()
+                    .map_or(0, BridgeConf::worker_slots),
             max_wal_senders = floor.max_wal_senders,
             max_prepared_transactions = floor.max_prepared_transactions,
             max_locks_per_transaction = floor.max_locks_per_transaction,

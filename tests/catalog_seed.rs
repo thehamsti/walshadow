@@ -307,7 +307,10 @@ async fn seed_all_databases_covers_rotated_catalogs_of_other_databases() {
 
     let primary = connect(&sh).await;
     let mut only_followed = CatalogTracker::new();
-    only_followed.seed_from_source(&primary).await.expect("seed");
+    only_followed
+        .seed_from_source(&primary)
+        .await
+        .expect("seed");
     assert!(
         !only_followed.is_catalog(tenant_b, rotated),
         "followed-database seed alone misses the other database's rotation",
