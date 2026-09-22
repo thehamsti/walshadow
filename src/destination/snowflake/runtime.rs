@@ -56,6 +56,14 @@ pub struct SnowflakeRuntime {
     in_flight: Semaphore,
     merge_in_flight: Semaphore,
     merge_notifies: Mutex<HashMap<String, Arc<Notify>>>,
+    /// `ack_after = "outbox"`: ids of enqueued live batches for the applier
+    /// pool, which reloads each payload from disk
+    appliers: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Enqueued live batches the appliers have not finished
+    outstanding: std::sync::atomic::AtomicU64,
+    applied: Notify,
+    /// First non-transient apply failure; delivery stops on it
+    apply_failed: std::sync::OnceLock<String>,
 }
 
 impl std::fmt::Debug for SnowflakeRuntime {
@@ -100,10 +108,17 @@ impl SnowflakeRuntime {
             channels: Mutex::new(HashMap::new()),
             ready: Mutex::new(HashMap::new()),
             shared_ddl: Mutex::new(std::collections::HashSet::new()),
+            appliers: std::sync::OnceLock::new(),
+            outstanding: std::sync::atomic::AtomicU64::new(0),
+            applied: Notify::new(),
+            apply_failed: std::sync::OnceLock::new(),
         });
         runtime.preflight().await?;
         runtime.recover_schema_changes().await?;
         runtime.recover().await?;
+        if runtime.config.ack_after == crate::destination::config::AckAfter::Outbox {
+            runtime.spawn_appliers();
+        }
         Ok(runtime)
     }
 
@@ -125,7 +140,8 @@ impl SnowflakeRuntime {
                 && next.merge_concurrency == current.merge_concurrency
                 && next.metadata_concurrency == current.metadata_concurrency
                 && next.state == current.state
-                && next.merge_interval_ms == current.merge_interval_ms,
+                && next.merge_interval_ms == current.merge_interval_ms
+                && next.ack_after == current.ack_after,
             "Snowflake channel, pool, merge-interval and state settings take effect on restart"
         );
         self.http.update_config(next.http_config()?)
@@ -402,6 +418,9 @@ impl SnowflakeRuntime {
     }
 
     pub async fn apply_schema_at(&self, event: &SchemaEvent, commit_lsn: u64) -> Result<()> {
+        if !matches!(event, SchemaEvent::Added { .. }) {
+            self.quiesce().await?;
+        }
         match event {
             SchemaEvent::Added { desc } => self.ensure_table(desc).await,
             SchemaEvent::Changed { old, new, diff }
@@ -440,9 +459,125 @@ impl SnowflakeRuntime {
     }
 
     pub async fn deliver(&self, schema: TableSchema, rows: Vec<SnowflakeRow>) -> Result<()> {
+        if let Some(e) = self.apply_failed.get() {
+            bail!("Snowflake apply failed: {e}");
+        }
+        if let Some(queue) = self.appliers.get() {
+            return self.enqueue_for_appliers(schema, rows, queue).await;
+        }
         self.enqueue_delivery(schema, rows, None, None)
             .await
             .map(|_| ())
+    }
+
+    /// Durable enqueue, then hand the id to the applier pool. Returns once
+    /// the batch is fsynced: the source may acknowledge it
+    async fn enqueue_for_appliers(
+        &self,
+        schema: TableSchema,
+        rows: Vec<SnowflakeRow>,
+        queue: &tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Result<()> {
+        ensure!(!rows.is_empty(), "cannot deliver an empty Snowflake batch");
+        self.ensure_schema(&schema).await?;
+        let channel = pipe_name(&schema);
+        let sequence = self.state.allocate_sequence(&channel)?;
+        let expected_rows = rows.len() as u64;
+        let payload = Payload {
+            schema,
+            rows,
+            snapshot: None,
+            pending_generation: None,
+        };
+        let bytes = serde_json::to_vec(&payload)?;
+        drop(payload);
+        let mut hash = Sha256::new();
+        hash.update(sequence.to_be_bytes());
+        hash.update(&bytes);
+        let id = hex::encode(hash.finalize());
+        let batch = DurableBatch {
+            id: id.clone(),
+            channel,
+            sequence,
+            expected_rows,
+            payload: bytes,
+        };
+        self.enqueue_durable(&batch).await?;
+        self.outstanding
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if queue.send(id).is_err() {
+            self.outstanding
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            bail!("Snowflake applier pool stopped");
+        }
+        Ok(())
+    }
+
+    /// `max_in_flight` appliers draining the outbox queue. A transient
+    /// failure retries inside `apply`; anything else stops delivery, and the
+    /// batch stays durable for the next boot's recovery
+    fn spawn_appliers(self: &Arc<Self>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        if self.appliers.set(tx).is_err() {
+            return;
+        }
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..self.config.max_in_flight {
+            let runtime = Arc::downgrade(self);
+            let rx = rx.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Some(id) = rx.lock().await.recv().await else {
+                        return;
+                    };
+                    let Some(runtime) = runtime.upgrade() else {
+                        return;
+                    };
+                    let result = async {
+                        let Some(batch) = runtime.state.get_batch(&id)? else {
+                            return Ok(());
+                        };
+                        let payload: Payload = serde_json::from_slice(&batch.payload)
+                            .context("decode durable Snowflake batch")?;
+                        runtime.apply_retrying(&batch, &payload, true).await
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        let msg = format!("{e:#}");
+                        tracing::error!(
+                            target: "walshadow::snowflake",
+                            batch = %id,
+                            error = %msg,
+                            "outbox apply failed; delivery stops, the batch stays durable",
+                        );
+                        let _ = runtime.apply_failed.set(msg);
+                    }
+                    runtime
+                        .outstanding
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    runtime.applied.notify_waiters();
+                }
+            });
+        }
+    }
+
+    /// Wait until every outbox batch handed to the appliers has applied: a
+    /// schema change, truncate or drop must not race an older batch
+    pub async fn quiesce(&self) -> Result<()> {
+        loop {
+            if let Some(e) = self.apply_failed.get() {
+                bail!("Snowflake apply failed: {e}");
+            }
+            if self.outstanding.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return Ok(());
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(200), self.applied.notified()).await;
+        }
+    }
+
+    /// Batches acknowledged to the source but not yet applied in Snowflake
+    pub fn outbox_outstanding(&self) -> u64 {
+        self.outstanding.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub async fn deliver_snapshot(
@@ -1210,6 +1345,10 @@ mod tests {
             in_flight: Semaphore::new(1),
             merge_in_flight: Semaphore::new(4),
             merge_notifies: Mutex::new(HashMap::new()),
+            appliers: std::sync::OnceLock::new(),
+            outstanding: std::sync::atomic::AtomicU64::new(0),
+            applied: Notify::new(),
+            apply_failed: std::sync::OnceLock::new(),
         };
         let batch = DurableBatch {
             id: "batch1".into(),

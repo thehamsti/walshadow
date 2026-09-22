@@ -321,6 +321,10 @@ mod tests {
             in_flight: Semaphore::new(1),
             merge_in_flight: Semaphore::new(1),
             merge_notifies: Mutex::new(HashMap::new()),
+            appliers: std::sync::OnceLock::new(),
+            outstanding: std::sync::atomic::AtomicU64::new(0),
+            applied: Notify::new(),
+            apply_failed: std::sync::OnceLock::new(),
         };
         let schema = TableSchema {
             database: "DB".into(),

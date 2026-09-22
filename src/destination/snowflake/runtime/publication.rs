@@ -397,6 +397,8 @@ impl SnowflakeRuntime {
     }
 
     pub async fn publish_snapshot(&self, desc: &RelDescriptor, operation_id: &str) -> Result<()> {
+        // Live rows written into the hidden generation must land first
+        self.quiesce().await?;
         self.ensure_table(desc).await?;
         let schema = self.schema(desc)?;
         let lock = self.table_lock(&schema).await;
@@ -883,6 +885,10 @@ mod tests {
             in_flight: Semaphore::new(1),
             merge_in_flight: Semaphore::new(1),
             merge_notifies: Mutex::new(HashMap::new()),
+            appliers: std::sync::OnceLock::new(),
+            outstanding: std::sync::atomic::AtomicU64::new(0),
+            applied: Notify::new(),
+            apply_failed: std::sync::OnceLock::new(),
         };
         let schema = TableSchema {
             database: "PUBLIC".into(),

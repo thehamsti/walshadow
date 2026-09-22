@@ -13,6 +13,7 @@ struct TruncateBarrier {
 
 impl SnowflakeRuntime {
     pub async fn truncate_at(&self, desc: &RelDescriptor, record_lsn: u64) -> Result<()> {
+        self.quiesce().await?;
         ensure!(record_lsn != 0, "TRUNCATE WAL record LSN is missing");
         let operation_id = truncate_operation_id(&self.source_identity, desc.oid, record_lsn);
         if let Some(record) = self.state.generation(&operation_id)?
@@ -233,6 +234,10 @@ mod tests {
             in_flight: Semaphore::new(1),
             merge_in_flight: Semaphore::new(1),
             merge_notifies: Mutex::new(HashMap::new()),
+            appliers: std::sync::OnceLock::new(),
+            outstanding: std::sync::atomic::AtomicU64::new(0),
+            applied: Notify::new(),
+            apply_failed: std::sync::OnceLock::new(),
         };
         let mut desc = RelDescriptor {
             rfn: RelFileNode {

@@ -59,6 +59,22 @@ pub struct SnowflakeConfig {
     /// COPY over a large backlog can take far longer than a status poll
     #[serde(default = "statement_timeout")]
     pub statement_timeout_secs: u64,
+    /// When a live batch counts as delivered for the source slot
+    #[serde(default)]
+    pub ack_after: AckAfter,
+}
+
+/// Acknowledging at `outbox` lets the slot advance once a batch is fsynced
+/// locally, so a Snowflake outage fills local disk (bounded by
+/// `state.max_bytes`) instead of the primary's WAL. The state directory then
+/// holds rows no other copy has: back it up. `apply` waits for the verified
+/// apply receipt
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AckAfter {
+    #[default]
+    Apply,
+    Outbox,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]
