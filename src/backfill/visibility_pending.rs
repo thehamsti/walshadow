@@ -309,6 +309,7 @@ pub async fn ship(
         config,
         HashSet::new(),
         emitter.snowflake.is_some(),
+        None,
     ));
 
     let replayed = replay(spool, &tx).await;

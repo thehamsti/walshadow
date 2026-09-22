@@ -286,7 +286,7 @@ fn render_text_is_type_native_and_rejects_bad_cells() {
     let tmp = tempfile::tempdir().unwrap();
     let (pg, mut sock) = open(tmp.path());
     let int4: u32 = pg.sql("SELECT 'int4'::regtype::oid::text").parse().unwrap();
-    let mut request = vec![0x05];
+    let mut request = vec![0x06];
     request.extend_from_slice(&1u32.to_be_bytes());
     request.extend_from_slice(&int4.to_be_bytes());
     request.extend_from_slice(&(-1i32).to_be_bytes());
@@ -322,7 +322,7 @@ fn render_text_handles_array_and_domain_input() {
         .sql("SELECT 'ws_positive'::regtype::oid::text")
         .parse()
         .unwrap();
-    let mut request = vec![0x05];
+    let mut request = vec![0x06];
     request.extend_from_slice(&2u32.to_be_bytes());
     for (oid, value) in [
         (array_oid, b"{1,2}".as_slice()),

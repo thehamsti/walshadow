@@ -20,8 +20,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
+use crate::toast::FetchedValue;
+
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
-pub const PROTO_VERSION: u32 = 4;
+pub const PROTO_VERSION: u32 = 7;
 /// Catalog column plans. Must equal `WS_PROJECTION_VERSION`
 pub const PROJECTION_VERSION: u32 = 1;
 
@@ -38,6 +40,8 @@ const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_SCAN_OIDS: usize = 65536;
 /// Matches `WS_MAX_WORKERS`, the ceiling on `walshadow.bridge_workers`
 pub const MAX_BRIDGE_WORKERS: usize = 8;
+/// Must match `WS_MAX_FETCH_VALUES`
+pub const MAX_FETCH_VALUES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -46,14 +50,16 @@ pub enum Op {
     EncodeNative = 0x02,
     Scan = 0x03,
     ReplayLsn = 0x04,
-    RenderText = 0x05,
+    FetchToast = 0x05,
+    RenderText = 0x06,
 }
 
-pub const OP_LABELS: [&str; 5] = [
+pub const OP_LABELS: [&str; 6] = [
     "hello",
     "encode_native",
     "scan",
     "replay_lsn",
+    "fetch_toast",
     "render_text",
 ];
 pub const OP_COUNT: usize = OP_LABELS.len();
@@ -225,6 +231,14 @@ impl NativeResponse<'_> {
     }
 }
 
+/// One value's chunk run as shadow holds it now
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchedChunks {
+    pub value: FetchedValue,
+    /// Newest normal chunk `xmin`, zero if no chunk has one
+    pub xmin: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct ScanResult {
     /// `GetXLogReplayRecPtr` before the scan
@@ -386,6 +400,65 @@ impl Bridge {
     pub async fn replay_lsn(&self) -> Result<u64, BridgeError> {
         let body = self.call(Op::ReplayLsn, request_frame(0)).await?;
         Cursor::at(&body, 1).u64()
+    }
+
+    /// Read stored TOAST chunks from one shadow relation in one round trip.
+    /// `values` contains unique `(value_id, expected stored size)` pairs;
+    /// results come back one per value, in request order.
+    ///
+    /// `min_replay_lsn` is minimum replay position. Value chunks precede
+    /// referring record, so replay only needs to reach referrer. Returned bytes
+    /// remain compressed for daemon to decode.
+    ///
+    /// Include newest chunk `xmin` for comparison with shadow store's xid ceiling
+    pub async fn fetch_toast(
+        &self,
+        toast_relid: u32,
+        values: &[(u32, usize)],
+        min_replay_lsn: u64,
+    ) -> Result<Vec<FetchedChunks>, BridgeError> {
+        if values.is_empty() || values.len() > MAX_FETCH_VALUES {
+            return Err(BridgeError::Protocol(format!(
+                "toast fetch of {} values, want 1..{MAX_FETCH_VALUES}",
+                values.len()
+            )));
+        }
+        let mut frame = request_frame(16 + values.len() * 8);
+        frame.extend_from_slice(&min_replay_lsn.to_be_bytes());
+        frame.extend_from_slice(&toast_relid.to_be_bytes());
+        frame.extend_from_slice(&(values.len() as u32).to_be_bytes());
+        for &(id, expected) in values {
+            frame.extend_from_slice(&id.to_be_bytes());
+            frame.extend_from_slice(&(expected as u32).to_be_bytes());
+        }
+
+        let body = self.call(Op::FetchToast, frame).await?;
+        let mut c = Cursor::at(&body, 1);
+        let n = c.u32()? as usize;
+        if n != values.len() {
+            return Err(BridgeError::Protocol(format!(
+                "toast fetch answered {n} values for {} asked",
+                values.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let tag = c.u8()?;
+            let xmin = c.u32()?;
+            let len = c.u32()? as usize;
+            let value = match tag {
+                0 => FetchedValue::Assembled(c.take(len)?.to_vec()),
+                1 => FetchedValue::Missing,
+                2 => FetchedValue::Mismatch { got: len },
+                other => {
+                    return Err(BridgeError::Protocol(format!(
+                        "toast fetch result tag {other}"
+                    )));
+                }
+            };
+            out.push(FetchedChunks { value, xmin });
+        }
+        Ok(out)
     }
 
     /// Return response remainder as one locally framed Native block.

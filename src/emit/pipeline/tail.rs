@@ -125,6 +125,18 @@ pub struct OwnedTail {
 }
 
 impl OwnedTail {
+    #[cfg(test)]
+    pub(crate) fn null() -> Self {
+        let (msg_tx, ack, parts) = spawn_null(Arc::new(Monotone::new(0)));
+        Self {
+            msg_tx,
+            ack,
+            parts,
+            fatal: Fatal::new(),
+            context: "test",
+        }
+    }
+
     pub async fn spawn(
         emitter: &EmitterConfig,
         inserter_pool_size: usize,
@@ -154,6 +166,8 @@ impl OwnedTail {
         })
     }
 
+    /// [`Self::finish`] without closing the tail: what licenses recording
+    /// resume progress mid-pass
     pub async fn checkpoint(&self, through: u64) -> Result<(), String> {
         flush_and_prove(&self.msg_tx, &self.ack, through, &self.fatal)
             .await
@@ -318,6 +332,7 @@ pub async fn spawn_with_config(
         BatcherConfig {
             row_budget: emitter.row_budget,
             byte_budget: emitter.byte_budget,
+            inserters: n,
             flush_timeout,
         },
         Allocator::global(&mimalloc::MiMalloc),

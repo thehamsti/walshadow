@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 use crate::backfill::backup_page_walk::{BackfillTuple, CatalogMap};
-use crate::backfill::spool::{DeferredReader, DeferredSpool};
+use crate::backfill::spool::{DeferredReader, DeferredSpool, SpoolMark};
+use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
 use crate::emit::ch_emitter::EmitterStats;
@@ -21,6 +22,7 @@ use crate::emit::route::{RouteSnapshot, RowPolicy, freeze_routes};
 use crate::mapping::{MappingSnapshot, TableMapping};
 use crate::ops::oracle::render_ext_columns;
 use crate::schema::{RelDescriptor, RelName};
+use crate::ticker::Ticker;
 use crate::toast::{
     FetchedValue, ToastResolver, ToastRow, check_value_caps, detoasted_value, finish_value,
     pointer_extsize,
@@ -102,6 +104,44 @@ impl Drop for DeferredFootprint<'_> {
     }
 }
 
+struct DeferredReplayProgress<'a> {
+    stats: &'a EmitterStats,
+    total: u64,
+    processed: u64,
+}
+
+impl<'a> DeferredReplayProgress<'a> {
+    fn new(stats: &'a EmitterStats, total: u64) -> Self {
+        stats
+            .bootstrap_deferred_replay_bytes
+            .fetch_add(total, Ordering::Relaxed);
+        Self {
+            stats,
+            total,
+            processed: 0,
+        }
+    }
+
+    fn advance(&mut self, remaining: u64) {
+        shift(
+            &self.stats.bootstrap_deferred_replayed_bytes,
+            &mut self.processed,
+            self.total - remaining,
+        );
+    }
+}
+
+impl Drop for DeferredReplayProgress<'_> {
+    fn drop(&mut self) {
+        self.stats
+            .bootstrap_deferred_replayed_bytes
+            .fetch_sub(self.processed, Ordering::Relaxed);
+        self.stats
+            .bootstrap_deferred_replay_bytes
+            .fetch_sub(self.total, Ordering::Relaxed);
+    }
+}
+
 /// Move a shared gauge from what this holder reported to what it holds now
 fn shift(gauge: &AtomicU64, held: &mut u64, now: u64) {
     if now >= *held {
@@ -138,6 +178,7 @@ pub async fn drain(
     config: Option<Arc<ResolvedConfig>>,
     skip_initial: HashSet<RelName>,
     neutral_values: bool,
+    barrier: Option<Arc<WalkBarrier>>,
 ) -> Result<BootstrapDrainOutcome, String> {
     let (mut deferred, handback) = match deferral {
         Deferral::Rejected => (None, false),
@@ -152,7 +193,10 @@ pub async fn drain(
     let mut chunk_batch = Vec::new();
     let mut chunk_batch_bytes = 0;
     let mut out = RowBuf::default();
+    let mut consumed = 0u64;
+    let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
     while let Some(batch) = rx.recv().await {
+        consumed += batch.len() as u64;
         for tuple in batch {
             let rfn = tuple.rfn;
             let source_lsn = tuple.source_lsn;
@@ -203,7 +247,8 @@ pub async fn drain(
             let mut tuple = tuple;
             let mut permit = None;
             if tuple.has_mapped_external(&route.mapping) {
-                if resolver.stores_chunks() {
+                // Defer until page walk has populated or started backing store
+                if !resolver.fill_on_miss() {
                     let spool = deferred.as_mut().ok_or_else(|| {
                         format!("bootstrap: undeferrable external value in {}", rel.rel_name)
                     })?;
@@ -223,6 +268,29 @@ pub async fn drain(
             }
             out.push(&msg_tx, seq, rel, route, tuple, permit).await?;
             bump(&mut open, &mut rows_routed);
+        }
+        // Resumable walk: close the seq space and fsync the spool so the
+        // checkpointer can name every tuple consumed so far durable
+        if let Some(b) = &barrier
+            && ticker.fire()
+        {
+            if !chunk_batch.is_empty() {
+                flush_chunks(&resolver, &mut chunk_batch).await?;
+                chunk_batch_bytes = 0;
+            }
+            out.flush(&msg_tx).await?;
+            if let Some((_, seq, rows)) = open.take() {
+                ack.placed(seq, rows);
+            }
+            let mut mark = SpoolMark::default();
+            if let Some(spool) = deferred.as_mut() {
+                mark = spool
+                    .checkpoint()
+                    .await
+                    .map_err(|e| format!("bootstrap: deferred spool checkpoint: {e}"))?;
+                footprint.publish(spool);
+            }
+            b.publish_drain(consumed, next_seq, mark).await;
         }
     }
     out.flush(&msg_tx).await?;
@@ -255,6 +323,7 @@ pub async fn drain(
                 &resolver,
                 next_seq,
                 neutral_values,
+                None,
             )
             .await?;
             Ok(BootstrapDrainOutcome {
@@ -289,6 +358,7 @@ pub async fn drain_deferred(
     config: Option<&ResolvedConfig>,
     first_seq: u64,
     neutral_values: bool,
+    checkpoint: Option<ReplayCheckpoint<'_>>,
 ) -> Result<BootstrapDrainOutcome, String> {
     let routes = freeze_routes(mapping, config, row_policy);
     resolve_spooled(
@@ -301,8 +371,15 @@ pub async fn drain_deferred(
         resolver,
         first_seq,
         neutral_values,
+        checkpoint,
     )
     .await
+}
+
+pub struct ReplayCheckpoint<'a> {
+    pub state: &'a mut crate::backfill::backup_checkpoint::BackupCheckpoint,
+    pub dir: &'a std::path::Path,
+    pub tail: &'a crate::emit::pipeline::tail::OwnedTail,
 }
 
 /// Route spooled referrers under one trailing seq, registered on the first
@@ -318,6 +395,7 @@ async fn resolve_spooled(
     resolver: &ToastResolver,
     first_seq: u64,
     neutral_values: bool,
+    mut checkpoint: Option<ReplayCheckpoint<'_>>,
 ) -> Result<BootstrapDrainOutcome, String> {
     tracing::info!(
         target: "walshadow::bootstrap",
@@ -330,14 +408,21 @@ async fn resolve_spooled(
     let mut out = RowBuf::default();
     let mut seq = None;
     let mut placed = 0u64;
+    let total_bytes = spool.spooled_bytes();
+    let mut next_seq = first_seq;
+    let mut total_placed = 0;
+    let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
     let mut replay = spool
         .into_reader()
         .await
         .map_err(|e| format!("bootstrap: deferred spool seal: {e}"))?;
+    let mut progress = DeferredReplayProgress::new(stats, total_bytes);
+    progress.advance(replay.remaining_file_bytes());
     // Read and fetch the next batch while this one routes: spool reads and
     // inserts otherwise leave the store pool idle
     let mut ready = prepare_batch(&mut replay, routes, catalog, stats, resolver).await?;
     while let Some(batch) = ready.take() {
+        let remaining = replay.remaining_file_bytes();
         let (next, routed) = tokio::join!(
             prepare_batch(&mut replay, routes, catalog, stats, resolver),
             route_batch(
@@ -345,30 +430,60 @@ async fn resolve_spooled(
                 &mut out,
                 msg_tx,
                 ack,
-                first_seq,
+                next_seq,
                 &mut seq,
                 &mut placed,
                 neutral_values,
             ),
         );
         routed?;
+        progress.advance(remaining);
+        if let Some(c) = checkpoint.as_mut() {
+            out.flush(msg_tx).await?;
+            if let Some(s) = seq.take() {
+                ack.placed(s, placed);
+                next_seq = s + 1;
+            }
+            total_placed += placed;
+            placed = 0;
+            if ticker.fire() {
+                c.tail.checkpoint(next_seq).await?;
+                c.state.offset = total_bytes - remaining;
+                c.state.rows += total_placed;
+                total_placed = 0;
+                c.state.save(c.dir).await.map_err(|e| e.to_string())?;
+            }
+        }
         ready = next?;
     }
     out.flush(msg_tx).await?;
-    replay
-        .finish()
-        .await
-        .map_err(|e| format!("bootstrap: deferred spool cleanup: {e}"))?;
+    let rows_routed = match checkpoint.as_mut() {
+        Some(c) => {
+            c.tail.checkpoint(next_seq).await?;
+            c.state.offset = total_bytes;
+            c.state.rows += total_placed;
+            c.state.save(c.dir).await.map_err(|e| e.to_string())?;
+            c.state.rows
+        }
+        // Resumable passes keep the spool until the pass itself publishes
+        None => {
+            replay
+                .finish()
+                .await
+                .map_err(|e| format!("bootstrap: deferred spool cleanup: {e}"))?;
+            placed
+        }
+    };
     let next_seq = match seq {
         Some(s) => {
             ack.placed(s, placed);
             s + 1
         }
-        None => first_seq,
+        None => next_seq,
     };
     Ok(BootstrapDrainOutcome {
         next_seq,
-        rows_routed: placed,
+        rows_routed,
         deferred: None,
     })
 }
@@ -480,6 +595,15 @@ fn mapped_pointers(tuple: &BackfillTuple, mapping: &TableMapping) -> Vec<Pointer
         .collect()
 }
 
+/// Replace oversized values with NULL and remove them from fetch list
+fn fill_oversize(
+    tuple: &mut BackfillTuple,
+    sites: &mut Vec<PointerSite>,
+    resolver: &ToastResolver,
+) {
+    sites.retain(|site| !resolver.fill_oversize(&mut tuple.columns[site.idx], &site.p));
+}
+
 /// Batch whose values are resolved, holding the leaf permit its rows ride
 struct ResolvedReplayBatch {
     rows: Vec<ReplayRow>,
@@ -555,7 +679,7 @@ async fn next_batch(
         resident: 0,
     };
     while batch.rows.len() < REPLAY_BATCH_ROWS && batch.need + batch.resident < REPLAY_FETCH_BYTES {
-        let Some(tuple) = replay
+        let Some(mut tuple) = replay
             .next()
             .await
             .map_err(|e| format!("bootstrap: deferred spool replay: {e}"))?
@@ -570,12 +694,14 @@ async fn next_batch(
             stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        let pointers = mapped_pointers(&tuple, &route.mapping);
+        let mut pointers = mapped_pointers(&tuple, &route.mapping);
         batch.need += check_value_caps(
             pointers.iter().map(|site| site.p),
             resolver.inline_value_max(),
+            resolver.overflow(),
         )
         .map_err(|e| format!("bootstrap: {e}"))?;
+        fill_oversize(&mut tuple, &mut pointers, resolver);
         batch.resident += crate::backfill::spool::approx_bytes(&tuple);
         batch.rows.push(ReplayRow {
             tuple,
@@ -693,8 +819,21 @@ fn apply_fetched(
             resolver.note_filled_default();
             Ok((ColumnValue::Null, 0))
         }
-        // No superseding version can precede deferred resolution: the
-        // walk put these chunks moments earlier, a miss is a bug
+        // Confirmed ID reuse needs no store ownership check
+        Some(FetchedValue::Generation) => {
+            resolver.note_filled_generation();
+            Ok((ColumnValue::Null, 0))
+        }
+        // Interpret miss according to store ownership.
+        //
+        // Walk-seeded store must contain chunks written during this pass.
+        //
+        // Read-only store contains state at end of backup. Missing value was
+        // removed after copied row and is superseded by later row version.
+        Some(_) if !resolver.stores_chunks() => {
+            resolver.note_filled_superseded();
+            Ok((ColumnValue::Null, 0))
+        }
         Some(outcome) => {
             resolver.note_fetch_miss();
             let extsize = pointer_extsize(p);
@@ -702,7 +841,10 @@ fn apply_fetched(
                 FetchedValue::Mismatch { got } => {
                     format!("chunks sum to {got} bytes, pointer says {extsize}")
                 }
-                _ => "has no chunks in the store".into(),
+                FetchedValue::Missing => "has no chunks in the store".into(),
+                FetchedValue::Assembled(_) | FetchedValue::Generation => {
+                    unreachable!("matched above")
+                }
             };
             Err(format!(
                 "bootstrap: relation {} column {target} value_id={} on toast relid={}: \
@@ -722,12 +864,17 @@ pub(crate) async fn resolve_or_fill_toast(
     mapping: &TableMapping,
     resolver: &ToastResolver,
 ) -> Result<Option<crate::budget::MemoryPermit>, String> {
-    let sites = mapped_pointers(tuple, mapping);
+    let mut sites = mapped_pointers(tuple, mapping);
     if sites.is_empty() {
         return Ok(None);
     }
-    let need = check_value_caps(sites.iter().map(|site| site.p), resolver.inline_value_max())
-        .map_err(|e| format!("bootstrap: {e}"))?;
+    let need = check_value_caps(
+        sites.iter().map(|site| site.p),
+        resolver.inline_value_max(),
+        resolver.overflow(),
+    )
+    .map_err(|e| format!("bootstrap: {e}"))?;
+    fill_oversize(tuple, &mut sites, resolver);
     let mut leaf = crate::budget::acquire_opt(resolver.budget(), need).await;
     let mut retained = 0usize;
     for site in &sites {
@@ -782,6 +929,61 @@ fn row_from_columns(mut tuple: BackfillTuple, toast_relid: u32) -> Option<ToastR
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deferred_replay_progress_preserves_other_lanes_on_drop() {
+        use super::*;
+        let stats = EmitterStats::default();
+        let mut first = DeferredReplayProgress::new(&stats, 100);
+        let mut second = DeferredReplayProgress::new(&stats, 200);
+        first.advance(75);
+        second.advance(100);
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replay_bytes
+                .load(Ordering::Relaxed),
+            300
+        );
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replayed_bytes
+                .load(Ordering::Relaxed),
+            125
+        );
+        drop(first);
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replay_bytes
+                .load(Ordering::Relaxed),
+            200
+        );
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replayed_bytes
+                .load(Ordering::Relaxed),
+            100
+        );
+        second.advance(0);
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replayed_bytes
+                .load(Ordering::Relaxed),
+            200
+        );
+        drop(second);
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replay_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replayed_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
     /// Flatten the drain's coalesced `Rows` chunks back to a row list
     async fn collect_rows(rx: &mut mpsc::Receiver<BatcherMsg>) -> Vec<RoutedRow> {
         let mut rows = Vec::new();
@@ -798,6 +1000,87 @@ mod tests {
     }
 
     use super::*;
+
+    /// Distinguish missing data in walk-seeded store from superseded value in
+    /// read-only end-of-backup store
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_miss_is_fatal_for_a_seeded_mirror_and_superseded_for_a_read_only_store() {
+        use crate::toast::{ChunkStore, ChunkStoreError, MemChunkStore, ToastRow};
+
+        struct ReadOnly;
+
+        #[async_trait::async_trait]
+        impl ChunkStore for ReadOnly {
+            fn accepts_writes(&self) -> bool {
+                false
+            }
+            async fn put(&self, _: &[ToastRow]) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("put"))
+            }
+            async fn fetch_many(
+                &self,
+                _: u32,
+                values: &[(u32, usize)],
+                _: u64,
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+                // Incomplete value is absent from end-of-backup state
+                Ok(vec![FetchedValue::Mismatch { got: 7984 }; values.len()])
+            }
+            async fn truncate_mirror(&self, _: u32) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("truncate_mirror"))
+            }
+            async fn rewrite_barrier(&self, _: u32, _: u64, _: u64) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("rewrite_barrier"))
+            }
+        }
+
+        let ptr = crate::decode::heap_decoder::ToastPointer {
+            va_rawsize: 9104,
+            va_extinfo: 9100,
+            va_valueid: 16402,
+            va_toastrelid: 16390,
+        };
+        let rel = crate::backfill::backup_page_walk::toast_chunk_rel();
+        let short = Some(FetchedValue::Mismatch { got: 7984 });
+
+        // Walk-seeded store must contain chunks just written
+        let seeded = ToastResolver::with_store(
+            Arc::new(MemChunkStore::new()),
+            Arc::new(EmitterStats::default()),
+        );
+        assert!(seeded.stores_chunks());
+        let err = apply_fetched(short.clone(), &ptr, 25, &rel, "body", &seeded)
+            .expect_err("a seeded mirror losing its own chunk must stop the load");
+        assert!(
+            err.contains("chunks sum to 7984 bytes, pointer says 9100"),
+            "{err}"
+        );
+        assert_eq!(
+            seeded
+                .stats_handle()
+                .toast_fetch_miss
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        // Missing read-only value is superseded at end-of-backup state
+        let stats = Arc::new(EmitterStats::default());
+        let read_only = ToastResolver::with_store(Arc::new(ReadOnly), stats.clone());
+        assert!(!read_only.stores_chunks() && !read_only.fill_on_miss());
+        let (column, retained) = apply_fetched(short, &ptr, 25, &rel, "body", &read_only)
+            .expect("a read-only backend fills instead of failing the load");
+        assert_eq!(column, ColumnValue::Null);
+        assert_eq!(retained, 0);
+        assert_eq!(
+            stats.toast_values_filled_superseded.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats.toast_fetch_miss.load(Ordering::Relaxed),
+            0,
+            "not counted as a miss: it is the expected answer, not a fault",
+        );
+    }
     use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
 
@@ -1020,6 +1303,7 @@ mod tests {
             None,
             HashSet::new(),
             false,
+            None,
         )
         .await
         .unwrap_err();
@@ -1066,6 +1350,7 @@ mod tests {
             None,
             HashSet::new(),
             false,
+            None,
         ));
 
         let mut by_seq: HashMap<u64, u64> = HashMap::new();
@@ -1120,6 +1405,7 @@ mod tests {
             None,
             HashSet::new(),
             false,
+            None,
         ));
 
         let seqs: Vec<u64> = collect_rows(&mut msg_rx)
@@ -1172,6 +1458,7 @@ mod tests {
             None,
             HashSet::new(),
             false,
+            None,
         ));
 
         let rows = collect_rows(&mut msg_rx).await;
@@ -1186,6 +1473,63 @@ mod tests {
             "unresolved toast NULL-filled"
         );
         assert_eq!(stats.toast_values_filled_default.load(Ordering::Relaxed), 1);
+        drop(ack);
+        collector.await.unwrap();
+    }
+
+    /// Replace oversized deferred value without fetching it
+    #[tokio::test]
+    async fn null_overflow_fills_oversize_toast_without_fetch() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        let mut tables = HashMap::new();
+        tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
+        let mapping = Arc::new(tables);
+
+        let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
+        let (ack, collector) = ack::spawn(emitter_ack);
+        let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
+
+        tup_tx
+            .send(vec![bytea_toast_tuple(16400, 16500, 1)])
+            .await
+            .unwrap();
+        drop(tup_tx);
+
+        let stats = Arc::new(EmitterStats::default());
+        // Pointer footprint is 5 bytes
+        let resolver = ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats.clone())
+            .with_inline_value_max(4)
+            .with_overflow(crate::emit::ch_emitter::InlineValueOverflow::Null);
+        let drain_task = tokio::spawn(drain(
+            tup_rx,
+            catalog,
+            mapping,
+            msg_tx,
+            ack.clone(),
+            stats.clone(),
+            resolver,
+            Deferral::Local(mem_spool()),
+            Default::default(),
+            None,
+            HashSet::new(),
+            false,
+            None,
+        ));
+
+        let rows = collect_rows(&mut msg_rx).await;
+        let outcome = drain_task.await.unwrap().unwrap();
+        assert_eq!(outcome.rows_routed, 1);
+        assert_eq!(rows.len(), 1);
+        let cols = &rows[0].committed.decoded.new.as_ref().unwrap().columns;
+        assert_eq!(cols[0], Some(ColumnValue::Null));
+        assert_eq!(
+            stats.toast_values_filled_oversize.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(stats.toast_values_filled_default.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 0);
         drop(ack);
         collector.await.unwrap();
     }
@@ -1239,6 +1583,7 @@ mod tests {
             None,
             HashSet::new(),
             false,
+            None,
         ));
 
         let rows = collect_rows(&mut msg_rx).await;
@@ -1294,6 +1639,7 @@ mod tests {
             None,
             HashSet::new(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1318,6 +1664,7 @@ mod tests {
             None,
             outcome.next_seq,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1377,6 +1724,7 @@ mod tests {
                 None,
                 HashSet::new(),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -1406,6 +1754,7 @@ mod tests {
                 None,
                 first_seq,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -1459,6 +1808,7 @@ mod tests {
             None,
             HashSet::new(),
             false,
+            None,
         ));
         drop(tup_tx);
 
@@ -1525,6 +1875,7 @@ mod tests {
             None,
             HashSet::new(),
             false,
+            None,
         ));
 
         let routed = collect_rows(&mut msg_rx).await;
@@ -1546,6 +1897,136 @@ mod tests {
         );
         drop(ack);
         collector.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_excludes_failed_prefetch_and_resumes_acknowledged_prefix() {
+        use crate::backfill::backup_checkpoint::BackupCheckpoint;
+        use crate::emit::ch_emitter::EmitterConfig;
+        use crate::emit::pipeline::tail::OwnedTail;
+        use crate::runtime_config::InitialLoadMode;
+        use crate::toast::{ChunkStore, ChunkStoreError};
+
+        struct FailPrefetch(AtomicU64);
+        #[async_trait::async_trait]
+        impl ChunkStore for FailPrefetch {
+            async fn truncate_mirror(&self, _: u32) -> Result<(), ChunkStoreError> {
+                Ok(())
+            }
+            async fn rewrite_barrier(&self, _: u32, _: u64, _: u64) -> Result<(), ChunkStoreError> {
+                Ok(())
+            }
+
+            async fn put(&self, _: &[ToastRow]) -> Result<(), ChunkStoreError> {
+                Ok(())
+            }
+            async fn fetch_many(
+                &self,
+                _: u32,
+                values: &[(u32, usize)],
+                _: u64,
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+                tokio::time::advance(std::time::Duration::from_secs(31)).await;
+                if self.0.fetch_add(1, Ordering::Relaxed) == 1 {
+                    return Err(ChunkStoreError::Shadow("injected prefetch failure".into()));
+                }
+                Ok(values
+                    .iter()
+                    .map(|_| FetchedValue::Assembled(b"hello".to_vec()))
+                    .collect())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bootstrap_deferred.bin");
+        let mut spool = DeferredSpool::new(path.clone(), 0);
+        for _ in 0..=REPLAY_BATCH_ROWS {
+            spool
+                .push(bytea_toast_tuple(16400, 16500, 1))
+                .await
+                .unwrap();
+        }
+        let mark = spool.checkpoint().await.unwrap();
+        let total = spool.spooled_bytes();
+        let mut state = BackupCheckpoint::new(
+            InitialLoadMode::ObjectStore,
+            &[],
+            &Arc::default(),
+            &EmitterConfig::default(),
+            None,
+        );
+        state.spool = mark;
+        state.save(dir.path()).await.unwrap();
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        let mut tables = HashMap::new();
+        tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
+        let mapping = Arc::new(tables);
+        let stats = Arc::new(EmitterStats::default());
+        let resolver =
+            ToastResolver::with_store(Arc::new(FailPrefetch(AtomicU64::new(0))), stats.clone());
+        let tail = OwnedTail::null();
+        stats
+            .bootstrap_deferred_spool_bytes
+            .store(total, Ordering::Relaxed);
+        let result = drain_deferred(
+            spool,
+            &catalog,
+            &mapping,
+            &tail.msg_tx,
+            &tail.ack,
+            &stats,
+            &resolver,
+            &Default::default(),
+            None,
+            0,
+            false,
+            Some(ReplayCheckpoint {
+                state: &mut state,
+                dir: dir.path(),
+                tail: &tail,
+            }),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("injected prefetch failure"));
+        let mut saved = BackupCheckpoint::load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(saved.rows, REPLAY_BATCH_ROWS as u64);
+        assert_eq!(saved.offset, total - total / saved.spool.records);
+        assert!(path.exists());
+        tail.finish(1).await.unwrap();
+
+        let spool = DeferredSpool::resume(path.clone(), saved.spool, saved.offset)
+            .await
+            .unwrap();
+        stats
+            .bootstrap_deferred_spool_bytes
+            .store(total, Ordering::Relaxed);
+        let tail = OwnedTail::null();
+        let result = drain_deferred(
+            spool,
+            &catalog,
+            &mapping,
+            &tail.msg_tx,
+            &tail.ack,
+            &stats,
+            &resolver,
+            &Default::default(),
+            None,
+            0,
+            false,
+            Some(ReplayCheckpoint {
+                state: &mut saved,
+                dir: dir.path(),
+                tail: &tail,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.rows_routed, REPLAY_BATCH_ROWS as u64 + 1);
+        assert_eq!(saved.offset, total);
+        assert_eq!(result.next_seq, 1);
+        assert!(path.exists(), "retain spool until pass publishes");
+        tail.finish(result.next_seq).await.unwrap();
     }
 
     /// One round trip per mirror resolves a whole batch, distinct values
@@ -1619,6 +2100,7 @@ mod tests {
             None,
             HashSet::new(),
             false,
+            None,
         ));
 
         let rows = collect_rows(&mut msg_rx).await;

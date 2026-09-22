@@ -49,6 +49,7 @@
 //! reported once WAL apply passes `P_hi = pg_current_wal_lsn()` read at COPY
 //! EOF; nothing is gated on it.
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,6 +67,7 @@ use walrus::pg::replication::conn::PgConfig;
 
 use crate::backfill::backfill_staging::{self, StagingPlan, StagingRel, StagingSession};
 use crate::backfill::backfill_types::{BackupRequest, PassContext, PassOutcome};
+use crate::backfill::backup_checkpoint::BackupCheckpoint;
 use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap};
 use crate::backfill::opt_in::Backfiller;
 use crate::catalog::shadow_catalog::ShadowCatalog;
@@ -97,7 +99,7 @@ use crate::toast::ToastResolver;
 const COPY_SLAB_ROWS: usize = 1024;
 /// Decoded value bytes per hop. With
 /// [`BOOTSTRAP_TUPLE_CHANNEL_CAP`] this is the resident payload ceiling
-const COPY_SLAB_BYTES: usize = 1 << 20;
+pub const COPY_SLAB_BYTES: usize = 1 << 20;
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 const LEDGER_FILENAME: &str = "backfills.toml";
@@ -148,6 +150,13 @@ struct LedgerEntry {
     /// whether the exchange applied
     #[serde(default)]
     staging_uuid: Option<String>,
+    /// Resumable COPY cursor: filenode the cursor was measured against, and
+    /// the next heap block to read. A rewrite changes the filenode, which
+    /// retires the cursor instead of skipping relocated rows
+    #[serde(default)]
+    copy_relfilenode: Option<u32>,
+    #[serde(default)]
+    copy_next_block: Option<u32>,
 }
 
 fn default_ledger_mode() -> String {
@@ -163,6 +172,16 @@ struct LedgerRec {
     mode: InitialLoadMode,
     swapped: bool,
     staging_uuid: Option<String>,
+    copy: Option<CopyCursor>,
+}
+
+/// Where a chunked COPY stopped. Every chunk below `next_block` proved its
+/// rows durable before this was written, so resume replays at most the chunk
+/// in flight when the daemon died
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyCursor {
+    relfilenode: u32,
+    next_block: u32,
 }
 
 struct Ledger {
@@ -195,6 +214,12 @@ impl Ledger {
                                     mode,
                                     swapped: e.swapped,
                                     staging_uuid: e.staging_uuid,
+                                    copy: e.copy_relfilenode.zip(e.copy_next_block).map(
+                                        |(relfilenode, next_block)| CopyCursor {
+                                            relfilenode,
+                                            next_block,
+                                        },
+                                    ),
                                 },
                             )
                         })
@@ -237,6 +262,8 @@ impl Ledger {
                     mode: rec.mode.as_str().into(),
                     swapped: rec.swapped,
                     staging_uuid: rec.staging_uuid.clone(),
+                    copy_relfilenode: rec.copy.map(|c| c.relfilenode),
+                    copy_next_block: rec.copy.map(|c| c.next_block),
                 })
                 .collect(),
         };
@@ -263,6 +290,7 @@ impl Ledger {
                     mode: InitialLoadMode::BaseBackup,
                     swapped: false,
                     staging_uuid: None,
+                    copy: None,
                 }
             });
         }
@@ -270,6 +298,41 @@ impl Ledger {
             ledger.persist().await?;
         }
         Ok(added)
+    }
+
+    async fn fallback_to_copy(
+        &mut self,
+        rel: &RelName,
+        mode: InitialLoadMode,
+        s_lsn: u64,
+    ) -> std::io::Result<bool> {
+        let Some(rec) = self.entries.get_mut(rel) else {
+            return Ok(false);
+        };
+        if rec.done
+            || rec.swapped
+            || rec.staging_uuid.is_some()
+            || rec.mode != mode
+            || rec.s_lsn.get() != s_lsn
+        {
+            return Ok(false);
+        }
+        rec.mode = InitialLoadMode::Copy;
+        if let Err(e) = self.persist().await {
+            self.entries.get_mut(rel).unwrap().mode = mode;
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Advance the COPY cursor. Callers write it only once the chunk below
+    /// `next_block` proved durable
+    async fn note_copy(&mut self, rel: &RelName, cursor: CopyCursor) -> std::io::Result<()> {
+        let Some(rec) = self.entries.get_mut(rel) else {
+            return Ok(());
+        };
+        rec.copy = Some(cursor);
+        self.persist().await
     }
 
     fn pending_count(&self) -> u64 {
@@ -383,23 +446,53 @@ fn column_plan(desc: &RelDescriptor) -> CopyPlan {
     }
 }
 
-/// Copy visible, detoasted rows from `desc` into `tx`, tagged `lsn`
+/// Heap pages a COPY chunk spans when `[bootstrap] copy_chunk_blocks` is
+/// unset. Matches PostgreSQL's 1 GiB segment at the default page size, so a
+/// restart re-reads at most one segment's worth
+pub const COPY_CHUNK_BLOCKS: u32 = 131_072;
+
+/// Half-open heap block range for one COPY chunk. `end` absent reads to the
+/// end of the relation, covering pages appended while the copy ran
+#[derive(Debug, Clone, Copy)]
+pub struct BlockRange {
+    pub start: u32,
+    pub end: Option<u32>,
+}
+
+/// `WHERE` clause pinning a chunk to its pages. A TID range scan reads
+/// exactly those pages; the whole-relation range emits nothing so a table
+/// small enough for one chunk plans as it always did
+fn ctid_range(range: BlockRange) -> String {
+    match (range.start, range.end) {
+        (0, None) => String::new(),
+        (start, None) => format!(" WHERE ctid >= '({start},0)'::tid"),
+        (0, Some(end)) => format!(" WHERE ctid < '({end},0)'::tid"),
+        (start, Some(end)) => {
+            format!(" WHERE ctid >= '({start},0)'::tid AND ctid < '({end},0)'::tid")
+        }
+    }
+}
+
+/// Copy visible, detoasted rows in `range` from `desc` into `tx`, tagged `lsn`
 ///
 /// Slabs the channel: one hop per [`COPY_SLAB_BYTES`] of decoded values, not
 /// one per row. Byte-triggered so wide rows keep the resident bound whatever
 /// the row count
-pub(crate) async fn copy_rows_into(
+pub async fn copy_rows_into(
     client: &tokio_postgres::Client,
     desc: &RelDescriptor,
     lsn: u64,
     tx: &mpsc::Sender<Vec<BackfillTuple>>,
+    stats: &EmitterStats,
+    range: BlockRange,
 ) -> anyhow::Result<u64> {
     let plan = column_plan(desc);
     let sql = format!(
-        "COPY (SELECT {} FROM ONLY {}.{}) TO STDOUT (FORMAT binary)",
+        "COPY (SELECT {} FROM ONLY {}.{}{}) TO STDOUT (FORMAT binary)",
         plan.select,
         quote_ident(&desc.rel_name.namespace),
         quote_ident(&desc.rel_name.name),
+        ctid_range(range),
     );
     let byte_fields = vec![Type::BYTEA; plan.cols.len()];
     let copy = client.copy_out(&sql).await.context("backfill: COPY out")?;
@@ -410,9 +503,11 @@ pub(crate) async fn copy_rows_into(
     let mut slab_bytes = 0usize;
     while let Some(row) = stream.next().await {
         let row = row.context("backfill: COPY stream")?;
+        let mut payload_bytes = 0u64;
         let mut columns: Vec<Option<ColumnValue>> = vec![None; plan.natts];
         for (i, cp) in plan.cols.iter().enumerate() {
             let raw: Option<&[u8]> = row.try_get(i).context("backfill: COPY field")?;
+            payload_bytes += raw.map_or(0, |bytes| bytes.len() as u64);
             let v = raw
                 .map(|raw| decode_field(cp.kind, cp.type_oid, raw))
                 .transpose()
@@ -437,6 +532,10 @@ pub(crate) async fn copy_rows_into(
             columns,
         });
         rows += 1;
+        stats.backfill_copy_rows.fetch_add(1, Ordering::Relaxed);
+        stats
+            .backfill_copy_bytes
+            .fetch_add(payload_bytes, Ordering::Relaxed);
         if slab.len() >= COPY_SLAB_ROWS || slab_bytes >= COPY_SLAB_BYTES {
             slab_bytes = 0;
             tx.send(std::mem::take(&mut slab))
@@ -705,6 +804,7 @@ impl CopyBackfiller {
                             mode,
                             swapped: false,
                             staging_uuid: None,
+                            copy: None,
                         },
                     );
                     if let Err(e) = inner.ledger.persist().await {
@@ -798,8 +898,8 @@ impl CopyBackfiller {
 
     /// Coalesced backup pass: wait out the window, drain the mode's queue,
     /// run one cluster-sized pass for every queued rel. Regime A: a failed
-    /// pass leaves every entry pending (next boot's seed re-queues them) and
-    /// never poisons the pump.
+    /// pass falls back to COPY when enabled, otherwise stays pending.
+    /// Failure never poisons the pump.
     async fn run_backup_pass(self: Arc<Self>, mode: InitialLoadMode) {
         tokio::time::sleep(self.coalesce_window).await;
         let reqs: Vec<BackupRequest> = {
@@ -819,16 +919,16 @@ impl CopyBackfiller {
                     target: "walshadow::backfill",
                     mode = mode.as_str(),
                     tables = reqs.len(),
-                    rows_walked = outcome.rows_walked,
-                    rows_gated = outcome.rows_gated,
-                    rows_deferred = outcome.rows_deferred,
+                    rows_walked = outcome.counts.walked,
+                    rows_gated = outcome.counts.gated,
+                    rows_deferred = outcome.counts.deferred,
                     rows_pending = outcome.rows_pending,
                     pending_tables = outcome.pending_tables.len(),
-                    multixact_emitted = outcome.multixact_emitted,
+                    multixact_emitted = outcome.counts.multixact,
                     rows_replayed = outcome.rows_replayed,
                     replay_commits_past_s = outcome.replay_commits_past_s,
                     gap_segments = outcome.gap_segments,
-                    pg_xact_segments = outcome.pg_xact_segments,
+                    pg_xact_segments = outcome.counts.pg_xact_segments,
                     pg_xact_patch = outcome.pg_xact_patch_len,
                     b_redo = %format_pg_lsn(outcome.b_redo),
                     "backup backfill pass complete",
@@ -840,15 +940,56 @@ impl CopyBackfiller {
                     mode = mode.as_str(),
                     tables = reqs.len(),
                     error = %format!("{e:#}"),
-                    "backup backfill pass failed; entries stay pending (re-run on next boot)",
+                    "backup backfill pass failed",
                 );
+                if self.emitter.bootstrap.copy_fallback.unwrap_or(true) {
+                    for req in &reqs {
+                        if self.prepare_copy_fallback(mode, req).await {
+                            self.clone().run(req.desc.clone(), req.s_lsn.into()).await;
+                        }
+                    }
+                }
             }
         }
         let mut inner = self.inner.lock().await;
         for r in &reqs {
-            inner.active.remove(&r.desc.rel_name);
+            if inner
+                .ledger
+                .entries
+                .get(&r.desc.rel_name)
+                .is_none_or(|rec| rec.mode == mode && rec.s_lsn.get() == r.s_lsn)
+            {
+                inner.active.remove(&r.desc.rel_name);
+            }
         }
         self.refresh_gauges(&inner.ledger);
+    }
+
+    async fn prepare_copy_fallback(&self, mode: InitialLoadMode, req: &BackupRequest) -> bool {
+        let mut inner = self.inner.lock().await;
+        let rel = &req.desc.rel_name;
+        match inner.ledger.fallback_to_copy(rel, mode, req.s_lsn).await {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(e) => {
+                tracing::error!(
+                    target: "walshadow::backfill",
+                    qname = %rel,
+                    error = %e,
+                    "COPY fallback ledger persist failed; entry stays pending",
+                );
+                return false;
+            }
+        }
+        self.refresh_gauges(&inner.ledger);
+        tracing::warn!(
+            target: "walshadow::backfill",
+            qname = %rel,
+            previous_mode = mode.as_str(),
+            s_lsn = %format_pg_lsn(req.s_lsn),
+            "retrying failed backup load through COPY",
+        );
+        true
     }
 
     /// Staged pass (architecture/bootstrap.md): rows land in per-rel
@@ -864,9 +1005,36 @@ impl CopyBackfiller {
         if let Some(runtime) = dest.snowflake.clone() {
             return self.staged_pass_snowflake(mode, reqs, dest, runtime).await;
         }
-        let staging = backfill_staging::prepare(dest.clone(), &self.mapping, reqs)
+        let scratch_dir = self.spill_dir.join("backup_backfill");
+        let config = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
+        let mut checkpoint = BackupCheckpoint::new(
+            mode,
+            reqs,
+            &self.mapping.snapshot().await,
+            &dest,
+            config.as_deref(),
+        );
+        // Mid-walk progress names files whose rows are only in staging, so it
+        // keeps the tables just as a completed walk does
+        let resumed = match BackupCheckpoint::load(&scratch_dir).await? {
+            Some(saved) if saved.matches(&checkpoint) && saved.resuming() => {
+                let mut session = backfill_staging::StagingSession::connect(dest.clone()).await?;
+                saved.staging_intact(&mut session).await?.then_some(saved)
+            }
+            _ => None,
+        };
+        match resumed {
+            Some(saved) => checkpoint = saved,
+            None => BackupCheckpoint::discard(&scratch_dir).await?,
+        }
+        let resuming = checkpoint.resuming();
+        let staging = backfill_staging::prepare(dest.clone(), &self.mapping, reqs, resuming)
             .await
             .context("staging prepare")?;
+        if !resuming {
+            let mut session = backfill_staging::StagingSession::connect(dest.clone()).await?;
+            checkpoint.capture_staging(&staging, &mut session).await?;
+        }
         let ctx = PassContext {
             pg: self.source_pg(),
             emitter: dest,
@@ -875,16 +1043,21 @@ impl CopyBackfiller {
             stats: self.stats.clone(),
             catalog: self.catalog.clone(),
             log: self.log.clone(),
-            scratch_dir: self.spill_dir.join("backup_backfill"),
+            scratch_dir,
             config_rx: self.config_rx.clone(),
             history_rx: self.history_rx.clone(),
             budget: self.budget.clone(),
             oracle: self.oracle.clone(),
             source_major: self.source_major,
+            checkpoint,
         };
         let outcome = crate::backfill::backup_backfill::run_pass(&ctx, mode, reqs).await?;
         self.publish_staged(&staging, reqs).await;
         self.record_pending(&outcome).await;
+        BackupCheckpoint::discard(&ctx.scratch_dir).await?;
+        tokio::fs::remove_file(ctx.scratch_dir.join("bootstrap_deferred.bin"))
+            .await
+            .ok();
         Ok(outcome)
     }
 
@@ -915,6 +1088,17 @@ impl CopyBackfiller {
                 .collect();
             let mut pass_emitter = (*dest).clone();
             pass_emitter.snowflake_snapshots = Arc::new(plan.operations.clone());
+            // Snowflake generations make a rerun idempotent, so the pass
+            // never resumes from a backup checkpoint
+            let scratch_dir = self.spill_dir.join("backup_backfill");
+            BackupCheckpoint::discard(&scratch_dir).await?;
+            let checkpoint = BackupCheckpoint::new(
+                mode,
+                &active_reqs,
+                &plan.mapping.snapshot().await,
+                &pass_emitter,
+                config.as_deref(),
+            );
             let ctx = PassContext {
                 pg: self.source_pg(),
                 emitter: Arc::new(pass_emitter),
@@ -923,14 +1107,16 @@ impl CopyBackfiller {
                 stats: self.stats.clone(),
                 catalog: self.catalog.clone(),
                 log: self.log.clone(),
-                scratch_dir: self.spill_dir.join("backup_backfill"),
+                scratch_dir,
                 config_rx: self.config_rx.clone(),
                 history_rx: self.history_rx.clone(),
                 budget: self.budget.clone(),
                 oracle: self.oracle.clone(),
                 source_major: self.source_major,
+                checkpoint,
             };
             outcome = crate::backfill::backup_backfill::run_pass(&ctx, mode, &active_reqs).await?;
+            BackupCheckpoint::discard(&ctx.scratch_dir).await?;
         }
         // Pending visibility rows are durable before publication. Their xid
         // manifest must be durable too, so a crash after a view swap cannot
@@ -1218,6 +1404,7 @@ impl CopyBackfiller {
             rec.done = true;
             rec.swapped = false;
             rec.staging_uuid = None;
+            rec.copy = None;
             if let Err(e) = inner.ledger.persist().await {
                 tracing::warn!(
                     target: "walshadow::backfill",
@@ -1255,6 +1442,7 @@ impl CopyBackfiller {
             Ok(outcome) => {
                 if let Some(entry) = inner.ledger.entries.get_mut(&desc.rel_name) {
                     entry.done = true;
+                    entry.copy = None;
                     if let Err(e) = inner.ledger.persist().await {
                         tracing::warn!(
                             target: "walshadow::backfill",
@@ -1327,6 +1515,86 @@ impl CopyBackfiller {
             });
         }
 
+        let rows = self.copy_chunks(&client, desc, s_lsn).await?;
+        // Upper bound on the COPY snapshot; WAL apply past it = converged
+        let p_hi = current_wal_lsn(&client).await?;
+        Ok(CopyOutcome {
+            rows,
+            skipped_empty: false,
+            p_hi,
+        })
+    }
+
+    /// Walk the relation in heap-block chunks, persisting the cursor once each
+    /// chunk's rows are durable. A rewrite between chunks relocates rows, so
+    /// the cursor it invalidates restarts the table rather than skipping pages
+    async fn copy_chunks(
+        &self,
+        client: &tokio_postgres::Client,
+        desc: &Arc<RelDescriptor>,
+        s_lsn: Pos<Snapshot>,
+    ) -> anyhow::Result<u64> {
+        let chunk = self
+            .emitter
+            .bootstrap
+            .copy_chunk_blocks
+            .map_or(COPY_CHUNK_BLOCKS, NonZeroU32::get);
+        // A rewrite is the only way past the first pass, and it changes the
+        // filenode, so the cursor a restart reads never matches twice
+        for _ in 0..2 {
+            let (relfilenode, blocks) = relation_extent(client, desc.oid).await?;
+            let mut start = self
+                .copy_cursor(&desc.rel_name)
+                .await
+                .filter(|c| c.relfilenode == relfilenode)
+                .map_or(0, |c| c.next_block);
+            if start > 0 {
+                tracing::info!(
+                    target: "walshadow::backfill",
+                    qname = %desc.rel_name,
+                    start_block = start,
+                    blocks,
+                    "resuming COPY from persisted cursor",
+                );
+            }
+            let mut rows = 0;
+            loop {
+                let end = start.checked_add(chunk).filter(|e| *e < blocks);
+                rows += self
+                    .copy_chunk(client, desc, s_lsn, BlockRange { start, end })
+                    .await?;
+                let Some(end) = end else { return Ok(rows) };
+                if relation_extent(client, desc.oid).await?.0 != relfilenode {
+                    tracing::warn!(
+                        target: "walshadow::backfill",
+                        qname = %desc.rel_name,
+                        "relation rewritten mid-COPY; restarting from first block",
+                    );
+                    break;
+                }
+                start = end;
+                self.note_copy_progress(
+                    &desc.rel_name,
+                    CopyCursor {
+                        relfilenode,
+                        next_block: start,
+                    },
+                )
+                .await;
+            }
+        }
+        anyhow::bail!("backfill: relation rewritten twice during COPY")
+    }
+
+    /// One chunk on its own tail: proving `finish` is what licenses the cursor
+    /// write, so each chunk owns a seq space a restart can discard whole
+    async fn copy_chunk(
+        &self,
+        client: &tokio_postgres::Client,
+        desc: &Arc<RelDescriptor>,
+        s_lsn: Pos<Snapshot>,
+        range: BlockRange,
+    ) -> anyhow::Result<u64> {
         // Dedicated tail: own CH connection, own seq space, own fatal.
         let tail = OwnedTail::spawn(
             &self.dest_emitter(),
@@ -1356,28 +1624,36 @@ impl CopyBackfiller {
             self.config_rx.as_ref().map(|rx| rx.borrow().clone()),
             HashSet::new(),
             false,
+            None,
         ));
 
-        let rows = crate::ops::stages::COPY
-            .measure(copy_rows_into(&client, desc, s_lsn.get(), &tup_tx))
-            .await?;
+        let copied = crate::ops::stages::COPY
+            .measure(copy_rows_into(
+                client,
+                desc,
+                s_lsn.get(),
+                &tup_tx,
+                &self.stats,
+                range,
+            ))
+            .await;
         drop(tup_tx);
-
         let outcome = drain
             .await
             .context("backfill: drain join")?
-            .map_err(anyhow::Error::msg)?;
-        // Upper bound on the COPY snapshot; WAL apply past it = converged
-        let p_hi = current_wal_lsn(&client).await?;
+            .map_err(anyhow::Error::msg);
+        let (rows, outcome) = match (copied, outcome) {
+            (Ok(rows), Ok(outcome)) => (rows, outcome),
+            (Err(e), _) | (_, Err(e)) => {
+                tail.quiesce().await;
+                return Err(e);
+            }
+        };
         crate::ops::stages::INSERT_FLUSH
             .measure(tail.finish(outcome.next_seq))
             .await
             .map_err(anyhow::Error::msg)?;
-        Ok(CopyOutcome {
-            rows,
-            skipped_empty: false,
-            p_hi,
-        })
+        Ok(rows)
     }
 
     async fn copy_once_snowflake(
@@ -1451,7 +1727,17 @@ impl CopyBackfiller {
             let (tx, rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
             let copy = async {
                 let result = crate::ops::stages::COPY
-                    .measure(copy_rows_into(client, desc, s_lsn.get(), &tx))
+                    .measure(copy_rows_into(
+                        client,
+                        desc,
+                        s_lsn.get(),
+                        &tx,
+                        &self.stats,
+                        BlockRange {
+                            start: 0,
+                            end: None,
+                        },
+                    ))
                     .await;
                 drop(tx);
                 result
@@ -1493,6 +1779,44 @@ impl CopyBackfiller {
             p_hi,
         })
     }
+
+    async fn copy_cursor(&self, rel: &RelName) -> Option<CopyCursor> {
+        self.inner.lock().await.ledger.entries.get(rel)?.copy
+    }
+
+    /// Cursor loss only costs a repeated chunk, so a failed persist logs
+    async fn note_copy_progress(&self, rel: &RelName, cursor: CopyCursor) {
+        let mut inner = self.inner.lock().await;
+        if let Err(e) = inner.ledger.note_copy(rel, cursor).await {
+            tracing::warn!(
+                target: "walshadow::backfill",
+                qname = %rel,
+                error = %e,
+                "COPY cursor persist failed; restart repeats the chunk",
+            );
+        }
+    }
+}
+
+/// Current filenode and heap block count. Both come from one read so the
+/// count belongs to the filenode the chunk loop pins
+async fn relation_extent(client: &tokio_postgres::Client, oid: u32) -> anyhow::Result<(u32, u32)> {
+    let row = client
+        .query_one(
+            &format!(
+                "SELECT relfilenode, \
+                 (pg_relation_size(oid) / current_setting('block_size')::int8)::int8 \
+                 FROM pg_class WHERE oid = {oid}"
+            ),
+            &[],
+        )
+        .await
+        .context("backfill: relation extent")?;
+    let blocks: i64 = row.get(1);
+    Ok((
+        row.get::<_, u32>(0),
+        u32::try_from(blocks).unwrap_or(u32::MAX),
+    ))
 }
 
 fn snowflake_copy_operation_id(source_identity: &str, desc: &RelDescriptor, s_lsn: u64) -> String {
@@ -1738,6 +2062,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fallback_ledger_guards_and_persistence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = RelName::new("app", "orders");
+        let mode = InitialLoadMode::ObjectStore;
+        let mut ledger = Ledger::load(tmp.path()).await;
+        let pending = LedgerRec {
+            s_lsn: 100.into(),
+            done: false,
+            mode,
+            swapped: false,
+            staging_uuid: None,
+            copy: None,
+        };
+        assert!(!ledger.fallback_to_copy(&rel, mode, 100).await.unwrap());
+        for rec in [
+            LedgerRec {
+                done: true,
+                ..pending.clone()
+            },
+            LedgerRec {
+                swapped: true,
+                ..pending.clone()
+            },
+            LedgerRec {
+                staging_uuid: Some("uuid".into()),
+                ..pending.clone()
+            },
+            LedgerRec {
+                s_lsn: 200.into(),
+                ..pending.clone()
+            },
+            LedgerRec {
+                mode: InitialLoadMode::BaseBackup,
+                ..pending.clone()
+            },
+        ] {
+            ledger.entries.insert(rel.clone(), rec);
+            assert!(!ledger.fallback_to_copy(&rel, mode, 100).await.unwrap());
+        }
+        ledger.entries.insert(rel.clone(), pending);
+        ledger.persist().await.unwrap();
+        let original_dir = ledger.dir.clone();
+        let blocker = tmp.path().join("not-a-directory");
+        std::fs::write(&blocker, "blocked").unwrap();
+        ledger.dir = blocker;
+        assert!(ledger.fallback_to_copy(&rel, mode, 100).await.is_err());
+        assert_eq!(ledger.entries[&rel].mode, mode);
+        assert_eq!(Ledger::load(tmp.path()).await.entries[&rel].mode, mode);
+        ledger.dir = original_dir;
+        assert!(ledger.fallback_to_copy(&rel, mode, 100).await.unwrap());
+        let resumed = Ledger::load(tmp.path()).await;
+        assert_eq!(resumed.entries[&rel].mode, InitialLoadMode::Copy);
+        assert_eq!(resumed.entries[&rel].s_lsn.get(), 100);
+        assert!(!resumed.entries[&rel].done);
+    }
+
+    #[test]
+    fn ctid_range_bounds_each_chunk_and_leaves_a_lone_chunk_unqualified() {
+        let clause = |start, end| ctid_range(BlockRange { start, end });
+        assert_eq!(clause(0, None), "");
+        assert_eq!(clause(0, Some(8)), " WHERE ctid < '(8,0)'::tid");
+        assert_eq!(clause(8, None), " WHERE ctid >= '(8,0)'::tid");
+        assert_eq!(
+            clause(8, Some(16)),
+            " WHERE ctid >= '(8,0)'::tid AND ctid < '(16,0)'::tid"
+        );
+    }
+
+    #[tokio::test]
     async fn ledger_round_trips_and_survives_corruption() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ledger = Ledger::load(tmp.path()).await;
@@ -1750,6 +2143,10 @@ mod tests {
                 mode: InitialLoadMode::Copy,
                 swapped: false,
                 staging_uuid: None,
+                copy: Some(CopyCursor {
+                    relfilenode: 16400,
+                    next_block: 512,
+                }),
             },
         );
         ledger.entries.insert(
@@ -1760,6 +2157,7 @@ mod tests {
                 mode: InitialLoadMode::ObjectStore,
                 swapped: false,
                 staging_uuid: None,
+                copy: None,
             },
         );
         ledger.entries.insert(
@@ -1770,6 +2168,7 @@ mod tests {
                 mode: InitialLoadMode::ObjectStore,
                 swapped: true,
                 staging_uuid: Some("a-uuid".into()),
+                copy: None,
             },
         );
         ledger.persist().await.unwrap();
@@ -1779,7 +2178,16 @@ mod tests {
         assert_eq!((orders.s_lsn.get(), orders.done), (0x1000, false));
         assert_eq!(orders.mode, InitialLoadMode::Copy);
         assert!(!orders.swapped);
+        assert_eq!(
+            orders.copy,
+            Some(CopyCursor {
+                relfilenode: 16400,
+                next_block: 512
+            }),
+            "COPY cursor round-trips",
+        );
         let done = again.entries.get(&RelName::new("app", "done")).unwrap();
+        assert_eq!(done.copy, None);
         assert_eq!((done.s_lsn.get(), done.done), (0x800, true));
         assert_eq!(done.mode, InitialLoadMode::ObjectStore, "mode round-trips");
         let mid = again.entries.get(&RelName::new("app", "mid_swap")).unwrap();

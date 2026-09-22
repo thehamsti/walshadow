@@ -554,7 +554,7 @@ fn one_char(s: String, what: &str) -> Result<char> {
 mod tests {
     use super::*;
     use crate::backfill::backup_page_walk::{PAGE_BYTES, make_rel, synth_single_tuple_page};
-    use crate::backfill::backup_source::{BackupSink, BackupSource, FileKind, FileMeta};
+    use crate::backfill::backup_source::{BackupSink, BackupSource, FileMeta};
     use crate::decode::heap_decoder::HeapOp;
     use async_trait::async_trait;
 
@@ -608,7 +608,7 @@ mod tests {
                     path: "base/5/1259".into(),
                     size: 7,
                     mode: 0o600,
-                    kind: FileKind::File,
+                    ..Default::default()
                 },
                 b"catalog".to_vec(),
             ),
@@ -617,7 +617,7 @@ mod tests {
                     path: "base/5/16400".into(),
                     size: PAGE_BYTES as u64,
                     mode: 0o600,
-                    kind: FileKind::File,
+                    ..Default::default()
                 },
                 synth,
             ),
@@ -626,7 +626,7 @@ mod tests {
                     path: "pg_replslot/0/state".into(),
                     size: 4,
                     mode: 0o600,
-                    kind: FileKind::File,
+                    ..Default::default()
                 },
                 b"slot".to_vec(),
             ),
@@ -635,7 +635,7 @@ mod tests {
                     path: "pg_control".into(),
                     size: 3,
                     mode: 0o600,
-                    kind: FileKind::File,
+                    ..Default::default()
                 },
                 b"ctl".to_vec(),
             ),

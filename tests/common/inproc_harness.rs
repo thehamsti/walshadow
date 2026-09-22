@@ -44,7 +44,9 @@ use walshadow::pg::socket_conninfo;
 use walshadow::pipeline::reorder::ReorderSink;
 use walshadow::pipeline::{PipelineConfig, PipelineHandle, TailKind};
 use walshadow::pos::{EmitterAck, Floor, Monotone};
-use walshadow::record::{MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE};
+use walshadow::record::{
+    BoundaryKind, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE,
+};
 use walshadow::schema::RelName;
 use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
@@ -614,19 +616,24 @@ impl RecordSink for PipelineSinks {
             if let (Some(capture), Some(members)) = (&self.capture, &record.aborted_tree) {
                 capture.forget_aborted(members);
             }
-            if let (Some(capture), Some(info)) = (&self.capture, &record.boundary_info)
-                && capture.admits(info, record.next_lsn)
-            {
-                self.catalog
-                    .lock()
-                    .await
-                    .wait_for_replay(record.next_lsn)
-                    .await
-                    .map_err(|e| SinkError::Other(format!("harness boundary wait: {e}")))?;
-                capture.charge_hold(info, std::time::Duration::ZERO);
-                capture
-                    .capture_boundary(info, record.source_lsn, record.next_lsn)
-                    .await?;
+            if let (Some(capture), Some(info)) = (&self.capture, &record.boundary_info) {
+                if capture.admits(info, record.next_lsn) {
+                    self.catalog
+                        .lock()
+                        .await
+                        .wait_for_replay(record.next_lsn)
+                        .await
+                        .map_err(|e| SinkError::Other(format!("harness boundary wait: {e}")))?;
+                    capture.charge_hold(info, std::time::Duration::ZERO);
+                    capture
+                        .capture_boundary(info, record.source_lsn, record.next_lsn)
+                        .await?;
+                } else if matches!(info.kind, BoundaryKind::Commit) {
+                    // Save an empty batch without waiting, as daemon does
+                    capture
+                        .capture_boundary(info, record.source_lsn, record.next_lsn)
+                        .await?;
+                }
             }
             self.metrics.on_record(record).await?;
             self.decoder.on_record(record).await?;
@@ -685,12 +692,15 @@ pub async fn build_pipeline_with(
 }
 
 /// `build_pipeline` with the oracle wired in, so oracle-routed columns convert
-/// to Native through the shadow's `walshadow` module (architecture/values.md).
-pub async fn build_pipeline_with_oracle(
+/// to Native through the shadow's `walshadow` module (architecture/values.md),
+/// and with final say over the emitter config — `[toast] mode = "shadow"`
+/// wants both, since it reads values through the oracle's bridge
+pub async fn build_pipeline_tuned(
     args: BuildPipelineArgs<'_>,
-    oracle: Arc<walshadow::oracle::Oracle>,
+    tune: impl FnOnce(&mut EmitterConfig),
+    oracle: Option<Arc<walshadow::oracle::Oracle>>,
 ) -> Pipeline {
-    build_pipeline_inner(args, |_| {}, Some(oracle)).await
+    build_pipeline_inner(args, tune, oracle).await
 }
 
 async fn build_pipeline_inner(
@@ -856,6 +866,23 @@ async fn build_pipeline_inner(
     }
 
     tune(&mut emitter_cfg);
+    // Stand in for bootstrap, which seeds eligibility from the source catalog
+    // and persists it for the next boot to load. No harness runs bootstrap, so
+    // take what shadow already holds, then persist on the same path
+    if emitter_cfg.toast.mode.is_shadow() {
+        let rels = walshadow::backfill::pg_path::user_relation_filenodes(
+            &shadow.config().data_dir,
+            shadow_db_oid,
+        )
+        .await
+        .expect("list shadow relations");
+        stream.filter_mut().keep_user_rels(rels, 0);
+        stream
+            .filter_mut()
+            .persist_shadow_rels(&shadow.config().data_dir)
+            .await
+            .expect("persist shadow replay eligibility");
+    }
     let pending_cfg = emitter_cfg.pending_capture;
     let pending_catalog = Arc::new(walshadow::pending::PendingCatalog::default());
 
@@ -871,6 +898,10 @@ async fn build_pipeline_inner(
         toml::Table::new(),
         mapping.clone(),
     );
+    // Apply daemon's TOAST admission check to opt-ins
+    if let Some(rels) = stream.filter().shadow_rels() {
+        config_resolver.bind_shadow_toast(rels.held());
+    }
     let ddl_cfg = DdlConfig::from_resolved(
         &config_rx.borrow(),
         emitter_cfg.database.clone(),

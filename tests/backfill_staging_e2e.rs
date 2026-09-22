@@ -5,6 +5,7 @@ mod fx;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, watch};
@@ -17,7 +18,7 @@ use walshadow::mapping::{ColumnMapping, MappingHandle, TableMapping, TableTarget
 use walshadow::runtime_config::InitialLoadMode;
 use walshadow::schema::{RelDescriptor, RelName};
 use walshadow::shadow::Shadow;
-use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
+use walshadow::shadow_catalog::ShadowCatalog;
 use walshadow::timeline::TimelineHistory;
 
 struct Fixture {
@@ -28,24 +29,14 @@ struct Fixture {
     catalog: Arc<Mutex<ShadowCatalog>>,
     log: Arc<DescriptorLog>,
     desc: Arc<RelDescriptor>,
+    stats: Arc<EmitterStats>,
     _tmp: tempfile::TempDir,
 }
 
 impl Fixture {
     async fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let source = fx::make_source(&tmp);
-        source.initdb().unwrap();
-        source.write_base_conf().unwrap();
-        fx::append_source_conf(&source).unwrap();
-        fx::append_bridge_conf(
-            &source.config().data_dir,
-            &source.config().socket_dir,
-            "postgres",
-            fx::pgext_dir(),
-        )
-        .unwrap();
-        source.start().unwrap();
+        let source = fx::start_bridged_source(&tmp);
         let stop = fx::StopOnDrop { sh: &source };
         source
             .psql_one(
@@ -55,23 +46,7 @@ impl Fixture {
                  CHECKPOINT",
             )
             .unwrap();
-        let bridge = Arc::new(
-            walshadow::bridge::connect_with_budget(
-                &source.config().socket_dir.join("walshadow-bridge.sock"),
-                1,
-                Duration::from_secs(20),
-            )
-            .await
-            .unwrap(),
-        );
-        let pg = fx::pg_cfg(&source, "backfill-staging");
-        let mut catalog = ShadowCatalog::connect(
-            &walshadow::pg::socket_conninfo(&pg.host, pg.port, &pg.user, &pg.database),
-            ShadowCatalogConfig::default(),
-            bridge.clone(),
-        )
-        .await
-        .unwrap();
+        let (bridge, mut catalog) = fx::connect_catalog(&source, "backfill-staging").await;
         let (_, descs) = catalog.fetch_all_descriptors().await.unwrap();
         let desc = Arc::new(
             descs
@@ -102,6 +77,9 @@ impl Fixture {
         fx::create_ch_dest_table(&ch, "default", "t").unwrap();
         let emitter = EmitterConfig {
             port: ports.ch_tcp,
+            inserter_pool_size: 4,
+            byte_budget: 1 << 20,
+            row_budget: 1,
             insert_timeout: Duration::from_secs(2),
             ..Default::default()
         };
@@ -136,6 +114,7 @@ impl Fixture {
             catalog: Arc::new(Mutex::new(catalog)),
             log,
             desc,
+            stats: Arc::new(EmitterStats::default()),
             _tmp: tmp,
         }
     }
@@ -152,7 +131,7 @@ impl Fixture {
                 fx::pg_cfg(&self.source, "backfill-staging"),
                 self.emitter.clone(),
                 self.mapping.clone(),
-                Arc::new(EmitterStats::default()),
+                self.stats.clone(),
                 self.catalog.clone(),
                 self.log.clone(),
                 dir,
@@ -174,6 +153,7 @@ impl Fixture {
                 desc: self.desc.clone(),
                 s_lsn: 100,
             }],
+            false,
         )
         .await
         .unwrap();
@@ -232,6 +212,19 @@ async fn backup_opt_in_replaces_stale_rows_and_reloads_after_opt_out() {
     assert_eq!(backfiller.pending_by_mode(), [0, 1, 0]);
     wait_done(&backfiller, dir.path()).await;
     assert_eq!(fx.rows(), "1\tone\n2\ttwo\n3\tthree");
+    let walked = fx
+        .stats
+        .backfill_backup_walk
+        .tuples_emitted
+        .load(Ordering::Relaxed);
+    let tapped = fx
+        .stats
+        .backfill_backup_pump
+        .bytes_tapped
+        .load(Ordering::Relaxed);
+    assert!(walked >= 3);
+    assert!(tapped >= 8192);
+    assert_eq!(fx.stats.backfill_copy_rows.load(Ordering::Relaxed), 0);
     assert_eq!(fx.ch.query("EXISTS default.t__wsstg").unwrap(), "0");
 
     fx.source.psql_one("DELETE FROM public.t WHERE id = 2; UPDATE public.t SET name = 'updated' WHERE id = 1; INSERT INTO public.t VALUES (4, 'four'); CHECKPOINT").unwrap();
@@ -246,6 +239,20 @@ async fn backup_opt_in_replaces_stale_rows_and_reloads_after_opt_out() {
         .await;
     wait_done(&backfiller, dir.path()).await;
     assert_eq!(fx.rows(), "1\tupdated\n3\tthree\n4\tfour");
+    assert!(
+        fx.stats
+            .backfill_backup_walk
+            .tuples_emitted
+            .load(Ordering::Relaxed)
+            > walked
+    );
+    assert!(
+        fx.stats
+            .backfill_backup_pump
+            .bytes_tapped
+            .load(Ordering::Relaxed)
+            > tapped
+    );
     assert_eq!(
         fx.ch
             .query("SELECT uniqExact(_lsn), min(_lsn) FROM default.t FINAL")
@@ -403,4 +410,112 @@ async fn staged_schema_change_discards_load_and_keeps_retry_pending() {
             .unwrap(),
         "1\tnew"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resumed_copy_preserves_boundary_and_newer_live_rows() {
+    if !fx::requirements_available() {
+        return;
+    }
+    let mut fx = Fixture::new().await;
+    fx.emitter.bootstrap.copy_fallback = Some(false);
+    let dir = tempfile::tempdir().unwrap();
+    fx.source.psql_one("ALTER TABLE public.t ALTER COLUMN name SET STORAGE EXTERNAL; UPDATE public.t SET name = repeat('external', 1000) WHERE id = 1").unwrap();
+    fx.ch
+        .query("INSERT INTO default.t (id, name, _lsn) VALUES (2, 'live', 200)")
+        .unwrap();
+    std::fs::write(
+        dir.path().join("backfills.toml"),
+        r#"version = 1
+[[backfill]]
+namespace = "public"
+relname = "t"
+s_lsn = "0/64"
+done = false
+mode = "copy"
+swapped = false
+"#,
+    )
+    .unwrap();
+    let backfiller = fx.backfiller(dir.path()).await;
+    backfiller
+        .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, 300)
+        .await;
+    wait_done(&backfiller, dir.path()).await;
+    assert_eq!(
+        fx.ch
+            .query("SELECT id, length(name), _lsn FROM default.t FINAL ORDER BY id")
+            .unwrap(),
+        "1\t8000\t100\n2\t4\t200\n3\t5\t100"
+    );
+    let ledger = read_ledger(dir.path());
+    assert_eq!(ledger["backfill"][0]["mode"].as_str(), Some("copy"));
+    assert_eq!(ledger["backfill"][0]["s_lsn"].as_str(), Some("0/64"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_backup_defaults_to_copy_at_original_boundary() {
+    if !fx::requirements_available() {
+        return;
+    }
+    let fx = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    fx.ch
+        .query("INSERT INTO default.t (id, name, _lsn) VALUES (2, 'live', 200)")
+        .unwrap();
+    let backfiller = fx.backfiller(dir.path()).await;
+    backfiller
+        .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, 100)
+        .await;
+    wait_done(&backfiller, dir.path()).await;
+    assert_eq!(fx.rows(), "1\tone\n2\tlive\n3\tthree");
+    assert_eq!(
+        fx.stats
+            .backfill_copy_rows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        3
+    );
+    assert_eq!(
+        fx.stats
+            .backfill_copy_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        23
+    );
+    let ledger = read_ledger(dir.path());
+    assert_eq!(ledger["backfill"][0]["mode"].as_str(), Some("copy"));
+    assert_eq!(ledger["backfill"][0]["s_lsn"].as_str(), Some("0/64"));
+    assert_eq!(
+        fx.ch
+            .query("SELECT id, _lsn FROM default.t FINAL ORDER BY id")
+            .unwrap(),
+        "1\t100\n2\t200\n3\t100"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_backup_can_disable_copy_fallback() {
+    if !fx::requirements_available() {
+        return;
+    }
+    let mut fx = Fixture::new().await;
+    fx.emitter.bootstrap.copy_fallback = Some(false);
+    let dir = tempfile::tempdir().unwrap();
+    let backfiller = fx.backfiller(dir.path()).await;
+    backfiller
+        .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, 100)
+        .await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while fx.ch.query("EXISTS default.t__wsstg").unwrap() != "1" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(backfiller.pending_by_mode(), [0, 0, 1]);
+    assert_eq!(
+        read_ledger(dir.path())["backfill"][0]["mode"].as_str(),
+        Some("object_store")
+    );
+    assert_eq!(fx.rows(), "");
 }

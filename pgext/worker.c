@@ -434,7 +434,8 @@ ws_dispatch(StringInfo req, StringInfo resp)
 	{
 		uint8		op = pq_getmsgbyte(req);
 
-		if (op == WS_OP_ENCODE_NATIVE || op == WS_OP_SCAN || op == WS_OP_RENDER_TEXT)
+		if (op == WS_OP_ENCODE_NATIVE || op == WS_OP_SCAN ||
+			op == WS_OP_FETCH_TOAST || op == WS_OP_RENDER_TEXT)
 		{
 			SetCurrentStatementStartTimestamp();
 			StartTransactionCommand();
@@ -463,6 +464,9 @@ ws_dispatch(StringInfo req, StringInfo resp)
 				break;
 			case WS_OP_SCAN:
 				ws_handle_scan(req, resp);
+				break;
+			case WS_OP_FETCH_TOAST:
+				ws_handle_fetch_toast(req, resp);
 				break;
 			default:
 				ereport(ERROR,

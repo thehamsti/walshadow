@@ -234,10 +234,14 @@ pub async fn prepare_snowflake_with_kind(
 
 /// Rebuild one staging table per mapped rel (`DROP` + `CREATE .. AS` clones
 /// structure and engine) and snapshot the routing map against them.
+///
+/// `reuse` keeps the existing tables: a resumed pass is vouched for by rows
+/// already in them, so rebuilding would throw its own progress away
 pub async fn prepare(
     emitter: Arc<EmitterConfig>,
     live: &MappingHandle,
     reqs: &[BackupRequest],
+    reuse: bool,
 ) -> Result<StagingPlan> {
     let mut sess = StagingSession::connect(emitter).await?;
     // Freeze routing for entire staging plan
@@ -260,9 +264,11 @@ pub async fn prepare(
             table: m.target.table.clone(),
             s_lsn: r.s_lsn,
         };
-        sess.rebuild_staging(&rel)
-            .await
-            .with_context(|| format!("backfill_staging: rebuild staging for {name}"))?;
+        if !reuse {
+            sess.rebuild_staging(&rel)
+                .await
+                .with_context(|| format!("backfill_staging: rebuild staging for {name}"))?;
+        }
         staged.insert(
             name.clone(),
             TableMapping {

@@ -3,7 +3,7 @@
 //! Used by greenfield window replay and object-store gap replay. Emit commits
 //! above page-walk coverage and through each target's upper bound
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -173,20 +173,38 @@ impl WalReplaySink {
         self.replay
     }
 
+    /// Mirror writes flushed, seq boundary reported. Commits close their own
+    /// seq, so a segment boundary leaves none open
+    pub async fn segment_boundary(&mut self) -> std::result::Result<u64, SinkError> {
+        self.flush_rows().await?;
+        Ok(self.replay.next_seq)
+    }
+
+    /// Lowest first-record LSN still buffered. A resume above it would drop
+    /// the prefix of a transaction that commits later
+    pub async fn oldest_inflight(&self) -> Option<u64> {
+        self.buffer
+            .lock()
+            .await
+            .inflight_snapshot()
+            .into_iter()
+            .map(|e| e.first_lsn)
+            .min()
+    }
+
     /// Flush pending rows and finish replay
     pub async fn finish(mut self) -> std::result::Result<ReplayStats, SinkError> {
         self.flush_rows().await?;
         Ok(self.stats())
     }
 
-    /// Mirror every chunk tuple a restored TOAST page image carries, not
-    /// only the one its record names. The image is a page copy, not
-    /// transactional evidence, so it bypasses the xact stash: neighbours
-    /// belong to other writers and an abort must not withdraw them
+    /// Mirror all chunks from restored TOAST page image. Bypass transaction
+    /// stash because neighboring tuples may belong to other transactions.
     ///
-    /// Repairs a backup page the walk read mid-write. Any page a backup
-    /// modifies is written before its first change in the window, so the
-    /// image carries what the torn copy lost
+    /// Repair backup pages copied during concurrent writes.
+    ///
+    /// Process Heap images and XLOG_FPI_FOR_HINT images. Deletes of pre-backup
+    /// chunks may have only latter image.
     async fn harvest_toast_images(
         &mut self,
         record: &Record<'_>,
@@ -474,6 +492,10 @@ impl RecordSink for WalReplaySink {
     ) -> Pin<Box<dyn Future<Output = std::result::Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             let rm = record.parsed.header.resource_manager_id;
+            // Capture TOAST page images from Heap and XLOG resource managers
+            if crate::filter::classify::is_page_image(&record.parsed) {
+                self.harvest_toast_images(record).await?;
+            }
             if rm == RmId::Heap as u8 || rm == RmId::Heap2 as u8 {
                 if let Some(rel) = record.parsed.blocks.first().map(|b| b.header.location.rel) {
                     if self.filter_rfns.contains(&(rel.db_node, rel.rel_node)) {
@@ -547,6 +569,61 @@ impl SegmentSink for DropSegments {
     }
 }
 
+/// Segment-at-a-time driver behind [`pump_segments_through`]. Split out so a
+/// resumable caller can checkpoint between segments without closing the
+/// stream, which would strand a record spanning the boundary
+pub struct SegmentPump {
+    stream: WalStream,
+    seg_sink: DropSegments,
+}
+
+impl SegmentPump {
+    pub fn start(first: &SegmentName, target_db_oid: Oid) -> Result<Self> {
+        let mut stream =
+            WalStream::new(first.timeline, WAL_SEG_SIZE, first.start_lsn(WAL_SEG_SIZE))
+                .map_err(|e| anyhow::anyhow!("wal_replay: WalStream: {e}"))?;
+        stream.filter_mut().set_target_db(target_db_oid);
+        Ok(Self {
+            stream,
+            seg_sink: DropSegments,
+        })
+    }
+
+    pub async fn push(
+        &mut self,
+        seg: &SegmentName,
+        path: &Path,
+        sink: &mut (dyn RecordSink + Send),
+    ) -> Result<()> {
+        if seg.timeline != self.stream.timeline() {
+            self.stream
+                .adopt_timeline(seg.timeline)
+                .map_err(|e| anyhow::anyhow!("wal_replay: {}: {e}", seg.format()))?;
+        }
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
+        self.stream
+            .push(
+                seg.start_lsn(WAL_SEG_SIZE),
+                &bytes,
+                sink,
+                &mut self.seg_sink,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("wal_replay: {}: {e}", seg.format()))?;
+        Ok(())
+    }
+
+    pub async fn close(self, sink: &mut (dyn RecordSink + Send)) -> Result<()> {
+        self.stream
+            .close(None, sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("wal_replay: close: {e}"))?;
+        Ok(())
+    }
+}
+
 /// Replay fetched segments in LSN order, following each segment's timeline
 pub async fn pump_segments_through(
     segments: &[(SegmentName, PathBuf)],
@@ -556,29 +633,11 @@ pub async fn pump_segments_through(
     let Some((first, _)) = segments.first() else {
         return Ok(());
     };
-    let mut stream = WalStream::new(first.timeline, WAL_SEG_SIZE, first.start_lsn(WAL_SEG_SIZE))
-        .map_err(|e| anyhow::anyhow!("wal_replay: WalStream: {e}"))?;
-    stream.filter_mut().set_target_db(target_db_oid);
-    let mut seg_sink = DropSegments;
+    let mut pump = SegmentPump::start(first, target_db_oid)?;
     for (seg, path) in segments {
-        if seg.timeline != stream.timeline() {
-            stream
-                .adopt_timeline(seg.timeline)
-                .map_err(|e| anyhow::anyhow!("wal_replay: {}: {e}", seg.format()))?;
-        }
-        let bytes = tokio::fs::read(path)
-            .await
-            .with_context(|| format!("read {}", path.display()))?;
-        stream
-            .push(seg.start_lsn(WAL_SEG_SIZE), &bytes, sink, &mut seg_sink)
-            .await
-            .map_err(|e| anyhow::anyhow!("wal_replay: {}: {e}", seg.format()))?;
+        pump.push(seg, path, sink).await?;
     }
-    stream
-        .close(None, sink)
-        .await
-        .map_err(|e| anyhow::anyhow!("wal_replay: close: {e}"))?;
-    Ok(())
+    pump.close(sink).await
 }
 
 #[cfg(test)]

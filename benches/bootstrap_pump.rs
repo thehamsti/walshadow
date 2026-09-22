@@ -393,6 +393,7 @@ async fn bench_drain(shape: Shape) -> Report {
         None,
         ahash::HashSet::default(),
         false,
+        None,
     )
     .await
     .unwrap();
