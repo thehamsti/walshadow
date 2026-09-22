@@ -75,8 +75,42 @@ impl SnowflakeRuntime {
             }
             return Ok((u64::from(desc.rfn.rel_node), 0));
         }
-        let bytes =
-            barrier_bytes.context("physical relation changed without a TRUNCATE barrier")?;
+        // A finished handoff guards only the storage it retired: returning to
+        // it would let pre-TRUNCATE rows back in
+        let barrier_bytes = match barrier_bytes {
+            Some(bytes) => {
+                let barrier: TruncateBarrier = serde_json::from_slice(&bytes)?;
+                ensure!(
+                    barrier.old_physical != physical,
+                    "relation returned to storage its TRUNCATE retired"
+                );
+                barrier.new_physical.is_none().then_some(bytes)
+            }
+            None => None,
+        };
+        let Some(bytes) = barrier_bytes else {
+            // No TRUNCATE registered its barrier ahead of this storage, and a
+            // TRUNCATE always does (it replays in WAL order before any row of
+            // the new file): this is a rewrite that keeps every row
+            // (VACUUM FULL, CLUSTER). Rows only change incarnation, which
+            // feeds event ids, not keys, so the current state stays valid
+            ensure!(
+                self.state.compare_exchange_metadata(
+                    &key,
+                    Some(stored.as_bytes()),
+                    physical.as_bytes()
+                )?,
+                "physical relation identity changed concurrently"
+            );
+            tracing::info!(
+                target: "walshadow::snowflake",
+                relation = %desc.rel_name,
+                from = stored,
+                to = %physical,
+                "relation storage rewritten; rows keep their state",
+            );
+            return Ok((u64::from(desc.rfn.rel_node), 0));
+        };
         let mut barrier: TruncateBarrier = serde_json::from_slice(&bytes)?;
         ensure!(
             barrier.old_physical == stored && barrier.new_physical.is_none(),
@@ -238,6 +272,8 @@ mod tests {
             outstanding: std::sync::atomic::AtomicU64::new(0),
             applied: Notify::new(),
             apply_failed: std::sync::OnceLock::new(),
+            landed: Default::default(),
+            last_cleanup: Default::default(),
         };
         let mut desc = RelDescriptor {
             rfn: RelFileNode {
@@ -255,9 +291,11 @@ mod tests {
             attributes: vec![],
         };
         runtime.lineage_with_truncate_barrier(&desc).unwrap();
-        let original = desc.clone();
+        // A rewrite with no TRUNCATE barrier (VACUUM FULL, CLUSTER) keeps rows
         desc.rfn.rel_node = 2;
-        assert!(runtime.lineage_with_truncate_barrier(&desc).is_err());
+        runtime.lineage_with_truncate_barrier(&desc).unwrap();
+        let original = desc.clone();
+        desc.rfn.rel_node = 5;
         let op = truncate_operation_id("1", desc.oid, 100);
         runtime
             .state
@@ -272,8 +310,10 @@ mod tests {
         runtime.state.mark_generation_replayed(&op).unwrap();
         runtime.lineage_with_truncate_barrier(&desc).unwrap();
         runtime.lineage_with_truncate_barrier(&desc).unwrap();
+        // The storage a TRUNCATE retired never comes back
         assert!(runtime.lineage_with_truncate_barrier(&original).is_err());
+        // A later rewrite after the finished handoff is accepted
         desc.rfn.rel_node = 3;
-        assert!(runtime.lineage_with_truncate_barrier(&desc).is_err());
+        runtime.lineage_with_truncate_barrier(&desc).unwrap();
     }
 }

@@ -1045,6 +1045,8 @@ mod tests {
             outstanding: std::sync::atomic::AtomicU64::new(0),
             applied: Notify::new(),
             apply_failed: std::sync::OnceLock::new(),
+            landed: Default::default(),
+            last_cleanup: Default::default(),
         };
         let old = schema(vec![(1, "id")]);
         let record = SchemaChangeRecord {
@@ -1130,6 +1132,8 @@ mod tests {
             outstanding: std::sync::atomic::AtomicU64::new(0),
             applied: Notify::new(),
             apply_failed: std::sync::OnceLock::new(),
+            landed: Default::default(),
+            last_cleanup: Default::default(),
         };
         runtime
             .drop_relation_at(7, &RelName::new("PUBLIC", "T"), 100)

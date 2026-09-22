@@ -64,6 +64,9 @@ pub struct SnowflakeRuntime {
     applied: Notify,
     /// First non-transient apply failure; delivery stops on it
     apply_failed: std::sync::OnceLock<String>,
+    /// (landing, receipts) tables applied into since the last cleanup
+    landed: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    last_cleanup: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl std::fmt::Debug for SnowflakeRuntime {
@@ -112,6 +115,8 @@ impl SnowflakeRuntime {
             outstanding: std::sync::atomic::AtomicU64::new(0),
             applied: Notify::new(),
             apply_failed: std::sync::OnceLock::new(),
+            landed: Default::default(),
+            last_cleanup: Default::default(),
         });
         runtime.preflight().await?;
         runtime.recover_schema_changes().await?;
@@ -445,16 +450,37 @@ impl SnowflakeRuntime {
         )
     }
 
+    /// Replay every unapplied batch. Concurrently, so batches of one table
+    /// join one grouped MERGE instead of each waiting out the merge interval;
+    /// version-ordered MERGEs make their order irrelevant
     pub async fn recover(&self) -> Result<()> {
-        for id in self.state.pending_ids()? {
-            let Some(batch) = self.state.get_batch(&id)? else {
-                continue;
-            };
-            let payload: Payload =
-                serde_json::from_slice(&batch.payload).context("decode durable Snowflake batch")?;
-            self.ensure_schema(&payload.schema).await?;
-            self.apply(&batch, &payload).await?;
+        use futures::StreamExt;
+        let ids = self.state.pending_ids()?;
+        if ids.is_empty() {
+            return Ok(());
         }
+        let started = std::time::Instant::now();
+        let total = ids.len();
+        let results: Vec<Result<()>> = futures::stream::iter(ids)
+            .map(|id| async move {
+                let Some(batch) = self.state.get_batch(&id)? else {
+                    return Ok(());
+                };
+                let payload: Payload = serde_json::from_slice(&batch.payload)
+                    .context("decode durable Snowflake batch")?;
+                self.ensure_schema(&payload.schema).await?;
+                self.apply(&batch, &payload).await
+            })
+            .buffer_unordered(self.config.max_in_flight.max(1))
+            .collect()
+            .await;
+        results.into_iter().collect::<Result<Vec<()>>>()?;
+        tracing::info!(
+            target: "walshadow::snowflake",
+            batches = total,
+            elapsed_secs = started.elapsed().as_secs_f64(),
+            "recovered durable batches",
+        );
         Ok(())
     }
 
@@ -714,7 +740,54 @@ impl SnowflakeRuntime {
                 "reclaimed Snowflake state",
             );
         }
+        self.clean_landing().await;
         Ok(())
+    }
+
+    /// Hourly: drop landing rows whose batch has an apply receipt (the
+    /// receipt commits with the MERGE, and a retried batch checks its receipt
+    /// before landing again), and receipts older than a week (only batches
+    /// still unapplied locally are ever retried, and those are recent).
+    /// Landing lookups filter by batch id, so an unpruned landing table makes
+    /// every later batch scan the whole history
+    async fn clean_landing(&self) {
+        const EVERY: Duration = Duration::from_secs(3600);
+        {
+            let mut last = self.last_cleanup.lock().unwrap();
+            match *last {
+                Some(at) if at.elapsed() < EVERY => return,
+                None => {
+                    *last = Some(std::time::Instant::now());
+                    return;
+                }
+                _ => *last = Some(std::time::Instant::now()),
+            }
+        }
+        let tables: Vec<_> = self.landed.lock().unwrap().drain().collect();
+        let receipts: std::collections::BTreeSet<_> = tables.iter().map(|(_, r)| r.clone()).collect();
+        for (landing, receipts_table) in &tables {
+            let sql = format!(
+                "DELETE FROM {landing} l USING {receipts_table} r WHERE l._WS_BATCH_ID = r.BATCH_ID"
+            );
+            if let Err(e) = self.http.execute_sql(&sql, Uuid::new_v4()).await {
+                tracing::warn!(target: "walshadow::snowflake", table = %landing, error = %format!("{e:#}"), "landing cleanup failed; retried next hour");
+                self.landed
+                    .lock()
+                    .unwrap()
+                    .insert((landing.clone(), receipts_table.clone()));
+            }
+        }
+        for receipts_table in receipts {
+            let sql = format!(
+                "DELETE FROM {receipts_table} WHERE APPLIED_AT < DATEADD(day, -7, CURRENT_TIMESTAMP())"
+            );
+            if let Err(e) = self.http.execute_sql(&sql, Uuid::new_v4()).await {
+                tracing::warn!(target: "walshadow::snowflake", error = %format!("{e:#}"), "receipt pruning failed");
+            }
+        }
+        if !tables.is_empty() {
+            tracing::info!(target: "walshadow::snowflake", tables = tables.len(), "landing tables pruned of applied batches");
+        }
     }
 
     /// Apply, retrying transient transport failures. Every step is
@@ -728,7 +801,16 @@ impl SnowflakeRuntime {
     ) -> Result<()> {
         let mut attempt = 0u32;
         loop {
-            match self.apply_once(batch, payload, fresh && attempt == 0).await {
+            let outcome = self.apply_once(batch, payload, fresh && attempt == 0).await;
+            if outcome.is_ok()
+                && let Ok(plan) = TableSqlPlan::new(&payload.schema, &self.config.internal_schema)
+            {
+                self.landed
+                    .lock()
+                    .unwrap()
+                    .insert((plan.landing_table, plan.receipts_table));
+            }
+            match outcome {
                 Err(e) if attempt < APPLY_RETRIES && transient(&e) => {
                     attempt += 1;
                     let delay = Duration::from_millis(500u64 << attempt.min(6));
@@ -1349,6 +1431,8 @@ mod tests {
             outstanding: std::sync::atomic::AtomicU64::new(0),
             applied: Notify::new(),
             apply_failed: std::sync::OnceLock::new(),
+            landed: Default::default(),
+            last_cleanup: Default::default(),
         };
         let batch = DurableBatch {
             id: "batch1".into(),

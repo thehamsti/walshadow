@@ -255,10 +255,13 @@ impl StateStore {
         // The manifest is the commit point: a final payload without one is
         // a crashed enqueue that restart deletes, so no rename is needed
         let result = (|| -> anyhow::Result<()> {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Rows may hold anything the source does
             let mut f = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
+                .mode(0o600)
                 .open(&path)?;
             f.write_all(&batch.payload)?;
             f.sync_all()?;

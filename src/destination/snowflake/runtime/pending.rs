@@ -325,6 +325,8 @@ mod tests {
             outstanding: std::sync::atomic::AtomicU64::new(0),
             applied: Notify::new(),
             apply_failed: std::sync::OnceLock::new(),
+            landed: Default::default(),
+            last_cleanup: Default::default(),
         };
         let schema = TableSchema {
             database: "DB".into(),
