@@ -625,6 +625,7 @@ pub(super) async fn open_tenant(boot: TenantBoot<'_>) -> Result<(Tenant, Boundar
             emitter_cfg.replicate_all = false;
             emitter_cfg.table_opt_ins.clear();
             emitter_cfg.table_initial_loads.clear();
+            emitter_cfg.table_entries.clear();
         }
         for (rel, row) in &activation.opt_ins {
             emitter_cfg

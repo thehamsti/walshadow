@@ -300,7 +300,17 @@ fn tail(log: &str) -> String {
     lines[lines.len().saturating_sub(40)..].join("\n")
 }
 
+/// Tenant `b` names its table explicitly, the others replicate everything,
+/// so both scope paths attach through priming
 fn tenant_fragment(id: &str, db: &str, ch_port: u16, state: &str) -> String {
+    let scope = if id == "b" {
+        format!(
+            "[tenant.{id}.stream]\nreplicate_all = false\n\
+             [tenant.{id}.table.app.orders]\nreplicate = true\ninitial_load = \"copy\"\n"
+        )
+    } else {
+        format!("[tenant.{id}.stream]\nreplicate_all = true\n")
+    };
     format!(
         "[tenant.{id}]\n\
          dbname = \"{db}\"\n\
@@ -309,8 +319,7 @@ fn tenant_fragment(id: &str, db: &str, ch_port: u16, state: &str) -> String {
          host = \"127.0.0.1\"\n\
          port = {ch_port}\n\
          database = \"tenant_{id}\"\n\
-         [tenant.{id}.stream]\n\
-         replicate_all = true\n\
+         {scope}\
          [tenant.{id}.namespace.app]\n\
          target_database = \"tenant_{id}\"\n\
          auto_create = true\n"
@@ -357,6 +366,14 @@ async fn tenants_share_one_slot_attach_live_detach_and_resume() {
     h.wait_phase("b", "active", t).await.unwrap();
     h.wait_rows("a", "app_a", 50, t).await.unwrap();
     h.wait_rows("b", "app_b", 50, t).await.unwrap();
+    let b_state = h.state("b").unwrap();
+    let start = b_state["start_tables"].as_array().unwrap();
+    assert_eq!(start.len(), 1, "{b_state:?}");
+    assert_eq!(start[0]["initial_load"].as_str(), Some("copy"));
+    assert!(
+        !h.stderr().lines().any(|l| l.contains("tenant=b") && l.contains("ensure CH dest")),
+        "explicit tables stay out of scope while priming"
+    );
 
     // Live changes stay in their own tenant
     let a = connect(&h.source, "app_a").await.unwrap();

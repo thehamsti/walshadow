@@ -324,9 +324,12 @@ pub struct Activation {
 impl Activation {
     fn apply(&self, base: &mut EmitterConfig) {
         if self.priming {
+            // Table rules scope relations too (`[table.*] replicate = true`),
+            // not only opt-ins: clear them all until the start scope publishes
             base.replicate_all = false;
             base.table_opt_ins.clear();
             base.table_initial_loads.clear();
+            base.table_entries.clear();
         }
         for (rel, row) in &self.opt_ins {
             base.table_opt_ins
