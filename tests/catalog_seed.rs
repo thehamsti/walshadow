@@ -249,3 +249,79 @@ async fn seed_skips_user_tables() {
     // PG_CLASS_OID exposure — touch it so it doesn't drift unused.
     let _ = PG_CLASS_OID;
 }
+
+/// A catalog another database rotated before attach must be seeded too:
+/// shadow replays every database's catalogs, and bootstrap landing keeps
+/// only files the tracker calls catalog
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seed_all_databases_covers_rotated_catalogs_of_other_databases() {
+    use walrus::pg::replication::conn::PgConfig;
+    use walrus::pg::replication::tls::{SslMode, TlsParams};
+
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let sh = make_cluster(&tmp, ports::PG_SOURCE_PORT);
+    sh.initdb().expect("initdb");
+    sh.write_base_conf().expect("conf");
+    sh.start().expect("start");
+    let _stop = StopOnDrop { sh: &sh };
+    sh.psql_one("CREATE DATABASE tenant_b").expect("create db");
+    let tenant_b: u32 = sh
+        .psql_one("SELECT oid::int8 FROM pg_database WHERE datname = 'tenant_b'")
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let cfg = sh.config();
+    let pgcfg = PgConfig {
+        host: cfg.socket_dir.to_string_lossy().into_owned(),
+        port: cfg.port,
+        user: "postgres".into(),
+        password: None,
+        database: "postgres".into(),
+        application_name: "walshadow-test".into(),
+        sslmode: SslMode::Disable,
+        tls: TlsParams::default(),
+    };
+    let mut b_cfg = pgcfg.clone();
+    b_cfg.database = "tenant_b".into();
+    let b = walshadow::source_feed::open_sql_client(&b_cfg)
+        .await
+        .expect("connect tenant_b");
+    // pg_description is unmapped: its rotation lands only in pg_class
+    b.batch_execute("VACUUM FULL pg_description")
+        .await
+        .expect("vacuum full");
+    let rotated: u32 = b
+        .query_one(
+            "SELECT pg_relation_filenode('pg_description'::regclass)::int8",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0) as u32;
+    assert!(rotated >= 16384, "rotation must escape the < 16384 rule");
+
+    let primary = connect(&sh).await;
+    let mut only_followed = CatalogTracker::new();
+    only_followed
+        .seed_from_source(&primary)
+        .await
+        .expect("seed");
+    assert!(
+        !only_followed.is_catalog(tenant_b, rotated),
+        "followed-database seed alone misses the other database's rotation",
+    );
+
+    let mut tracker = CatalogTracker::new();
+    walshadow::source_feed::seed_all_databases(&mut tracker, &primary, &pgcfg)
+        .await
+        .expect("seed all");
+    assert!(
+        tracker.is_catalog(tenant_b, rotated),
+        "rotated pg_description {rotated} of tenant_b must be catalog",
+    );
+}

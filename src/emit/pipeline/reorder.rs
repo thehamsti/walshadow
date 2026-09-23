@@ -319,6 +319,7 @@ impl ReorderSink {
             .iter()
             .map(|(rel, row)| (rel.clone(), row.clone()))
             .collect();
+        let mut deferred = crate::backfill::opt_in::DeferredBackfills::default();
         for (rel, row) in candidates {
             let known = self
                 .catalog
@@ -336,20 +337,22 @@ impl ReorderSink {
                 );
                 continue;
             }
-            crate::backfill::opt_in::apply_table_opt_in(
+            crate::backfill::opt_in::apply_table_opt_in_deferred(
                 &resolver,
                 applicator,
                 &self.catalog,
-                self.backfiller.as_ref(),
+                self.backfiller.is_some(),
                 &rel,
                 &row,
                 commit_lsn,
+                &mut deferred,
             )
             .await
             .map_err(|e| SinkError::Other(format!("reload opt-in: {e}")))?;
             self.pending_opt_ins.remove(&rel);
             self.applied_opt_ins.insert(rel);
         }
+        deferred.start(self.backfiller.as_ref()).await;
         Ok(())
     }
 
@@ -1191,6 +1194,10 @@ impl RecordSink for ReorderSink {
                 self.ack.trailing(lsn);
                 buf.advance_idle(lsn);
             }
+            // A quiet database never reaches a commit barrier, so apply
+            // reloaded opt-ins here: with nothing buffered, the idle position
+            // bounds their backfill exactly as a commit would
+            self.maybe_apply_reload(lsn).await?;
             // Quiescent source never re-enters on_commit; retire due drops
             // here so the flush doesn't wait for a later commit
             self.flush_due_retires().await

@@ -6,7 +6,8 @@ Review these limits before production use
 
 - PostgreSQL 16, 17, 18, and 19, daemon rejects unaudited majors
 - shadow PostgreSQL major must match source major
-- one source database per walshadow process
+- one source database per walshadow process unless [tenants](tenants.md) are
+  configured; tenants share one slot and shadow, each follows one database
 - `wal_level = logical` required
 - every replicated table needs usable replica identity
 - prepared transactions are not supported for production use; commit and abort

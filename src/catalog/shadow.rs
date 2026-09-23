@@ -78,6 +78,32 @@ pub struct BridgeConf {
     /// so this is how many oracle round trips can be in flight. Worker 0
     /// keeps `socket_path`; worker `i` listens on `socket_path.i`
     pub workers: usize,
+    /// `walshadow.tenant_bridge_workers`: pool size per tenant database
+    pub tenant_workers: usize,
+    /// Tenant pools to reserve worker slots for. `max_worker_processes` is
+    /// postmaster-scoped, so headroom for tenants added later is set here
+    pub tenant_capacity: usize,
+}
+
+/// File beside `postgresql.conf` naming the tenant databases, rewritten and
+/// reloaded as tenants come and go
+pub const TENANT_CONF_FILE: &str = "walshadow_tenants.conf";
+
+/// FNV-1a of a database name, matching pgext `ws_name_hash`
+fn name_hash(name: &str) -> u32 {
+    let mut h: u32 = 2166136261;
+    for b in name.bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(16777619);
+    }
+    h
+}
+
+/// Socket worker 0 of `dbname`'s tenant pool listens on; worker `i` adds `.i`
+pub fn tenant_bridge_socket(base: &Path, dbname: &str) -> PathBuf {
+    let mut path = base.as_os_str().to_owned();
+    path.push(format!(".t{:08x}", name_hash(dbname)));
+    PathBuf::from(path)
 }
 
 impl BridgeConf {
@@ -89,7 +115,22 @@ impl BridgeConf {
             io_timeout: Duration::from_secs(30),
             lock_timeout: Duration::from_secs(1),
             workers: 1,
+            tenant_workers: 2,
+            tenant_capacity: 0,
         }
+    }
+
+    /// Worker slots the bridge needs beyond the source's floor: the static
+    /// pool, the tenant launcher, and every reserved tenant pool
+    pub fn worker_slots(&self) -> u32 {
+        let per_tenant = self
+            .tenant_workers
+            .clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS);
+        (self
+            .workers
+            .clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS)
+            + 1
+            + self.tenant_capacity * per_tenant) as u32
     }
 
     /// `postgresql.conf` lines that start the worker. `dbname` is the database
@@ -110,12 +151,16 @@ impl BridgeConf {
              walshadow.database = '{}'\n\
              walshadow.io_timeout_ms = {}\n\
              walshadow.lock_timeout_ms = {}\n\
-             walshadow.bridge_workers = {}\n",
+             walshadow.bridge_workers = {}\n\
+             walshadow.tenant_bridge_workers = {}\n\
+             include_if_exists = '{TENANT_CONF_FILE}'\n",
             quote_path(&self.socket_path),
             quote(dbname),
             self.io_timeout.as_millis(),
             self.lock_timeout.as_millis(),
             self.workers
+                .clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS),
+            self.tenant_workers
                 .clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS),
         ));
         out
@@ -353,9 +398,11 @@ impl Shadow {
             // PG only logs excess workers and drops them, so a bridge pool over
             // the default leaves sockets the daemon never finds
             max_worker_processes = SourceGucFloor::default().max_worker_processes
-                + self.config.bridge.as_ref().map_or(0, |b| {
-                    b.workers.clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS) as u32
-                }),
+                + self
+                    .config
+                    .bridge
+                    .as_ref()
+                    .map_or(0, BridgeConf::worker_slots),
         );
         let mut f = fs::OpenOptions::new().append(true).open(&conf_path)?;
         f.write_all(body.as_bytes())?;
@@ -405,9 +452,11 @@ impl Shadow {
             max_connections = floor.max_connections,
             // PG only logs excess workers and drops their registration
             max_worker_processes = floor.max_worker_processes
-                + self.config.bridge.as_ref().map_or(0, |b| {
-                    b.workers.clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS) as u32
-                }),
+                + self
+                    .config
+                    .bridge
+                    .as_ref()
+                    .map_or(0, BridgeConf::worker_slots),
             max_wal_senders = floor.max_wal_senders,
             max_prepared_transactions = floor.max_prepared_transactions,
             max_locks_per_transaction = floor.max_locks_per_transaction,
@@ -445,6 +494,28 @@ impl Shadow {
         let conf_path = self.config.data_dir.join("postgresql.conf");
         let mut f = fs::OpenOptions::new().append(true).open(&conf_path)?;
         f.write_all(primary_conninfo_line(conninfo).as_bytes())?;
+        self.run("pg_ctl", ["-D", self.config.data_str(), "reload"])?;
+        Ok(())
+    }
+
+    /// Name the databases that get tenant bridge pools and reload, so the
+    /// launcher starts pools for new ones and stops removed ones. Atomic
+    /// replace: a reload never reads a half-written list
+    pub fn set_tenant_databases(&self, dbnames: &[String]) -> Result<()> {
+        let list = dbnames
+            .iter()
+            .map(|d| format!("\"{}\"", d.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!(
+            "# walshadow-owned, rewritten as tenants change\n\
+             walshadow.tenant_databases = '{}'\n",
+            list.replace('\'', "''"),
+        );
+        let path = self.config.data_dir.join(TENANT_CONF_FILE);
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, body)?;
+        fs::rename(&tmp, &path)?;
         self.run("pg_ctl", ["-D", self.config.data_str(), "reload"])?;
         Ok(())
     }
@@ -963,7 +1034,8 @@ mod tests {
         Shadow::new(cfg).write_base_conf().unwrap();
 
         let conf = fs::read_to_string(data_dir.join("postgresql.conf")).unwrap();
-        let want = SourceGucFloor::default().max_worker_processes + 8;
+        // Static pool, plus the tenant launcher
+        let want = SourceGucFloor::default().max_worker_processes + 8 + 1;
         assert!(
             conf.contains(&format!("max_worker_processes = {want}\n")),
             "{conf}"

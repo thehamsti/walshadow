@@ -68,6 +68,7 @@ pub(crate) async fn client(url: Url) -> SnowflakeHttp {
         schema: Some("PUBLIC".into()),
         warehouse: Some("WH".into()),
         role: None,
+        statement_timeout: std::time::Duration::from_secs(60),
     })
     .unwrap()
 }
@@ -84,6 +85,7 @@ fn rejects_non_https_and_credential_urls() {
         schema: None,
         warehouse: None,
         role: None,
+        statement_timeout: std::time::Duration::from_secs(60),
     };
     assert!(SnowflakeHttp::new(config("http://example.snowflakecomputing.com/")).is_err());
     assert!(SnowflakeHttp::new(config("https://u:p@example.snowflakecomputing.com/")).is_err());
@@ -93,15 +95,15 @@ fn rejects_non_https_and_credential_urls() {
 #[tokio::test]
 async fn sql_retry_receipts_are_stable_within_a_destination_and_isolated_between_destinations() {
     let url = Url::parse("http://127.0.0.1:1/").unwrap();
-    let mut first = client(url.clone()).await;
+    let first = client(url.clone()).await;
     let restarted = client(url).await;
     let operation = Uuid::new_v4();
     let receipt = first.sql_request_id(operation);
     assert_eq!(receipt, restarted.sql_request_id(operation));
-    first.config.database = Some("OTHER_DB".into());
+    first.edit_config(|c| c.database = Some("OTHER_DB".into()));
     assert_ne!(receipt, first.sql_request_id(operation));
-    first.config.database = Some("DB".into());
-    first.config.schema = Some("OTHER_SCHEMA".into());
+    first.edit_config(|c| c.database = Some("DB".into()));
+    first.edit_config(|c| c.schema = Some("OTHER_SCHEMA".into()));
     assert_ne!(receipt, first.sql_request_id(operation));
     assert_ne!(receipt, restarted.sql_request_id(Uuid::new_v4()));
 }
@@ -214,15 +216,12 @@ async fn named_channel_open_append_and_status_use_scoped_token() {
         (200, "127.0.0.1"),
         (200, "scoped-token"),
         (200, r#"{"next_continuation_token":"cont-1","channel_status":{"channel_status_code":"ACTIVE","rows_inserted":0,"rows_parsed":0,"rows_error_count":0}}"#),
-        (200, r#"{"hostname":"127.0.0.1"}"#),
-        (200, r#"{"token":"scoped-token"}"#),
         (200, r#"{"next_continuation_token":"cont-2"}"#),
-        (200, r#"{"hostname":"127.0.0.1"}"#),
-        (200, r#"{"token":"scoped-token"}"#),
+        // Host and scoped token are cached across ingest calls
         (200, r#"{"channel_statuses":{"CH":{"channel_status_code":"ACTIVE","last_committed_offset_token":"7","rows_inserted":1,"rows_parsed":1,"rows_errors":0}}}"#),
     ]).await;
-    let mut client = client(url).await;
-    client.config.role = Some("STREAMING_ROLE".into());
+    let client = client(url).await;
+    client.edit_config(|c| c.role = Some("STREAMING_ROLE".into()));
     let channel = ChannelRef {
         database: "DB".into(),
         schema: "PUBLIC".into(),
@@ -270,13 +269,13 @@ async fn named_channel_open_append_and_status_use_scoped_token() {
     );
     assert!(requests[2].contains("scoped-token"));
     assert!(
-        requests[5].contains(
+        requests[3].contains(
             "/v2/streaming/data/databases/DB/schemas/PUBLIC/pipes/PIPE/channels/CH/rows?"
         )
     );
-    assert!(requests[5].contains("{\"A\":1}\n"));
+    assert!(requests[3].contains("{\"A\":1}\n"));
     assert!(
-        requests[8]
+        requests[4]
             .contains("/v2/streaming/databases/DB/schemas/PUBLIC/pipes/PIPE:bulk-channel-status")
     );
 }

@@ -525,6 +525,54 @@ impl SourceFeed {
     }
 }
 
+impl SourceFeed {
+    /// Source connection parameters, for per-database sessions
+    pub fn pg_config(&self) -> &PgConfig {
+        &self.cfg
+    }
+}
+
+/// Seed `tracker` from every connectable source database, not only the
+/// connected one. Other databases' catalogs replay on shadow too, and a
+/// catalog they rotated before attach is invisible to the < 16384 rule.
+/// A database the role cannot enter is skipped with a warning: shadow
+/// replays it anyway, but walshadow can then never follow it
+pub async fn seed_all_databases(
+    tracker: &mut crate::filter::catalog_tracker::CatalogTracker,
+    primary: &Client,
+    cfg: &PgConfig,
+) -> Result<usize> {
+    use crate::filter::catalog_tracker::CatalogTracker;
+    let mut added = tracker
+        .seed_from_source(primary)
+        .await
+        .context("seed followed database")?;
+    let others = CatalogTracker::other_databases(primary)
+        .await
+        .context("list source databases")?;
+    for (oid, datname) in others {
+        let mut db_cfg = cfg.clone();
+        db_cfg.database = datname.clone();
+        match open_sql_client(&db_cfg).await {
+            Ok(client) => {
+                added += tracker
+                    .seed_from_source(&client)
+                    .await
+                    .with_context(|| format!("seed catalog filenodes of database {datname}"))?;
+            }
+            Err(e) => tracing::warn!(
+                target: "walshadow",
+                db_oid = oid,
+                datname,
+                error = %format!("{e:#}"),
+                "cannot connect to seed catalog filenodes; a catalog it rotated \
+                 before attach is not tracked and it cannot be followed",
+            ),
+        }
+    }
+    Ok(added)
+}
+
 /// Mirrors wal-rus's transport choice: unix socket when `host` starts
 /// with `/`, TLS-or-plain TCP otherwise. Shared with the COPY backfiller
 /// ([`crate::backfill::copy_backfill`]), which opens its own session per backfill.

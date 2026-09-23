@@ -103,6 +103,8 @@ pub const COPY_SLAB_BYTES: usize = 1 << 20;
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 const LEDGER_FILENAME: &str = "backfills.toml";
+/// COPY initial loads in flight when `[bootstrap] copy_concurrency` is unset
+const DEFAULT_COPY_CONCURRENCY: usize = 8;
 const LEDGER_VERSION: u32 = 1;
 
 /// Backup-mode opt-ins wait this long for siblings before the pass fires, so
@@ -659,6 +661,8 @@ pub struct CopyBackfiller {
     /// Per-mode split of `pending`: copy / base_backup / object_store.
     pending_by_mode: [AtomicU64; 3],
     coalesce_window: Duration,
+    /// COPY initial loads in flight, bounded by `[bootstrap] copy_concurrency`
+    copy_slots: tokio::sync::Semaphore,
 }
 
 impl CopyBackfiller {
@@ -678,6 +682,7 @@ impl CopyBackfiller {
         source_major: u32,
     ) -> Self {
         let ledger = Ledger::load(spill_dir).await;
+        let emitter_copy_concurrency = emitter.bootstrap.copy_concurrency.map(|n| n.get());
         let emitter = Arc::new(emitter);
         let pending = AtomicU64::new(ledger.pending_count());
         let pending_by_mode = [
@@ -708,6 +713,9 @@ impl CopyBackfiller {
             pending,
             pending_by_mode,
             coalesce_window: BACKUP_COALESCE_WINDOW,
+            copy_slots: tokio::sync::Semaphore::new(
+                emitter_copy_concurrency.unwrap_or(DEFAULT_COPY_CONCURRENCY),
+            ),
         }
     }
 
@@ -1435,7 +1443,10 @@ impl CopyBackfiller {
     }
 
     async fn run(self: Arc<Self>, desc: Arc<RelDescriptor>, s_lsn: Pos<Snapshot>) {
-        let res = self.copy_once(&desc, s_lsn).await;
+        let res = match self.copy_slots.acquire().await {
+            Ok(_slot) => self.copy_once(&desc, s_lsn).await,
+            Err(e) => Err(anyhow::anyhow!("COPY slots closed: {e}")),
+        };
         let mut inner = self.inner.lock().await;
         inner.active.remove(&desc.rel_name);
         match res {
@@ -1857,9 +1868,25 @@ async fn drain_snowflake_copy(
     generation_id: u64,
     incarnation: u64,
 ) -> anyhow::Result<Vec<String>> {
+    // Snapshot batches land as Parquet through COPY INTO, which favors larger
+    // files than live streaming, and several stay in flight so verified
+    // batches of the generation share one grouped MERGE instead of each
+    // paying a full round trip before the next seals
+    let row_limit = runtime.config.batch_rows.max(SNAPSHOT_BATCH_ROWS);
+    let byte_limit = runtime.config.batch_bytes.max(SNAPSHOT_BATCH_BYTES);
+    let in_flight = runtime.config.channels_per_table.clamp(1, 4);
+    let mut deliveries = tokio::task::JoinSet::new();
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
     let mut ids = Vec::new();
+    let send = |batch: Vec<SnowflakeRow>,
+                deliveries: &mut tokio::task::JoinSet<anyhow::Result<String>>| {
+        let runtime = runtime.clone();
+        let schema = schema.clone();
+        let operation_id = operation_id.clone();
+        deliveries
+            .spawn(async move { runtime.deliver_snapshot(schema, batch, &operation_id).await });
+    };
     while let Some(slab) = rx.recv().await {
         for tuple in slab {
             let mut committed = tuple.into_committed_insert();
@@ -1879,25 +1906,36 @@ async fn drain_snowflake_copy(
                 )
                 .map_err(anyhow::Error::msg)?,
             );
-            if batch.len() >= runtime.config.batch_rows || batch_bytes >= runtime.config.batch_bytes
-            {
-                ids.push(
-                    runtime
-                        .deliver_snapshot(schema.clone(), std::mem::take(&mut batch), &operation_id)
-                        .await?,
-                );
+            if batch.len() >= row_limit || batch_bytes >= byte_limit {
+                while deliveries.len() >= in_flight {
+                    ids.push(joined(deliveries.join_next().await)?);
+                }
+                send(std::mem::take(&mut batch), &mut deliveries);
                 batch_bytes = 0;
             }
         }
     }
     if !batch.is_empty() {
-        ids.push(
-            runtime
-                .deliver_snapshot(schema, batch, &operation_id)
-                .await?,
-        );
+        send(batch, &mut deliveries);
+    }
+    while let Some(done) = deliveries.join_next().await {
+        ids.push(joined(Some(done))?);
     }
     Ok(ids)
+}
+
+/// Snapshot batch floors; live batches keep `[snowflake] batch_rows/bytes`
+const SNAPSHOT_BATCH_ROWS: usize = 200_000;
+const SNAPSHOT_BATCH_BYTES: usize = 32 << 20;
+
+fn joined(
+    done: Option<Result<anyhow::Result<String>, tokio::task::JoinError>>,
+) -> anyhow::Result<String> {
+    match done {
+        Some(Ok(result)) => result,
+        Some(Err(e)) => Err(anyhow::anyhow!("snapshot delivery task failed: {e}")),
+        None => Err(anyhow::anyhow!("snapshot delivery task disappeared")),
+    }
 }
 
 #[async_trait]

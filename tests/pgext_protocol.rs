@@ -18,6 +18,7 @@ const OP_ENCODE_NATIVE: u8 = 0x02;
 const OP_SCAN: u8 = 0x03;
 const CELL_DEFAULT: u8 = 0x00;
 const CELL_DISK_RAW: u8 = 0x01;
+const CELL_TEXT: u8 = 0x02;
 const CELL_LITERAL: u8 = 0x03;
 /// `pg_class`, the one catalog id every scan case below uses
 const CAT_CLASS: u8 = 1;
@@ -303,6 +304,61 @@ fn render_text_is_type_native_and_rejects_bad_cells() {
     let msg = error_of(&mut sock, &bad);
     assert!(msg.contains("invalid oid or tag"), "{msg}");
     hello(&mut sock);
+
+    // A count of zero, or more cells than the frame could hold at their
+    // minimum 13 bytes each, is refused before any cell is read
+    for n_cells in [0u32, 2] {
+        let mut bad = request.clone();
+        bad[1..5].copy_from_slice(&n_cells.to_be_bytes());
+        let msg = error_of(&mut sock, &bad);
+        assert!(msg.contains("invalid cell count"), "{msg}");
+    }
+
+    // A cell length reaching past the frame
+    let mut bad = request.clone();
+    bad[14..18].copy_from_slice(&5u32.to_be_bytes());
+    let msg = error_of(&mut sock, &bad);
+    assert!(msg.contains("length past frame"), "{msg}");
+
+    // Text cells go to typinput as C strings, so an embedded NUL would
+    // silently truncate them
+    let mut bad = request[..13].to_vec();
+    bad.push(CELL_TEXT);
+    lenstr(&mut bad, b"4\x002");
+    let msg = error_of(&mut sock, &bad);
+    assert!(msg.contains("contains NUL"), "{msg}");
+    hello(&mut sock);
+}
+
+/// Output text is not bounded by the request: varbit renders one character
+/// per bit, so a 34 MiB body renders past the 256 MiB response cap
+#[test]
+fn render_text_refuses_output_past_the_response_cap() {
+    if !pgext::pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (pg, mut sock) = open(tmp.path());
+    let worker = pg.worker_pid().expect("worker running");
+    let varbit: u32 = pg
+        .sql("SELECT 'varbit'::regtype::oid::text")
+        .parse()
+        .unwrap();
+    let bytes = 34usize << 20;
+    let mut body = Vec::with_capacity(4 + bytes);
+    body.extend_from_slice(&((bytes * 8) as i32).to_ne_bytes());
+    body.resize(4 + bytes, 0xa5);
+    let mut request = vec![0x06];
+    request.extend_from_slice(&1u32.to_be_bytes());
+    request.extend_from_slice(&varbit.to_be_bytes());
+    request.extend_from_slice(&(-1i32).to_be_bytes());
+    request.push(CELL_DISK_RAW);
+    lenstr(&mut request, &body);
+    let msg = error_of(&mut sock, &request);
+    assert!(msg.contains("exceeds response cap"), "{msg}");
+    hello(&mut sock);
+    assert_eq!(pg.worker_pid(), Some(worker), "the cap cost the worker");
 }
 
 #[test]

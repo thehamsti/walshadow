@@ -171,6 +171,9 @@ pub struct ResolvedConfig {
     pub table_opt_ins: HashMap<RelName, TableRow>,
     /// `[stream] paused` (live: pump idles when true).
     pub paused: bool,
+    /// `[stream] replicate_all`. Live so a tenant attached mid-stream starts
+    /// with nothing in scope and widens once primed
+    pub replicate_all: bool,
 }
 
 impl ResolvedConfig {
@@ -302,6 +305,38 @@ pub struct ConfigResolver {
     /// TOAST heaps shadow can replay, set after filter loads replay eligibility
     /// Unset outside shadow mode, which reads values from destination mirror
     shadow_toast: std::sync::OnceLock<ShadowHeld>,
+    /// Tenant this resolver serves: a reload reads the merged file through
+    /// that tenant's `[tenant.<id>]` view. Unset for the single-database layout
+    tenant: std::sync::OnceLock<String>,
+    /// Scope a tenant attached mid-stream holds over what the file says
+    activation: std::sync::Mutex<Activation>,
+}
+
+/// While priming, nothing is in scope whatever the config says; once primed,
+/// the tables in scope at the tenant's start carry their initial load as
+/// opt-ins, persisted by the tenant so a restart resumes unfinished loads
+#[derive(Debug, Default, Clone)]
+pub struct Activation {
+    pub priming: bool,
+    pub opt_ins: HashMap<RelName, TableRow>,
+}
+
+impl Activation {
+    fn apply(&self, base: &mut EmitterConfig) {
+        if self.priming {
+            // Table rules scope relations too (`[table.*] replicate = true`),
+            // not only opt-ins: clear them all until the start scope publishes
+            base.replicate_all = false;
+            base.table_opt_ins.clear();
+            base.table_initial_loads.clear();
+            base.table_entries.clear();
+        }
+        for (rel, row) in &self.opt_ins {
+            base.table_opt_ins
+                .entry(rel.clone())
+                .or_insert_with(|| row.clone());
+        }
+    }
 }
 
 impl ConfigResolver {
@@ -336,8 +371,34 @@ impl ConfigResolver {
             opt_in_total: AtomicU64::new(0),
             opt_out_total: AtomicU64::new(0),
             shadow_toast: std::sync::OnceLock::new(),
+            tenant: std::sync::OnceLock::new(),
+            activation: std::sync::Mutex::new(Activation::default()),
         });
         (this, rx)
+    }
+
+    /// Replace the activation layer; the next [`reload`](Self::reload)
+    /// publishes it
+    pub fn set_activation(&self, activation: Activation) {
+        *self.activation.lock().unwrap() = activation;
+    }
+
+    /// What `base` would resolve to under this resolver's overlay and CLI
+    /// layers, without publishing: lets a tenant decide its start scope from
+    /// the full config before any of it takes effect
+    pub async fn preview(&self, base: &EmitterConfig) -> ResolvedConfig {
+        let inner = self.inner.lock().await;
+        let prev = self.tx.borrow().column_rules.clone();
+        Self::resolve(base, &inner.overlay, &self.cli, &inner.opt_in, &prev).0
+    }
+
+    /// Serve tenant `id`: reloads see only its effective config
+    pub fn bind_tenant(&self, id: &str) {
+        let _ = self.tenant.set(id.to_string());
+    }
+
+    pub fn tenant(&self) -> Option<&str> {
+        self.tenant.get().map(String::as_str)
     }
 
     /// Set shadow TOAST eligibility once, before first opt-in
@@ -703,6 +764,7 @@ impl ConfigResolver {
             source: base.source.clone(),
             table_opt_ins: base.table_opt_ins.clone(),
             paused: base.paused,
+            replicate_all: base.replicate_all,
         };
 
         // Runtime-derived layers (before the overlay target loop so a
@@ -843,16 +905,32 @@ impl ConfigResolver {
         let Some(path) = &self.toml_path else {
             return Ok(());
         };
-        let merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
+        let mut merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
+        if let Some(id) = self.tenant.get() {
+            let tenants = crate::tenants::TenantsConfig::from_table(&merged)
+                .map_err(|e| EmitterError::Config(format!("{e:#}")))?
+                .ok_or_else(|| EmitterError::Config("tenants are no longer configured".into()))?;
+            // Removal and detach are the tenant supervisor's; this tenant's
+            // snapshot stays until it tears the tenant down
+            let Some(decl) = tenants.get(id) else {
+                return Ok(());
+            };
+            merged = decl.effective_table(&merged);
+        }
         let selection = crate::destination::config::DestinationConfig::from_table(&merged)
             .map_err(|e| EmitterError::Config(e.to_string()))?;
         let mut base = EmitterConfig::from_table(&merged)?;
         let mut inner = self.inner.lock().await;
         match (&inner.base.snowflake, selection.snowflake) {
             (Some(runtime), Some(config)) => {
-                if runtime.config != config || base.source.dbname != inner.base.source.dbname {
-                    return Err(EmitterError::Config("Snowflake settings and source database are bound for the session; restart with matching durable state to change them".into()));
+                if base.source.dbname != inner.base.source.dbname {
+                    return Err(EmitterError::Config("the source database is bound for the session; detach and re-attach the tenant to follow another".into()));
                 }
+                // Credentials, role, warehouse and timing apply live; what
+                // durable state is bound to, and pool sizes, do not
+                runtime
+                    .update_settings(&config)
+                    .map_err(|e| EmitterError::Config(format!("{e:#}")))?;
                 if !base.column_entries.is_empty() || !base.tables.is_empty() {
                     return Err(EmitterError::Config(
                         "Snowflake requires source-shaped tables without explicit column mappings"
@@ -873,6 +951,7 @@ impl ConfigResolver {
                 ));
             }
         }
+        self.activation.lock().unwrap().apply(&mut base);
         inner.base = base;
         self.republish(&inner).await;
         Ok(())

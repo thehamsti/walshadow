@@ -261,11 +261,18 @@ impl SnowflakeRuntime {
                 }
             }
         }
-        let sequence = self
-            .state
-            .allocate_sequence(&format!("snapshot-attempt/{}", schema.relation_oid))?;
         let digest = hex::encode(Sha256::digest(logical_id.as_bytes()));
-        let operation_id = format!("snap_{}_{}", &digest[..24], sequence);
+        // Skip ids an earlier attempt already journaled: state written before
+        // attempt sequences were durable can repeat one after a restart
+        let operation_id = loop {
+            let sequence = self
+                .state
+                .allocate_durable_sequence(&format!("snapshot-attempt/{}", schema.relation_oid))?;
+            let candidate = format!("snap_{}_{}", &digest[..24], sequence);
+            if self.state.generation(&candidate)?.is_none() {
+                break candidate;
+            }
+        };
         self.state
             .put_metadata(&snapshot_logical_key(&operation_id), logical_id.as_bytes())?;
         self.prepare_snapshot(desc, snapshot_lsn, &operation_id)
@@ -397,6 +404,8 @@ impl SnowflakeRuntime {
     }
 
     pub async fn publish_snapshot(&self, desc: &RelDescriptor, operation_id: &str) -> Result<()> {
+        // Live rows written into the hidden generation must land first
+        self.quiesce().await?;
         self.ensure_table(desc).await?;
         let schema = self.schema(desc)?;
         let lock = self.table_lock(&schema).await;
@@ -709,7 +718,7 @@ impl SnowflakeRuntime {
             self.view_comment(schema, plan).await?.as_deref() == Some(plan.view_marker.as_str()),
             "Snowflake view marker missing after publication"
         );
-        Ok(())
+        self.record_published_view(schema, &plan.view_switch_sql)
     }
 
     /// Caller holds the table lock and has already observed the generation
@@ -883,6 +892,12 @@ mod tests {
             in_flight: Semaphore::new(1),
             merge_in_flight: Semaphore::new(1),
             merge_notifies: Mutex::new(HashMap::new()),
+            appliers: std::sync::OnceLock::new(),
+            outstanding: std::sync::atomic::AtomicU64::new(0),
+            applied: Notify::new(),
+            apply_failed: std::sync::OnceLock::new(),
+            landed: Default::default(),
+            last_cleanup: Default::default(),
         };
         let schema = TableSchema {
             database: "PUBLIC".into(),

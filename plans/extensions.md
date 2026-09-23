@@ -4,39 +4,21 @@ Keep these ideas scoped to a consumer and a proof of value. Retain proposed
 interfaces and dependencies so other workstreams can account for them before
 a deployment promotes one into a standalone implementation plan
 
-## Multiple ClickHouse destinations
+## Multiple destinations for one database
 
-Start with separate daemons when destinations need independent failure handling
-Integrated fan-out is useful only when sharing source WAL, shadow, and decode
-cost outweighs coupling destinations
-
-Define acknowledgement and retention policy before adding routing. A shared
-source slot cannot pass a destination that still needs replay unless its work
-is durably retained elsewhere. Bound lag and spill, expose per-destination
-failures, and decide whether a failed destination stops all progress
-
-For fan-in, validate schema compatibility and row-key identity across sources
-Equal keys from two source tables must not accidentally collapse. Define DDL
-ownership and per-destination policy before moving routes live. Test partial
-destination failure, restart, and route changes with in-flight work
+[Tenants](../docs/tenants.md) already fan one WAL stream out to one
+destination per source database, with coupled retention (the slot follows
+the least resume floor), per-tenant lag/stall eviction, and per-tenant
+durable Snowflake outboxes. What remains is several destinations for *one*
+database, and fan-in
 
 Proposed route result is zero or more `(DestinationId, target)` pairs. Give each
 stable destination ID its own connection settings, batcher/inserter pool, DDL
-applicator, budgets, and contiguous acknowledgement state. Key encoding plans by
-destination plus table. Compose per-destination completion with existing
-per-inserter sequence counts before allowing global floor to advance
-
-Ship coupled retention first if integrated fan-out is justified: all required
-destinations bound progress, with explicit lag/disk limits. Independent progress
-requires durable per-destination queues containing rows, schema/control events,
-route snapshots, and [TOAST dependencies](shadow_toast.md). Spill alone is not
-durability, define checkpoint and deletion protocol before releasing source WAL
-
-Per-destination cursor positions can avoid replay to destinations already ahead
-A global minimum is usable only when every replayed effect remains idempotent,
-including DDL and routing changes. Version cursor format and map legacy state
-to default destination. Keep endpoint credentials local; expose logical route
-rules through [runtime config](runtime_config.md) after default-only path works
+applicator, budgets, and contiguous acknowledgement state; a tenant already
+bundles those, so a second destination could be a second tenant over the same
+database once routing permits it. Replay from the least floor is safe only
+while every replayed effect stays idempotent, including DDL and routing
+changes
 
 Fan-in needs source identity in destination key when source key domains overlap
 `_lsn` and `_xid` do not by themselves prevent equal primary keys from collapsing

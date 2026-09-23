@@ -647,7 +647,7 @@ impl SnowflakeRuntime {
                 == Some(plan.view_marker.as_str()),
             "schema view marker missing after replacement"
         );
-        Ok(())
+        self.record_published_view(&record.new, &plan.view_switch_sql)
     }
 
     fn advance_schema_active(&self, record: &SchemaChangeRecord, next: u64) -> Result<()> {
@@ -1041,6 +1041,12 @@ mod tests {
             in_flight: Semaphore::new(1),
             merge_in_flight: Semaphore::new(1),
             merge_notifies: Mutex::new(HashMap::new()),
+            appliers: std::sync::OnceLock::new(),
+            outstanding: std::sync::atomic::AtomicU64::new(0),
+            applied: Notify::new(),
+            apply_failed: std::sync::OnceLock::new(),
+            landed: Default::default(),
+            last_cleanup: Default::default(),
         };
         let old = schema(vec![(1, "id")]);
         let record = SchemaChangeRecord {
@@ -1122,6 +1128,12 @@ mod tests {
             in_flight: Semaphore::new(1),
             merge_in_flight: Semaphore::new(1),
             merge_notifies: Mutex::new(HashMap::new()),
+            appliers: std::sync::OnceLock::new(),
+            outstanding: std::sync::atomic::AtomicU64::new(0),
+            applied: Notify::new(),
+            apply_failed: std::sync::OnceLock::new(),
+            landed: Default::default(),
+            last_cleanup: Default::default(),
         };
         runtime
             .drop_relation_at(7, &RelName::new("PUBLIC", "T"), 100)

@@ -24,3 +24,6 @@ __pycache__/
 /docs/johns-test-datax-experiment.md
 /scripts/*johns-test-datax*.py
 /scripts/snowflake-jtdx-ab.py
+/scripts/mt-run.py
+/scripts/mt-validate.py
+/scripts/provision-datax-dev.py

@@ -3,8 +3,9 @@
 The Snowflake destination is opt-in. It consumes PostgreSQL WAL into a durable local
 queue, sends small batches through Snowpipe Streaming Named Channels, stages larger
 batches as Parquet in S3, and applies verified batches to typed current-state tables.
-ClickHouse remains the default destination. Use a separate daemon, slot, and state
-directory for each destination.
+ClickHouse remains the default destination. Each destination needs its own state
+directory; many client databases can share one daemon and slot as
+[tenants](tenants.md), each with its own Snowflake database.
 
 The integrated path supports `none`, `copy`, `base_backup`, and `object_store`
 table loads, direct and object-store bootstrap, pending backup-row visibility,
@@ -56,10 +57,23 @@ one destination with `[destination] kind = "snowflake"`; do not include `[ch]`.
 Snowflake TOML directly. Use `--config` (the existing `--ch-config` spelling is
 an alias) to supply the file.
 
-Snowflake settings and the source database are bound for the daemon session.
-Changing them through live reload is rejected; source endpoint changes retain
-the existing planned-switchover checks. Credential file contents can rotate
-without restarting. Live batches seal at 50,000 rows, 8 MiB, or 250 ms by
+The source database and what durable state is bound to (account, database,
+internal schema, stage, schema mapping) are fixed for the session; changing
+them needs fresh state (with tenants, a detach and re-attach). Role,
+warehouse, user, credential file paths and `statement_timeout_secs` reload
+live; channel, pool, merge-interval, state and `ack_after` settings apply on
+restart. Credential file contents can rotate without restarting. Source
+endpoint changes retain the existing planned-switchover checks.
+
+Statements poll until `statement_timeout_secs` (default 6 hours), refreshing
+credentials as they go. Transient transport failures (throttling, 5xx,
+timeouts, dropped connections) retry the batch with backoff; the batch stays
+durable and every retry checks its apply receipt first. A full outbox
+(`state.max_bytes`) holds deliveries until applied batches release space
+instead of stopping. Restarts replace a public view only when its definition
+changed, so change tracking and downstream streams survive them. Applied
+manifests and TOAST history below the durable resume floor are reclaimed
+once a minute. Live batches seal at 50,000 rows, 8 MiB, or 250 ms by
 default; verified live batches then coalesce up to 64 MiB or 15 seconds before
 MERGE, with at most four tables merging concurrently. Snapshot and pending-row
 applies bypass that wait; snapshot batches are verified outside the table lock

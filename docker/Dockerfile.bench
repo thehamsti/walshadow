@@ -6,7 +6,7 @@
 # Snowflake uses walshadow's authenticated SQL client; build its native
 # dependencies alongside the benchmark engine.
 FROM rust:1-alpine AS builder
-RUN apk add --no-cache build-base clang-dev cmake lz4-dev zstd-dev
+RUN apk add --no-cache build-base clang-dev cmake linux-headers lz4-dev zstd-dev
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 ENV CFLAGS="-Dunreachable()=__builtin_unreachable()"
 WORKDIR /src

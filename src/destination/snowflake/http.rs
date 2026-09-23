@@ -11,7 +11,9 @@ use std::{
 use uuid::Uuid;
 
 const MAX_NDJSON: usize = 4 * 1024 * 1024;
-const MAX_ATTEMPTS: usize = 5;
+const MAX_ATTEMPTS: usize = 8;
+/// Refresh cached credentials this long before they would expire
+const CREDENTIAL_LIFETIME: Duration = Duration::from_secs(45 * 60);
 
 #[derive(Clone)]
 pub enum AuthConfig {
@@ -46,12 +48,25 @@ pub struct HttpConfig {
     pub schema: Option<String>,
     pub warehouse: Option<String>,
     pub role: Option<String>,
+    /// Longest a statement may stay running before its caller fails
+    pub statement_timeout: Duration,
 }
 
 #[derive(Clone)]
 pub struct SnowflakeHttp {
     client: Client,
-    config: HttpConfig,
+    /// Swappable so role, warehouse and credential paths change live
+    config: std::sync::Arc<std::sync::RwLock<std::sync::Arc<HttpConfig>>>,
+    cache: std::sync::Arc<CredentialCache>,
+}
+
+/// Signed JWTs and ingest scoped tokens are valid for about an hour; each
+/// request re-signing or re-exchanging them cost extra round trips and a key
+/// file read. OAuth token files are still re-read, so rotation stays live
+#[derive(Default)]
+struct CredentialCache {
+    jwt: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+    ingest: tokio::sync::Mutex<Option<(String, String, std::time::Instant)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,7 +117,11 @@ impl SnowflakeHttp {
             .redirect(Policy::none())
             .timeout(Duration::from_secs(60))
             .build()?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config: std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(config))),
+            cache: Default::default(),
+        })
     }
 
     #[cfg(test)]
@@ -112,11 +131,47 @@ impl SnowflakeHttp {
             .redirect(Policy::none())
             .timeout(Duration::from_secs(5))
             .build()?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config: std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(config))),
+            cache: Default::default(),
+        })
+    }
+
+    /// Settings snapshot; cheap, and never held across an await
+    fn cfg(&self) -> std::sync::Arc<HttpConfig> {
+        self.config.read().unwrap().clone()
+    }
+
+    /// Swap role, warehouse and credential settings. The endpoint, database
+    /// and schema stay: durable request ids and receipts are scoped to them.
+    /// Cached credentials are dropped so the next request uses the new ones
+    pub fn update_config(&self, next: HttpConfig) -> Result<()> {
+        let current = self.cfg();
+        ensure!(
+            next.account_url == current.account_url
+                && next.database == current.database
+                && next.schema == current.schema,
+            "Snowflake endpoint, database and schema are bound to durable state"
+        );
+        *self.config.write().unwrap() = std::sync::Arc::new(next);
+        *self.cache.jwt.lock().unwrap() = None;
+        if let Ok(mut ingest) = self.cache.ingest.try_lock() {
+            *ingest = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edit_config(&self, edit: impl FnOnce(&mut HttpConfig)) {
+        let mut next = (*self.cfg()).clone();
+        edit(&mut next);
+        *self.config.write().unwrap() = std::sync::Arc::new(next);
     }
 
     async fn token(&self) -> Result<(String, &'static str)> {
-        match &self.config.auth {
+        let config = self.cfg();
+        match &config.auth {
             AuthConfig::OAuthTokenFile { path } => {
                 let token = tokio::fs::read_to_string(path)
                     .await
@@ -134,6 +189,11 @@ impl SnowflakeHttp {
                 private_key_path,
                 public_key_fingerprint,
             } => {
+                if let Some((token, at)) = self.cache.jwt.lock().unwrap().as_ref()
+                    && at.elapsed() < CREDENTIAL_LIFETIME
+                {
+                    return Ok((token.clone(), "KEYPAIR_JWT"));
+                }
                 ensure!(
                     !account.is_empty()
                         && !user.is_empty()
@@ -153,16 +213,15 @@ impl SnowflakeHttp {
                     iat: now,
                     exp: now + 59 * 60,
                 };
-                Ok((
-                    encode(&Header::new(Algorithm::RS256), &claims, &key)?,
-                    "KEYPAIR_JWT",
-                ))
+                let token = encode(&Header::new(Algorithm::RS256), &claims, &key)?;
+                *self.cache.jwt.lock().unwrap() = Some((token.clone(), std::time::Instant::now()));
+                Ok((token, "KEYPAIR_JWT"))
             }
         }
     }
 
     fn url(&self, path: &str) -> Result<Url> {
-        Ok(self.config.account_url.join(path)?)
+        Ok(self.cfg().account_url.join(path)?)
     }
 
     async fn send(
@@ -192,11 +251,11 @@ impl SnowflakeHttp {
             .client
             .request(method, url)
             .header("Accept", "application/json")
-            .header("User-Agent", &self.config.user_agent);
+            .header("User-Agent", &self.cfg().user_agent);
         if let Some(token) = bearer {
             req = req.bearer_auth(token);
         }
-        if let Some(role) = &self.config.role {
+        if let Some(role) = &self.cfg().role {
             req = req.header("X-Snowflake-Role", role);
         }
         if let Some(kind) = token_type {
@@ -317,7 +376,7 @@ impl SnowflakeHttp {
                 .append_pair("requestId", &request_id.to_string())
                 .append_pair("async", "true")
                 .append_pair("retry", "true");
-            let mut body = json!({"statement":sql,"timeout":0,"database":self.config.database,"schema":self.config.schema,"warehouse":self.config.warehouse,"role":self.config.role});
+            let mut body = json!({"statement":sql,"timeout":0,"database":self.cfg().database,"schema":self.cfg().schema,"warehouse":self.cfg().warehouse,"role":self.cfg().role});
             if let Some(count) = count {
                 body["parameters"] = json!({"MULTI_STATEMENT_COUNT":count.to_string()});
             }
@@ -344,22 +403,26 @@ impl SnowflakeHttp {
             Uuid::parse_str(&handle).is_ok(),
             "invalid Snowflake statement handle"
         );
-        for attempt in 0..60 {
-            if status == StatusCode::OK {
-                break;
-            }
+        let deadline = std::time::Instant::now() + self.cfg().statement_timeout;
+        let mut token = token;
+        let mut attempt = 0;
+        while status != StatusCode::OK {
             ensure!(
                 status == StatusCode::ACCEPTED,
                 "unexpected SQL status {status}"
             );
-            tokio::time::sleep(backoff(attempt.min(4))).await;
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "Snowflake SQL still running after {:?}",
+                self.cfg().statement_timeout
+            );
+            tokio::time::sleep(backoff(attempt)).await;
+            attempt += 1;
+            // A statement can outlive the credential it was submitted with
+            token = self.token().await?.0;
             let url = self.url(&format!("/api/v2/statements/{handle}"))?;
             (status, body) = self.sql_get(url, &token, kind).await?;
         }
-        ensure!(
-            status == StatusCode::OK,
-            "Snowflake SQL did not finish in polling window"
-        );
         Ok((handle, body, token, kind))
     }
 
@@ -368,7 +431,7 @@ impl SnowflakeHttp {
         // The same source operation can be tested against multiple isolated
         // destinations by one Snowflake user. SQL API retries are account-side;
         // their IDs must not reuse a receipt from a different database/schema.
-        let context = serde_json::to_vec(&(operation, &self.config.database, &self.config.schema))
+        let context = serde_json::to_vec(&(operation, &self.cfg().database, &self.cfg().schema))
             .expect("serializable SQL request context");
         let digest = Sha256::digest(context);
         let mut bytes = [0; 16];
@@ -386,21 +449,27 @@ impl SnowflakeHttp {
         let body = match initial {
             Some(body) => body,
             None => {
-                let mut complete = None;
-                for attempt in 0..60 {
+                let deadline = std::time::Instant::now() + self.cfg().statement_timeout;
+                let mut attempt = 0;
+                loop {
+                    let token = self.token().await?.0;
                     let url = self.url(&format!("/api/v2/statements/{handle}"))?;
-                    let (status, body) = self.sql_get(url, token, kind).await?;
+                    let (status, body) = self.sql_get(url, &token, kind).await?;
                     if status == StatusCode::OK {
-                        complete = Some(body);
-                        break;
+                        break body;
                     }
                     ensure!(
                         status == StatusCode::ACCEPTED,
                         "unexpected SQL status {status}"
                     );
-                    tokio::time::sleep(backoff(attempt.min(4))).await;
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "individual SQL statement still running after {:?}",
+                        self.cfg().statement_timeout
+                    );
+                    tokio::time::sleep(backoff(attempt)).await;
+                    attempt += 1;
                 }
-                complete.context("individual SQL statement did not finish")?
             }
         };
         ensure!(
@@ -447,24 +516,24 @@ impl SnowflakeHttp {
             )
             .await?;
         let host = streaming_scalar(&body, "hostname")?.replace('_', "-");
-        validate_ingest_host(&host, &self.config.account_url)?;
+        validate_ingest_host(&host, &self.cfg().account_url)?;
         Ok(host)
     }
 
     async fn scoped_token(&self, host: &str) -> Result<String> {
-        validate_ingest_host(host, &self.config.account_url)?;
+        validate_ingest_host(host, &self.cfg().account_url)?;
         let (token, kind) = self.token().await?;
         let url = self.url("/oauth/token")?;
         // Ingest authorization uses the role in the scoped token, independently
         // of the SQL API role and the REST context header.
-        let scope = match &self.config.role {
+        let scope = match &self.cfg().role {
             Some(role) => format!("{host} session:role:{role}"),
             None => host.to_owned(),
         };
         let mut request = self
             .client
             .post(url)
-            .header("User-Agent", &self.config.user_agent)
+            .header("User-Agent", &self.cfg().user_agent)
             .header("Accept", "application/json")
             .header("X-Snowflake-Authorization-Token-Type", kind)
             .bearer_auth(token)
@@ -472,7 +541,7 @@ impl SnowflakeHttp {
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                 ("scope", scope.as_str()),
             ]);
-        if let Some(role) = &self.config.role {
+        if let Some(role) = &self.cfg().role {
             request = request.header("X-Snowflake-Role", role);
         }
         let response = request.send().await?;
@@ -489,28 +558,62 @@ impl SnowflakeHttp {
     }
 
     fn ingest_url(&self, host: &str, path: &str) -> Result<Url> {
-        let mut url = self.config.account_url.clone();
+        let mut url = self.cfg().account_url.clone();
         url.set_host(Some(host))?;
         Ok(url.join(path)?)
     }
 
-    async fn ingest(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+    /// Ingest host and scoped token, cached until near expiry
+    async fn ingest_credentials(&self) -> Result<(String, String)> {
+        let mut cached = self.cache.ingest.lock().await;
+        if let Some((host, token, at)) = cached.as_ref()
+            && at.elapsed() < CREDENTIAL_LIFETIME
+        {
+            return Ok((host.clone(), token.clone()));
+        }
         let host = self.discover_ingest_host().await?;
         let scoped = self.scoped_token(&host).await?;
-        let (status, value) = self
-            .send(
-                method,
-                self.ingest_url(&host, path)?,
-                body,
-                Some(&scoped),
-                None,
-            )
-            .await?;
-        ensure!(
-            status == StatusCode::OK,
-            "unexpected streaming status {status}"
-        );
-        Ok(value)
+        *cached = Some((host.clone(), scoped.clone(), std::time::Instant::now()));
+        Ok((host, scoped))
+    }
+
+    /// Forget cached ingest credentials after an authorization failure
+    async fn invalidate_ingest(&self) {
+        *self.cache.ingest.lock().await = None;
+    }
+
+    async fn ingest(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        let mut attempt = 0;
+        loop {
+            let (host, scoped) = self.ingest_credentials().await?;
+            match self
+                .send(
+                    method.clone(),
+                    self.ingest_url(&host, path)?,
+                    body.clone(),
+                    Some(&scoped),
+                    None,
+                )
+                .await
+            {
+                Ok((status, value)) => {
+                    ensure!(
+                        status == StatusCode::OK,
+                        "unexpected streaming status {status}"
+                    );
+                    return Ok(value);
+                }
+                Err(e) if attempt + 1 < MAX_ATTEMPTS && e.to_string().contains("HTTP 401") => {
+                    self.invalidate_ingest().await;
+                }
+                // Channel open and status reads are idempotent
+                Err(e) if attempt + 1 < MAX_ATTEMPTS && retryable(&e) => {
+                    tokio::time::sleep(backoff(attempt)).await;
+                }
+                Err(e) => return Err(e),
+            }
+            attempt += 1;
+        }
     }
 
     pub async fn open_channel(
@@ -583,8 +686,7 @@ impl SnowflakeHttp {
             ndjson.len() <= MAX_NDJSON,
             "Snowflake streaming payload exceeds 4 MB"
         );
-        let host = self.discover_ingest_host().await?;
-        let scoped = self.scoped_token(&host).await?;
+        let (host, scoped) = self.ingest_credentials().await?;
         let mut url = self.ingest_url(
             &host,
             &channel
@@ -602,15 +704,18 @@ impl SnowflakeHttp {
         let mut request = self
             .client
             .post(url)
-            .header("User-Agent", &self.config.user_agent)
+            .header("User-Agent", &self.cfg().user_agent)
             .header("Accept", "application/json")
             .header("Content-Type", "application/x-ndjson")
             .bearer_auth(scoped)
             .body(ndjson);
-        if let Some(role) = &self.config.role {
+        if let Some(role) = &self.cfg().role {
             request = request.header("X-Snowflake-Role", role);
         }
         let response = request.send().await?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            self.invalidate_ingest().await;
+        }
         ensure!(
             !response.status().is_redirection(),
             "Snowflake streaming append redirected"
@@ -725,7 +830,7 @@ fn retryable(error: &anyhow::Error) -> bool {
         .any(|code| msg.contains(code))
 }
 fn backoff(attempt: usize) -> Duration {
-    Duration::from_millis((200u64 << attempt.min(4)).min(3000))
+    Duration::from_millis((200u64 << attempt.min(6)).min(10_000))
 }
 fn validate_endpoint(url: &Url, test_http: bool) -> Result<()> {
     ensure!(

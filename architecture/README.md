@@ -32,6 +32,19 @@ exact replay position, persists descriptors, and attaches `SchemaEvent` to
 `XactBuffer`. Queued row processing uses that history when decoding and
 planning committed transactions
 
+## Tenants
+
+Physical WAL carries every database of the cluster, and shadow replays all
+their catalogs, so one pump and one slot can serve many source databases.
+Each [tenant](../docs/tenants.md) owns a descriptor log, transaction buffer,
+catalog capture, bridge pool, pipeline and destination for one database. The
+[router](../src/source/tenant_router.rs) sends each record to the tenant
+whose database wrote it (block locators, truncate payloads, commit dbinfo,
+boundary database) and broadcasts records that name none; idle tenants get
+position heartbeats so their acks move. The session's resume floor is the
+least tenant resume floor. Tenant wiring lives in
+[tenant.rs](../src/bin/stream/tenant.rs)
+
 ## Commit pipeline
 
 ![Commit pipeline: bounded DecodeJob queue fans out to M workers, rows merge through one batcher, InsertBatch queue fans out to N inserters, and separate Register, Placed and Acked events advance a contiguous watermark](workers.svg)

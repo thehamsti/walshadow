@@ -359,6 +359,7 @@ impl RecordSink for QueueingRecordSink {
                 boundary_info: record.boundary_info.clone(),
                 aborted_tree: record.aborted_tree.clone(),
                 defer_catalog_decode: record.defer_catalog_decode,
+                xact_db: record.xact_db,
             });
             if self.buf.len() >= self.batch_size {
                 self.flush_buf().await?;

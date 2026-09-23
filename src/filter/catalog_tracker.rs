@@ -426,6 +426,22 @@ impl CatalogTracker {
         Ok(added)
     }
 
+    /// Connectable databases other than `client`'s, the rest of the
+    /// cluster [`seed_from_source`](Self::seed_from_source) must also cover.
+    /// Shadow replays every database's catalogs, so a rotated catalog in
+    /// any of them needs its filenode seeded, not only the followed one's
+    pub async fn other_databases(client: &Client) -> Result<Vec<(Oid, String)>, SeedError> {
+        let rows = client
+            .query(
+                "SELECT oid, datname FROM pg_database \
+                 WHERE datallowconn AND datname <> current_database() \
+                 ORDER BY oid",
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }

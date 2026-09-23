@@ -184,7 +184,7 @@ pub struct CreateShape<'a> {
     pub primary_key: &'a [String],
 }
 
-pub(crate) fn is_system_namespace(ns: &str, runtime_config_schema: Option<&str>) -> bool {
+pub fn is_system_namespace(ns: &str, runtime_config_schema: Option<&str>) -> bool {
     ns == "pg_catalog"
         || ns == "information_schema"
         || ns == "pg_toast"
@@ -336,7 +336,7 @@ impl DdlApplicator {
                 self.config.target_database.clone(),
                 self.config.soft_delete,
                 self.config.system.clone(),
-                self.config.replicate_all,
+                snap.replicate_all,
                 self.config.runtime_config_schema.clone(),
             );
             let conn = (
@@ -873,7 +873,7 @@ impl DdlApplicator {
                     self.config.target_database.clone(),
                     self.config.soft_delete,
                     self.config.system.clone(),
-                    self.config.replicate_all,
+                    rc.replicate_all,
                     self.config.runtime_config_schema.clone(),
                 )
             })

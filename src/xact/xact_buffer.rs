@@ -348,6 +348,8 @@ pub struct XactBufferStats {
     /// Aborts for xids never buffered. Runs higher than
     /// `commits_unknown_xid`: aborts often hit xacts that wrote nothing
     pub aborts_unknown_xid: u64,
+    /// Commits dropped for preceding the tenant's start
+    pub commits_before_start: u64,
     /// Highest commit-record LSN handed to a drain. Snapshot for the
     /// manifest `drain` role, monotonic. The durable-ack sibling lives in
     /// the pipeline ack collector, not here
@@ -743,6 +745,8 @@ pub struct XactBuffer {
     pending_stash: HashMap<u32, StashResolution>,
     /// Committed transactions waiting for durable acknowledgment
     pending_durable: PendingDurable,
+    /// Commits below this drain as nothing (tenant attached past them)
+    min_commit_lsn: u64,
     bytes_in_memory: usize,
     stats: XactBufferStats,
     /// Shared with the WAL pump: the pump opens a `txn` span here at first
@@ -781,6 +785,7 @@ impl XactBuffer {
             marker_order: VecDeque::new(),
             pending_stash: HashMap::new(),
             pending_durable: PendingDurable::default(),
+            min_commit_lsn: 0,
             bytes_in_memory: 0,
             stats: XactBufferStats::default(),
             span_registry: TxnSpanRegistry::new(),
@@ -1288,6 +1293,21 @@ impl XactBuffer {
         let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
         xids.push(top_xid);
         xids.extend_from_slice(subxids);
+        if commit_lsn < self.min_commit_lsn {
+            // Committed before this buffer's tenant started: its initial load
+            // covers these effects, and its rows may predate descriptor history
+            self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn.into());
+            self.span_registry.prune(&xids);
+            self.discard_states(&xids).await?;
+            self.stats.commits_before_start += 1;
+            return Ok(CommittedDrain {
+                commit_ts,
+                commit_lsn,
+                had_states: false,
+                merged: None,
+                generations: Vec::new(),
+            });
+        }
         let mut states: Vec<XactState> = Vec::with_capacity(xids.len());
         for x in &xids {
             if let Some(st) = self.inflight.remove(x) {
@@ -1394,8 +1414,25 @@ impl XactBuffer {
         // the loop below, closing the span as aborted.
         self.span_registry.prune(&xids);
 
+        if !self.discard_states(&xids).await? {
+            self.stats.aborts_unknown_xid += 1;
+            return Ok(());
+        }
+        // One bump per abort record, not per subxid
+        self.stats.aborted_xacts_total += 1;
+        Ok(())
+    }
+
+    /// Commits below this LSN drain as nothing. A tenant attached mid-stream
+    /// starts past every transaction it saw only part of
+    pub fn set_min_commit_lsn(&mut self, lsn: u64) {
+        self.min_commit_lsn = lsn;
+    }
+
+    /// Drop the buffered state of `xids`, returning whether any existed
+    async fn discard_states(&mut self, xids: &[u32]) -> std::result::Result<bool, XactBufferError> {
         let mut any = false;
-        for x in xids {
+        for &x in xids {
             let Some(mut st) = self.inflight.remove(&x) else {
                 continue;
             };
@@ -1422,13 +1459,7 @@ impl XactBuffer {
             }
         }
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
-        if !any {
-            self.stats.aborts_unknown_xid += 1;
-            return Ok(());
-        }
-        // One bump per abort record, not per subxid
-        self.stats.aborted_xacts_total += 1;
-        Ok(())
+        Ok(any)
     }
 
     #[cfg(test)]

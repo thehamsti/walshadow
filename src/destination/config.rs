@@ -52,6 +52,29 @@ pub struct SnowflakeConfig {
     /// `max_in_flight`.
     #[serde(default = "metadata_concurrency")]
     pub metadata_concurrency: usize,
+    /// Tables whose MERGE may run at once; bounds warehouse concurrency
+    #[serde(default = "merge_concurrency")]
+    pub merge_concurrency: usize,
+    /// How long one SQL statement may run before delivery stops. A MERGE or
+    /// COPY over a large backlog can take far longer than a status poll
+    #[serde(default = "statement_timeout")]
+    pub statement_timeout_secs: u64,
+    /// When a live batch counts as delivered for the source slot
+    #[serde(default)]
+    pub ack_after: AckAfter,
+}
+
+/// Acknowledging at `outbox` lets the slot advance once a batch is fsynced
+/// locally, so a Snowflake outage fills local disk (bounded by
+/// `state.max_bytes`) instead of the primary's WAL. The state directory then
+/// holds rows no other copy has: back it up. `apply` waits for the verified
+/// apply receipt
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AckAfter {
+    #[default]
+    Apply,
+    Outbox,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]
@@ -114,6 +137,12 @@ fn merge_interval() -> u64 {
 }
 fn metadata_concurrency() -> usize {
     32
+}
+fn merge_concurrency() -> usize {
+    4
+}
+fn statement_timeout() -> u64 {
+    6 * 3600
 }
 
 impl DestinationConfig {
@@ -202,6 +231,14 @@ impl SnowflakeConfig {
         ensure!(
             (1..=256).contains(&self.metadata_concurrency),
             "metadata_concurrency must be 1..=256"
+        );
+        ensure!(
+            (1..=64).contains(&self.merge_concurrency),
+            "merge_concurrency must be 1..=64"
+        );
+        ensure!(
+            self.statement_timeout_secs >= 60,
+            "statement_timeout_secs must be at least 60"
         );
         ensure!(
             self.max_in_flight > 0
@@ -301,6 +338,7 @@ impl SnowflakeConfig {
             schema: Some(self.internal_schema.clone()),
             warehouse: Some(self.warehouse.clone()),
             role: Some(self.role.clone()),
+            statement_timeout: std::time::Duration::from_secs(self.statement_timeout_secs),
         })
     }
 }

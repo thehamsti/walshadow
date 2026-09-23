@@ -236,7 +236,9 @@ fn empty_socket_path_defines_gucs_without_a_worker() {
 
     assert_eq!(
         pg.sql("SELECT count(*)::text FROM pg_settings WHERE name LIKE 'walshadow.%'"),
-        "5"
+        // socket_path, database, io/lock timeouts, bridge_workers,
+        // tenant_databases, tenant_bridge_workers
+        "7"
     );
     assert_eq!(
         pg.sql(
@@ -270,4 +272,60 @@ fn worker_serves_a_connection_whose_buffers_cannot_widen() {
     // Both the handshake and the request behind it crossed the connection
     // whose buffers stayed at the default
     hello(&mut conn);
+}
+
+/// The launcher gives each listed database its own pool, worker `i` on the
+/// `.i` suffix. It runs pools short rather than failing when worker slots
+/// run out, and refuses an unparseable list or a name no database can have,
+/// without disturbing the pools already running
+#[test]
+fn tenant_launcher_starts_pools_and_refuses_bad_lists() {
+    if !pgext::pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut pg = pgext::stage(tmp.path(), ports::PG_SHADOW_PORT, Duration::from_secs(20));
+    // Static bridge, launcher and logical replication launcher leave three
+    // slots: one whole pool of two, then one member of the next
+    pg.append_conf("max_worker_processes = 6\n");
+    pg.start(&[]);
+    pg.wait_log(0, "walshadow bridge listening");
+    for db in ["ws_tenant_a", "ws_tenant_b"] {
+        pg.sql(&format!("CREATE DATABASE {db}"));
+    }
+
+    let from = pg.log_len();
+    pg.shadow()
+        .set_tenant_databases(&["ws_tenant_a".into(), "ws_tenant_b".into()])
+        .unwrap();
+    let first = walshadow::catalog::shadow::tenant_bridge_socket(&pg.bridge_path(), "ws_tenant_a");
+    let mut second = first.clone().into_os_string();
+    second.push(".1");
+    let second = std::path::PathBuf::from(second);
+    wait_until("tenant pool listening", || {
+        first.exists() && second.exists()
+    });
+    let mut a0 = hello_on(&first);
+    hello_on(&second);
+    let line = pg.wait_log(from, "no worker slot for tenant");
+    assert!(line.contains("\"ws_tenant_b\" bridge 1"), "{line}");
+
+    // Unterminated quote: the whole list is refused and nothing stops
+    let from = pg.log_len();
+    pg.append_conf("walshadow.tenant_databases = '\"ws_tenant_a'\n");
+    pg.reload();
+    pg.wait_log(from, "invalid walshadow.tenant_databases");
+    hello(&mut a0);
+
+    // Past NAMEDATALEN no database can match, so the name is skipped and the
+    // pools it replaced stop
+    let from = pg.log_len();
+    pg.append_conf(&format!(
+        "walshadow.tenant_databases = '{}'\n",
+        "x".repeat(70)
+    ));
+    pg.reload();
+    pg.wait_log(from, "cannot serve tenant");
+    pg.wait_log(from, "stopping bridges for removed tenant \"ws_tenant_a\"");
 }
