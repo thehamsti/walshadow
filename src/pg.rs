@@ -1,7 +1,10 @@
 //! Source-PG sidecar SQL helpers shared across sweep/backfill/config paths.
 
+use std::time::{Duration, Instant};
+
 use tokio_postgres::types::{FromSql, Oid, PgLsn, Type};
 use tokio_postgres::{Client, Row};
+use walrus::pg::backup::format_pg_lsn;
 
 use crate::schema::RelAttr;
 
@@ -129,6 +132,54 @@ pub async fn current_wal_lsn(client: &Client) -> anyhow::Result<u64> {
     let row = client.query_one("SELECT pg_current_wal_lsn()", &[]).await?;
     let lsn: PgLsn = row.get(0);
     Ok(lsn.into())
+}
+
+/// WAL position a query's snapshot sits at or below: the insert position on
+/// a primary, the replay position on a standby, where `pg_current_wal_lsn()`
+/// is an error.
+pub async fn snapshot_wal_lsn(client: &Client) -> anyhow::Result<u64> {
+    let row = client
+        .query_one(
+            "SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() \
+             ELSE pg_current_wal_lsn() END",
+            &[],
+        )
+        .await?;
+    let lsn: Option<PgLsn> = row.get(0);
+    Ok(lsn.map_or(0, u64::from))
+}
+
+/// On a standby, wait for replay to reach `lsn`, so a snapshot taken next
+/// sees every commit at or below it. A primary returns at once
+pub async fn await_replay(client: &Client, lsn: u64, timeout: Duration) -> anyhow::Result<()> {
+    let began = Instant::now();
+    loop {
+        let row = client
+            .query_one("SELECT pg_is_in_recovery(), pg_last_wal_replay_lsn()", &[])
+            .await?;
+        let replay: Option<PgLsn> = row.get(1);
+        let replay = replay.map_or(0, u64::from);
+        if !row.get::<_, bool>(0) || replay >= lsn {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            began.elapsed() < timeout,
+            "standby replay at {} still below {} after {timeout:?}",
+            format_pg_lsn(replay),
+            format_pg_lsn(lsn),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// A standby cancelled the query to let replay through (SQLSTATE 40001,
+/// 40P01: `src/backend/storage/ipc/standby.c`); running it again can succeed
+pub fn is_recovery_conflict(err: &anyhow::Error) -> bool {
+    use tokio_postgres::error::SqlState;
+    err.chain()
+        .filter_map(|e| e.downcast_ref::<tokio_postgres::Error>())
+        .filter_map(tokio_postgres::Error::code)
+        .any(|c| *c == SqlState::T_R_SERIALIZATION_FAILURE || *c == SqlState::T_R_DEADLOCK_DETECTED)
 }
 
 /// `pg_snapshot_xmax(pg_current_snapshot())`; statement's active snapshot,

@@ -57,6 +57,16 @@ pub struct SourceConn {
     pub sslmode: SslMode,
     #[serde(deserialize_with = "crate::toml_de::de_nonempty")]
     pub slot: Option<String>,
+    /// Standby endpoint for the bulk reads (BASE_BACKUP data files, COPY
+    /// initial loads), so they load a replica's disk instead of the
+    /// primary's. Unset falls back to `host` / `user`; the WAL stream, slot
+    /// and control queries always stay on the primary
+    #[serde(deserialize_with = "crate::toml_de::de_nonempty")]
+    pub replica_host: Option<String>,
+    /// Replica routing user, e.g. PlanetScale's `<user>|replica`; shares
+    /// `password`
+    #[serde(deserialize_with = "crate::toml_de::de_nonempty")]
+    pub replica_user: Option<String>,
 }
 
 impl Default for SourceConn {
@@ -70,6 +80,8 @@ impl Default for SourceConn {
             // libpq default, matching `PgConfig::resolve`
             sslmode: SslMode::Prefer,
             slot: None,
+            replica_host: None,
+            replica_user: None,
         }
     }
 }
@@ -85,6 +97,8 @@ impl std::fmt::Debug for SourceConn {
             .field("dbname", &self.dbname)
             .field("sslmode", &self.sslmode)
             .field("slot", &self.slot)
+            .field("replica_host", &self.replica_host)
+            .field("replica_user", &self.replica_user)
             .finish()
     }
 }
@@ -126,6 +140,21 @@ impl SourceConn {
             sslmode: self.sslmode,
             tls: TlsParams::resolve(&walrus::config::Vars::default()),
         }
+    }
+
+    /// Standby endpoint for bulk reads, `None` when `[source]` names none
+    pub fn replica_pg_config(&self) -> Option<PgConfig> {
+        if self.replica_host.is_none() && self.replica_user.is_none() {
+            return None;
+        }
+        let mut cfg = self.to_pg_config();
+        if let Some(host) = &self.replica_host {
+            cfg.host = host.clone();
+        }
+        if let Some(user) = &self.replica_user {
+            cfg.user = user.clone();
+        }
+        Some(cfg)
     }
 
     /// Credential-free endpoint for logs, metrics labels, and `ctl status`
@@ -2075,6 +2104,38 @@ mod tests {
         );
         resolver.reload().await.unwrap();
         assert_eq!(rx.borrow().drop_table_strategy, DropTableStrategy::Retain);
+    }
+
+    #[test]
+    fn source_conn_replica_overrides_host_and_user() {
+        let root: toml::Table = toml::from_str(
+            "[source]\nhost = \"primary\"\nuser = \"repl\"\npassword = \"pw\"\n\
+             dbname = \"app\"\nreplica_user = \"repl|replica\"\n",
+        )
+        .unwrap();
+        let conn = SourceConn::from_table(&root).unwrap();
+        let replica = conn.replica_pg_config().expect("replica configured");
+        assert_eq!(
+            (replica.host.as_str(), replica.user.as_str()),
+            ("primary", "repl|replica")
+        );
+        assert_eq!(replica.password.as_deref(), Some("pw"));
+        assert_eq!(replica.database, "app");
+        assert_eq!(conn.to_pg_config().user, "repl");
+
+        let moved: toml::Table =
+            toml::from_str("[source]\nhost = \"primary\"\nreplica_host = \"standby\"\n").unwrap();
+        let replica = SourceConn::from_table(&moved).unwrap().replica_pg_config();
+        assert_eq!(replica.map(|r| r.host), Some("standby".into()));
+
+        let bare: toml::Table =
+            toml::from_str("[source]\nhost = \"primary\"\nreplica_user = \"\"\n").unwrap();
+        assert!(
+            SourceConn::from_table(&bare)
+                .unwrap()
+                .replica_pg_config()
+                .is_none()
+        );
     }
 
     #[test]

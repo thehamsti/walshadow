@@ -182,6 +182,10 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     // otherwise silently skip its backfill; idle it costs one ledger read.
     let mut pg = input.source.to_pg_config();
     pg.database = conn.name.clone();
+    let replica = input.source.replica_pg_config().map(|mut r| {
+        r.database = conn.name.clone();
+        r
+    });
     let backfiller = Arc::new(
         walshadow::copy_backfill::CopyBackfiller::new(
             pg,
@@ -201,6 +205,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         )
         .await
         .context("load backfill ledger")?
+        .with_replica(replica)
         .with_backup_loads(input.primary),
     );
     let backfiller_effects: Option<Arc<dyn walshadow::opt_in::Backfiller>> =

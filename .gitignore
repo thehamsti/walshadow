@@ -27,3 +27,4 @@ __pycache__/
 /scripts/mt-run.py
 /scripts/mt-validate.py
 /scripts/provision-datax-dev.py
+/scripts/c2-run.py

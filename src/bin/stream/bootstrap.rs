@@ -23,7 +23,7 @@ use walshadow::backfill_bootstrap::{
     spawn_greenfield_bootstrap,
 };
 use walshadow::backup_source::BackupSource;
-use walshadow::backup_source_direct::DirectSource;
+use walshadow::backup_source_direct::{DirectSource, WalLeg};
 use walshadow::backup_source_object_store::ObjectStoreSource;
 use walshadow::bootstrap_marker::{self, BootstrapMarker};
 use walshadow::ch_emitter::{BootstrapMode, EmitterConfig, EmitterStats};
@@ -118,8 +118,10 @@ pub(crate) fn shadow_data_dir_initialized(dir: &std::path::Path) -> bool {
 /// `wait_through(K)` proves every bootstrap seq durable on CH before
 /// teardown, so the WAL pump resumes against a fully-shipped baseline.
 /// `None`: rows drain to a metrics-only observer via `drain_backfill`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_bootstrap(
     src_cfg: &PgConfig,
+    replica_cfg: Option<&PgConfig>,
     feed: &mut SourceFeed,
     args: &Args,
     plan: &BootstrapPlan,
@@ -198,16 +200,49 @@ pub(crate) async fn run_bootstrap(
             } else {
                 None
             };
+            // A standby serves the data files only where nothing reads the
+            // window off the feed: a greenfield load's window leg starts at
+            // the primary's position, above a standby's backup start
+            let replica = match replica_cfg {
+                Some(_) if ch_config.is_some() => {
+                    tracing::warn!(
+                        target: "walshadow::bootstrap",
+                        "[source] replica ignored: a greenfield bootstrap reads the primary",
+                    );
+                    None
+                }
+                r => r,
+            };
+            // Without an archive, the window's WAL streams from the primary
+            // beside a standby's backup: the standby recycles it mid-copy
+            let wal_leg = replica.is_some() && hydrate.is_none();
             let opts = BaseBackupOpts {
                 // `basic()` stamp lets `pg_stat_progress_basebackup` and
                 // `backup_label` read the label as a wall-clock instant
                 label: format!("walshadow-bootstrap-{}", Timestamp::now().basic()),
-                fast_checkpoint: args.bootstrap_fast_checkpoint,
+                // A standby otherwise starts at its last restartpoint, which
+                // can sit below what the primary's slot still retains
+                fast_checkpoint: args.bootstrap_fast_checkpoint || replica.is_some(),
                 no_verify_checksums: false,
                 max_rate_kib: args.bootstrap_max_rate_kib,
-                wal: hydrate.is_none(),
+                wal: hydrate.is_none() && !wal_leg,
             };
-            (Box::new(DirectSource::new(src_cfg.clone(), opts)), hydrate)
+            let mut direct = DirectSource::new(replica.unwrap_or(src_cfg).clone(), opts);
+            if let Some(replica) = replica {
+                tracing::info!(
+                    target: "walshadow::bootstrap",
+                    host = %replica.host,
+                    user = %replica.user,
+                    wal_leg,
+                    "BASE_BACKUP reads a standby",
+                );
+            }
+            if wal_leg {
+                direct = direct.with_wal_leg(WalLeg {
+                    source: src_cfg.clone(),
+                });
+            }
+            (Box::new(direct), hydrate)
         }
         BootstrapMode::ObjectStore => {
             let settings = ch_config

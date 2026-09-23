@@ -226,6 +226,7 @@ pub(crate) async fn run_session(
             shutdown,
             run_bootstrap(
                 &cfg,
+                source_conn.replica_pg_config().as_ref(),
                 &mut feed,
                 args,
                 &bootstrap_plan,

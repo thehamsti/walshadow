@@ -56,7 +56,8 @@
 //! unreadable or foreign one stops boot, since its entries name staging
 //! tables and swap phases nothing else records. Completion is observability:
 //! convergence is reported once WAL apply passes `P_hi = pg_current_wal_lsn()`
-//! read at COPY EOF; nothing is gated on it.
+//! read at COPY EOF (the replay position when COPY reads a standby); nothing
+//! is gated on it.
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -93,7 +94,7 @@ use crate::emit::pipeline::{Fatal, bootstrap};
 use crate::emit::route::RouteSnapshot;
 use crate::mapping::MappingHandle;
 use crate::ops::oracle::Oracle;
-use crate::pg::{current_wal_lsn, quote_ident};
+use crate::pg::{await_replay, is_recovery_conflict, quote_ident, snapshot_wal_lsn};
 use crate::pos::{Pos, Snapshot};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{
@@ -115,6 +116,10 @@ use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 const LEDGER_FILENAME: &str = "backfills.toml";
 /// COPY initial loads in flight when `[bootstrap] copy_concurrency` is unset
 const DEFAULT_COPY_CONCURRENCY: usize = 8;
+/// A standby this far behind `S` is not one to load from
+const REPLICA_REPLAY_WAIT: Duration = Duration::from_secs(600);
+/// Loads a standby's recovery conflicts cancel, re-run in place
+const RECOVERY_CONFLICT_ATTEMPTS: u32 = 5;
 const LEDGER_VERSION: u32 = 1;
 
 /// Output settings `pgext/worker.c` pins for typoutput, plus row security:
@@ -747,6 +752,8 @@ struct Inner {
 pub struct CopyBackfiller {
     /// Boot source endpoint; [`Self::source_pg`] prefers the live one
     pg: PgConfig,
+    /// Boot standby endpoint for COPY reads, `None` reads the primary
+    replica_pg: Option<PgConfig>,
     /// Boot emitter; [`Self::dest_emitter`] overlays the live CH connection
     emitter: Arc<EmitterConfig>,
     /// Last [`Self::dest_emitter`] snapshot, rebuilt only when the destination
@@ -819,6 +826,7 @@ impl CopyBackfiller {
         ];
         Ok(Self {
             pg,
+            replica_pg: None,
             dest: std::sync::Mutex::new(emitter.clone()),
             emitter,
             mapping,
@@ -870,6 +878,19 @@ impl CopyBackfiller {
         match live {
             Some(conn) if !conn.host.is_empty() => conn.to_pg_config(),
             _ => self.pg.clone(),
+        }
+    }
+
+    /// Endpoint COPY reads from: the live `[source]` replica when one is set,
+    /// else the boot replica, else [`Self::source_pg`]
+    fn copy_pg(&self) -> PgConfig {
+        let live = self.config_rx.as_ref().map(|rx| rx.borrow().source.clone());
+        match live {
+            Some(conn) if !conn.host.is_empty() => conn
+                .replica_pg_config()
+                .or_else(|| self.replica_pg.clone())
+                .unwrap_or_else(|| conn.to_pg_config()),
+            _ => self.replica_pg.clone().unwrap_or_else(|| self.pg.clone()),
         }
     }
 
@@ -1018,6 +1039,13 @@ impl CopyBackfiller {
                 }
             }
         }
+    }
+
+    /// COPY reads this standby instead of the primary: `[source]
+    /// replica_host` / `replica_user` for this backfiller's database
+    pub fn with_replica(mut self, replica: Option<PgConfig>) -> Self {
+        self.replica_pg = replica;
+        self
     }
 
     /// A cluster backup covers one database, so every other one loads by COPY
@@ -1640,7 +1668,27 @@ impl CopyBackfiller {
 
     async fn run(self: Arc<Self>, desc: Arc<RelDescriptor>, s_lsn: Pos<Snapshot>) {
         let res = match self.copy_slots.acquire().await {
-            Ok(_slot) => self.copy_once(&desc, s_lsn).await,
+            Ok(_slot) => {
+                let mut attempt = 1;
+                loop {
+                    match self.copy_once(&desc, s_lsn).await {
+                        Err(e)
+                            if attempt < RECOVERY_CONFLICT_ATTEMPTS && is_recovery_conflict(&e) =>
+                        {
+                            tracing::warn!(
+                                target: "walshadow::backfill",
+                                qname = %desc.rel_name,
+                                attempt,
+                                error = %format!("{e:#}"),
+                                "standby cancelled COPY for replay; re-running the load",
+                            );
+                            attempt += 1;
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                        res => break res,
+                    }
+                }
+            }
             Err(e) => Err(anyhow::anyhow!("COPY slots closed: {e}")),
         };
         let mut inner = self.inner.lock().await;
@@ -1694,7 +1742,7 @@ impl CopyBackfiller {
             quote_ident(&desc.rel_name.name)
         );
         self.seed_toast(desc, s_lsn).await?;
-        let client = self.open_copy_client().await?;
+        let client = self.open_copy_client(s_lsn).await?;
 
         if let Some(runtime) = self.dest_emitter().snowflake.clone() {
             return self
@@ -1709,7 +1757,7 @@ impl CopyBackfiller {
             .context("backfill: emptiness probe")?
             .get(0);
         if !nonempty {
-            let p_hi = current_wal_lsn(&client).await?;
+            let p_hi = snapshot_wal_lsn(&client).await?;
             return Ok(CopyOutcome {
                 rows: 0,
                 skipped_empty: true,
@@ -1719,7 +1767,7 @@ impl CopyBackfiller {
 
         let rows = self.copy_chunks(&client, desc, s_lsn).await?;
         // Upper bound on the COPY snapshot; WAL apply past it = converged
-        let p_hi = current_wal_lsn(&client).await?;
+        let p_hi = snapshot_wal_lsn(&client).await?;
         Ok(CopyOutcome {
             rows,
             skipped_empty: false,
@@ -1905,7 +1953,7 @@ impl CopyBackfiller {
             return Ok(CopyOutcome {
                 rows: 0,
                 skipped_empty: false,
-                p_hi: current_wal_lsn(client).await?,
+                p_hi: snapshot_wal_lsn(client).await?,
             });
         }
         anyhow::ensure!(
@@ -1974,7 +2022,7 @@ impl CopyBackfiller {
             .mark_snapshot_loaded(desc, &operation_id, &batch_ids, rows == 0)
             .await?;
         runtime.publish_snapshot(desc, &operation_id).await?;
-        let p_hi = current_wal_lsn(client).await?;
+        let p_hi = snapshot_wal_lsn(client).await?;
         Ok(CopyOutcome {
             rows,
             skipped_empty: rows == 0,
@@ -1982,14 +2030,22 @@ impl CopyBackfiller {
         })
     }
 
-    async fn open_copy_client(&self) -> anyhow::Result<tokio_postgres::Client> {
-        let client = open_sql_client(&self.source_pg())
+    /// Session for one load's reads. On a standby it first waits for replay
+    /// to pass `S`: the load's rows stand in for every change at or below it
+    async fn open_copy_client(
+        &self,
+        s_lsn: Pos<Snapshot>,
+    ) -> anyhow::Result<tokio_postgres::Client> {
+        let client = open_sql_client(&self.copy_pg())
             .await
             .context("backfill: source sql connect")?;
         client
             .batch_execute(COPY_SESSION_SETUP)
             .await
             .context("backfill: source session setup")?;
+        await_replay(&client, s_lsn.get(), REPLICA_REPLAY_WAIT)
+            .await
+            .context("backfill: standby replay")?;
         Ok(client)
     }
 
@@ -2013,7 +2069,7 @@ impl CopyBackfiller {
             return Ok(());
         }
         let resolver = ToastResolver::from_config(&emitter, self.stats.clone());
-        let client = self.open_copy_client().await?;
+        let client = self.open_copy_client(s_lsn).await?;
         let chunks = copy_toast_into(&client, &resolver, desc, s_lsn.get()).await?;
         tracing::info!(
             target: "walshadow::backfill",
