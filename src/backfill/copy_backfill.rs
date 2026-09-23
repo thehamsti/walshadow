@@ -1880,15 +1880,12 @@ async fn drain_snowflake_copy(
     let mut batch_bytes = 0usize;
     let mut ids = Vec::new();
     let send = |batch: Vec<SnowflakeRow>,
-                    deliveries: &mut tokio::task::JoinSet<anyhow::Result<String>>| {
+                deliveries: &mut tokio::task::JoinSet<anyhow::Result<String>>| {
         let runtime = runtime.clone();
         let schema = schema.clone();
         let operation_id = operation_id.clone();
-        deliveries.spawn(async move {
-            runtime
-                .deliver_snapshot(schema, batch, &operation_id)
-                .await
-        });
+        deliveries
+            .spawn(async move { runtime.deliver_snapshot(schema, batch, &operation_id).await });
     };
     while let Some(slab) = rx.recv().await {
         for tuple in slab {

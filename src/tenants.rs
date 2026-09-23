@@ -5,7 +5,7 @@
 //! slot and full-cluster shadow per client. Every tenant gets its own
 //! descriptor history, transaction buffer, pipeline, destination and state
 //! directory; the pump routes each record to the tenant whose database wrote
-//! it (see [`TenantRoute`]).
+//! it (see [`TenantRouter`](crate::source::tenant_router::TenantRouter)).
 //!
 //! Configuration is `[tenant.<id>]` tables in the merged config, usually one
 //! `<config>.d/60-tenant-<id>.toml` each so `ctl tenant` can add, replace and

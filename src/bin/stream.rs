@@ -2636,9 +2636,7 @@ async fn run_session(
                 &t.boundary_hold_stats,
                 &t.capture_stats,
                 &t.desc_log,
-                t.config_resolver
-                    .as_deref()
-                    .or(metrics_resolver.as_deref()),
+                t.config_resolver.as_deref().or(metrics_resolver.as_deref()),
                 t.copy_backfiller.as_deref(),
                 StageCounters {
                     emitter: emitter_stats,
