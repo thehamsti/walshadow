@@ -16,12 +16,13 @@ ARG PG_MAJOR=18
 
 FROM rust:1-alpine AS rust-builder
 # build-base: gcc 15 + musl-dev + make. lz4/zstd dev+headers for the
-# clickhouse-c-rs codecs. Dynamic musl link (crt-static off) so the binary
+# clickhouse-c-rs codecs. linux-headers: librocksdb-sys includes <linux/fs.h>. Dynamic musl link (crt-static off) so the binary
 # resolves liblz4.so.1/libzstd.so.1 shipped in postgres:*-alpine at runtime.
 RUN apk add --no-cache \
         build-base \
         clang-dev \
         cmake \
+        linux-headers \
         lz4-dev \
         zstd-dev
 ENV RUSTFLAGS="-C target-feature=-crt-static"
