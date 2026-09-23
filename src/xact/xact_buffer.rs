@@ -46,7 +46,9 @@ use tokio::sync::Mutex;
 use tracing::Instrument;
 use walrus::pg::walparser::{RelFileNode, RmId};
 
-use crate::catalog::desc_log::{Ambiguity, DescriptorLog, LogEntry, LogValue, LookupResult};
+use crate::catalog::desc_log::{
+    Ambiguity, DescriptorLog, DescriptorLogs, LogEntry, LogValue, LookupResult,
+};
 use crate::catalog::pending::{PendingCatalog, PendingSlot};
 use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats};
 use crate::decode::heap_decoder::{
@@ -386,8 +388,8 @@ impl XactBufferStats {
 }
 
 /// One non-tuple item interleaved into a committed xact's drain, ordered by
-/// `source_lsn`. Heap tuples ride the sibling `heaps` vec (batched for the
-/// decode pool); a `DrainEntry` is applied in WAL order *between* heap
+/// `source_lsn`. Heap tuples ride the sibling `heaps` vec (batched for
+/// planning); a `DrainEntry` is applied in WAL order *between* heap
 /// segments. `Catalog` fences DDL, `Config` refreshes runtime mapping,
 /// `ToastBarrier` closes rewrite generations. All inherit merge tie-break:
 /// control event sorts before heap at equal LSN.
@@ -439,7 +441,7 @@ impl XactState {
             first_lsn = first_lsn,
         );
         Self {
-            first_lsn: first_lsn.into(),
+            first_lsn: Pos::new(first_lsn),
             in_mem: Vec::new(),
             in_mem_bytes: 0,
             spill: None,
@@ -533,7 +535,7 @@ impl PendingDurable {
         while self
             .by_first_lsn
             .peek()
-            .is_some_and(|Reverse(xact)| xact.commit_lsn <= durable_ack.get())
+            .is_some_and(|Reverse(xact)| xact.commit_lsn <= durable_ack.retag())
         {
             self.by_first_lsn.pop();
         }
@@ -776,7 +778,7 @@ pub struct XactBuffer {
 
 impl XactBuffer {
     pub fn new(config: XactBufferConfig) -> std::result::Result<Self, XactBufferError> {
-        let store = SpillStore::new(config.spill_dir.clone())?;
+        let store = SpillStore::new(crate::fs::scratch_dir(&config.spill_dir))?;
         Ok(Self {
             config,
             store,
@@ -846,20 +848,17 @@ impl XactBuffer {
         self.span_registry.clone()
     }
 
-    /// Clear leftover spill files from a prior crash. Cursor file
-    /// guarantees on-disk state was either drained-to-CH or
-    /// replayable from `decoder_lsn`, so the spill dir is always
-    /// safe to wipe at startup. Plan-spool leftovers share the dir and the
-    /// same replayability argument. Caller invokes once before any `on_*`.
+    /// Wipe scratch left by a prior crash. Cursor file guarantees on-disk
+    /// state was either drained-to-CH or replayable from `decoder_lsn`, so
+    /// scratch is always safe to wipe at startup. Caller invokes once before
+    /// any `on_*`.
     pub async fn clear_spill_dir(&self) -> std::result::Result<(), XactBufferError> {
-        self.store.clear().await?;
-        crate::emit::pipeline::plan_spool::clean_plan_files(self.store.dir())
-            .map_err(SpillError::from)?;
-        Ok(())
+        Ok(self.store.clear()?)
     }
 
-    /// Transient-state directory shared by spill and plan files
-    pub fn spill_dir(&self) -> &Path {
+    /// Scratch directory under spill dir, shared by spill, body spool and
+    /// plan files
+    pub fn scratch_dir(&self) -> &Path {
         self.store.dir()
     }
 
@@ -1278,7 +1277,7 @@ impl XactBuffer {
 
     /// Commit drain: hand back a [`CommittedDrain`] that streams bounded
     /// [`DrainedBatch`] slices from a lazy k-way merge. Detoast and dispatch
-    /// run in the decode pool / barrier coordinator; pipeline ack collector
+    /// run in the reorder planner / barrier coordinator; pipeline ack collector
     /// owns `emitter_ack_lsn`.
     pub async fn drain_committed(
         &mut self,
@@ -1296,7 +1295,7 @@ impl XactBuffer {
         if commit_lsn < self.min_commit_lsn {
             // Committed before this buffer's tenant started: its initial load
             // covers these effects, and its rows may predate descriptor history
-            self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn.into());
+            self.stats.drain_lsn = self.stats.drain_lsn.max(Pos::new(commit_lsn));
             self.span_registry.prune(&xids);
             self.discard_states(&xids).await?;
             self.stats.commits_before_start += 1;
@@ -1314,7 +1313,7 @@ impl XactBuffer {
                 states.push(st);
             }
         }
-        self.stats.drain_lsn = self.stats.drain_lsn.max(commit_lsn.into());
+        self.stats.drain_lsn = self.stats.drain_lsn.max(Pos::new(commit_lsn));
         if states.is_empty() {
             // Read-only / filter-dropped: reorder coordinator still
             // registers a seq so the contiguous watermark passes commit_lsn
@@ -1329,7 +1328,7 @@ impl XactBuffer {
         }
         // Preserve floor while decoded slices remain undurable
         if let Some(first) = states.iter().map(|st| st.first_lsn).min() {
-            self.pending_durable.push(first, commit_lsn.into());
+            self.pending_durable.push(first, Pos::new(commit_lsn));
         }
         for st in &states {
             self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
@@ -1370,16 +1369,15 @@ impl XactBuffer {
     /// post-COMMIT WAL (page padding, RUNNING_XACTS, CHECKPOINT) counts as
     /// drained when quiescent. The durable ack side lives in the ack
     /// collector (`AckHandle::trailing`).
-    pub fn advance_idle(&mut self, lsn: impl Into<Pos<Drain>>) {
+    pub fn advance_idle(&mut self, lsn: Pos<Drain>) {
         if self.stats.xacts_active != 0 {
             return;
         }
-        self.stats.drain_lsn = self.stats.drain_lsn.max(lsn.into());
+        self.stats.drain_lsn = self.stats.drain_lsn.max(lsn);
     }
 
     /// Floor durable acknowledgment at first record of each undurable transaction
-    pub fn resume_safe_lsn(&mut self, durable_ack: impl Into<Pos<EmitterAck>>) -> Pos<ResumeSafe> {
-        let durable_ack = durable_ack.into();
+    pub fn resume_safe_lsn(&mut self, durable_ack: Pos<EmitterAck>) -> Pos<ResumeSafe> {
         self.pending_durable.prune(durable_ack);
         Pos::new(
             self.inflight
@@ -1397,10 +1395,10 @@ impl XactBuffer {
     pub async fn abort(
         &mut self,
         xid: u32,
-        abort_lsn: impl Into<Pos<Drain>>,
+        abort_lsn: Pos<Drain>,
         subxids: &[u32],
     ) -> std::result::Result<(), XactBufferError> {
-        self.stats.drain_lsn = self.stats.drain_lsn.max(abort_lsn.into());
+        self.stats.drain_lsn = self.stats.drain_lsn.max(abort_lsn);
         // `xid` is header xact_id: top abort or subxact standalone
         // rollback. Drop `xid` + every sub. For mid-xact subxact rollback
         // (PG `RecordSubTransactionAbort` writes a separate
@@ -2023,7 +2021,7 @@ impl MergedDrain {
 
     /// Chunks accumulated since the last take, sealed into a generation.
     /// Bytes stay gauged until the generation's last holder drops; spool
-    /// flush makes the sealed refs readable to decode workers.
+    /// flush makes the sealed refs readable to planning detoast.
     fn take_chunks(&mut self) -> std::result::Result<ChunkGeneration, XactBufferError> {
         self.flush_spool()?;
         let resident = self.chunk_gauge.split(self.chunk_bytes);
@@ -2147,7 +2145,7 @@ pub struct OrderedEvent {
 }
 
 /// One bounded slice of a committed xact for the parallel pipeline. Heaps
-/// still TOAST-toasted; the decode pool handles detoast + routing.
+/// still TOAST-toasted; the planner handles detoast + routing.
 /// Non-empty `ordered_events` (or a `HeapOp::Truncate` heap) makes the
 /// slice a barrier the reorder coordinator serializes against ClickHouse.
 pub struct DrainedBatch {
@@ -2158,7 +2156,7 @@ pub struct DrainedBatch {
     /// precedes its referrer, so every heap's value lives in exactly one
     /// generation sealed no later than this slice; slices share payloads via
     /// `Arc` instead of copying per batch, and each generation is immutable
-    /// once sealed (decode pool reads while later slices load).
+    /// once sealed (planning reads while later slices load).
     pub chunks: Vec<Arc<ChunkGeneration>>,
     /// WAL-ordered births and tombstones, empty without store
     pub new_rows: ToastRowBatch,
@@ -2324,7 +2322,7 @@ impl CommittedDrain {
 /// heap's tuples; the caller rides it with the routed row to insert ack
 /// so decoded values (and their encoder slab copy) stay covered past
 /// this call. `None` without budget or external values.
-/// Pub for the decode pool, gap replay, and tests.
+/// Pub for the planner, gap replay, and tests.
 pub async fn detoast_heap(
     heap: &mut DescribedHeap,
     // Xact body spool backing `File` refs; None while memory-resident
@@ -2359,8 +2357,14 @@ pub async fn detoast_heap(
     for p in &pointers {
         *uses.entry((p.va_toastrelid, p.va_valueid)).or_default() += 1;
     }
-    let cache =
-        prefetch_store_values(&pointers, chunk_maps, resolver, heap.decoded.source_lsn).await?;
+    let cache = prefetch_store_values(
+        &pointers,
+        chunk_maps,
+        resolver,
+        heap.decoded.rfn.db_node,
+        heap.decoded.source_lsn,
+    )
+    .await?;
     let mut res = ValueResolution {
         spool,
         xact_maps: chunk_maps,
@@ -2419,6 +2423,7 @@ async fn prefetch_store_values(
     pointers: &[ToastPointer],
     chunk_maps: &[&ChunkRefMap],
     resolver: &ToastResolver,
+    db_oid: u32,
     bound: u64,
 ) -> std::result::Result<HashMap<(u32, u32), CachedValue>, XactBufferError> {
     let mut cache = HashMap::new();
@@ -2443,16 +2448,14 @@ async fn prefetch_store_values(
             .map(|p| (p.va_valueid, pointer_extsize(p)))
             .collect();
         let got = resolver
-            .fetch_values(toast_relid, &batch, bound)
+            .fetch_values(db_oid, toast_relid, &batch, bound)
             .await
             .map_err(|e| XactBufferError::Detoast(format!("toast store fetch: {e}")))?
             .expect("store checked via fill_on_miss");
         for (p, fetched) in ptrs.iter().zip(got) {
-            let cached = match fetched {
-                FetchedValue::Assembled(stored) => CachedValue::Decoded(finish_value(p, stored)?),
-                FetchedValue::Missing => CachedValue::Missing,
-                FetchedValue::Mismatch { .. } => CachedValue::Mismatch,
-                FetchedValue::Generation => CachedValue::Generation,
+            let cached = match StoreMiss::split(Some(fetched)) {
+                Ok(stored) => Ok(finish_value(p, stored)?),
+                Err(miss) => Err(miss),
             };
             cache.insert((p.va_toastrelid, p.va_valueid), cached);
         }
@@ -2462,13 +2465,87 @@ async fn prefetch_store_values(
 
 /// Store-fetched value decoded once per key; cloned for all but the last
 /// use, which moves the buffer
-enum CachedValue {
-    Decoded(Vec<u8>),
-    /// Safe only after supersession or replayed owner TRUNCATE
+type CachedValue = std::result::Result<Vec<u8>, StoreMiss>;
+
+/// Who owns chunk store contents, deciding what an unresolved value means
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissPolicy {
+    /// Referrer outlived its value: safe only after supersession or replayed
+    /// owner TRUNCATE, later row version carries current value
+    Streaming,
+    /// Walk-seeded store must contain chunks written during this pass, so a
+    /// miss is a gap
+    BootstrapOwned,
+    /// Read-only store holds state at end of backup: missing value was
+    /// removed after copied row and a later row version supersedes it
+    BootstrapReadOnly,
+}
+
+impl MissPolicy {
+    pub(crate) fn bootstrap(resolver: &ToastResolver) -> Self {
+        if resolver.stores_chunks() {
+            Self::BootstrapOwned
+        } else {
+            Self::BootstrapReadOnly
+        }
+    }
+}
+
+/// Store fetch outcome without assembled bytes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreMiss {
+    /// No store to consult
+    NoStore,
+    /// No live chunk visible at bound
     Missing,
-    Mismatch,
+    Mismatch {
+        got: usize,
+    },
     /// Value id now holds a later generation, original is unreadable
     Generation,
+}
+
+impl StoreMiss {
+    /// Split assembled bytes from misses; `None` is a store-less fetch
+    pub(crate) fn split(fetched: Option<FetchedValue>) -> std::result::Result<Vec<u8>, Self> {
+        match fetched {
+            None => Err(Self::NoStore),
+            Some(FetchedValue::Assembled(stored)) => Ok(stored),
+            Some(FetchedValue::Missing) => Err(Self::Missing),
+            Some(FetchedValue::Mismatch { got }) => Err(Self::Mismatch { got }),
+            Some(FetchedValue::Generation) => Err(Self::Generation),
+        }
+    }
+}
+
+/// Fill an unresolved value with NULL per `policy`, counting its cause.
+/// `Err` carries miss detail when policy fails closed
+pub(crate) fn fill_store_miss(
+    miss: StoreMiss,
+    p: &ToastPointer,
+    resolver: &ToastResolver,
+    policy: MissPolicy,
+) -> std::result::Result<ColumnValue, String> {
+    match (miss, policy) {
+        (StoreMiss::NoStore, _) => resolver.note_filled_default(),
+        (StoreMiss::Generation, _) => resolver.note_filled_generation(),
+        (StoreMiss::Mismatch { .. }, MissPolicy::Streaming) => resolver.note_filled_mismatch(),
+        (StoreMiss::Missing, MissPolicy::Streaming) | (_, MissPolicy::BootstrapReadOnly) => {
+            resolver.note_filled_superseded()
+        }
+        (StoreMiss::Missing, MissPolicy::BootstrapOwned) => {
+            resolver.note_fetch_miss();
+            return Err("has no chunks in the store".into());
+        }
+        (StoreMiss::Mismatch { got }, MissPolicy::BootstrapOwned) => {
+            resolver.note_fetch_miss();
+            return Err(format!(
+                "chunks sum to {got} bytes, pointer says {}",
+                pointer_extsize(p)
+            ));
+        }
+    }
+    Ok(ColumnValue::Null)
 }
 
 /// Per-heap value resolution over prefetched store values, decoded bytes
@@ -2547,37 +2624,27 @@ impl ValueResolution<'_> {
         p: &ToastPointer,
         type_oid: u32,
     ) -> std::result::Result<ColumnValue, XactBufferError> {
-        if self.resolver.fill_on_miss() {
-            // Disabled mode: no store to consult
-            self.resolver.note_filled_default();
-            return Ok(ColumnValue::Null);
-        }
         let key = (p.va_toastrelid, p.va_valueid);
-        match self.cache.get(&key).expect("prefetched with the heap") {
-            CachedValue::Missing => {
-                self.resolver.note_filled_superseded();
-                return Ok(ColumnValue::Null);
-            }
-            CachedValue::Mismatch => {
-                self.resolver.note_filled_mismatch();
-                return Ok(ColumnValue::Null);
-            }
-            CachedValue::Generation => {
-                self.resolver.note_filled_generation();
-                return Ok(ColumnValue::Null);
-            }
-            CachedValue::Decoded(_) => {}
+        let miss = if self.resolver.fill_on_miss() {
+            Some(StoreMiss::NoStore)
+        } else {
+            let cached = self.cache.get(&key).expect("prefetched with the heap");
+            cached.as_ref().err().copied()
+        };
+        if let Some(miss) = miss {
+            return fill_store_miss(miss, p, self.resolver, MissPolicy::Streaming)
+                .map_err(XactBufferError::Detoast);
         }
         let uses = self.uses.get_mut(&key).expect("counted in detoast_heap");
         *uses -= 1;
         let raw = if *uses > 0 {
-            let Some(CachedValue::Decoded(v)) = self.cache.get(&key) else {
-                unreachable!("matched Decoded above")
+            let Some(Ok(v)) = self.cache.get(&key) else {
+                unreachable!("matched Ok above")
             };
             v.clone()
         } else {
-            let Some(CachedValue::Decoded(v)) = self.cache.remove(&key) else {
-                unreachable!("matched Decoded above")
+            let Some(Ok(v)) = self.cache.remove(&key) else {
+                unreachable!("matched Ok above")
             };
             v
         };
@@ -2664,7 +2731,7 @@ pub(crate) fn reassemble_value_ref(
 /// [`ToastChunk`]; semantic errors absorb into [`DecoderStats`] rather
 /// than poison the stream.
 pub struct BufferingDecoderSink {
-    log: Arc<DescriptorLog>,
+    logs: DescriptorLogs,
     buffer: Arc<Mutex<XactBuffer>>,
     stats: Arc<DecoderStats>,
     /// `txn` span registry. When set (tracing on), the decoder parents its
@@ -2678,9 +2745,9 @@ pub struct BufferingDecoderSink {
 }
 
 impl BufferingDecoderSink {
-    pub fn new(log: Arc<DescriptorLog>, buffer: Arc<Mutex<XactBuffer>>) -> Self {
+    pub fn new(logs: DescriptorLogs, buffer: Arc<Mutex<XactBuffer>>) -> Self {
         Self {
-            log,
+            logs,
             buffer,
             stats: Arc::new(DecoderStats::default()),
             span_registry: None,
@@ -2767,11 +2834,13 @@ impl BufferingDecoderSink {
             // LSN is unreachable anyway — TRUNCATE rotates the filenode (so
             // its own commit publishes no in-place verdict) and a concurrent
             // xact cannot hold this rel's AccessExclusiveLock
+            // Relid array belongs to a database this daemon does not
+            // follow: its OIDs name nothing here
+            let Some(log) = self.logs.lookup(parsed.db_oid) else {
+                break;
+            };
             let (rel, valid_from) =
-                match self
-                    .log
-                    .descriptor_by_oid_in_db_at_spanned(parsed.db_oid, relid, source_lsn)
-                {
+                match log.descriptor_by_oid_in_db_at_spanned(parsed.db_oid, relid, source_lsn) {
                     Ok(found) => found,
                     // Record's whole relid array belongs to another database:
                     // its OIDs name nothing here, whatever they collide with
@@ -2892,11 +2961,17 @@ impl RecordSink for BufferingDecoderSink {
                 .as_ref()
                 .and_then(|r| r.decode_parent(txn_xid));
             let _ = sampled;
+            // Unfollowed database: same skip a foreign-db lookup takes
+            let Some(log) = self.logs.lookup(rfn.db_node) else {
+                self.stats
+                    .catalog_not_found
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            };
             // Wait-free interval lookup: every record reaching this worker
             // already has log coverage (capture runs inside the boundary
             // hold, before successor bytes publish)
-            let (rel, rel_valid_from) = match self.log.descriptor_at_spanned(rfn, record.source_lsn)
-            {
+            let (rel, rel_valid_from) = match log.descriptor_at_spanned(rfn, record.source_lsn) {
                 Ok(pair) => pair,
                 Err(LookupResult::Present(_)) => {
                     unreachable!("spanned lookup returns Present via Ok")
@@ -2910,7 +2985,7 @@ impl RecordSink for BufferingDecoderSink {
                     return Ok(());
                 }
                 Err(LookupResult::NotCovered)
-                    if record.source_lsn <= self.log.covered_through() || txn_xid == 0 =>
+                    if record.source_lsn <= log.covered_through() || txn_xid == 0 =>
                 {
                     self.stats
                         .catalog_not_found
@@ -3622,10 +3697,10 @@ mod tests {
             b.on_heap(heap_with_value(11, 100 + i, 256)).await.unwrap();
         }
         assert!(b.stats().spill_xacts_active >= 1, "spill must engage");
-        let spill_dir = tmp.path().to_path_buf();
+        let spill_dir = crate::fs::scratch_dir(tmp.path());
         let before: Vec<_> = std::fs::read_dir(&spill_dir).unwrap().collect();
         assert!(!before.is_empty(), "spill file present");
-        b.abort(11, 200, &[]).await.unwrap();
+        b.abort(11, Pos::new(200), &[]).await.unwrap();
         let after: Vec<_> = std::fs::read_dir(&spill_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -3640,14 +3715,14 @@ mod tests {
     async fn advance_idle_moves_drain_lsn_monotonically() {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
-        b.advance_idle(100);
+        b.advance_idle(Pos::new(100));
         assert_eq!(b.stats().drain_lsn, 100);
         // Regressing input never lowers the field
-        b.advance_idle(50);
+        b.advance_idle(Pos::new(50));
         assert_eq!(b.stats().drain_lsn, 100);
         // Inflight xact parks the advance
         b.on_heap(heap_with_value(7, 150, 16)).await.unwrap();
-        b.advance_idle(300);
+        b.advance_idle(Pos::new(300));
         assert_eq!(b.stats().drain_lsn, 100);
     }
 
@@ -3656,24 +3731,32 @@ mod tests {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         // Use acknowledgment when no transactions remain
-        assert_eq!(b.resume_safe_lsn(500), 500);
+        assert_eq!(b.resume_safe_lsn(Pos::new(500)), 500);
         // Open transactions lower resume point
         b.on_heap(heap_with_value(7, 100, 16)).await.unwrap();
         b.on_heap(heap_with_value(8, 150, 16)).await.unwrap();
-        assert_eq!(b.resume_safe_lsn(500), 100);
+        assert_eq!(b.resume_safe_lsn(Pos::new(500)), 100);
         // Keep floor while committed slices remain undurable
         let drain = b.drain_committed(8, 0, 200, &[], false).await.unwrap();
         assert!(drain.had_states);
         drop(drain);
-        assert_eq!(b.resume_safe_lsn(180), 100, "open xid 7 still floors");
-        b.abort(7, 210, &[]).await.unwrap();
-        assert_eq!(b.resume_safe_lsn(180), 150, "xid 8 undurable at ack 180");
+        assert_eq!(
+            b.resume_safe_lsn(Pos::new(180)),
+            100,
+            "open xid 7 still floors"
+        );
+        b.abort(7, Pos::new(210), &[]).await.unwrap();
+        assert_eq!(
+            b.resume_safe_lsn(Pos::new(180)),
+            150,
+            "xid 8 undurable at ack 180"
+        );
         // Drop floor once acknowledgment reaches commit
-        assert_eq!(b.resume_safe_lsn(200), 200);
+        assert_eq!(b.resume_safe_lsn(Pos::new(200)), 200);
         // Ignore commits without buffered rows
         let empty = b.drain_committed(9, 0, 300, &[], false).await.unwrap();
         assert!(!empty.had_states);
-        assert_eq!(b.resume_safe_lsn(300), 300);
+        assert_eq!(b.resume_safe_lsn(Pos::new(300)), 300);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3685,15 +3768,15 @@ mod tests {
         b.on_heap(heap_with_value(21, 420, 16)).await.unwrap();
         let drain = b.drain_committed(21, 0, 450, &[20], false).await.unwrap();
         drop(drain);
-        assert_eq!(b.resume_safe_lsn(440), 400);
-        assert_eq!(b.resume_safe_lsn(450), 450);
+        assert_eq!(b.resume_safe_lsn(Pos::new(440)), 400);
+        assert_eq!(b.resume_safe_lsn(Pos::new(450)), 450);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn abort_unknown_xid_counts() {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
-        b.abort(101, 0, &[]).await.unwrap();
+        b.abort(101, Pos::ZERO, &[]).await.unwrap();
         assert_eq!(b.stats().aborts_unknown_xid, 1);
     }
 
@@ -3709,7 +3792,7 @@ mod tests {
         for i in 0..3 {
             b.on_heap(heap_with_value(2, 200 + i, 128)).await.unwrap();
         }
-        let by_filename: Vec<String> = std::fs::read_dir(tmp.path())
+        let by_filename: Vec<String> = std::fs::read_dir(crate::fs::scratch_dir(tmp.path()))
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -3723,8 +3806,8 @@ mod tests {
             !by_filename.iter().any(|n| n.contains("xid-0000000002-")),
             "xid=2 must remain in-memory, saw {by_filename:?}"
         );
-        b.abort(1, 300, &[]).await.unwrap();
-        b.abort(2, 300, &[]).await.unwrap();
+        b.abort(1, Pos::new(300), &[]).await.unwrap();
+        b.abort(2, Pos::new(300), &[]).await.unwrap();
     }
 
     /// Aborts must advance `drain_lsn`, else an all-abort workload never
@@ -3734,12 +3817,12 @@ mod tests {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         b.on_heap(heap_with_value(7, 100, 16)).await.unwrap();
-        b.abort(7, 0x4000, &[]).await.unwrap();
+        b.abort(7, Pos::new(0x4000), &[]).await.unwrap();
         assert_eq!(b.stats().drain_lsn, 0x4000);
         // Lower-LSN abort must not regress the monotonic mark
-        b.abort(99, 0x100, &[]).await.unwrap();
+        b.abort(99, Pos::new(0x100), &[]).await.unwrap();
         assert_eq!(b.stats().drain_lsn, 0x4000);
-        b.abort(101, 0x8000, &[]).await.unwrap();
+        b.abort(101, Pos::new(0x8000), &[]).await.unwrap();
         assert_eq!(b.stats().drain_lsn, 0x8000);
     }
 
@@ -4089,6 +4172,61 @@ mod tests {
         }
     }
 
+    /// One miss matrix for streaming and both bootstrap store owners: each
+    /// cell's fill counter, or fail-closed detail plus fetch-miss count
+    #[test]
+    fn fill_store_miss_policy_matrix() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let p = ToastPointer {
+            va_rawsize: 8,
+            va_extinfo: 4,
+            va_valueid: 55,
+            va_toastrelid: 16500,
+        };
+        let misses = [
+            StoreMiss::NoStore,
+            StoreMiss::Missing,
+            StoreMiss::Mismatch { got: 3 },
+            StoreMiss::Generation,
+        ];
+        // Columns: default, superseded, mismatch, generation, fetch_miss
+        let cases = [
+            (MissPolicy::Streaming, [1, 1, 1, 1, 0]),
+            (MissPolicy::BootstrapReadOnly, [1, 2, 0, 1, 0]),
+            (MissPolicy::BootstrapOwned, [1, 0, 0, 1, 2]),
+        ];
+        for (policy, want) in cases {
+            let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+            let resolver = ToastResolver::disabled().with_stats(stats.clone());
+            let mut errs = Vec::new();
+            for miss in misses {
+                match fill_store_miss(miss, &p, &resolver, policy) {
+                    Ok(v) => assert_eq!(v, ColumnValue::Null),
+                    Err(detail) => errs.push(detail),
+                }
+            }
+            let counts = [
+                stats.toast_values_filled_default.load(Relaxed),
+                stats.toast_values_filled_superseded.load(Relaxed),
+                stats.toast_values_filled_mismatch.load(Relaxed),
+                stats.toast_values_filled_generation.load(Relaxed),
+                stats.toast_fetch_miss.load(Relaxed),
+            ];
+            assert_eq!(counts, want, "{policy:?}");
+            if policy == MissPolicy::BootstrapOwned {
+                assert_eq!(
+                    errs,
+                    [
+                        "has no chunks in the store",
+                        "chunks sum to 3 bytes, pointer says 4",
+                    ]
+                );
+            } else {
+                assert!(errs.is_empty(), "{policy:?}: {errs:?}");
+            }
+        }
+    }
+
     /// Miss policy split: in-xact gap stays a hard error; a store-side miss
     /// (key absent from every xact map) NULL-fills + counts superseded;
     /// disabled mode NULL-fills + counts default.
@@ -4104,7 +4242,7 @@ mod tests {
 
         // Store miss: no xact map holds the key → superseded fill
         let mut t = toast_ptr_tuple(55);
-        let cache = HashMap::from_iter([(key, CachedValue::Missing)]);
+        let cache = HashMap::from_iter([(key, Err(StoreMiss::Missing))]);
         let mut r = seeded(&store_resolver, None, &[], cache);
         r.resolve_tuple(&mut t, &rel).unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Null));
@@ -4159,7 +4297,7 @@ mod tests {
 
         // Store-resolved hit lands assembled bytes
         let mut t = toast_ptr_tuple(55);
-        let cache = HashMap::from_iter([(key, CachedValue::Decoded(b"abcd".to_vec()))]);
+        let cache = HashMap::from_iter([(key, Ok(b"abcd".to_vec()))]);
         let mut r = seeded(&store_resolver, None, &[], cache);
         r.resolve_tuple(&mut t, &rel).unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
@@ -4169,7 +4307,7 @@ mod tests {
         // Store-side run deviation (partial merge collapse): fills,
         // counted mismatch — not superseded, not a hard error
         let mut t = toast_ptr_tuple(55);
-        let cache = HashMap::from_iter([(key, CachedValue::Mismatch)]);
+        let cache = HashMap::from_iter([(key, Err(StoreMiss::Mismatch { got: 3 }))]);
         seeded(&store_resolver, None, &[], cache)
             .resolve_tuple(&mut t, &rel)
             .unwrap();
@@ -4234,7 +4372,7 @@ mod tests {
             va_valueid: 55,
             va_toastrelid: 16500,
         };
-        let cache = prefetch_store_values(&[p, p], &[], &resolver, 10)
+        let cache = prefetch_store_values(&[p, p], &[], &resolver, 0, 10)
             .await
             .unwrap();
         let mut r = ValueResolution {
@@ -4293,9 +4431,10 @@ mod tests {
             va_toastrelid: 16500,
         };
         let in_xact = mem_refs((16500, 57), &[(0, b"abcd")]);
-        let cache = prefetch_store_values(&[ptr(55), ptr(56), ptr(57)], &[&in_xact], &resolver, 10)
-            .await
-            .unwrap();
+        let cache =
+            prefetch_store_values(&[ptr(55), ptr(56), ptr(57)], &[&in_xact], &resolver, 0, 10)
+                .await
+                .unwrap();
         assert_eq!(cache.len(), 2, "in-xact key stays out of the cache");
         assert_eq!(
             stats
@@ -4433,7 +4572,7 @@ mod tests {
         b.on_heap(heap_with_value(300, 100, 16)).await.unwrap();
         b.on_heap(heap_with_value(301, 200, 16)).await.unwrap();
         b.on_heap(heap_with_value(302, 300, 16)).await.unwrap();
-        b.abort(300, 0x500, &[301, 302]).await.unwrap();
+        b.abort(300, Pos::new(0x500), &[301, 302]).await.unwrap();
         assert!(b.active_xids().is_empty());
         // One bump per terminator record, not per subxid
         assert_eq!(b.stats().aborted_xacts_total, 1);
@@ -4798,7 +4937,7 @@ mod tests {
         let buffer = Arc::new(Mutex::new(
             XactBuffer::new(cfg(spill_dir.path().to_path_buf())).unwrap(),
         ));
-        let mut sink = BufferingDecoderSink::new(log.clone(), buffer);
+        let mut sink = BufferingDecoderSink::new(DescriptorLogs::single(log.clone()), buffer);
 
         sink.on_record(&truncate_record(6)).await.unwrap();
         assert_eq!(
@@ -4875,7 +5014,7 @@ mod tests {
             .await
             .unwrap();
         inject_ordinary(&mut b, rfn, rel);
-        b.abort(1, 0x1000, &[]).await.unwrap();
+        b.abort(1, Pos::new(0x1000), &[]).await.unwrap();
         assert!(b.pending_stash.is_empty());
     }
 
@@ -5318,7 +5457,7 @@ mod tests {
     }
 
     fn spill_files(dir: &std::path::Path) -> Vec<String> {
-        std::fs::read_dir(dir)
+        std::fs::read_dir(crate::fs::scratch_dir(dir))
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -5443,7 +5582,7 @@ mod tests {
     }
 
     fn toastbody_files(dir: &std::path::Path) -> Vec<String> {
-        std::fs::read_dir(dir)
+        std::fs::read_dir(crate::fs::scratch_dir(dir))
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())

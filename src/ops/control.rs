@@ -31,26 +31,28 @@ use crate::source_feed::open_sql_client;
 /// session to reconcile its tenant set against the new config
 #[derive(Default)]
 pub struct Reloader {
-    resolver: Mutex<Option<Arc<crate::config::ConfigResolver>>>,
+    /// One per followed database: a reload republishes each database's own
+    /// scope of the same document
+    resolvers: Mutex<Vec<Arc<crate::config::ConfigResolver>>>,
     tenants: Mutex<std::collections::BTreeMap<String, Arc<crate::config::ConfigResolver>>>,
     reconcile: std::sync::atomic::AtomicBool,
 }
 
 impl Reloader {
-    pub async fn set_resolver(&self, r: Option<Arc<crate::config::ConfigResolver>>) {
-        *self.resolver.lock().await = r.clone();
+    pub async fn set_resolvers(&self, r: Vec<Arc<crate::config::ConfigResolver>>) {
+        *self.resolvers.lock().await = r.clone();
         // Control socket serves before the session wires a resolver;
         // apply/reload in that window persist fragments but republish
-        // nothing (reload() below no-ops on None). Sweep once at wiring so
-        // file state and published config converge
-        if let Some(r) = r
-            && let Err(e) = r.reload().await
-        {
-            tracing::warn!(
-                target: "walshadow::control",
-                error = %e,
-                "config sweep at resolver wiring failed",
-            );
+        // nothing (reload() below no-ops while empty). Sweep once at wiring
+        // so file state and published config converge
+        for r in &r {
+            if let Err(e) = r.reload().await {
+                tracing::warn!(
+                    target: "walshadow::control",
+                    error = %e,
+                    "config sweep at resolver wiring failed",
+                );
+            }
         }
     }
 
@@ -78,18 +80,21 @@ impl Reloader {
     }
 
     /// Live reconfigure: re-read the merged config + republish. No restart.
-    /// A tenant whose reload fails keeps its last snapshot; the first error
-    /// is reported after every resolver had its turn
-    pub async fn reload(&self) -> anyhow::Result<()> {
+    /// Return databases the config now names that this process does not
+    /// follow: shadow registers its bridge workers at startup, so they need a
+    /// restart rather than a reload. A tenant whose reload fails keeps its
+    /// last snapshot; the first error is reported after every tenant had its
+    /// turn
+    pub async fn reload(&self) -> anyhow::Result<Vec<String>> {
         self.reconcile
             .store(true, std::sync::atomic::Ordering::Release);
-        let r = self.resolver.lock().await.clone();
-        let mut first_err = None;
-        if let Some(r) = r
-            && let Err(e) = r.reload().await
-        {
-            first_err = Some(anyhow::anyhow!("reload: {e}"));
+        let resolvers = self.resolvers.lock().await.clone();
+        for r in &resolvers {
+            r.reload()
+                .await
+                .map_err(|e| anyhow::anyhow!("reload: {e}"))?;
         }
+        let mut first_err = None;
         let tenants: Vec<_> = self
             .tenants
             .lock()
@@ -108,10 +113,15 @@ impl Reloader {
                 first_err.get_or_insert(anyhow::anyhow!("reload tenant {id}: {e}"));
             }
         }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
+        if let Some(e) = first_err {
+            return Err(e);
         }
+        let Some(first) = resolvers.first() else {
+            return Ok(Vec::new());
+        };
+        let mut unfollowed = first.configured_databases().await;
+        unfollowed.retain(|db| !resolvers.iter().any(|r| r.dbname() == db));
+        Ok(unfollowed)
     }
 }
 
@@ -167,6 +177,17 @@ impl<'a> Request<'a> {
 pub fn ok() -> String {
     "OK\n".into()
 }
+/// `OK` plus what a reload could not act on, which `ctl` prints as-is
+fn ok_note(unfollowed: &[String]) -> String {
+    if unfollowed.is_empty() {
+        return ok();
+    }
+    format!(
+        "OK config names {} this process does not follow; restart to replicate\n",
+        unfollowed.join(", "),
+    )
+}
+
 pub fn ok_with(body: &str) -> String {
     if body.is_empty() {
         ok()
@@ -239,7 +260,7 @@ async fn dispatch(buf: &[u8], ctx: &SharedCtx) -> String {
     let res: Result<String> = match req.verb {
         "apply" => apply(ctx, &req).await,
         "unset" => unset(ctx, &req).await,
-        "reload" => ctx.reloader.reload().await.map(|()| ok()),
+        "reload" => ctx.reloader.reload().await.map(|dbs| ok_note(&dbs)),
         "show" => config_show(ctx).await,
         "status" => stream_status(ctx).await,
         "tables" => tables_list(ctx, &req).await,
@@ -264,22 +285,18 @@ async fn apply(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
     }
     let frag = frag_path(&ctx.ch_config);
     let _guard = ctx.frag_lock.lock().await;
-    let prev = tokio::fs::read(&frag).await.ok();
     let mut root = load(&frag).await?;
     crate::ch_emitter::merge_tables(&mut root, req.config.clone());
-    save(&frag, &root).await?;
-    commit_or_rollback(ctx, &frag, prev).await
+    commit(ctx, &frag, &root).await
 }
 
 /// Removes named keys without touching operator-owned base config
 async fn unset(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
     let frag = frag_path(&ctx.ch_config);
     let _guard = ctx.frag_lock.lock().await;
-    let prev = tokio::fs::read(&frag).await.ok();
     let mut root = load(&frag).await?;
     apply_mask(&mut root, &req.config);
-    save(&frag, &root).await?;
-    commit_or_rollback(ctx, &frag, prev).await
+    commit(ctx, &frag, &root).await
 }
 
 fn apply_mask(root: &mut Table, mask: &Table) {
@@ -294,23 +311,24 @@ fn apply_mask(root: &mut Table, mask: &Table) {
     }
 }
 
-/// Restores last valid fragment when validation fails
-async fn commit_or_rollback(ctx: &SharedCtx, frag: &Path, prev: Option<Vec<u8>>) -> Result<String> {
-    if let Err(e) = validate(ctx).await {
-        if let Some(bytes) = prev {
-            tokio::fs::write(frag, bytes).await?;
-        } else {
-            tokio::fs::remove_file(frag).await?;
-        }
-        return Err(e).context("rejected: merged config invalid");
-    }
-    ctx.reloader.reload().await?;
-    Ok(ok())
+/// Persist `root` as fragment `frag` only once merged config accepts it, so
+/// file never holds a rejected fragment, not even briefly
+async fn commit(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<String> {
+    validate(ctx, frag, root)
+        .await
+        .context("rejected: merged config invalid")?;
+    save(frag, root).await?;
+    let unfollowed = ctx.reloader.reload().await?;
+    Ok(ok_note(&unfollowed))
 }
 
 /// Matches startup validation so accepted fragments remain restart-safe
-async fn validate(ctx: &SharedCtx) -> Result<()> {
-    let merged = get_config(ctx).await?;
+async fn validate(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<()> {
+    let mut merged = ctx.cli_base.clone();
+    crate::ch_emitter::merge_tables(
+        &mut merged,
+        crate::ch_emitter::load_merged_with(&ctx.ch_config, Some((frag, root))).await?,
+    );
     crate::ch_emitter::EmitterConfig::from_table(&merged)
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -339,12 +357,18 @@ async fn get_config(ctx: &SharedCtx) -> Result<Table> {
 
 async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
     let root = scoped(get_config(ctx).await?, req)?;
-    let client = pg_connect(&root).await?;
+    let db = req
+        .config
+        .get("database")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| dbname(&root));
+    let client = pg_connect(&root, Some(db)).await?;
     let ns = req.config.get("namespace").and_then(Value::as_str);
     let listed = introspect::tables(&client, ns)
         .await
         .context("list tables")?;
-    let selected: ahash::HashSet<(String, String)> = selected_tables(&root).into_iter().collect();
+    let selected: ahash::HashSet<(String, String)> =
+        selected_tables(&root, db).into_iter().collect();
     let arr = listed
         .into_iter()
         .map(|t| {
@@ -368,7 +392,8 @@ async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
 
 async fn schemas_list(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
     let root = scoped(get_config(ctx).await?, req)?;
-    let client = pg_connect(&root).await?;
+    let db = req.config.get("database").and_then(Value::as_str);
+    let client = pg_connect(&root, db).await?;
     let names: Vec<Value> = introspect::schemas(&client)
         .await
         .context("list schemas")?
@@ -388,7 +413,8 @@ async fn columns_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> 
         bail!("usage: columns list with [config] `namespace = \"..\"`, `relname = \"..\"`");
     };
     let root = scoped(get_config(ctx).await?, req)?;
-    let client = pg_connect(&root).await?;
+    let db = req.config.get("database").and_then(Value::as_str);
+    let client = pg_connect(&root, db).await?;
     let arr = introspect::columns(&client, &RelName::new(ns, rel))
         .await
         .context("list columns")?
@@ -406,28 +432,54 @@ async fn columns_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> 
     Ok(ok_toml(&out))
 }
 
-/// (namespace, relname) for every `[table.<ns>.<rel>]` block in `root` whose
-/// `replicate` isn't `false` (present block = in scope).
-fn selected_tables(root: &Table) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    if let Some(Value::Table(tbl)) = root.get("table") {
-        for (ns, nsv) in tbl {
-            if let Value::Table(nst) = nsv {
-                for (rel, relv) in nst {
-                    if let Value::Table(block) = relv
-                        && block.get("replicate").and_then(Value::as_bool) != Some(false)
-                    {
-                        out.push((ns.clone(), rel.clone()));
-                    }
-                }
-            }
-        }
+/// Default source database for `[table.*]` entries
+fn dbname(root: &Table) -> &str {
+    root.get("source")
+        .and_then(Value::as_table)
+        .and_then(|t| t.get("dbname"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+/// Databases the config names: `[source] dbname` plus every `[database.*]` key
+fn databases(root: &Table) -> Vec<String> {
+    let mut out = vec![dbname(root).to_string()];
+    if let Some(Value::Table(tbl)) = root.get("database") {
+        out.extend(tbl.keys().cloned());
     }
+    out.retain(|db| !db.is_empty());
+    out.sort();
+    out.dedup();
     out
 }
 
-fn namespace_str(root: &Table, namespace: &str, key: &str) -> Option<String> {
-    root.get("namespace")
+/// Tables `db` replicates, ie its entries without `replicate = false`
+fn selected_tables(root: &Table, db: &str) -> Vec<(String, String)> {
+    replicated_entries(root, db)
+        .into_iter()
+        .map(|(ns, rel, _)| (ns.to_string(), rel.to_string()))
+        .collect()
+}
+
+fn replicated_entries<'t>(root: &'t Table, db: &str) -> Vec<(&'t str, &'t str, &'t Table)> {
+    let mut out = crate::ch_emitter::table_entries_for(root, db);
+    out.retain(|(.., block)| block.get("replicate").and_then(Value::as_bool) != Some(false));
+    out
+}
+
+/// `[namespace.<ns>]` for `[source] dbname`, `[database.<db>.namespace.<ns>]`
+/// for the rest
+fn namespace_str(root: &Table, db: &str, namespace: &str, key: &str) -> Option<String> {
+    let section = if db == dbname(root) {
+        root.get("namespace")
+    } else {
+        root.get("database")
+            .and_then(Value::as_table)
+            .and_then(|t| t.get(db))
+            .and_then(Value::as_table)
+            .and_then(|t| t.get("namespace"))
+    };
+    section
         .and_then(Value::as_table)
         .and_then(|t| t.get(namespace))
         .and_then(Value::as_table)
@@ -436,35 +488,20 @@ fn namespace_str(root: &Table, namespace: &str, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn status_tables(root: &Table, source_database: &str, ch_database: &str) -> Vec<Value> {
-    selected_tables(root)
+fn status_tables(root: &Table, db: &str, ch_database: &str) -> Vec<Value> {
+    replicated_entries(root, db)
         .into_iter()
-        .map(|(ns, rel)| {
-            let block = root
-                .get("table")
-                .and_then(Value::as_table)
-                .and_then(|t| t.get(&ns))
-                .and_then(Value::as_table)
-                .and_then(|t| t.get(&rel))
-                .and_then(Value::as_table);
-            let block_str = |key: &str| {
-                block
-                    .and_then(|b| b.get(key))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            };
+        .map(|(ns, rel, block)| {
+            let block_str = |key: &str| block.get(key).and_then(Value::as_str).map(str::to_owned);
             let database = block_str("target_database")
-                .or_else(|| namespace_str(root, &ns, "target_database"))
+                .or_else(|| namespace_str(root, db, ns, "target_database"))
                 .unwrap_or_else(|| ch_database.to_owned());
-            let table = block_str("target_table").unwrap_or_else(|| rel.clone());
+            let table = block_str("target_table").unwrap_or_else(|| rel.to_owned());
             let initial_load = block_str("initial_load")
-                .or_else(|| namespace_str(root, &ns, "initial_load"))
+                .or_else(|| namespace_str(root, db, ns, "initial_load"))
                 .unwrap_or_else(|| "none".into());
             let mut entry = Table::new();
-            entry.insert(
-                "source_table".into(),
-                format!("{source_database}.{ns}.{rel}").into(),
-            );
+            entry.insert("source_table".into(), format!("{db}.{ns}.{rel}").into());
             entry.insert(
                 "destination_table".into(),
                 format!("{database}.{table}").into(),
@@ -491,20 +528,34 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
         .and_then(Value::as_str)
         .unwrap_or("localhost")
         .to_string();
-    let section_str = |section: &str, key: &str, fallback: &str| {
-        root.get(section)
-            .and_then(Value::as_table)
-            .and_then(|t| t.get(key))
-            .and_then(Value::as_str)
-            .unwrap_or(fallback)
-            .to_string()
-    };
-    let source_database = section_str("source", "dbname", "postgres");
-    let ch_database = section_str("ch", "database", "default");
-    let tables = status_tables(&root, &source_database, &ch_database);
+    let ch_database = root
+        .get("ch")
+        .and_then(Value::as_table)
+        .and_then(|t| t.get("database"))
+        .and_then(Value::as_str)
+        .unwrap_or("default")
+        .to_string();
+    // One entry per database, each holding that database's selected tables
+    let per_db: Vec<Value> = databases(&root)
+        .iter()
+        .map(|db| {
+            let mut row = Table::new();
+            row.insert("dbname".into(), db.clone().into());
+            row.insert(
+                "tables".into(),
+                Value::Array(status_tables(&root, db, &ch_database)),
+            );
+            Value::Table(row)
+        })
+        .collect();
+    // Flat list stays the primary database's, which is what a single-database
+    // deployment reports
+    let tables = status_tables(&root, dbname(&root), &ch_database);
     let snap = ctx.metrics.snapshot().await;
     let mut out = Table::new();
     out.insert("paused".into(), paused.into());
+    out.insert("dbname".into(), dbname(&root).to_string().into());
+    out.insert("databases".into(), Value::Array(per_db));
     out.insert("ch_host".into(), ch_host.into());
     out.insert("ch_database".into(), ch_database.into());
     out.insert("tables".into(), Value::Array(tables));
@@ -618,24 +669,31 @@ async fn load(path: &Path) -> Result<Table> {
 }
 
 async fn save(path: &Path, root: &Table) -> Result<()> {
-    if let Some(dir) = path.parent()
-        && !dir.as_os_str().is_empty()
-    {
-        tokio::fs::create_dir_all(dir).await.ok();
-    }
-    tokio::fs::write(path, toml::to_string(root).context("serialize toml")?)
-        .await
-        .with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        bail!("bad fragment path {}", path.display());
+    };
+    tokio::fs::create_dir_all(dir).await.ok();
+    crate::fs::write_atomic(
+        dir,
+        name,
+        toml::to_string(root).context("serialize toml")?.as_bytes(),
+    )
+    .await
+    .with_context(|| format!("write {}", path.display()))
 }
 
 // TODO: use daemon catalog rather than a second connection per request
-pub(crate) async fn pg_connect(root: &Table) -> Result<Client> {
+/// `dbname` names one of the config's databases; `None` takes `[source] dbname`
+pub(crate) async fn pg_connect(root: &Table, dbname: Option<&str>) -> Result<Client> {
     let conn = SourceConn::from_table(root).map_err(|e| anyhow::anyhow!("[source] {e}"))?;
     if conn.host.is_empty() {
         bail!("source host not set");
     }
-    open_sql_client(&conn.to_pg_config())
+    let mut cfg = conn.to_pg_config();
+    if let Some(db) = dbname {
+        cfg.database = db.to_string();
+    }
+    open_sql_client(&cfg)
         .await
         .with_context(|| format!("connect source {}", conn.endpoint()))
 }
@@ -669,6 +727,45 @@ mod tests {
         } else {
             toml.parse().unwrap()
         }
+    }
+
+    /// Scope `status` and `tables list` to one source database
+    #[test]
+    fn selected_tables_resolve_the_database_key_level() {
+        let root = cfg("[source]\ndbname = \"app\"\n\
+             [table.public.orders]\nreplicate = true\n\
+             [database.app.table.public.invoices]\nreplicate = true\n\
+             [database.app.table.public.audit]\nreplicate = false\n\
+             [database.billing.table.public.ledger]\nreplicate = true\n");
+        let mut got = selected_tables(&root, "app");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("public".to_string(), "invoices".to_string()),
+                ("public".to_string(), "orders".to_string()),
+            ]
+        );
+        assert_eq!(
+            selected_tables(&root, "billing"),
+            vec![("public".to_string(), "ledger".to_string())],
+            "prefixed entries belong to their own database"
+        );
+        assert_eq!(databases(&root), vec!["app", "billing"]);
+        // Invalid config selects no tables here
+        assert!(
+            selected_tables(&Table::new(), "app").is_empty(),
+            "no [table.*]"
+        );
+        assert!(
+            selected_tables(&cfg("table = 3\n"), "app").is_empty(),
+            "table is not a table"
+        );
+        assert!(
+            selected_tables(&cfg("[table.public]\norders = 3\n"), "app").is_empty(),
+            "entry is not a table"
+        );
+        assert!(databases(&cfg("table = 3\n")).is_empty(), "no dbname");
     }
 
     #[test]
@@ -727,6 +824,37 @@ mod tests {
         let mut r = String::new();
         s.read_to_string(&mut r).await.unwrap();
         r
+    }
+
+    /// A reload cannot add a database: shadow registers its workers at startup
+    #[tokio::test]
+    async fn reload_reports_databases_it_cannot_follow() {
+        const DOC: &str = "[ch]\nhost = \"ch\"\n[source]\ndbname = \"app\"\n\
+             [table.public.orders]\nreplicate = true\n\
+             [database.billing.table.public.ledger]\nreplicate = true\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ch-config.toml");
+        tokio::fs::write(&path, DOC).await.unwrap();
+        let doc: Table = DOC.parse().unwrap();
+        let base = crate::ch_emitter::EmitterConfig::for_database(&doc, "app").unwrap();
+        let (resolver, _rx) = crate::config::ConfigResolver::new(
+            &base,
+            crate::config::CliOverrides::default(),
+            Some(path),
+            Table::new(),
+            crate::mapping::mapping_handle(Default::default()),
+        );
+        let reloader = Reloader::default();
+        reloader.set_resolvers(vec![resolver]).await;
+        assert_eq!(
+            reloader.reload().await.unwrap(),
+            vec!["billing".to_string()],
+            "`app` is followed, `billing` needs a restart"
+        );
+        assert!(
+            ok_note(&["billing".to_string()]).starts_with("OK config names billing"),
+            "ctl prints the note on the OK line"
+        );
     }
 
     #[tokio::test]
@@ -883,17 +1011,24 @@ mod tests {
 
     // Invalid fragments must not poison later reloads or starts
     #[tokio::test]
-    async fn apply_rejects_and_rolls_back_invalid() {
+    async fn apply_rejects_invalid_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("c.sock");
         let _h = serve(sock.clone(), ctx_at(dir.path())).await.unwrap();
         let frag = dir.path().join("ch-config.d/50-api.toml");
 
         assert!(
+            call(&sock, "apply", "[ch]\nport = 70000")
+                .await
+                .starts_with("ERR")
+        );
+        assert!(!frag.exists(), "rejected first apply left a fragment");
+        assert!(
             call(&sock, "apply", "[ch]\nhost = \"ch\"\nport = 9000")
                 .await
                 .starts_with("OK")
         );
+        assert!(!frag.with_extension("toml.tmp").exists());
         assert!(
             call(&sock, "apply", "[ch]\nport = 70000")
                 .await
@@ -901,5 +1036,24 @@ mod tests {
         );
         let f = std::fs::read_to_string(&frag).unwrap();
         assert!(f.contains("port = 9000") && !f.contains("70000"), "{f}");
+    }
+
+    // Candidate validates in its lexical slot, so a later fragment still wins
+    #[tokio::test]
+    async fn apply_validates_under_later_fragments() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let _h = serve(sock.clone(), ctx_at(dir.path())).await.unwrap();
+        let confd = dir.path().join("ch-config.d");
+        std::fs::create_dir_all(&confd).unwrap();
+        std::fs::write(confd.join("60-op.toml"), "[ch]\nport = 70000\n").unwrap();
+
+        let resp = call(&sock, "apply", "[ch]\nport = 9000").await;
+        assert!(resp.starts_with("ERR"), "{resp}");
+        assert!(!confd.join("50-api.toml").exists());
+
+        std::fs::write(confd.join("60-op.toml"), "[ch]\nport = 9000\n").unwrap();
+        let resp = call(&sock, "apply", "[ch]\nport = 70000").await;
+        assert!(resp.starts_with("OK"), "{resp}");
     }
 }

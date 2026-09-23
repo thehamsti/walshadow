@@ -127,12 +127,13 @@ pub struct OwnedTail {
 impl OwnedTail {
     #[cfg(test)]
     pub(crate) fn null() -> Self {
-        let (msg_tx, ack, parts) = spawn_null(Arc::new(Monotone::new(0)));
+        let fatal = Fatal::new();
+        let (msg_tx, ack, parts) = spawn_null(Arc::new(Monotone::default()), fatal.clone());
         Self {
             msg_tx,
             ack,
             parts,
-            fatal: Fatal::new(),
+            fatal,
             context: "test",
         }
     }
@@ -150,7 +151,7 @@ impl OwnedTail {
             emitter,
             inserter_pool_size,
             stats,
-            Arc::new(Monotone::<EmitterAck>::new(0)),
+            Arc::new(Monotone::<EmitterAck>::default()),
             fatal.clone(),
             config_rx,
             oracle,
@@ -224,8 +225,9 @@ pub async fn spawn(
 /// identical to the CH tail, so reorder/decode stages run unchanged.
 pub fn spawn_null(
     emitter_ack: Arc<Monotone<EmitterAck>>,
+    fatal: Fatal,
 ) -> (mpsc::Sender<BatcherMsg>, AckHandle, TailParts) {
-    let (ack, collector) = ack::spawn(emitter_ack);
+    let (ack, collector) = ack::spawn(emitter_ack, fatal);
     let collector = AbortOnDropHandle::new(collector);
     let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(256);
     let swallow_ack = ack.clone();
@@ -282,7 +284,7 @@ pub async fn spawn_with_config(
     }
     let n = inserter_pool_size.max(1);
 
-    let (ack, collector) = ack::spawn(emitter_ack);
+    let (ack, collector) = ack::spawn(emitter_ack, fatal.clone());
     let collector = AbortOnDropHandle::new(collector);
 
     // Rows and FlushAll share one FIFO channel so a flush can't overtake rows
@@ -383,7 +385,7 @@ fn spawn_snowflake_tail(
     fatal: Fatal,
     oracle: Option<Arc<Oracle>>,
 ) -> (mpsc::Sender<BatcherMsg>, AckHandle, TailParts) {
-    let (ack, collector) = ack::spawn(emitter_ack);
+    let (ack, collector) = ack::spawn(emitter_ack, fatal.clone());
     let (msg_tx, mut rx) = mpsc::channel::<BatcherMsg>(256);
     let worker_ack = ack.clone();
     let snapshot_operations = emitter.snowflake_snapshots.clone();
@@ -777,7 +779,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_tail_closes_workers_with_live_producers() {
-        let (tx, ack, parts) = spawn_null(Arc::new(Monotone::new(0)));
+        let (tx, ack, parts) = spawn_null(Arc::new(Monotone::default()), Fatal::new());
         drop(parts);
         tokio::time::timeout(std::time::Duration::from_secs(1), tx.closed())
             .await
@@ -786,8 +788,8 @@ mod tests {
     }
     #[tokio::test]
     async fn snowflake_delivery_failure_does_not_advance_ack() {
-        let watermark = Arc::new(Monotone::<EmitterAck>::new(0));
-        let (ack, collector) = ack::spawn(watermark.clone());
+        let watermark = Arc::new(Monotone::<EmitterAck>::new(crate::pos::Pos::ZERO));
+        let (ack, collector) = ack::spawn(watermark.clone(), Fatal::new());
         ack.register(0, 100);
         ack.register(1, 200);
         ack.placed(0, 1);
@@ -822,8 +824,8 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_snowflake_batches_ack_contiguously() {
-        let watermark = Arc::new(Monotone::<EmitterAck>::new(0));
-        let (ack, collector) = ack::spawn(watermark.clone());
+        let watermark = Arc::new(Monotone::<EmitterAck>::new(crate::pos::Pos::ZERO));
+        let (ack, collector) = ack::spawn(watermark.clone(), Fatal::new());
         ack.register(0, 100);
         ack.register(1, 200);
         ack.placed(0, 1);

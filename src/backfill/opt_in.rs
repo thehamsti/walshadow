@@ -43,6 +43,12 @@ pub trait Backfiller: Send + Sync {
     );
 
     async fn note_opt_out(&self, rel: &RelName);
+
+    /// Why this backfiller cannot serve `mode`, so callers refuse the request
+    /// before creating a destination it would leave empty
+    fn refuses(&self, _mode: InitialLoadMode) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Dispatch one `config_table` row's inclusion intent. `opt_in_lsn` is the
@@ -71,7 +77,7 @@ pub async fn apply_table_opt_in(
         resolver,
         applicator,
         catalog,
-        backfiller.is_some(),
+        backfiller,
         rel,
         row,
         opt_in_lsn,
@@ -120,7 +126,7 @@ pub async fn apply_table_opt_in_deferred(
     resolver: &ConfigResolver,
     applicator: &mut DdlApplicator,
     catalog: &Arc<Mutex<ShadowCatalog>>,
-    has_backfiller: bool,
+    backfiller: Option<&Arc<dyn Backfiller>>,
     rel: &RelName,
     row: &TableRow,
     opt_in_lsn: u64,
@@ -138,13 +144,7 @@ pub async fn apply_table_opt_in_deferred(
                 Some(desc) => {
                     if shadow_serves_toast(resolver, catalog, &desc).await? {
                         opt_in_known(
-                            resolver,
-                            applicator,
-                            has_backfiller,
-                            &desc,
-                            row,
-                            opt_in_lsn,
-                            deferred,
+                            resolver, applicator, backfiller, &desc, row, opt_in_lsn, deferred,
                         )
                         .await?;
                     }
@@ -207,7 +207,7 @@ pub async fn materialize_pending_on_added(
             );
         }
         let mut none = DeferredBackfills::default();
-        opt_in_known(resolver, applicator, false, desc, &row, 0, &mut none).await?;
+        opt_in_known(resolver, applicator, None, desc, &row, 0, &mut none).await?;
     }
     Ok(())
 }
@@ -217,12 +217,24 @@ pub async fn materialize_pending_on_added(
 async fn opt_in_known(
     resolver: &ConfigResolver,
     applicator: &mut DdlApplicator,
-    has_backfiller: bool,
+    backfiller: Option<&Arc<dyn Backfiller>>,
     desc: &Arc<RelDescriptor>,
     row: &TableRow,
     opt_in_lsn: u64,
     deferred: &mut DeferredBackfills,
 ) -> Result<(), EmitterError> {
+    if let Some(mode) = row.initial_load.as_deref().and_then(|m| m.parse().ok())
+        && let Some(reason) = backfiller.and_then(|b| b.refuses(mode))
+    {
+        tracing::error!(
+            target: "walshadow::config",
+            qname = %desc.rel_name,
+            mode = mode.as_str(),
+            reason,
+            "initial_load unsupported here; table left out of scope",
+        );
+        return Ok(());
+    }
     let snowflake_mapping = applicator
         .snowflake_opt_in_mapping(
             desc,
@@ -251,7 +263,7 @@ async fn opt_in_known(
     if let Some(mode) = row.initial_load.as_deref() {
         match mode.parse() {
             Ok(InitialLoadMode::None) => {}
-            Ok(parsed) => match has_backfiller {
+            Ok(parsed) => match backfiller.is_some() {
                 true => deferred.starts.push((desc.clone(), parsed, opt_in_lsn)),
                 false => tracing::info!(
                     target: "walshadow::config",

@@ -50,7 +50,8 @@ least tenant resume floor. Tenant wiring lives in
 ![Commit pipeline: bounded DecodeJob queue fans out to M workers, rows merge through one batcher, InsertBatch queue fans out to N inserters, and separate Register, Placed and Acked events advance a contiguous watermark](workers.svg)
 
 `BufferingDecoderSink` and `ReorderSink` share one record-queue worker
-`[ch].decoder_pool_size` and `[ch].inserter_pool_size` size downstream pools
+`ReorderSink` plans each commit and places its rows onto the batcher in order
+`[ch].inserter_pool_size` sizes the inserter pool
 Each inserter owns a ClickHouse connection and can take any sealed batch
 
 Sequence numbers identify work slices, not necessarily whole transactions
@@ -66,9 +67,9 @@ and plan data can spill to disk
 | [TOAST and type conversion](values.md) | Historical large values and PostgreSQL conversion | [resolver](../src/toast/resolver.rs), [oracle](../src/ops/oracle.rs) |
 | [Shadow TOAST storage](shadow-toast.md) | PostgreSQL-backed large values and physical WAL routing | [reader](../src/toast/shadow_store.rs), [filter](../src/filter/engine.rs) |
 | [Bootstrap](bootstrap.md) | Backup visibility, concurrent WAL, and initial-load publication | [backup](../src/backfill/backfill_bootstrap.rs), [window](../src/backfill/bootstrap_window.rs) |
-| [Restart and cleanup](recovery.md) | Durable progress, retained history, and timeline crossing | [manifest](../src/source/manifest.rs), [status loop](../src/bin/stream.rs) |
+| [Restart and cleanup](recovery.md) | Durable progress, retained history, and timeline crossing | [manifest](../src/source/manifest.rs), [status loop](../src/bin/stream/session.rs) |
 
-Streaming wiring lives in [stream.rs](../src/bin/stream.rs), queue ownership
+Streaming wiring lives in [stream/](../src/bin/stream/), queue ownership
 in [queueing_record_sink.rs](../src/source/queueing_record_sink.rs), and pool
 assembly in [pipeline/mod.rs](../src/emit/pipeline/mod.rs)
 

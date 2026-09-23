@@ -43,7 +43,7 @@ use walshadow::mapping::{
 use walshadow::pg::socket_conninfo;
 use walshadow::pipeline::reorder::ReorderSink;
 use walshadow::pipeline::{PipelineConfig, PipelineHandle, TailKind};
-use walshadow::pos::{EmitterAck, Floor, Monotone};
+use walshadow::pos::{EmitterAck, Floor, Monotone, Pos};
 use walshadow::record::{
     BoundaryKind, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE,
 };
@@ -532,7 +532,7 @@ async fn bootstrap_clusters_inner(
 // Pipeline builder + pump loop. `build_pipeline` wires SourceFeed →
 // WalStream → the parallel decode+insert pipeline (`src/pipeline`:
 // reorder → decode pool → batcher → inserter pool, the same wiring
-// `bin/stream.rs` stands up behind `--ch-config`) → DirSegmentSink against
+// `bin/stream/session.rs` stands up behind `--ch-config`) → DirSegmentSink against
 // a pre-bootstrapped PG pair + CH server. `pump_segments` runs the inner
 // loop until `segments_needed` segments ship or `deadline` elapses; tests
 // then `pipeline.shutdown().await` to drain the tail before asserting CH
@@ -570,7 +570,7 @@ pub struct DdlPipelineArgs {
     /// Source-PG schema holding the `config_*` runtime-config overlay tables
     /// (TOML `[runtime_config] schema`). `Some` diverts their heap writes into
     /// `ConfigEvent`s (never CH) and enables per-table opt-in dispatch —
-    /// same wiring `bin/stream.rs` stands up when the schema is configured.
+    /// same wiring `bin/stream/session.rs` stands up when the schema is configured.
     /// Install the tables on source via `sql/runtime_config_install.sql`
     /// inside the bootstrap `schema_sql`.
     pub config_schema: Option<String>,
@@ -579,7 +579,7 @@ pub struct DdlPipelineArgs {
 // ---------------------------------------------------------------------------
 // `build_pipeline` wires the feed/catalog bootstrap and the `src/pipeline`
 // fan-out (decode pool → batcher → inserter pool, reorder coordinator) — the
-// same wiring `bin/stream.rs` stands up behind `--ch-config`.
+// same wiring `bin/stream/session.rs` stands up behind `--ch-config`.
 //
 // `TRUNCATE` rides the reorder barrier as a `HeapOp::Truncate` heap and so
 // needs no extra wiring (the applicator is always built below). Schema-
@@ -591,7 +591,7 @@ pub struct DdlPipelineArgs {
 
 /// Record-sink chain feeding the parallel pipeline: `metrics → decoder
 /// (heaps → xact buffer) → reorder (commit → dispatch to decode pool)`.
-/// Clone of `bin/stream.rs`'s `DaemonSinks` with the reorder coordinator
+/// Clone of `bin/stream/sinks.rs`'s `DaemonSinks` with the reorder coordinator
 /// as the drain half.
 pub struct PipelineSinks {
     pub metrics: MetricsRecordSink,
@@ -601,7 +601,7 @@ pub struct PipelineSinks {
     /// the boundary hold; the synchronous harness has no gate, so
     /// `wait_for_replay` stands in before capturing (nothing past the
     /// commit has been pumped yet — serial record cadence)
-    pub capture: Option<walshadow::catalog_capture::CatalogCapture>,
+    pub capture: walshadow::catalog_capture::CaptureSet,
     pub catalog: Arc<Mutex<ShadowCatalog>>,
 }
 
@@ -613,24 +613,24 @@ impl RecordSink for PipelineSinks {
         Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            if let (Some(capture), Some(members)) = (&self.capture, &record.aborted_tree) {
-                capture.forget_aborted(members);
+            if let Some(members) = &record.aborted_tree {
+                self.capture.forget_aborted(members);
             }
-            if let (Some(capture), Some(info)) = (&self.capture, &record.boundary_info) {
-                if capture.admits(info, record.next_lsn) {
+            if let Some(info) = &record.boundary_info {
+                if self.capture.admits(info, record.next_lsn) {
                     self.catalog
                         .lock()
                         .await
                         .wait_for_replay(record.next_lsn)
                         .await
                         .map_err(|e| SinkError::Other(format!("harness boundary wait: {e}")))?;
-                    capture.charge_hold(info, std::time::Duration::ZERO);
-                    capture
+                    self.capture.charge_hold(info, std::time::Duration::ZERO);
+                    self.capture
                         .capture_boundary(info, record.source_lsn, record.next_lsn)
                         .await?;
                 } else if matches!(info.kind, BoundaryKind::Commit) {
                     // Save an empty batch without waiting, as daemon does
-                    capture
+                    self.capture
                         .capture_boundary(info, record.source_lsn, record.next_lsn)
                         .await?;
                 }
@@ -727,7 +727,7 @@ async fn build_pipeline_inner(
         .with_status_interval(Duration::from_millis(500));
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned).unwrap();
+    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
     stream.set_bytes_sink(Box::new(walshadow::shadow_stream::ShadowStreamSink::new(
         shadow_stream_state,
     )));
@@ -764,7 +764,7 @@ async fn build_pipeline_inner(
             .await
             .unwrap_or_else(|e| panic!("bridge connect on {}: {e}", bridge_path.display())),
     );
-    let catalog = ShadowCatalog::connect(&shadow_conninfo, cat_cfg, bridge)
+    let catalog = ShadowCatalog::connect(&shadow_conninfo, cat_cfg, bridge.clone())
         .await
         .expect("connect shadow catalog");
     let catalog = Arc::new(Mutex::new(catalog));
@@ -796,7 +796,7 @@ async fn build_pipeline_inner(
         );
     }
 
-    // DDL wiring (mirrors bin/stream.rs --ch-config): fold namespace /
+    // DDL wiring (mirrors bin/stream/session.rs --ch-config): fold namespace /
     // drop-strategy overrides into the emitter config *before* the
     // applicator reads it. Schema events come solely from descriptor
     // capture at catalog boundaries.
@@ -807,7 +807,7 @@ async fn build_pipeline_inner(
         }
     }
 
-    // Descriptor log + capture (mirrors bin/stream.rs): seed the baseline
+    // Descriptor log + capture (mirrors bin/stream/source_db.rs): seed the baseline
     // snapshot at the boot head, capture at boundaries thereafter.
     let shadow_db_oid = catalog
         .lock()
@@ -916,22 +916,27 @@ async fn build_pipeline_inner(
         .with_resolver(config_resolver.clone())
         .with_oracle(oracle.clone());
     let stats = Arc::new(EmitterStats::default());
-    let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
+    let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());
     // Aligned boot head stands in for the daemon's resolved floor (a
     // rebuilt harness re-reads from the segment start, like a daemon
     // restart): retires queued by this run defer until a test advances
     // the floor; ledger entries below a prior run's segment are due and
     // retire in the boot flush below.
-    let resume_floor = Arc::new(Monotone::<Floor>::new(WalStream::align_down(
+    let resume_floor = Arc::new(Monotone::<Floor>::new(Pos::new(WalStream::align_down(
         ident.xlogpos,
         WAL_SEG_SIZE,
-    )));
-    let retires = walshadow::toast_retire::RetireLedger::load(&spill_dir)
+    ))));
+    let system_id: u64 = ident.sysid.parse().expect("sysid");
+    let retires = walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id)
         .await
         .expect("load toast retire ledger");
+    let pending_rows = walshadow::visibility_pending::PendingLedger::load(&spill_dir, system_id)
+        .await
+        .expect("load pending visibility ledger")
+        .shared();
     // COPY backfiller (`initial_load='copy'` opt-ins): own source SQL session +
     // CH tail per backfill, resume ledger beside the spill dir (mirrors
-    // bin/stream.rs when `[runtime_config] schema` is set).
+    // bin/stream/runtime_cfg.rs when `[runtime_config] schema` is set).
     let backfiller: Option<Arc<dyn walshadow::opt_in::Backfiller>> =
         if ddl.as_ref().is_some_and(|d| d.config_schema.is_some()) {
             Some(Arc::new(
@@ -951,33 +956,42 @@ async fn build_pipeline_inner(
                     None,
                     oracle.clone(),
                     (feed.server_version_num() / 10000) as u32,
+                    system_id,
+                    pending_rows.clone(),
                 )
-                .await,
+                .await
+                .expect("load backfill ledger"),
             ))
         } else {
             None
         };
+    let source_db = Arc::new(walshadow::source_db::SourceDb {
+        name: pgcfg.database.clone(),
+        oid: shadow_db_oid,
+        bridge: bridge.clone(),
+        catalog: catalog.clone(),
+        desc_log: desc_log.clone(),
+        emitter: Arc::new(emitter_cfg.clone()),
+        mapping,
+        resolver: Some(config_resolver.clone()),
+        config_rx: Some(config_rx.clone()),
+    });
     let pcfg = PipelineConfig {
         emitter: emitter_cfg,
         decoder_pool_size: 2,
         inserter_pool_size: 2,
-        catalog: catalog.clone(),
-        mapping,
+        dbs: Arc::new(walshadow::source_db::SourceDbs::single(source_db)),
         oracle,
-        applicator: Some(applicator),
+        applicators: [(shadow_db_oid, applicator)].into_iter().collect(),
         tail: TailKind::ClickHouse,
         buffer: xact_buffer.clone(),
         subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
-        log: desc_log.clone(),
         pending: pending_catalog.clone(),
         stats: stats.clone(),
         span_registry: None,
-        config_resolver: Some(config_resolver.clone()),
-        backfiller,
+        backfillers: backfiller.map(|b| (shadow_db_oid, b)).into_iter().collect(),
         retires,
-        pending_rows: walshadow::visibility_pending::PendingLedger::load(&spill_dir)
-            .await
-            .expect("load pending visibility ledger"),
+        pending_rows,
         resume_floor: resume_floor.clone(),
         budget: None,
     };
@@ -986,7 +1000,7 @@ async fn build_pipeline_inner(
         .await
         .expect("spawn decode+insert pipeline");
     // Prior run's drop segment is below the boot head; retire its queued
-    // mirrors now — no commit will replay the drop (mirrors bin/stream.rs)
+    // mirrors now — no commit will replay the drop (mirrors bin/stream/session.rs)
     reorder
         .flush_due_retires()
         .await
@@ -996,23 +1010,30 @@ async fn build_pipeline_inner(
         .await
         .expect("boot Added pass over descriptor log");
 
-    let mut decoder = BufferingDecoderSink::new(desc_log.clone(), xact_buffer.clone());
+    let mut decoder = BufferingDecoderSink::new(
+        walshadow::desc_log::DescriptorLogs::single(desc_log.clone()),
+        xact_buffer.clone(),
+    );
     if let Some(schema) = ddl.as_ref().and_then(|d| d.config_schema.as_deref()) {
         decoder = decoder.with_config_schema(Arc::from(schema));
     }
-    let capture = walshadow::catalog_capture::CatalogCapture::new(
-        desc_log.clone(),
-        catalog.clone(),
-        xact_buffer.clone(),
-        smgr_markers,
-        pending_catalog.clone(),
-        pending_cfg,
+    let mut capture = walshadow::catalog_capture::CaptureSet::default();
+    capture.insert(
+        shadow_db_oid,
+        walshadow::catalog_capture::CatalogCapture::new(
+            desc_log.clone(),
+            catalog.clone(),
+            xact_buffer.clone(),
+            smgr_markers,
+            pending_catalog.clone(),
+            pending_cfg,
+        ),
     );
     let sinks = PipelineSinks {
         metrics: MetricsRecordSink::default(),
         decoder,
         reorder,
-        capture: Some(capture),
+        capture,
         catalog,
     };
     let segment_sink =

@@ -110,7 +110,9 @@ fn db_scope(db: u32) -> Scope {
 /// One tenant's entry point: its hold sink (capture + queueing worker)
 pub struct RoutedTenant {
     pub id: String,
-    pub db_oid: u32,
+    /// Databases the tenant follows: one for a declared tenant, every
+    /// `[database.*]` for the single-tenant layout
+    pub db_oids: Vec<u32>,
     /// Records before this are never routed: the tenant's descriptor
     /// history starts here
     pub from_lsn: u64,
@@ -121,10 +123,10 @@ pub struct RoutedTenant {
 }
 
 impl RoutedTenant {
-    pub fn new(id: String, db_oid: u32, from_lsn: u64, sink: BoundaryHoldSink) -> Self {
+    pub fn new(id: String, db_oids: Vec<u32>, from_lsn: u64, sink: BoundaryHoldSink) -> Self {
         Self {
             id,
-            db_oid,
+            db_oids,
             from_lsn,
             sink,
             last_lsn: 0,
@@ -257,7 +259,7 @@ impl TenantRouter {
         let isolate = self.isolate;
         for t in &mut self.tenants {
             if let Scope::Db(db) = scope
-                && db != t.db_oid
+                && !t.db_oids.contains(&db)
             {
                 continue;
             }

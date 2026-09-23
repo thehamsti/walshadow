@@ -34,8 +34,8 @@ use crate::decode::heap_decoder::{self, ColumnValue};
 use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NamespaceMapping,
-    SystemColumns, TableMapping, TableTarget, apply_column_rule, derive_columns_for_mapping,
-    fold_diff_into_mapping,
+    SystemColumns, TableMapping, TableTarget, TargetOwners, apply_column_rule,
+    derive_columns_for_mapping, fold_diff_into_mapping,
 };
 use crate::ops::oracle::{Oracle, OracleCell};
 use crate::schema::{
@@ -43,6 +43,7 @@ use crate::schema::{
 };
 use crate::table_rules::{TableRule, TableRules};
 use ahash::{HashMap, HashSet, HashSetExt};
+use tokio_postgres::types::Oid;
 
 /// Knobs that don't ride the INSERT pump. [`DdlApplicator`] rebuilds them
 /// from a republished [`ResolvedConfig`] snapshot at each apply, so SIGHUP
@@ -217,6 +218,10 @@ pub struct DdlApplicator {
     /// Shadow PG renderer for tier-3 fast defaults
     oracle: Option<Arc<Oracle>>,
     ensured_databases: HashSet<String>,
+    /// This applicator's source database and the destinations every followed
+    /// database has claimed. Unset for a single database, which owns every
+    /// destination it names
+    owner: Option<(u32, Arc<TargetOwners>)>,
     pub stats: DdlStats,
 }
 
@@ -253,6 +258,7 @@ impl DdlApplicator {
             resolver: None,
             oracle: None,
             ensured_databases: HashSet::new(),
+            owner: None,
             stats: DdlStats::default(),
         })
     }
@@ -267,6 +273,34 @@ impl DdlApplicator {
     pub fn with_oracle(mut self, oracle: Option<Arc<Oracle>>) -> Self {
         self.oracle = oracle;
         self
+    }
+
+    /// Refuse destinations another followed database already writes to
+    pub fn with_target_owners(mut self, db_oid: u32, owners: Arc<TargetOwners>) -> Self {
+        self.owner = Some((db_oid, owners));
+        self
+    }
+
+    /// `false` when another database owns `target`, ie nothing may be created
+    /// or mapped there
+    async fn claims_target(&mut self, target: &TableTarget, rel: &RelName) -> bool {
+        let Some((db_oid, owners)) = &self.owner else {
+            return true;
+        };
+        let Err((owner_db, owner_rel)) = owners.claim(target, *db_oid, rel).await else {
+            return true;
+        };
+        tracing::error!(
+            target: "walshadow::ch_ddl",
+            qname = %rel,
+            db_oid = *db_oid,
+            owner_qname = %owner_rel,
+            owner_db_oid = owner_db,
+            destination = %target.sql(),
+            "another source database already writes this destination; \
+             set target_database or target_table to separate them",
+        );
+        false
     }
 
     pub fn config(&self) -> &DdlConfig {
@@ -374,22 +408,31 @@ impl DdlApplicator {
     /// Errors propagate; the worker task turns them into
     /// `DecoderSinkError` so the daemon poisons the stream cleanly.
     pub async fn apply(&mut self, event: &SchemaEvent) -> Result<(), EmitterError> {
-        self.apply_at(event, 0).await
+        self.apply_under(event, None, 0).await
     }
 
-    pub async fn apply_at(
+    /// Apply under frozen config `frozen`, the version
+    /// [`Self::predict_route_mapping`] planned with; `None` uses live config.
+    /// `commit_lsn` positions Snowflake schema changes in the WAL
+    pub async fn apply_under(
         &mut self,
         event: &SchemaEvent,
+        frozen: Option<&ResolvedConfig>,
         commit_lsn: u64,
     ) -> Result<(), EmitterError> {
         self.refresh_config().await?;
+        let cfg = self.plan_config(frozen);
         if let Some(snowflake) = self.conn_cfg.snowflake.clone() {
-            return self.apply_snowflake(event, &snowflake, commit_lsn).await;
+            return self
+                .apply_snowflake(event, &snowflake, commit_lsn, &cfg)
+                .await;
         }
         match event {
-            SchemaEvent::Added { desc } => self.apply_added(desc).await,
-            SchemaEvent::Changed { old, new, diff } => self.apply_changed(old, new, diff).await,
-            SchemaEvent::Dropped { oid: _, rel_name } => self.apply_dropped(rel_name).await,
+            SchemaEvent::Added { desc } => self.apply_added(desc, &cfg).await,
+            SchemaEvent::Changed { old, new, diff } => {
+                self.apply_changed(old, new, diff, &cfg).await
+            }
+            SchemaEvent::Dropped { oid: _, rel_name } => self.apply_dropped(rel_name, &cfg).await,
         }
     }
 
@@ -398,9 +441,10 @@ impl DdlApplicator {
         event: &SchemaEvent,
         snowflake: &crate::destination::snowflake::runtime::SnowflakeRuntime,
         commit_lsn: u64,
+        cfg: &DdlConfig,
     ) -> Result<(), EmitterError> {
         match event {
-            SchemaEvent::Added { desc } => self.apply_added(desc).await,
+            SchemaEvent::Added { desc } => self.apply_added(desc, cfg).await,
             SchemaEvent::Changed { old, new, diff } => {
                 let renamed_table = old.rel_name != new.rel_name;
                 let source_name = if renamed_table {
@@ -427,10 +471,10 @@ impl DdlApplicator {
                     }
                     mapped = TableMapping {
                         target: snowflake_target(new, snowflake),
-                        columns: snowflake_columns(new, &self.config.column_rules)?,
+                        columns: snowflake_columns(new, &cfg.column_rules)?,
                     };
                 } else {
-                    fold_diff_into_mapping(&mut mapped, new, diff, &self.config.column_rules);
+                    fold_diff_into_mapping(&mut mapped, new, diff, &cfg.column_rules);
                 }
                 validate_snowflake_route(new, &mapped, snowflake)?;
                 snowflake
@@ -452,7 +496,7 @@ impl DdlApplicator {
                             .await;
                     }
                 } else {
-                    self.fold_mapping_diff(new, diff).await;
+                    self.fold_mapping_diff(new, diff, cfg).await;
                 }
                 self.stats.alters_applied += 1;
                 Ok(())
@@ -462,7 +506,7 @@ impl DdlApplicator {
                     self.stats.skipped += 1;
                     return Ok(());
                 }
-                match self.config.drop_strategy_for(&rel_name.namespace) {
+                match cfg.drop_strategy_for(&rel_name.namespace) {
                     DropTableStrategy::Drop => {
                         snowflake
                             .apply_schema_at(event, commit_lsn)
@@ -478,7 +522,11 @@ impl DdlApplicator {
         }
     }
 
-    async fn apply_added(&mut self, desc: &RelDescriptor) -> Result<(), EmitterError> {
+    async fn apply_added(
+        &mut self,
+        desc: &RelDescriptor,
+        cfg: &DdlConfig,
+    ) -> Result<(), EmitterError> {
         // Mapped dest created from the mapping when missing; IF NOT EXISTS
         // no-ops an operator-managed table and re-creates after strategy=drop.
         if let Some(m) = self.mapping_for(&desc.rel_name).await {
@@ -491,10 +539,13 @@ impl DdlApplicator {
                 self.stats.creates_applied += 1;
                 return Ok(());
             }
+            if !self.claims_target(&m.target, &desc.rel_name).await {
+                self.stats.skipped += 1;
+                return Ok(());
+            }
             self.ensure_database(&m.target.database).await?;
-            let settings = self.config.rules.settings(&desc.rel_name);
-            let sql =
-                render_create_table_from_mapping(desc, &m, &self.config.create_shape(&settings));
+            let settings = cfg.rules.settings(&desc.rel_name);
+            let sql = render_create_table_from_mapping(desc, &m, &cfg.create_shape(&settings));
             self.execute(&sql).await?;
             self.stats.creates_applied += 1;
             // Dest that outlived an older mapping lacks columns routed since
@@ -510,16 +561,14 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(());
         }
-        if !self.config.auto_creates(&desc.rel_name) {
-            self.stats.skipped += 1;
-            return Ok(());
-        }
-        // Drives both CREATE TABLE and the row-routing mapping below so
-        // rows and DDL land in the same place
-        let settings = self.config.rules.settings(&desc.rel_name);
-        let target = self.config.create_target(&settings, &desc.rel_name);
         if let Some(snowflake) = &self.conn_cfg.snowflake {
-            let columns = snowflake_columns(desc, &self.config.column_rules)?;
+            if !cfg.auto_creates(&desc.rel_name) {
+                self.stats.skipped += 1;
+                return Ok(());
+            }
+            let settings = cfg.rules.settings(&desc.rel_name);
+            let target = cfg.create_target(&settings, &desc.rel_name);
+            let columns = snowflake_columns(desc, &cfg.column_rules)?;
             let expected = snowflake_target(desc, snowflake);
             if (settings.target_database.is_some() || settings.target_table.is_some())
                 && target != expected
@@ -539,19 +588,17 @@ impl DdlApplicator {
                 .await;
             return Ok(());
         }
-        let shape = self.config.create_shape(&settings);
-        let Some(sql) = render_create_table(desc, &target, &shape, &self.config.column_rules)?
-        else {
+        let Some((sql, mapping)) = derive_added(cfg, desc)? else {
             self.stats.skipped += 1;
             return Ok(());
         };
-        self.ensure_database(&target.database).await?;
+        if !self.claims_target(&mapping.target, &desc.rel_name).await {
+            self.stats.skipped += 1;
+            return Ok(());
+        }
+        self.ensure_database(&mapping.target.database).await?;
         self.execute(&sql).await?;
         self.stats.creates_applied += 1;
-        // Auto-derive a TableMapping so the emitter ships rows against
-        // the new CH table without TOML edits
-        let columns = derive_columns_for_mapping(desc, &self.config.column_rules);
-        let mapping = TableMapping { target, columns };
         self.register_mapping(&desc.rel_name, mapping).await;
         Ok(())
     }
@@ -590,6 +637,10 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(false);
         };
+        if !self.claims_target(&target, &desc.rel_name).await {
+            self.stats.skipped += 1;
+            return Ok(false);
+        }
         self.ensure_database(&target.database).await?;
         self.execute(&sql).await?;
         self.stats.creates_applied += 1;
@@ -601,6 +652,7 @@ impl DdlApplicator {
         _old: &RelDescriptor,
         new: &RelDescriptor,
         diff: &SchemaDiff,
+        cfg: &DdlConfig,
     ) -> Result<(), EmitterError> {
         let key = new.rel_name.clone();
         let Some((mapped_at, target)) = self.mapping_target(&key).await else {
@@ -637,7 +689,7 @@ impl DdlApplicator {
         let oracle = self.oracle.clone();
         for att in &diff.added_columns {
             let pk_member = replident_key_attnums(new).contains(&att.attnum);
-            let att = resolve_disk_default(oracle.as_deref(), att).await;
+            let att = resolve_disk_default(oracle.as_deref(), new.rfn.db_node, att).await;
             let Ok(resolved) = type_bridge::map(&att, pk_member) else {
                 // Unbridged type; operator TOML override is the recovery path
                 self.stats.skipped += 1;
@@ -646,7 +698,7 @@ impl DdlApplicator {
             let (name, resolved) = apply_column_rule(
                 &att.name,
                 resolved,
-                self.config.column_rules.settings(&new.rel_name, &att.name),
+                cfg.column_rules.settings(&new.rel_name, &att.name),
             );
             let sql = render_add_column(&target, &name, &resolved);
             self.execute(&sql).await?;
@@ -687,16 +739,16 @@ impl DdlApplicator {
         // rows against the new shape without TOML edits; operator-pinned
         // `target_name` overrides survive (only touch entries the
         // applicator could have produced, by src_attnum match)
-        self.fold_mapping_diff(new, diff).await;
+        self.fold_mapping_diff(new, diff, cfg).await;
         Ok(())
     }
 
-    async fn apply_dropped(&mut self, rel: &RelName) -> Result<(), EmitterError> {
+    async fn apply_dropped(&mut self, rel: &RelName, cfg: &DdlConfig) -> Result<(), EmitterError> {
         let Some((_, target)) = self.mapping_target(rel).await else {
             self.stats.skipped += 1;
             return Ok(());
         };
-        match self.config.drop_strategy_for(&rel.namespace) {
+        match cfg.drop_strategy_for(&rel.namespace) {
             DropTableStrategy::Retain => {
                 self.stats.skipped += 1;
                 tracing::info!(
@@ -820,7 +872,15 @@ impl DdlApplicator {
         if let Some(snowflake) = &self.conn_cfg.snowflake {
             return predict_snowflake_route_effect(&cfg, mapping, event, excluded, snowflake);
         }
-        predict_route_effect(&cfg, mapping, event, excluded)
+        let effect = predict_route_effect(&cfg, mapping, event, excluded)?;
+        // Trailing rows of the applying commit route through this prediction,
+        // so it may not name a destination another database owns
+        if let Some((rel, Some(m))) = &effect
+            && !self.claims_target(&m.target, rel).await
+        {
+            return Ok(None);
+        }
+        Ok(effect)
     }
 
     /// A source table rename changes two route keys in one WAL interval.
@@ -880,15 +940,18 @@ impl DdlApplicator {
             .unwrap_or_else(|| self.config.clone())
     }
 
-    async fn fold_mapping_diff(&mut self, new: &RelDescriptor, diff: &SchemaDiff) {
+    async fn fold_mapping_diff(&mut self, new: &RelDescriptor, diff: &SchemaDiff, cfg: &DdlConfig) {
         if let Some(r) = &self.resolver {
             r.apply_schema_diff(new, diff).await;
         } else {
-            mutate_mapping_for_diff(&self.mapping, new, diff, &self.config.column_rules).await;
+            mutate_mapping_for_diff(&self.mapping, new, diff, &cfg.column_rules).await;
         }
     }
 
     async fn forget_mapping(&mut self, rel: &RelName) {
+        if let Some((db_oid, owners)) = &self.owner {
+            owners.release(*db_oid, rel).await;
+        }
         if let Some(r) = &self.resolver {
             r.forget_derived_mapping(rel).await;
         } else {
@@ -1077,28 +1140,10 @@ fn predict_route_effect(
 ) -> Result<Option<(RelName, Option<TableMapping>)>, EmitterError> {
     match event {
         SchemaEvent::Added { desc } => {
-            // `replicate_all` is not predicted: it maps on first sight, which
-            // the executor's own apply covers
-            if mapping.contains_key(&desc.rel_name)
-                || excluded
-                || !(cfg
-                    .auto_create_namespaces
-                    .contains(&*desc.rel_name.namespace)
-                    || cfg.declared_scope(&desc.rel_name) == Some(true))
-            {
+            if mapping.contains_key(&desc.rel_name) || excluded {
                 return Ok(None);
             }
-            let settings = cfg.rules.settings(&desc.rel_name);
-            let target = cfg.create_target(&settings, &desc.rel_name);
-            let shape = cfg.create_shape(&settings);
-            if render_create_table(desc, &target, &shape, &cfg.column_rules)?.is_none() {
-                return Ok(None);
-            }
-            let columns = derive_columns_for_mapping(desc, &cfg.column_rules);
-            Ok(Some((
-                desc.rel_name.clone(),
-                Some(TableMapping { target, columns }),
-            )))
+            Ok(derive_added(cfg, desc)?.map(|(_, m)| (desc.rel_name.clone(), Some(m))))
         }
         SchemaEvent::Changed { new, diff, .. } => {
             let Some(mut m) = mapping.get(&new.rel_name).cloned() else {
@@ -1119,6 +1164,26 @@ fn predict_route_effect(
             Ok(Some((rel_name.clone(), None)))
         }
     }
+}
+
+/// `CREATE TABLE` plus row-routing mapping `Added` derives for an unmapped,
+/// unexcluded rel, so rows and DDL land in same place. `None` when out of
+/// scope or without a bridgeable shape
+fn derive_added(
+    cfg: &DdlConfig,
+    desc: &RelDescriptor,
+) -> Result<Option<(String, TableMapping)>, EmitterError> {
+    if !cfg.auto_creates(&desc.rel_name) {
+        return Ok(None);
+    }
+    let settings = cfg.rules.settings(&desc.rel_name);
+    let target = cfg.create_target(&settings, &desc.rel_name);
+    let shape = cfg.create_shape(&settings);
+    let Some(sql) = render_create_table(desc, &target, &shape, &cfg.column_rules)? else {
+        return Ok(None);
+    };
+    let columns = derive_columns_for_mapping(desc, &cfg.column_rules);
+    Ok(Some((sql, TableMapping { target, columns })))
 }
 
 /// Reject ALTER continuation after concurrent route republish
@@ -1196,7 +1261,11 @@ fn mapped_col_def(c: &ColumnMapping) -> String {
 
 /// Pinned worker sends raw defaults to avoid `pg_type` locks during replay
 /// Resolve through shadow PG so rows predating `ADD COLUMN` read PG's fast default
-async fn resolve_disk_default<'a>(oracle: Option<&Oracle>, att: &'a RelAttr) -> Cow<'a, RelAttr> {
+async fn resolve_disk_default<'a>(
+    oracle: Option<&Oracle>,
+    db: Oid,
+    att: &'a RelAttr,
+) -> Cow<'a, RelAttr> {
     let ColumnValue::PgPending { raw, .. } = heap_decoder::missing_value_for(att) else {
         return Cow::Borrowed(att);
     };
@@ -1204,7 +1273,7 @@ async fn resolve_disk_default<'a>(oracle: Option<&Oracle>, att: &'a RelAttr) -> 
         return Cow::Borrowed(att);
     };
     match oracle
-        .text_value(att.type_oid, att.typmod, OracleCell::DiskRaw(raw))
+        .text_value(db, att.type_oid, att.typmod, OracleCell::DiskRaw(raw))
         .await
     {
         Ok(text) => {
@@ -2445,6 +2514,49 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "live handle moved on"
+        );
+    }
+
+    /// Plan-time prediction shares apply's scope: `replicate_all` alone maps
+    /// a fresh user table, so its same-xact rows route
+    #[test]
+    fn prediction_maps_added_under_replicate_all() {
+        let mut cfg = DdlConfig {
+            drop_table_strategy: DropTableStrategy::Retain,
+            auto_create_namespaces: HashSet::new(),
+            replicate_all: true,
+            runtime_config_schema: None,
+            target_database: "default".into(),
+            namespaces: ahash::HashMap::default(),
+            soft_delete: false,
+            system: Arc::default(),
+            rules: Arc::default(),
+            column_rules: Arc::default(),
+        };
+        let added = SchemaEvent::Added {
+            desc: Arc::new(desc(
+                "fresh",
+                vec![att(1, "id", INT4OID, true, None)],
+                Some(vec![1]),
+            )),
+        };
+        let empty = MappingSnapshot::default();
+        let predicted = predict_route_effect(&cfg, &empty, &added, false).unwrap();
+        assert!(
+            matches!(&predicted, Some((r, Some(m))) if &*r.name == "fresh" && m.target.table == "fresh"),
+            "{predicted:?}"
+        );
+        assert!(
+            predict_route_effect(&cfg, &empty, &added, true)
+                .unwrap()
+                .is_none(),
+            "operator opt-out wins"
+        );
+        cfg.replicate_all = false;
+        assert!(
+            predict_route_effect(&cfg, &empty, &added, false)
+                .unwrap()
+                .is_none()
         );
     }
 

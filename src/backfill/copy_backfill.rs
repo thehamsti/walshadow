@@ -22,7 +22,14 @@
 //! Rows ship through the same insert tail as greenfield bootstrap
 //! ([`crate::emit::pipeline::tail`] + [`crate::emit::pipeline::bootstrap::drain`]), on a
 //! dedicated CH connection, so a backfill never blocks the live pipeline.
-//! COPY output is fully detoasted, so the disabled TOAST resolver suffices.
+//! COPY output is fully detoasted, so its rows need no TOAST resolver. Live
+//! updates past `S` can still carry a pre-load value's pointer unchanged, so
+//! in `clickhouse` value mode the load first copies the TOAST heap into the
+//! chunk mirror, before live apply passes `S` (see [`copy_toast_into`]).
+//!
+//! The COPY session pins the text output settings the shadow bridge worker
+//! pins (`pgext/worker.c`): values cast to `text` must render as the WAL
+//! path renders them, whatever role or database defaults say.
 //!
 //! ## Field decode
 //!
@@ -38,16 +45,18 @@
 //!
 //! ## Resume ledger
 //!
-//! `{spill_dir}/backfills.toml` persists per-qname `{s_lsn, done, mode}`. The
+//! `{spill_dir}/backfills.toml` persists per-qname `{s_lsn, done, mode}`,
+//! stamped with the source system identifier. The
 //! opt-in's WAL event is not re-delivered after the ack passes `S`, so the
 //! ledger is what carries an unfinished backfill across a restart: boot
 //! re-seeds opt-ins from `config_table` and re-runs the *recorded* mode for
 //! pending entries at their original `S` (dedup makes the re-run idempotent).
 //! A `done` entry stops every later boot from re-running (the daemon never
-//! writes `initial_load` back to source). Corrupt/absent ledger degrades to
-//! re-COPY, never to data loss. Completion is observability: convergence is
-//! reported once WAL apply passes `P_hi = pg_current_wal_lsn()` read at COPY
-//! EOF; nothing is gated on it.
+//! writes `initial_load` back to source). An absent ledger is empty; an
+//! unreadable or foreign one stops boot, since its entries name staging
+//! tables and swap phases nothing else records. Completion is observability:
+//! convergence is reported once WAL apply passes `P_hi = pg_current_wal_lsn()`
+//! read at COPY EOF; nothing is gated on it.
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -70,6 +79,7 @@ use crate::backfill::backfill_types::{BackupRequest, PassContext, PassOutcome};
 use crate::backfill::backup_checkpoint::BackupCheckpoint;
 use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap};
 use crate::backfill::opt_in::Backfiller;
+use crate::backfill::visibility_pending::{self, SharedPendingLedger};
 use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::config::ResolvedConfig;
 use crate::decode::codecs::NumericKind;
@@ -77,7 +87,7 @@ use crate::decode::heap_decoder::ColumnValue;
 use crate::destination::snowflake::runtime::SnowflakeRuntime;
 use crate::destination::snowflake::state::GenerationPhase;
 use crate::destination::snowflake::types::{SnowflakeRow, TableSchema};
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
+use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, ToastMode};
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
 use crate::emit::route::RouteSnapshot;
@@ -92,7 +102,7 @@ use crate::schema::{
     TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, UUIDOID, VARCHAROID,
 };
 use crate::source::source_feed::open_sql_client;
-use crate::toast::ToastResolver;
+use crate::toast::{ToastResolver, ToastRow};
 
 /// Rows per COPY-backfill channel hop. Byte trigger below bounds the wide-row
 /// case, so this only caps the narrow-row hop rate
@@ -107,6 +117,18 @@ const LEDGER_FILENAME: &str = "backfills.toml";
 const DEFAULT_COPY_CONCURRENCY: usize = 8;
 const LEDGER_VERSION: u32 = 1;
 
+/// Output settings `pgext/worker.c` pins for typoutput, plus row security:
+/// a filtered COPY would silently miss rows
+const COPY_SESSION_SETUP: &str = "SET row_security = off; SET TimeZone = 'UTC'; \
+     SET DateStyle = 'ISO,MDY'; SET IntervalStyle = 'postgres'; \
+     SET extra_float_digits = 1; SET bytea_output = 'hex'";
+
+/// Status of 32-bit xids at source, widened against the current epoch.
+/// NULL when source `pg_xact` no longer holds the xid
+const XID_STATUS_SQL: &str = "SELECT x, pg_xact_status((n - ((n - x) & 4294967295))::text::xid8) \
+     FROM unnest($1::int8[]) AS x, \
+     (SELECT pg_snapshot_xmax(pg_current_snapshot())::text::int8 AS n) AS cur";
+
 /// Backup-mode opt-ins wait this long for siblings before the pass fires, so
 /// an opt-in burst (several rows in one xact, or a boot seed) coalesces into
 /// one cluster-sized backup pass instead of one per table.
@@ -120,15 +142,18 @@ const BACKUP_COALESCE_WINDOW: Duration = Duration::from_millis(1000);
 /// finished initial loads. Returns how many new ledger entries were written.
 pub async fn record_bootstrap_loaded(
     spill_dir: &Path,
+    system_id: u64,
     rels: impl IntoIterator<Item = RelName>,
     s_lsn: u64,
 ) -> std::io::Result<usize> {
-    Ledger::record_bootstrap_loaded(spill_dir, rels, s_lsn).await
+    Ledger::record_bootstrap_loaded(spill_dir, system_id, rels, s_lsn).await
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LedgerFile {
     version: u32,
+    #[serde(default)]
+    system_id: Option<u64>,
     #[serde(default)]
     backfill: Vec<LedgerEntry>,
 }
@@ -159,6 +184,9 @@ struct LedgerEntry {
     copy_relfilenode: Option<u32>,
     #[serde(default)]
     copy_next_block: Option<u32>,
+    /// COPY load copied the TOAST heap into the chunk mirror
+    #[serde(default)]
+    toast_seeded: bool,
 }
 
 fn default_ledger_mode() -> String {
@@ -175,6 +203,7 @@ struct LedgerRec {
     swapped: bool,
     staging_uuid: Option<String>,
     copy: Option<CopyCursor>,
+    toast_seeded: bool,
 }
 
 /// Where a chunked COPY stopped. Every chunk below `next_block` proved its
@@ -188,71 +217,77 @@ struct CopyCursor {
 
 struct Ledger {
     dir: PathBuf,
+    system_id: u64,
     entries: HashMap<RelName, LedgerRec>,
 }
 
 impl Ledger {
-    async fn load(spill_dir: &Path) -> Self {
+    /// Absent file is an empty ledger. An unreadable one is an error: its
+    /// entries name staging tables and swap phases nothing else records
+    async fn load(spill_dir: &Path, system_id: u64) -> std::io::Result<Self> {
         let mut ledger = Self {
             dir: spill_dir.to_path_buf(),
+            system_id,
             entries: HashMap::new(),
         };
         let path = spill_dir.join(LEDGER_FILENAME);
-        if let Ok(text) = tokio::fs::read_to_string(&path).await {
-            match toml::from_str::<LedgerFile>(&text) {
-                Ok(file) if file.version == LEDGER_VERSION => {
-                    ledger.entries = file
-                        .backfill
-                        .into_iter()
-                        .map(|e| {
-                            // Only this daemon writes modes; an unparseable one
-                            // degrades to re-COPY like a corrupt ledger would
-                            let mode = e.mode.parse().unwrap_or(InitialLoadMode::Copy);
-                            (
-                                RelName::new(&e.namespace, &e.relname),
-                                LedgerRec {
-                                    s_lsn: e.s_lsn,
-                                    done: e.done,
-                                    mode,
-                                    swapped: e.swapped,
-                                    staging_uuid: e.staging_uuid,
-                                    copy: e.copy_relfilenode.zip(e.copy_next_block).map(
-                                        |(relfilenode, next_block)| CopyCursor {
-                                            relfilenode,
-                                            next_block,
-                                        },
-                                    ),
-                                },
-                            )
-                        })
-                        .collect();
-                }
-                // Degrades to re-COPY (idempotent), never to data loss
-                Ok(file) => {
-                    tracing::warn!(
-                        target: "walshadow::backfill",
-                        path = %path.display(),
-                        version = file.version,
-                        "backfill ledger version unsupported; treating as empty",
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "walshadow::backfill",
-                        path = %path.display(),
-                        error = %e,
-                        "backfill ledger unreadable; treating as empty",
-                    );
-                }
-            }
+        let invalid = |detail: String| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "backfill ledger {}: {detail}; restore it, removing it re-runs every \
+                     load and can orphan `__wsstg` staging tables",
+                    path.display()
+                ),
+            )
+        };
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ledger),
+            Err(e) => return Err(invalid(e.to_string())),
+        };
+        let file = toml::from_str::<LedgerFile>(&text).map_err(|e| invalid(e.to_string()))?;
+        if file.version != LEDGER_VERSION {
+            return Err(invalid(format!("unsupported version {}", file.version)));
         }
-        ledger
+        let unstamped = crate::fs::check_source(&path, file.system_id, system_id)?;
+        ledger.entries = file
+            .backfill
+            .into_iter()
+            .map(|e| {
+                // Only this daemon writes modes; an unparseable one
+                // degrades to re-COPY (idempotent)
+                let mode = e.mode.parse().unwrap_or(InitialLoadMode::Copy);
+                (
+                    RelName::new(&e.namespace, &e.relname),
+                    LedgerRec {
+                        s_lsn: e.s_lsn,
+                        done: e.done,
+                        mode,
+                        swapped: e.swapped,
+                        staging_uuid: e.staging_uuid,
+                        copy: e.copy_relfilenode.zip(e.copy_next_block).map(
+                            |(relfilenode, next_block)| CopyCursor {
+                                relfilenode,
+                                next_block,
+                            },
+                        ),
+                        toast_seeded: e.toast_seeded,
+                    },
+                )
+            })
+            .collect();
+        if unstamped {
+            ledger.persist().await?;
+        }
+        Ok(ledger)
     }
 
     /// Crash-safe persist via [`crate::fs::write_atomic`].
     async fn persist(&self) -> std::io::Result<()> {
         let file = LedgerFile {
             version: LEDGER_VERSION,
+            system_id: Some(self.system_id),
             backfill: self
                 .entries
                 .iter()
@@ -266,6 +301,7 @@ impl Ledger {
                     staging_uuid: rec.staging_uuid.clone(),
                     copy_relfilenode: rec.copy.map(|c| c.relfilenode),
                     copy_next_block: rec.copy.map(|c| c.next_block),
+                    toast_seeded: rec.toast_seeded,
                 })
                 .collect(),
         };
@@ -278,21 +314,23 @@ impl Ledger {
     /// existing entry is newer intent and stays untouched.
     pub(crate) async fn record_bootstrap_loaded(
         spill_dir: &Path,
+        system_id: u64,
         rels: impl IntoIterator<Item = RelName>,
         s_lsn: u64,
     ) -> std::io::Result<usize> {
-        let mut ledger = Self::load(spill_dir).await;
+        let mut ledger = Self::load(spill_dir, system_id).await?;
         let mut added = 0;
         for rel in rels {
             ledger.entries.entry(rel).or_insert_with(|| {
                 added += 1;
                 LedgerRec {
-                    s_lsn: s_lsn.into(),
+                    s_lsn: Pos::new(s_lsn),
                     done: true,
                     mode: InitialLoadMode::BaseBackup,
                     swapped: false,
                     staging_uuid: None,
                     copy: None,
+                    toast_seeded: false,
                 }
             });
         }
@@ -553,6 +591,87 @@ pub async fn copy_rows_into(
     Ok(rows)
 }
 
+/// Copy `desc`'s TOAST heap into the chunk mirror, rows keyed by TID and
+/// versioned `lsn`; returns chunks copied, 0 without a TOAST heap
+///
+/// With `lsn = S`, run after `S` and before live apply resolves anything
+/// past it, the mirror holds every value live at the scan, so each pointer a
+/// later update carries unchanged. WAL writes to a TID after `S` outrank
+/// these rows, so chunks written or removed after the scan stay current
+pub async fn copy_toast_into(
+    client: &tokio_postgres::Client,
+    resolver: &ToastResolver,
+    desc: &RelDescriptor,
+    lsn: u64,
+) -> anyhow::Result<u64> {
+    let Some(row) = client
+        .query_opt(
+            "SELECT t.oid, n.nspname::text, t.relname::text FROM pg_class c \
+             JOIN pg_class t ON t.oid = c.reltoastrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace WHERE c.oid = $1",
+            &[&desc.oid],
+        )
+        .await
+        .context("backfill: resolve TOAST heap")?
+    else {
+        return Ok(0);
+    };
+    let toast_relid: u32 = row.get(0);
+    let (nsp, rel): (String, String) = (row.get(1), row.get(2));
+    let sql = format!(
+        "COPY (SELECT ctid, chunk_id, chunk_seq, chunk_data FROM {}.{}) TO STDOUT (FORMAT binary)",
+        quote_ident(&nsp),
+        quote_ident(&rel),
+    );
+    let copy = client.copy_out(&sql).await.map_err(|e| {
+        if e.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) {
+            anyhow::anyhow!(
+                "backfill: source role cannot read {nsp}.{rel} of {}: seeding the chunk mirror \
+                 needs USAGE on schema pg_toast and SELECT on its TOAST heaps; grant \
+                 pg_read_all_data to the source role: {e}",
+                desc.rel_name,
+            )
+        } else {
+            anyhow::Error::new(e).context("backfill: TOAST COPY out")
+        }
+    })?;
+    let stream = BinaryCopyOutStream::new(copy, &[Type::BYTEA; 4]);
+    futures::pin_mut!(stream);
+    let mut chunks = 0u64;
+    let mut batch: Vec<ToastRow> = Vec::new();
+    let mut batch_bytes = 0usize;
+    while let Some(row) = stream.next().await {
+        let row = row.context("backfill: TOAST COPY stream")?;
+        let field = |i: usize| -> anyhow::Result<&[u8]> {
+            row.try_get::<Option<&[u8]>>(i)
+                .context("backfill: TOAST COPY field")?
+                .context("backfill: NULL TOAST column")
+        };
+        let tid = fixed::<6>(field(0)?, "ctid").map_err(anyhow::Error::msg)?;
+        let chunk_data = bytes::Bytes::copy_from_slice(field(3)?);
+        batch_bytes += chunk_data.len();
+        batch.push(ToastRow {
+            toast_relid,
+            blkno: u32::from_be_bytes(tid[..4].try_into().expect("4 bytes")),
+            offnum: u16::from_be_bytes(tid[4..].try_into().expect("2 bytes")),
+            chunk_id: u32::from_be_bytes(fixed(field(1)?, "chunk_id").map_err(anyhow::Error::msg)?),
+            chunk_seq: u32::from_be_bytes(
+                fixed(field(2)?, "chunk_seq").map_err(anyhow::Error::msg)?,
+            ),
+            chunk_data,
+            lsn,
+        });
+        chunks += 1;
+        if resolver.put_limit_reached(batch.len(), batch_bytes) {
+            resolver.put(&batch).await?;
+            batch.clear();
+            batch_bytes = 0;
+        }
+    }
+    resolver.put(&batch).await?;
+    Ok(chunks)
+}
+
 fn fixed<const N: usize>(raw: &[u8], what: &str) -> Result<[u8; N], String> {
     raw.try_into()
         .map_err(|_| format!("{what}: expected {N} bytes, got {}", raw.len()))
@@ -653,6 +772,9 @@ pub struct CopyBackfiller {
     oracle: Option<Arc<Oracle>>,
     /// Source PG major: picks the backup's pg_multixact offsets width
     source_major: u32,
+    /// A cluster backup walks the pages of the database `[source] dbname`
+    /// names, so only that database can load from one
+    backup_loads: bool,
     /// Fixed scratch paths require one cluster backup pass at a time
     backup_pass_lock: Mutex<()>,
     inner: Mutex<Inner>,
@@ -663,6 +785,9 @@ pub struct CopyBackfiller {
     coalesce_window: Duration,
     /// COPY initial loads in flight, bounded by `[bootstrap] copy_concurrency`
     copy_slots: tokio::sync::Semaphore,
+    /// Pending visibility ledger live apply folds commits into; backup passes
+    /// add their tables to this same instance
+    pending_rows: SharedPendingLedger,
 }
 
 impl CopyBackfiller {
@@ -680,8 +805,10 @@ impl CopyBackfiller {
         budget: Option<crate::budget::MemoryBudget>,
         oracle: Option<Arc<Oracle>>,
         source_major: u32,
-    ) -> Self {
-        let ledger = Ledger::load(spill_dir).await;
+        system_id: u64,
+        pending_rows: SharedPendingLedger,
+    ) -> std::io::Result<Self> {
+        let ledger = Ledger::load(spill_dir, system_id).await?;
         let emitter_copy_concurrency = emitter.bootstrap.copy_concurrency.map(|n| n.get());
         let emitter = Arc::new(emitter);
         let pending = AtomicU64::new(ledger.pending_count());
@@ -690,7 +817,7 @@ impl CopyBackfiller {
             AtomicU64::new(ledger.pending_count_for(InitialLoadMode::BaseBackup)),
             AtomicU64::new(ledger.pending_count_for(InitialLoadMode::ObjectStore)),
         ];
-        Self {
+        Ok(Self {
             pg,
             dest: std::sync::Mutex::new(emitter.clone()),
             emitter,
@@ -704,6 +831,7 @@ impl CopyBackfiller {
             budget,
             oracle,
             source_major,
+            backup_loads: true,
             backup_pass_lock: Mutex::new(()),
             inner: Mutex::new(Inner {
                 ledger,
@@ -716,7 +844,8 @@ impl CopyBackfiller {
             copy_slots: tokio::sync::Semaphore::new(
                 emitter_copy_concurrency.unwrap_or(DEFAULT_COPY_CONCURRENCY),
             ),
-        }
+            pending_rows,
+        })
     }
 
     /// Ledger entries awaiting backfill completion.
@@ -807,12 +936,13 @@ impl CopyBackfiller {
                     inner.ledger.entries.insert(
                         rel.clone(),
                         LedgerRec {
-                            s_lsn: opt_in_lsn.into(),
+                            s_lsn: Pos::new(opt_in_lsn),
                             done: false,
                             mode,
                             swapped: false,
                             staging_uuid: None,
                             copy: None,
+                            toast_seeded: false,
                         },
                     );
                     if let Err(e) = inner.ledger.persist().await {
@@ -823,7 +953,7 @@ impl CopyBackfiller {
                             "backfill ledger persist failed; a crash before completion re-streams without backfill",
                         );
                     }
-                    (opt_in_lsn.into(), mode)
+                    (Pos::new(opt_in_lsn), mode)
                 }
             };
             if !inner.active.insert(rel.clone()) {
@@ -864,6 +994,19 @@ impl CopyBackfiller {
         match mode {
             InitialLoadMode::None => {}
             InitialLoadMode::Copy => {
+                // Caller releases live apply past `S` once this returns
+                if let Err(e) = self.seed_toast(desc, s_lsn).await {
+                    tracing::error!(
+                        target: "walshadow::backfill",
+                        qname = %rel,
+                        error = %format!("{e:#}"),
+                        "backfill failed; entry stays pending (re-COPY on next boot)",
+                    );
+                    let mut inner = self.inner.lock().await;
+                    inner.active.remove(&rel);
+                    self.refresh_gauges(&inner.ledger);
+                    return;
+                }
                 let this = self.clone();
                 let desc = desc.clone();
                 tokio::spawn(async move { this.run(desc, s_lsn).await });
@@ -875,6 +1018,12 @@ impl CopyBackfiller {
                 }
             }
         }
+    }
+
+    /// A cluster backup covers one database, so every other one loads by COPY
+    pub fn with_backup_loads(mut self, allowed: bool) -> Self {
+        self.backup_loads = allowed;
+        self
     }
 
     /// Opt-out / row removal: drop the ledger entry so a later re-insert
@@ -953,7 +1102,9 @@ impl CopyBackfiller {
                 if self.emitter.bootstrap.copy_fallback.unwrap_or(true) {
                     for req in &reqs {
                         if self.prepare_copy_fallback(mode, req).await {
-                            self.clone().run(req.desc.clone(), req.s_lsn.into()).await;
+                            self.clone()
+                                .run(req.desc.clone(), Pos::new(req.s_lsn))
+                                .await;
                         }
                     }
                 }
@@ -1129,10 +1280,9 @@ impl CopyBackfiller {
         // Pending visibility rows are durable before publication. Their xid
         // manifest must be durable too, so a crash after a view swap cannot
         // leave undecided rows with no settlement path.
-        let mut ledger = crate::backfill::visibility_pending::PendingLedger::load(&self.spill_dir)
+        self.pending_rows
+            .lock()
             .await
-            .context("Snowflake pending visibility ledger load")?;
-        ledger
             .reconcile_snowflake(&runtime)
             .await
             .map_err(anyhow::Error::msg)
@@ -1157,46 +1307,92 @@ impl CopyBackfiller {
             );
         }
         crate::backfill::backfill_bootstrap::publish_snapshot_rels(&runtime, &plan.rels).await?;
+        let mut ledger = self.pending_rows.lock().await;
         if !ledger.is_empty() {
             let mut session = StagingSession::connect(dest).await?;
             crate::backfill::visibility_pending::settle(&mut ledger, &mut session, &self.stats)
                 .await
                 .map_err(anyhow::Error::msg)?;
         }
+        drop(ledger);
         for rel in &plan.rels {
             self.mark_done_entry(&rel.desc.rel_name).await;
         }
         Ok(outcome)
     }
 
-    /// Record after publication so EXCHANGE cannot discard promoted rows
+    /// Record after publication so EXCHANGE cannot discard promoted rows.
+    /// Persist retries rather than failing: the backfill entry is already
+    /// done, so this ledger alone names the pending tables, and every live
+    /// settle persists the shared instance too
     async fn record_pending(&self, outcome: &PassOutcome) {
         if outcome.pending_tables.is_empty() {
             return;
         }
-        let Ok(mut ledger) =
-            crate::backfill::visibility_pending::PendingLedger::load(&self.spill_dir)
-                .await
-                .inspect_err(|e| {
-                    tracing::error!(
-                        target: "walshadow::backfill",
-                        error = %e,
-                        "pending visibility ledger unreadable; pending rows stay unpromoted",
-                    );
-                })
-        else {
-            return;
-        };
-        for m in &outcome.pending_tables {
-            if let Err(e) = ledger.push(m).await {
-                tracing::error!(
-                    target: "walshadow::backfill",
-                    error = %e,
-                    qname = %m.rel.rel,
-                    "pending visibility ledger persist failed; pending rows stay unpromoted",
-                );
+        {
+            let mut ledger = self.pending_rows.lock().await;
+            for m in &outcome.pending_tables {
+                ledger.stage(m);
             }
         }
+        let mut backoff = Duration::from_millis(100);
+        while let Err(e) = self.pending_rows.lock().await.persist().await {
+            tracing::error!(
+                target: "walshadow::backfill",
+                error = %e,
+                retry_in = ?backoff,
+                "pending visibility ledger persist failed; retrying",
+            );
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+        if let Err(e) = self.settle_ended_pending().await {
+            tracing::error!(
+                target: "walshadow::backfill",
+                error = %format!("{e:#}"),
+                "pending visibility source check failed; rows promote as their xids end \
+                 or at next boot",
+            );
+        }
+    }
+
+    /// Live apply folds only outcomes arriving after an entry exists. Xids
+    /// ending between the pass's replay cut and [`Self::record_pending`]
+    /// went by already, so source `pg_xact` decides them
+    async fn settle_ended_pending(&self) -> anyhow::Result<()> {
+        let xids: Vec<u32> = self
+            .pending_rows
+            .lock()
+            .await
+            .outstanding()
+            .into_iter()
+            .collect();
+        if xids.is_empty() {
+            return Ok(());
+        }
+        let client = open_sql_client(&self.source_pg())
+            .await
+            .context("pending visibility: source sql connect")?;
+        let ended = xid_outcomes(&client, &xids).await?;
+        if ended.is_empty() {
+            return Ok(());
+        }
+        // Connect before locking: live apply folds every commit under it
+        let mut sess = StagingSession::connect(self.dest_emitter()).await?;
+        let mut ledger = self.pending_rows.lock().await;
+        let mut settled = 0;
+        for (xid, committed) in ended {
+            settled += ledger.note(xid, &[], committed);
+        }
+        if settled == 0 {
+            return Ok(());
+        }
+        self.stats
+            .pending_xacts_settled
+            .fetch_add(settled, Ordering::Relaxed);
+        visibility_pending::settle(&mut ledger, &mut sess, &self.stats)
+            .await
+            .map_err(anyhow::Error::msg)
     }
 
     /// Publish a successful pass. Per rel: schema-equality gate, persist
@@ -1497,13 +1693,8 @@ impl CopyBackfiller {
             quote_ident(&desc.rel_name.namespace),
             quote_ident(&desc.rel_name.name)
         );
-        let client = open_sql_client(&self.source_pg())
-            .await
-            .context("backfill: source sql connect")?;
-        client
-            .batch_execute("SET row_security = off")
-            .await
-            .context("backfill: reject row security filtering")?;
+        self.seed_toast(desc, s_lsn).await?;
+        let client = self.open_copy_client().await?;
 
         if let Some(runtime) = self.dest_emitter().snowflake.clone() {
             return self
@@ -1791,6 +1982,61 @@ impl CopyBackfiller {
         })
     }
 
+    async fn open_copy_client(&self) -> anyhow::Result<tokio_postgres::Client> {
+        let client = open_sql_client(&self.source_pg())
+            .await
+            .context("backfill: source sql connect")?;
+        client
+            .batch_execute(COPY_SESSION_SETUP)
+            .await
+            .context("backfill: source session setup")?;
+        Ok(client)
+    }
+
+    /// Copy the TOAST heap into the chunk mirror once per load, in
+    /// `clickhouse` value mode only: shadow mode reads values from shadow,
+    /// disabled mode keeps none
+    async fn seed_toast(&self, desc: &RelDescriptor, s_lsn: Pos<Snapshot>) -> anyhow::Result<()> {
+        let emitter = self.dest_emitter();
+        if emitter.toast.mode != ToastMode::Clickhouse || desc.toast_oid == 0 {
+            return Ok(());
+        }
+        let seeded = {
+            let inner = self.inner.lock().await;
+            inner
+                .ledger
+                .entries
+                .get(&desc.rel_name)
+                .is_none_or(|r| r.toast_seeded)
+        };
+        if seeded {
+            return Ok(());
+        }
+        let resolver = ToastResolver::from_config(&emitter, self.stats.clone());
+        let client = self.open_copy_client().await?;
+        let chunks = copy_toast_into(&client, &resolver, desc, s_lsn.get()).await?;
+        tracing::info!(
+            target: "walshadow::backfill",
+            qname = %desc.rel_name,
+            chunks,
+            "chunk mirror seeded from source TOAST heap",
+        );
+        let mut inner = self.inner.lock().await;
+        if let Some(rec) = inner.ledger.entries.get_mut(&desc.rel_name) {
+            rec.toast_seeded = true;
+            // Loss only repeats the seed, idempotent at equal TID and version
+            if let Err(e) = inner.ledger.persist().await {
+                tracing::warn!(
+                    target: "walshadow::backfill",
+                    qname = %desc.rel_name,
+                    error = %e,
+                    "backfill ledger persist failed; restart re-seeds the chunk mirror",
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn copy_cursor(&self, rel: &RelName) -> Option<CopyCursor> {
         self.inner.lock().await.ledger.entries.get(rel)?.copy
     }
@@ -1807,6 +2053,30 @@ impl CopyBackfiller {
             );
         }
     }
+}
+
+/// Ended xids among `xids` with their outcome, `true` for commit. Source
+/// omits xids still running and ones its `pg_xact` no longer holds
+pub async fn xid_outcomes(
+    client: &tokio_postgres::Client,
+    xids: &[u32],
+) -> anyhow::Result<Vec<(u32, bool)>> {
+    let wide: Vec<i64> = xids.iter().copied().map(i64::from).collect();
+    let rows = client
+        .query(XID_STATUS_SQL, &[&wide])
+        .await
+        .context("source xid status")?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let committed = match row.get::<_, Option<&str>>(1)? {
+                "committed" => true,
+                "aborted" => false,
+                _ => return None,
+            };
+            Some((row.get::<_, i64>(0) as u32, committed))
+        })
+        .collect())
 }
 
 /// Current filenode and heap block count. Both come from one read so the
@@ -1951,6 +2221,16 @@ impl Backfiller for CopyBackfiller {
 
     async fn note_opt_out(&self, rel: &RelName) {
         CopyBackfiller::note_opt_out(self, rel).await;
+    }
+
+    fn refuses(&self, mode: InitialLoadMode) -> Option<&'static str> {
+        let from_backup = matches!(
+            mode,
+            InitialLoadMode::BaseBackup | InitialLoadMode::ObjectStore
+        );
+        (from_backup && !self.backup_loads).then_some(
+            "a cluster backup covers only the database `[source] dbname` names, use \"copy\"",
+        )
     }
 }
 
@@ -2104,7 +2384,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let rel = RelName::new("app", "orders");
         let mode = InitialLoadMode::ObjectStore;
-        let mut ledger = Ledger::load(tmp.path()).await;
+        let mut ledger = Ledger::load(tmp.path(), 7).await.unwrap();
         let pending = LedgerRec {
             s_lsn: 100.into(),
             done: false,
@@ -2112,6 +2392,7 @@ mod tests {
             swapped: false,
             staging_uuid: None,
             copy: None,
+            toast_seeded: false,
         };
         assert!(!ledger.fallback_to_copy(&rel, mode, 100).await.unwrap());
         for rec in [
@@ -2147,10 +2428,13 @@ mod tests {
         ledger.dir = blocker;
         assert!(ledger.fallback_to_copy(&rel, mode, 100).await.is_err());
         assert_eq!(ledger.entries[&rel].mode, mode);
-        assert_eq!(Ledger::load(tmp.path()).await.entries[&rel].mode, mode);
+        assert_eq!(
+            Ledger::load(tmp.path(), 7).await.unwrap().entries[&rel].mode,
+            mode
+        );
         ledger.dir = original_dir;
         assert!(ledger.fallback_to_copy(&rel, mode, 100).await.unwrap());
-        let resumed = Ledger::load(tmp.path()).await;
+        let resumed = Ledger::load(tmp.path(), 7).await.unwrap();
         assert_eq!(resumed.entries[&rel].mode, InitialLoadMode::Copy);
         assert_eq!(resumed.entries[&rel].s_lsn.get(), 100);
         assert!(!resumed.entries[&rel].done);
@@ -2169,9 +2453,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ledger_round_trips_and_survives_corruption() {
+    async fn ledger_round_trips_and_rejects_corruption() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ledger = Ledger::load(tmp.path()).await;
+        let mut ledger = Ledger::load(tmp.path(), 7).await.unwrap();
         assert_eq!(ledger.pending_count(), 0);
         ledger.entries.insert(
             RelName::new("app", "orders"),
@@ -2185,6 +2469,7 @@ mod tests {
                     relfilenode: 16400,
                     next_block: 512,
                 }),
+                toast_seeded: true,
             },
         );
         ledger.entries.insert(
@@ -2196,6 +2481,7 @@ mod tests {
                 swapped: false,
                 staging_uuid: None,
                 copy: None,
+                toast_seeded: false,
             },
         );
         ledger.entries.insert(
@@ -2207,11 +2493,12 @@ mod tests {
                 swapped: true,
                 staging_uuid: Some("a-uuid".into()),
                 copy: None,
+                toast_seeded: false,
             },
         );
         ledger.persist().await.unwrap();
 
-        let again = Ledger::load(tmp.path()).await;
+        let again = Ledger::load(tmp.path(), 7).await.unwrap();
         let orders = again.entries.get(&RelName::new("app", "orders")).unwrap();
         assert_eq!((orders.s_lsn.get(), orders.done), (0x1000, false));
         assert_eq!(orders.mode, InitialLoadMode::Copy);
@@ -2235,13 +2522,39 @@ mod tests {
         assert_eq!(again.pending_count_for(InitialLoadMode::Copy), 1);
         assert_eq!(again.pending_count_for(InitialLoadMode::ObjectStore), 1);
 
+        assert!(again.entries[&RelName::new("app", "orders")].toast_seeded);
+
+        let foreign = Ledger::load(tmp.path(), 8).await.err().unwrap();
+        assert!(
+            foreign.to_string().contains("belongs to source system 7"),
+            "{foreign}"
+        );
+
         tokio::fs::write(tmp.path().join(LEDGER_FILENAME), b"not json")
             .await
             .unwrap();
-        let corrupt = Ledger::load(tmp.path()).await;
+        let corrupt = Ledger::load(tmp.path(), 7).await.err().unwrap();
         assert!(
-            corrupt.entries.is_empty(),
-            "corrupt ledger degrades to re-COPY"
+            corrupt.to_string().contains("orphan `__wsstg`"),
+            "corrupt ledger stops boot rather than orphaning staging: {corrupt}"
         );
+    }
+
+    #[tokio::test]
+    async fn unstamped_ledger_upgrades_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(LEDGER_FILENAME),
+            "version = 1\n[[backfill]]\nnamespace = 'app'\nrelname = 'orders'\n\
+             s_lsn = '0/64'\ndone = false\n",
+        )
+        .await
+        .unwrap();
+        let ledger = Ledger::load(tmp.path(), 7).await.unwrap();
+        let rec = &ledger.entries[&RelName::new("app", "orders")];
+        assert_eq!((rec.s_lsn.get(), rec.mode), (0x64, InitialLoadMode::Copy));
+        let text = std::fs::read_to_string(tmp.path().join(LEDGER_FILENAME)).unwrap();
+        assert!(text.contains("system_id = 7"), "{text}");
+        assert!(Ledger::load(tmp.path(), 8).await.is_err());
     }
 }

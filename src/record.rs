@@ -9,7 +9,6 @@ use thiserror::Error;
 use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{RmId, XLogRecord};
 
-use crate::filter::manifest::Manifest;
 use crate::source::timeline::TimelineHistory;
 
 pub const WAL_SEG_SIZE: u64 = walrus::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
@@ -137,6 +136,9 @@ pub struct BoundaryInfo {
     /// namespace rename changes every embedded namespace text with zero
     /// per-relation invals)
     pub capture_all: bool,
+    /// Database identified by catalog writes or commit record
+    /// Zero requests catalog capture for every configured database
+    pub db_oid: u32,
     pub kind: BoundaryKind,
     /// Tree members the filter drained at this commit, so promotion finds
     /// pending state a late `XLOG_XACT_ASSIGNMENT` left keyed under a
@@ -146,8 +148,6 @@ pub struct BoundaryInfo {
     /// replay waits. Save an empty batch for restart, since evidence that
     /// only statistics changed is lost on restart
     pub stats_only: bool,
-    /// Followed database the boundary belongs to, whose tenant captures it
-    pub db_oid: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,8 +162,6 @@ pub struct AffectedOid {
 pub enum SinkError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("serialize manifest: {0}")]
-    Manifest(#[from] serde_json::Error),
     #[error("{0}")]
     Other(String),
 }
@@ -230,14 +228,6 @@ pub trait RecordBytesSink: Send {
         bytes: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 
-    fn on_segment_boundary<'a>(
-        &'a mut self,
-        _start_lsn: u64,
-        _trailing_bytes: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(future::ready(Ok(())))
-    }
-
     fn on_segment_retired<'a>(
         &'a mut self,
         _new_start_lsn: u64,
@@ -251,17 +241,7 @@ pub trait SegmentSink {
         &'a mut self,
         seg: SegmentName,
         bytes: &'a [u8],
-        manifest: &'a Manifest,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
-
-    fn on_partial_segment<'a>(
-        &'a mut self,
-        seg: SegmentName,
-        bytes: &'a [u8],
-        manifest: &'a Manifest,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        self.on_segment(seg, bytes, manifest)
-    }
 }
 
 #[derive(Debug, Default)]
@@ -373,7 +353,7 @@ impl RecordSink for CompositeRecordSink {
 
 #[derive(Debug, Default)]
 pub struct CollectingSegmentSink {
-    pub segments: Vec<(SegmentName, Vec<u8>, Manifest)>,
+    pub segments: Vec<(SegmentName, Vec<u8>)>,
 }
 
 impl SegmentSink for CollectingSegmentSink {
@@ -381,10 +361,9 @@ impl SegmentSink for CollectingSegmentSink {
         &'a mut self,
         seg: SegmentName,
         bytes: &'a [u8],
-        manifest: &'a Manifest,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            self.segments.push((seg, bytes.to_vec(), manifest.clone()));
+            self.segments.push((seg, bytes.to_vec()));
             Ok(())
         })
     }
@@ -393,7 +372,6 @@ impl SegmentSink for CollectingSegmentSink {
 #[derive(Debug, Default)]
 pub struct CollectingBytesSink {
     pub chunks: Vec<(u64, Vec<u8>)>,
-    pub segment_boundaries: Vec<(u64, Vec<u8>)>,
 }
 
 impl RecordBytesSink for CollectingBytesSink {
@@ -404,17 +382,6 @@ impl RecordBytesSink for CollectingBytesSink {
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             self.chunks.push((start_lsn, bytes.to_vec()));
-            Ok(())
-        })
-    }
-
-    fn on_segment_boundary<'a>(
-        &'a mut self,
-        start_lsn: u64,
-        bytes: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.segment_boundaries.push((start_lsn, bytes.to_vec()));
             Ok(())
         })
     }

@@ -211,6 +211,10 @@ module and list tenant databases itself.
 
 ## Current limits
 
+- A tenant follows exactly one database. `[database.*]` entries
+  ([several databases](multi-database.md)) belong to the single-tenant
+  layout, where every database shares one pipeline and destination; the
+  daemon and `ctl` refuse them alongside `[tenants]`.
 - `[toast] mode = "shadow"` is single-database only.
 - Greenfield bootstrap with tenants builds shadow only (`direct` mode);
   tenants then initial-load with `copy`.

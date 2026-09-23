@@ -4,6 +4,15 @@
 //! records, mappings, PostgreSQL paths, ClickHouse transport, and backfill
 //! requests
 
+/// `<crate version> (<git sha>)`, what every binary prints for `--version`.
+/// The sha comes from build.rs
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("WALSHADOW_GIT_SHA"),
+    ")"
+);
+
 /// `info_span!(target: "walshadow::trace", …)` when `$on`, else a no-op span
 /// (fields unevaluated on the unsampled path).
 macro_rules! trace_span {
@@ -39,6 +48,7 @@ pub mod record;
 pub mod runtime_config;
 pub mod schema;
 pub mod source;
+pub mod source_db;
 pub mod table_rules;
 pub mod tenants;
 pub mod ticker;
@@ -60,7 +70,7 @@ pub use decode::{codecs, decoder_sink, fpi, heap_decoder, visibility, wal_xact};
 #[doc(hidden)]
 pub use emit::{ch_ddl, ch_emitter, pipeline};
 #[doc(hidden)]
-pub use filter::{catalog_tracker, classify, filter_segment, main_data, pg_class_decoder, rewrite};
+pub use filter::{catalog_tracker, classify, main_data, pg_class_decoder, rewrite};
 #[doc(hidden)]
 pub use ops::{
     bridge, control, ctl, init, introspect, metrics, oracle, preflight, retention, trace,

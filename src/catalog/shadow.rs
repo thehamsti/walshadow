@@ -74,10 +74,10 @@ pub struct BridgeConf {
     /// Bounds a catalog lock the worker cannot get, which would otherwise hang
     /// against recovery
     pub lock_timeout: Duration,
-    /// `walshadow.bridge_workers`. Each worker serves one request at a time,
-    /// so this is how many oracle round trips can be in flight. Worker 0
-    /// keeps `socket_path`; worker `i` listens on `socket_path.i`
+    /// Workers per database, each handles one request at a time
     pub workers: usize,
+    /// Databases in socket order, empty uses shadow's `dbname`
+    pub databases: Vec<String>,
     /// `walshadow.tenant_bridge_workers`: pool size per tenant database
     pub tenant_workers: usize,
     /// Tenant pools to reserve worker slots for. `max_worker_processes` is
@@ -115,26 +115,41 @@ impl BridgeConf {
             io_timeout: Duration::from_secs(30),
             lock_timeout: Duration::from_secs(1),
             workers: 1,
+            databases: Vec::new(),
             tenant_workers: 2,
             tenant_capacity: 0,
         }
     }
 
+    /// Databases in socket order, `fallback` when none were configured
+    fn database_list<'a>(&'a self, fallback: &'a str) -> Vec<&'a str> {
+        if self.databases.is_empty() {
+            return vec![fallback];
+        }
+        self.databases.iter().map(String::as_str).collect()
+    }
+
+    /// Bridge sockets the shadow will listen on
+    pub fn sockets(&self) -> usize {
+        self.databases.len().max(1) * self.worker_count()
+    }
+
+    fn worker_count(&self) -> usize {
+        self.workers
+            .clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS)
+    }
+
     /// Worker slots the bridge needs beyond the source's floor: the static
-    /// pool, the tenant launcher, and every reserved tenant pool
+    /// pools, the tenant launcher, and every reserved tenant pool
     pub fn worker_slots(&self) -> u32 {
         let per_tenant = self
             .tenant_workers
             .clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS);
-        (self
-            .workers
-            .clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS)
-            + 1
-            + self.tenant_capacity * per_tenant) as u32
+        (self.sockets() + 1 + self.tenant_capacity * per_tenant) as u32
     }
 
-    /// `postgresql.conf` lines that start the worker. `dbname` is the database
-    /// it connects to for catalog reads.
+    /// `postgresql.conf` lines that start the workers. `dbname` is the
+    /// database they connect to for catalog reads when `databases` is empty
     pub fn conf_text(&self, dbname: &str) -> String {
         let quote = |s: &str| s.replace('\'', "''");
         let quote_path = |p: &Path| quote(&p.to_string_lossy());
@@ -146,20 +161,26 @@ impl BridgeConf {
             ));
         }
         out.push_str("shared_preload_libraries = 'walshadow'\n");
+        // PostgreSQL requires double quotes to preserve case and embedded commas
+        let databases = self
+            .database_list(dbname)
+            .iter()
+            .map(|db| format!("\"{}\"", quote(&db.replace('"', "\"\""))))
+            .collect::<Vec<_>>()
+            .join(",");
         out.push_str(&format!(
             "walshadow.socket_path = '{}'\n\
-             walshadow.database = '{}'\n\
+             walshadow.databases = '{}'\n\
              walshadow.io_timeout_ms = {}\n\
              walshadow.lock_timeout_ms = {}\n\
              walshadow.bridge_workers = {}\n\
              walshadow.tenant_bridge_workers = {}\n\
              include_if_exists = '{TENANT_CONF_FILE}'\n",
             quote_path(&self.socket_path),
-            quote(dbname),
+            databases,
             self.io_timeout.as_millis(),
             self.lock_timeout.as_millis(),
-            self.workers
-                .clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS),
+            self.worker_count(),
             self.tenant_workers
                 .clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS),
         ));
@@ -186,7 +207,8 @@ pub struct ShadowConfig {
     /// that exists post-seed, ie source's superuser role name on
     /// managed Postgres where it isn't literally `postgres`.
     pub user: String,
-    /// `-d` for all probe connections.
+    /// `-d` for all probe connections. Also the primary source database,
+    /// which owns bridge socket 0
     pub dbname: String,
     /// `None` leaves `shared_preload_libraries` unset, so a postmaster whose
     /// `walshadow.so` is missing still starts. Preloading a library PG cannot
@@ -376,6 +398,14 @@ impl Shadow {
         Ok(())
     }
 
+    /// Worker slots the bridge needs, one per database per worker
+    fn bridge_worker_headroom(&self) -> u32 {
+        self.config
+            .bridge
+            .as_ref()
+            .map_or(0, BridgeConf::worker_slots)
+    }
+
     /// Append walshadow base settings to `postgresql.conf`. Each call
     /// appends a fresh block.
     pub fn write_base_conf(&self) -> Result<()> {
@@ -397,12 +427,8 @@ impl Shadow {
             port = self.config.port,
             // PG only logs excess workers and drops them, so a bridge pool over
             // the default leaves sockets the daemon never finds
-            max_worker_processes = SourceGucFloor::default().max_worker_processes
-                + self
-                    .config
-                    .bridge
-                    .as_ref()
-                    .map_or(0, BridgeConf::worker_slots),
+            max_worker_processes =
+                SourceGucFloor::default().max_worker_processes + self.bridge_worker_headroom(),
         );
         let mut f = fs::OpenOptions::new().append(true).open(&conf_path)?;
         f.write_all(body.as_bytes())?;
@@ -451,12 +477,7 @@ impl Shadow {
             port = self.config.port,
             max_connections = floor.max_connections,
             // PG only logs excess workers and drops their registration
-            max_worker_processes = floor.max_worker_processes
-                + self
-                    .config
-                    .bridge
-                    .as_ref()
-                    .map_or(0, BridgeConf::worker_slots),
+            max_worker_processes = floor.max_worker_processes + self.bridge_worker_headroom(),
             max_wal_senders = floor.max_wal_senders,
             max_prepared_transactions = floor.max_prepared_transactions,
             max_locks_per_transaction = floor.max_locks_per_transaction,
@@ -650,6 +671,25 @@ impl Shadow {
         Ok(out.status.code() == Some(0))
     }
 
+    /// Block until postmaster finishes startup like `pg_ctl start -w`,
+    /// `false` once it exits. Status is line 8 of `postmaster.pid`, see PG
+    /// `src/include/utils/pidfile.h`
+    pub fn wait_started(&self) -> Result<bool> {
+        let pid = self.config.data_dir.join("postmaster.pid");
+        while self.is_running()? {
+            let status = match fs::read_to_string(&pid) {
+                Ok(body) => body.lines().nth(7).map(|l| l.trim().to_owned()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(e.into()),
+            };
+            if matches!(status.as_deref(), Some("ready" | "standby")) {
+                return Ok(true);
+            }
+            thread::sleep(self.config.wait_poll);
+        }
+        Ok(false)
+    }
+
     /// Feed a SQL payload to `psql -f -` (eg `pg_dump --schema-only`).
     pub fn apply_schema_dump(&self, sql: &str) -> Result<()> {
         let mut child = Command::new(self.config.bin("psql"))
@@ -710,7 +750,7 @@ impl Shadow {
     /// Extension names with a control file in this install
     /// (`pg_available_extensions`) — ie the ones `CREATE EXTENSION` and the
     /// binary-upgrade dump can actually build here.
-    pub fn available_extensions(&self) -> Result<std::collections::HashSet<String>> {
+    pub fn available_extensions(&self) -> Result<ahash::HashSet<String>> {
         let raw = self
             .psql_one("SELECT coalesce(string_agg(name, ','), '') FROM pg_available_extensions")?;
         Ok(raw
@@ -1041,6 +1081,41 @@ mod tests {
             "{conf}"
         );
         assert!(conf.contains("walshadow.bridge_workers = 8\n"), "{conf}");
+        assert!(
+            conf.contains("walshadow.databases = '\"postgres\"'\n"),
+            "{conf}"
+        );
+    }
+
+    /// Workers multiply by database, and each name stays quoted so the
+    /// worker's `SplitIdentifierString` keeps its case
+    #[test]
+    fn base_conf_seats_every_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(data_dir.join("postgresql.conf"), b"").unwrap();
+
+        let mut cfg = ShadowConfig::new(data_dir.clone(), tmp.path().join("filtered"));
+        cfg.socket_dir = tmp.path().join("sock");
+        let mut bridge = BridgeConf::in_dir(&cfg.socket_dir);
+        bridge.workers = 3;
+        bridge.databases = vec!["app".into(), "Billing".into()];
+        cfg.bridge = Some(bridge.clone());
+        Shadow::new(cfg).write_base_conf().unwrap();
+
+        let conf = fs::read_to_string(data_dir.join("postgresql.conf")).unwrap();
+        // Two pools of three, plus the tenant launcher
+        let want = SourceGucFloor::default().max_worker_processes + 6 + 1;
+        assert!(
+            conf.contains(&format!("max_worker_processes = {want}\n")),
+            "{conf}"
+        );
+        assert!(
+            conf.contains("walshadow.databases = '\"app\",\"Billing\"'\n"),
+            "{conf}"
+        );
+        assert_eq!(bridge.sockets(), 6);
     }
 
     #[test]

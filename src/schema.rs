@@ -58,6 +58,26 @@ impl std::fmt::Display for RelName {
     }
 }
 
+/// Batch identity down the insert path: the same relation name in two source
+/// databases routes to two destinations, so the database is part of the key
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableKey {
+    pub db_oid: u32,
+    pub rel: RelName,
+}
+
+impl TableKey {
+    pub fn new(db_oid: u32, rel: RelName) -> Self {
+        Self { db_oid, rel }
+    }
+}
+
+impl std::fmt::Display for TableKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@db{}", self.rel, self.db_oid)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelDescriptor {
     pub rfn: RelFileNode,
@@ -157,8 +177,10 @@ pub struct RelAttr {
     pub missing_default: Option<MissingDefault>,
 }
 
-/// Fast default (`attmissingval`): raw on-disk bytes from the pinned worker, or
-/// `anyarray_out` text from the SQL path. Decoded by `missing_value_for`.
+/// Fast default (`attmissingval`), decoded by `missing_value_for`. Shadow
+/// catalog reads yield `Raw` on-disk bytes; `Text` (element's `anyarray_out`
+/// form) comes from source-PG SQL, which has no way to the bytes, oracle
+/// rendered DDL defaults, and descriptor logs older than raw shadow reads
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissingDefault {
     Raw(Vec<u8>),

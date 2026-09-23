@@ -4,9 +4,9 @@
 //! task (replay gates never pace wire delivery). Pairs with
 //! [`BufferingDecoderSink`](crate::xact::xact_buffer::BufferingDecoderSink); on each
 //! COMMIT/ABORT assigns a dense `seq`, registers it with the collector in
-//! order, then either dispatches to the decode pool or — for a DDL/TRUNCATE
-//! barrier — quiesces, drains earlier seqs to durable, and applies the schema
-//! change via [`DdlApplicator`] before resuming.
+//! order, then either places its rows onto the batcher or — for a
+//! DDL/TRUNCATE barrier — quiesces, drains earlier seqs to durable, and
+//! applies the schema change via [`DdlApplicator`] before resuming.
 //!
 //! Barrier coarseness is deliberate (DDL/TRUNCATE rare). Within a barrier
 //! xact, data segments between catalog/truncate ops each get their own seq
@@ -23,10 +23,8 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use walrus::pg::walparser::RmId;
 
 use crate::backfill::backfill_staging::StagingSession;
-use crate::backfill::visibility_pending::{self, PendingLedger};
-use crate::catalog::desc_log::DescriptorLog;
+use crate::backfill::visibility_pending::{self, SharedPendingLedger};
 use crate::catalog::pending::PendingCatalog;
-use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::decode::heap_decoder::{DescribedHeap, HeapOp};
 use crate::decode::visibility::{PgXactPatch, PgXactView, read_pg_xact};
 use crate::emit::ch_ddl::DdlApplicator;
@@ -43,36 +41,54 @@ use crate::decode::wal_xact::{
 use crate::ops::trace::TxnSpanRegistry;
 use crate::xact::xact_buffer::{DrainEntry, SubxactTracker, XactBuffer};
 
-use crate::config::{ConfigResolver, ResolvedConfig};
+use crate::config::ResolvedConfig;
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatcherMsg;
-use crate::emit::pipeline::decode::DecodeJob;
+use crate::emit::pipeline::decode;
 use crate::emit::pipeline::plan_spool::{PlanItem, SealedPlan};
 use crate::emit::pipeline::planner::{PlanRouteView, Planner, drain_reason};
 use crate::emit::route::{RouteSnapshot, RoutedHeap, RowPolicy};
-use crate::mapping::{MappingHandle, MappingSnapshot, TableMapping};
-use crate::pos::{Floor, Monotone};
+use crate::mapping::{MappingSnapshot, TableMapping};
+use crate::pos::{Floor, Monotone, Pos};
 use crate::runtime_config::{ConfigEvent, TableRow};
+use crate::source_db::{SourceDb, SourceDbs};
 use crate::toast::ToastResolver;
 use crate::toast::toast_retire::RetireLedger;
+use tokio_postgres::types::Oid;
+
+/// One followed database's ClickHouse-side state. Every transaction writes
+/// one database, so a commit selects one of these and keeps it for the whole
+/// drain
+struct DbScope {
+    db: Arc<SourceDb>,
+    /// `None` observes schema events without applying CH DDL
+    applicator: Option<DdlApplicator>,
+    /// Live-reload receiver; see [`ReorderSink::maybe_apply_reload`]
+    reload_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    /// COPY backfiller for this database's `initial_load` opt-ins
+    backfiller: Option<Arc<dyn crate::backfill::opt_in::Backfiller>>,
+    applied_opt_ins: HashSet<RelName>,
+    /// Opt-ins whose descriptor the shadow catalog can't resolve yet — a table
+    /// created just before `ctl tables select` races the CREATE's replay into
+    /// the shadow. Retried each commit until it resolves, then created +
+    /// backfilled (moves to `applied_opt_ins`).
+    pending_opt_ins: HashMap<RelName, TableRow>,
+}
 
 pub struct ReorderSink {
     buffer: Arc<Mutex<XactBuffer>>,
-    /// Interval-scoped descriptor oracle: stash resolution + truncate
-    log: Arc<DescriptorLog>,
+    /// Followed databases: descriptor log, shadow catalog, routing map and
+    /// rules per database
+    dbs: Arc<SourceDbs>,
+    /// Keyed by database oid, parallel to [`SourceDbs::all`]
+    scopes: HashMap<Oid, DbScope>,
     /// Speculative catalog state per in-flight xact, written by capture at
     /// command boundaries. Read at stash resolution, dropped once the
     /// commit's drain has consumed it
     pending: Arc<PendingCatalog>,
-    /// Opt-in dispatch still resolves by name against live shadow
-    catalog: Arc<Mutex<ShadowCatalog>>,
     subxact_tracker: Arc<Mutex<SubxactTracker>>,
-    /// `None` on the metrics-only (null-tail) configuration: schema events
-    /// and truncates are observed, never applied to CH
-    applicator: Option<DdlApplicator>,
     ack: AckHandle,
-    jobs_tx: async_channel::Sender<DecodeJob>,
     /// Shared FIFO channel to the batcher; `FlushAll` here orders after
     /// enqueued rows.
     msg_tx: mpsc::Sender<BatcherMsg>,
@@ -80,21 +96,14 @@ pub struct ReorderSink {
     /// Reorder owns the commit-order boundary, so bumps `xacts_committed`
     /// (per commit) and `truncates_emitted`.
     stats: Arc<EmitterStats>,
-    /// TOAST chunk resolver shared with decode workers
+    /// TOAST chunk resolver: planning detoast, mirror puts, retires
     resolver: ToastResolver,
-    /// Runtime-config overlay resolver. `Some` with the config overlay active;
-    /// a `DrainEntry::Config` applies to it inside the barrier fence so
-    /// trailing rows route against post-config state (plan §6).
-    config_resolver: Option<Arc<ConfigResolver>>,
-    /// COPY backfiller for `initial_load='copy'` opt-ins; spawns off the barrier
-    /// (detached task, own CH tail), the apply only records + launches.
-    backfiller: Option<Arc<dyn crate::backfill::opt_in::Backfiller>>,
     /// Retires wait until persisted replay floor passes dropping commit;
     /// ledger persists queue so a stop inside the wait window can't leak
     /// the mirror (resume never replays the drop)
     retires: RetireLedger,
     /// Retain undecided backup rows until transaction outcomes arrive
-    pending_rows: PendingLedger,
+    pending_rows: SharedPendingLedger,
     /// Control connection for the settle statements, opened on first hit
     pending_session: Option<StagingSession>,
     /// Whole emitter config, kept for that lazy connect
@@ -107,7 +116,7 @@ pub struct ReorderSink {
     next_seq: u64,
     /// Drain-slice budget: rows / bytes per [`DrainedBatch`] pulled from the
     /// buffer. Bounds resident decoded rows while a spilled xact streams
-    /// back; the decode pool works one slice while the next loads.
+    /// back.
     batch_rows: usize,
     batch_bytes: usize,
     /// Global resident-payload pool; slice admission acquired here before
@@ -117,25 +126,9 @@ pub struct ReorderSink {
     /// OTLP tracing is on; reorder parents `commit.drain`/`dispatch` under
     /// the `txn` and prunes the entry at commit (the buffer prunes at abort).
     span_registry: Option<TxnSpanRegistry>,
-    /// Live-reload receiver + the config-driven opt-in set applied so far. On a
-    /// republish (`ctl reload` / SIGHUP), the coordinator diffs `table_opt_ins`
-    /// at the next commit barrier — add → `apply_table_opt_in`, drop →
-    /// `exclude_table` (CH table retained).
-    reload_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
-    applied_opt_ins: HashSet<RelName>,
-    /// Opt-ins whose descriptor the shadow catalog can't resolve yet — a table
-    /// created just before `ctl tables select` races the CREATE's replay into
-    /// the shadow. Retried each commit until it resolves, then created +
-    /// backfilled (moves to `applied_opt_ins`).
-    pending_opt_ins: HashMap<RelName, TableRow>,
-    /// Shared routing map, snapshotted into `route_mapping` at route-state
-    /// resets (this coordinator's own event applies are the fenced writers).
-    mapping: MappingHandle,
-    /// Boot-only row-shape policy, frozen into route snapshots.
-    row_policy: RowPolicy,
     /// Byte cap per transaction plan spool file
     plan_disk_max: u64,
-    /// Plan spool directory (the xact spill dir), cached at spawn so the
+    /// Plan spool directory (xact scratch dir), cached at spawn so the
     /// per-commit path needs no buffer lock
     plan_dir: std::path::PathBuf,
     /// Frozen per transaction, with catalog events folded into local overlay
@@ -149,18 +142,17 @@ impl ReorderSink {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         buffer: Arc<Mutex<XactBuffer>>,
-        log: Arc<DescriptorLog>,
+        dbs: Arc<SourceDbs>,
         pending: Arc<PendingCatalog>,
-        catalog: Arc<Mutex<ShadowCatalog>>,
         subxact_tracker: Arc<Mutex<SubxactTracker>>,
-        applicator: Option<DdlApplicator>,
+        // One per database that applies CH DDL; absent leaves that
+        // database's events observed only
+        mut applicators: HashMap<Oid, DdlApplicator>,
         ack: AckHandle,
-        jobs_tx: async_channel::Sender<DecodeJob>,
         msg_tx: mpsc::Sender<BatcherMsg>,
         stats: Arc<EmitterStats>,
         resolver: ToastResolver,
-        config_resolver: Option<Arc<ConfigResolver>>,
-        backfiller: Option<Arc<dyn crate::backfill::opt_in::Backfiller>>,
+        mut backfillers: HashMap<Oid, Arc<dyn crate::backfill::opt_in::Backfiller>>,
         fatal: Fatal,
         span_registry: Option<TxnSpanRegistry>,
         batch_rows: usize,
@@ -169,11 +161,9 @@ impl ReorderSink {
         plan_dir: std::path::PathBuf,
         budget: Option<crate::budget::MemoryBudget>,
         retires: RetireLedger,
-        pending_rows: PendingLedger,
+        pending_rows: SharedPendingLedger,
         emitter: Arc<EmitterConfig>,
         resume_floor: Arc<Monotone<Floor>>,
-        mapping: MappingHandle,
-        row_policy: RowPolicy,
     ) -> Self {
         // subscribe() marks the current value seen, so a `ctl reload`
         // racing pipeline spawn would stay invisible to has_changed —
@@ -182,25 +172,36 @@ impl ReorderSink {
         // force the first commit to diff from scratch: re-applying
         // boot-seeded opt-ins is the designed-idempotent restart path
         // (CH table persists, backfill ledger dedups)
-        let reload_rx = config_resolver.as_ref().map(|r| {
-            let mut rx = r.subscribe();
-            rx.mark_changed();
-            rx
-        });
+        let scopes = dbs
+            .all()
+            .iter()
+            .map(|db| {
+                let reload_rx = db.resolver.as_ref().map(|r| {
+                    let mut rx = r.subscribe();
+                    rx.mark_changed();
+                    rx
+                });
+                let scope = DbScope {
+                    db: db.clone(),
+                    applicator: applicators.remove(&db.oid),
+                    backfiller: backfillers.remove(&db.oid),
+                    reload_rx,
+                    applied_opt_ins: HashSet::new(),
+                    pending_opt_ins: HashMap::new(),
+                };
+                (db.oid, scope)
+            })
+            .collect();
         Self {
             buffer,
-            log,
+            dbs,
+            scopes,
             pending,
-            catalog,
             subxact_tracker,
-            applicator,
             ack,
-            jobs_tx,
             msg_tx,
             stats,
             resolver,
-            config_resolver,
-            backfiller,
             fatal,
             next_seq: 0,
             batch_rows,
@@ -214,12 +215,6 @@ impl ReorderSink {
             pending_session: None,
             emitter,
             resume_floor,
-            reload_rx,
-            applied_opt_ins: HashSet::new(),
-            pending_opt_ins: HashMap::new(),
-            mapping,
-            row_policy,
-
             route_mapping: None,
             route_config: None,
         }
@@ -230,9 +225,21 @@ impl ReorderSink {
     /// versions for the next interval. Per commit this is the
     /// whole-transaction snapshot; a non-WAL-positioned republish landing
     /// mid-plan can't reroute rows already planned or split the transaction.
-    async fn reset_route_state(&mut self) {
-        self.route_mapping = Some(self.mapping.snapshot().await);
-        self.route_config = self.reload_rx.as_ref().map(|rx| rx.borrow().clone());
+    async fn reset_route_state(&mut self, db: Oid) {
+        // Read the handles out before the await: a borrow of the scope held
+        // across one would put the applicator's `!Sync` client in the sink
+        // future
+        let scoped = self.scopes.get(&db).map(|scope| {
+            let config = scope.reload_rx.as_ref().map(|rx| rx.borrow().clone());
+            (scope.db.mapping.clone(), config)
+        });
+        let Some((mapping, config)) = scoped else {
+            self.route_mapping = None;
+            self.route_config = None;
+            return;
+        };
+        self.route_mapping = Some(mapping.snapshot().await);
+        self.route_config = config;
     }
 
     /// Apply a live config reload's table opt-in/opt-out diff at a commit
@@ -240,30 +247,42 @@ impl ReorderSink {
     /// connection) already republished onto the watch; here we do the part that
     /// needs the applicator/catalog — create/drop the CH scope.
     async fn maybe_apply_reload(&mut self, commit_lsn: u64) -> Result<(), SinkError> {
-        let Some(resolver) = self.config_resolver.clone() else {
+        // A reload republishes every database's config, so the diff is not
+        // scoped to whichever database is committing
+        let dbs: Vec<Oid> = self.dbs.oids().collect();
+        for db in dbs {
+            self.apply_reload_for(db, commit_lsn).await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_reload_for(&mut self, db: Oid, commit_lsn: u64) -> Result<(), SinkError> {
+        let Some(scope) = self.scopes.get_mut(&db) else {
+            return Ok(());
+        };
+        let Some(resolver) = scope.db.resolver.clone() else {
             return Ok(());
         };
         // On a republish, re-diff `table_opt_ins`: opt-outs drain now, new
         // opt-ins queue as pending, dropped intents leave the queue.
-        let changed = self
+        let changed = scope
             .reload_rx
             .as_mut()
             .is_some_and(|rx| rx.has_changed().unwrap_or(false));
         if changed {
             let desired: Vec<(RelName, TableRow)> = {
-                let rx = self.reload_rx.as_mut().unwrap();
-                let snap = rx.borrow_and_update();
-                let config_schema = self
+                let log = scope.db.desc_log.clone();
+                let applied = &scope.applied_opt_ins;
+                let config_schema = scope
                     .applicator
                     .as_ref()
                     .and_then(|a| a.config().runtime_config_schema.clone());
+                let rx = scope.reload_rx.as_mut().unwrap();
+                let snap = rx.borrow_and_update();
                 // Keep prior pattern opt-ins in desired set
                 let scoped = snap.rules.pattern_scoped(
-                    || {
-                        self.log
-                            .user_rel_names_at(commit_lsn, config_schema.as_deref())
-                    },
-                    |rel| snap.tables.contains_key(rel) && !self.applied_opt_ins.contains(rel),
+                    || log.user_rel_names_at(commit_lsn, config_schema.as_deref()),
+                    |rel| snap.tables.contains_key(rel) && !applied.contains(rel),
                 );
                 snap.table_opt_ins
                     .iter()
@@ -276,7 +295,7 @@ impl ReorderSink {
                 .filter(|(_, row)| row.replicate == Some(true))
                 .map(|(rel, _)| rel.clone())
                 .collect();
-            let stale: Vec<RelName> = self
+            let stale: Vec<RelName> = scope
                 .applied_opt_ins
                 .iter()
                 .filter(|rel| !desired_in.contains(*rel))
@@ -284,44 +303,46 @@ impl ReorderSink {
                 .collect();
             for rel in stale {
                 resolver.exclude_table(&rel).await;
-                if let Some(b) = &self.backfiller {
+                if let Some(b) = &scope.backfiller {
                     b.note_opt_out(&rel).await;
                 }
-                self.applied_opt_ins.remove(&rel);
+                scope.applied_opt_ins.remove(&rel);
             }
-            self.pending_opt_ins
+            scope
+                .pending_opt_ins
                 .retain(|rel, _| desired_in.contains(rel));
             for (rel, row) in desired {
-                if row.replicate == Some(true) && !self.applied_opt_ins.contains(&rel) {
-                    self.pending_opt_ins.insert(rel, row);
+                if row.replicate == Some(true) && !scope.applied_opt_ins.contains(&rel) {
+                    scope.pending_opt_ins.insert(rel, row);
                 }
             }
             tracing::info!(
                 target: "walshadow::config",
-                pending = self.pending_opt_ins.len(),
-                applied = self.applied_opt_ins.len(),
+                pending = scope.pending_opt_ins.len(),
+                applied = scope.applied_opt_ins.len(),
                 "reload diff applied",
             );
         }
         // Each commit, apply any pending opt-in the shadow catalog can now
         // resolve — a table created just before `select` races the CREATE's
         // replay, so retry until the descriptor lands, then create + backfill.
-        if self.pending_opt_ins.is_empty() {
+        if scope.pending_opt_ins.is_empty() {
             return Ok(());
         }
         // No applicator (bootstrap drain / tests without DDL) → can't create
         // CH tables, so opt-ins stay pending.
-        let Some(applicator) = self.applicator.as_mut() else {
+        let Some(applicator) = scope.applicator.as_mut() else {
             return Ok(());
         };
-        let candidates: Vec<(RelName, TableRow)> = self
+        let candidates: Vec<(RelName, TableRow)> = scope
             .pending_opt_ins
             .iter()
             .map(|(rel, row)| (rel.clone(), row.clone()))
             .collect();
         let mut deferred = crate::backfill::opt_in::DeferredBackfills::default();
         for (rel, row) in candidates {
-            let known = self
+            let known = scope
+                .db
                 .catalog
                 .lock()
                 .await
@@ -340,8 +361,8 @@ impl ReorderSink {
             crate::backfill::opt_in::apply_table_opt_in_deferred(
                 &resolver,
                 applicator,
-                &self.catalog,
-                self.backfiller.is_some(),
+                &scope.db.catalog,
+                scope.backfiller.as_ref(),
                 &rel,
                 &row,
                 commit_lsn,
@@ -349,10 +370,10 @@ impl ReorderSink {
             )
             .await
             .map_err(|e| SinkError::Other(format!("reload opt-in: {e}")))?;
-            self.pending_opt_ins.remove(&rel);
-            self.applied_opt_ins.insert(rel);
+            scope.pending_opt_ins.remove(&rel);
+            scope.applied_opt_ins.insert(rel);
         }
-        deferred.start(self.backfiller.as_ref()).await;
+        deferred.start(scope.backfiller.as_ref()).await;
         Ok(())
     }
 
@@ -382,10 +403,14 @@ impl ReorderSink {
     /// poison the sink future's `Send` bound.
     async fn apply_config(
         &mut self,
+        db: Oid,
         event: &ConfigEvent,
         commit_lsn: u64,
     ) -> Result<(), SinkError> {
-        let Some(resolver) = self.config_resolver.clone() else {
+        let Some(scope) = self.scopes.get_mut(&db) else {
+            return Ok(());
+        };
+        let Some(resolver) = scope.db.resolver.clone() else {
             return Ok(());
         };
         // Overlay merge first (target overrides, global/namespace knobs).
@@ -395,12 +420,12 @@ impl ReorderSink {
         // backfill boundary `S` for an `initial_load` opt-in.
         match event {
             ConfigEvent::TableUpserted { rel, row } if !row.is_pattern() => {
-                if let Some(applicator) = self.applicator.as_mut() {
+                if let Some(applicator) = scope.applicator.as_mut() {
                     crate::backfill::opt_in::apply_table_opt_in(
                         &resolver,
                         applicator,
-                        &self.catalog,
-                        self.backfiller.as_ref(),
+                        &scope.db.catalog,
+                        scope.backfiller.as_ref(),
                         rel,
                         row,
                         commit_lsn,
@@ -414,25 +439,13 @@ impl ReorderSink {
                 pattern: false,
             } => {
                 resolver.exclude_table(rel).await;
-                if let Some(b) = &self.backfiller {
+                if let Some(b) = &scope.backfiller {
                     b.note_opt_out(rel).await;
                 }
             }
             _ => {}
         }
         Ok(())
-    }
-
-    // Helpers take `&mut self` so the borrow across awaits is `&mut Self`
-    // (Send): owned `DdlApplicator`/`BoxedAsyncClient` is Send but not Sync, so a
-    // shared `&Self` across an await wouldn't be Send.
-    async fn dispatch_job(&mut self, job: DecodeJob) -> Result<(), SinkError> {
-        self.stats.queue_jobs_out.fetch_add(1, Ordering::Relaxed);
-        tokio::select! {
-            biased;
-            _ = self.fatal.wait() => Err(self.fatal_err()),
-            r = self.jobs_tx.send(job) => r.map_err(|_| SinkError::Other("decode job queue closed".into())),
-        }
     }
 
     /// Seal every batcher table and wait for the reply. Sent on the shared row
@@ -450,19 +463,6 @@ impl ReorderSink {
     }
 
     // Barrier waits prefer concurrent fatal over successful completion
-    /// Wait until every dispatched seq is *placed* (decode pool routed all
-    /// their rows onto the shared channel), so a `FlushAll` orders after them.
-    async fn wait_all_placed(&mut self) -> Result<(), SinkError> {
-        let through = self.next_seq;
-        tokio::select! {
-            biased;
-            _ = self.fatal.wait() => Err(self.fatal_err()),
-            r = self.ack.wait_placed_through(through) => r.map_err(|e| {
-                SinkError::Other(format!("placed barrier through {through}: {e}"))
-            }),
-        }
-    }
-
     /// Block until every seq `< self.next_seq` is durable on CH, or a fatal
     /// trips (e.g. CH down past the inserter retry budget).
     async fn wait_all_durable(&mut self) -> Result<(), SinkError> {
@@ -477,27 +477,55 @@ impl ReorderSink {
     }
 
     /// Fence before applying a DDL event / TRUNCATE so it orders strictly
-    /// after all earlier data: wait placed, seal batcher, wait durable. The
-    /// placed-wait stops `FlushAll` sealing a partial set while the decode
-    /// pool is still routing earlier rows.
+    /// after all earlier data: seal batcher, wait durable. Rows place inline
+    /// before dispatch returns, so `FlushAll` orders after all of them
     async fn barrier_fence(&mut self) -> Result<(), SinkError> {
-        self.wait_all_placed().await?;
         self.flush_all_batcher().await?;
         self.wait_all_durable().await
     }
 
-    async fn apply_event(&mut self, event: &SchemaEvent, commit_lsn: u64) -> Result<(), SinkError> {
-        let Some(applicator) = self.applicator.as_mut() else {
+    async fn apply_event(
+        &mut self,
+        db: Oid,
+        event: &SchemaEvent,
+        commit_lsn: u64,
+    ) -> Result<(), SinkError> {
+        let Some(scope) = self.scopes.get_mut(&db) else {
             return Ok(());
         };
+        let resolver_cfg = scope.db.resolver.clone();
+        let mapping = scope.db.mapping.clone();
+        let Some(applicator) = scope.applicator.as_mut() else {
+            return Ok(());
+        };
+        // Same frozen config planning predicted with, so planned routes match
+        let frozen = self.route_config.as_deref();
+        // Pinned mappings outlive DROP, so only Added/Changed must match
+        let predicted = if cfg!(debug_assertions) && !matches!(event, SchemaEvent::Dropped { .. }) {
+            let before = mapping.snapshot().await;
+            applicator
+                .predict_route_mapping(event, &before, frozen)
+                .await
+                .map_err(|e| SinkError::Other(format!("ddl predict: {e}")))?
+        } else {
+            None
+        };
         applicator
-            .apply_at(event, commit_lsn)
+            .apply_under(event, frozen, commit_lsn)
             .await
             .map_err(|e| SinkError::Other(format!("ddl apply: {e}")))?;
+        if let Some((rel, m)) = predicted {
+            let after = mapping.snapshot().await;
+            debug_assert_eq!(
+                after.get(&rel),
+                m.as_ref(),
+                "{rel}: apply diverged from plan"
+            );
+        }
         // A `CREATE TABLE` for a forward-declared opt-in materialises here, in
         // the same barrier before this xact's trailing rows dispatch.
         if let SchemaEvent::Added { desc } = event
-            && let Some(resolver) = self.config_resolver.clone()
+            && let Some(resolver) = resolver_cfg
         {
             crate::backfill::opt_in::materialize_pending_on_added(&resolver, applicator, desc)
                 .await
@@ -511,7 +539,7 @@ impl ReorderSink {
             && self.resolver.stores_chunks()
         {
             self.retires
-                .push(*oid, commit_lsn)
+                .push(*oid, Pos::new(commit_lsn))
                 .await
                 .map_err(|e| SinkError::Other(format!("toast retire ledger: {e}")))?;
         }
@@ -533,7 +561,8 @@ impl ReorderSink {
             if desc.kind == 't' {
                 continue;
             }
-            self.apply_event(&SchemaEvent::Added { desc }, resume_lsn)
+            let db = desc.rfn.db_node;
+            self.apply_event(db, &SchemaEvent::Added { desc }, resume_lsn)
                 .await?;
         }
         Ok(())
@@ -574,7 +603,11 @@ impl ReorderSink {
         subxacts: &[u32],
         committed: bool,
     ) -> Result<(), SinkError> {
-        let settled = self.pending_rows.note(xid, subxacts, committed);
+        let settled = self
+            .pending_rows
+            .lock()
+            .await
+            .note(xid, subxacts, committed);
         if settled == 0 {
             return Ok(());
         }
@@ -585,7 +618,9 @@ impl ReorderSink {
     }
 
     async fn settle_pending(&mut self) -> Result<(), SinkError> {
-        if self.pending_rows.is_empty() {
+        let ledger = self.pending_rows.clone();
+        let mut ledger = ledger.lock().await;
+        if ledger.is_empty() {
             return Ok(());
         }
         if self.pending_session.is_none() {
@@ -596,7 +631,7 @@ impl ReorderSink {
             );
         }
         let sess = self.pending_session.as_mut().expect("just connected");
-        visibility_pending::settle(&mut self.pending_rows, sess, &self.stats)
+        visibility_pending::settle(&mut ledger, sess, &self.stats)
             .await
             .map_err(SinkError::Other)
     }
@@ -608,11 +643,13 @@ impl ReorderSink {
     ) -> Result<(), SinkError> {
         if let Some(runtime) = &self.emitter.snowflake {
             self.pending_rows
+                .lock()
+                .await
                 .reconcile_snowflake(runtime)
                 .await
                 .map_err(SinkError::Other)?;
         }
-        if self.pending_rows.is_empty() {
+        if self.pending_rows.lock().await.is_empty() {
             return Ok(());
         }
         if let Some(dir) = shadow_data_dir.filter(|d| d.join("pg_xact").is_dir()) {
@@ -622,6 +659,8 @@ impl ReorderSink {
             let patch = PgXactPatch::new();
             let fold = self
                 .pending_rows
+                .lock()
+                .await
                 .note_view(&PgXactView::new(&accum, &patch));
             self.stats
                 .pending_xacts_settled
@@ -656,12 +695,13 @@ impl ReorderSink {
 
     async fn apply_drain_entry(
         &mut self,
+        db: Oid,
         entry: &DrainEntry,
         commit_lsn: u64,
     ) -> Result<(), SinkError> {
         match entry {
-            DrainEntry::Catalog(ev) => self.apply_event(ev, commit_lsn).await,
-            DrainEntry::Config(ev) => self.apply_config(ev, commit_lsn).await,
+            DrainEntry::Catalog(ev) => self.apply_event(db, ev, commit_lsn).await,
+            DrainEntry::Config(ev) => self.apply_config(db, ev, commit_lsn).await,
             DrainEntry::ToastBarrier {
                 toast_relid,
                 marker_lsn,
@@ -673,7 +713,10 @@ impl ReorderSink {
     }
 
     async fn apply_truncate(&mut self, heap: &DescribedHeap) -> Result<(), SinkError> {
-        let Some(applicator) = self.applicator.as_mut() else {
+        let Some(scope) = self.scopes.get_mut(&heap.descriptor.rfn.db_node) else {
+            return Ok(());
+        };
+        let Some(applicator) = scope.applicator.as_mut() else {
             return Ok(());
         };
         // Attached at truncate fan-out (record time = pre-capture Present),
@@ -719,10 +762,13 @@ impl ReorderSink {
         Ok(())
     }
 
-    /// Dispatch accumulated planned heaps as one seq under a fresh
-    /// admission permit. Chunks ride empty: values detoasted at planning.
-    /// `publish` marks the commit's final data segment so its seq carries
-    /// the LSN publication (no trailing marker needed)
+    /// Place accumulated planned heaps as one seq under a fresh admission
+    /// permit; values detoasted at planning. `publish` marks the commit's
+    /// final data segment so its seq carries the LSN publication (no
+    /// trailing marker needed)
+    ///
+    /// Takes `&mut self` so the borrow across awaits is `&mut Self` (Send):
+    /// owned `DdlApplicator` is Send but not Sync
     async fn dispatch_planned(
         &mut self,
         pending: &mut Vec<RoutedHeap>,
@@ -736,24 +782,36 @@ impl ReorderSink {
         }
         let heaps = std::mem::take(pending);
         let bytes = std::mem::take(pending_bytes);
-        let permit = crate::budget::admit_opt(self.budget.as_ref(), bytes)
-            .await
-            .map(Arc::new);
+        let permit = tokio::select! {
+            biased;
+            _ = self.fatal.wait() => return Err(self.fatal_err()),
+            p = crate::budget::admit_opt(self.budget.as_ref(), bytes) => p.map(Arc::new),
+        };
         let seq = self.alloc_seq();
         if publish {
             self.ack.register(seq, commit_lsn);
         } else {
             self.ack.register_partial(seq, commit_lsn);
         }
-        let job = DecodeJob {
-            seq,
-            commit_ts,
-            commit_lsn,
-            heaps,
-            chunks: Vec::new(),
-            permit,
+        self.stats.queue_jobs_out.fetch_add(1, Ordering::Relaxed);
+        let chunk_rows = self.emitter.decode_chunk_rows;
+        let rows = tokio::select! {
+            biased;
+            _ = self.fatal.wait() => return Err(self.fatal_err()),
+            r = decode::place_rows(
+                &self.msg_tx,
+                &self.stats,
+                chunk_rows,
+                self.emitter.snowflake.is_some(),
+                seq,
+                commit_ts,
+                commit_lsn,
+                heaps,
+                permit,
+            ) => r.map_err(SinkError::Other)?,
         };
-        self.dispatch_job(job).await
+        self.ack.placed(seq, rows);
+        Ok(())
     }
 
     /// Replay one sealed plan through the existing barrier ordering. Routes
@@ -763,7 +821,11 @@ impl ReorderSink {
     /// fence per their carried cursor. The final data segment publishes the
     /// commit LSN when nothing follows it; otherwise the caller's trailing
     /// rows=0 marker does. Returns dispatched rows + whether it published
-    pub async fn execute_plan(&mut self, plan: &SealedPlan) -> Result<(u64, bool), SinkError> {
+    pub async fn execute_plan(
+        &mut self,
+        db: Oid,
+        plan: &SealedPlan,
+    ) -> Result<(u64, bool), SinkError> {
         let (commit_ts, commit_lsn) = (plan.commit_ts, plan.commit_lsn);
         // Mem-resident plans hold the bytes validated at write; file-backed
         // plans re-read from disk, checksum-verify fully before the first
@@ -798,7 +860,7 @@ impl ReorderSink {
                     )
                     .await?;
                     self.barrier_fence().await?;
-                    self.apply_drain_entry(&c.event, commit_lsn).await?;
+                    self.apply_drain_entry(db, &c.event, commit_lsn).await?;
                 }
                 PlanItem::Heap(h) if matches!(h.described.decoded.op, HeapOp::Truncate) => {
                     let upto = trunc.next().unwrap_or(rows_cursor);
@@ -858,6 +920,10 @@ impl ReorderSink {
         // the buffered work lives under the prepared xid — drain there, or
         // capture-keyed events would never leave the buffer
         let xid = payload.twophase_xid.unwrap_or(xid);
+        // One backend writes one database, so the whole drain routes through
+        // that database's log, rules and applicator. `xl_xact_dbinfo` is
+        // always logged at wal_level=logical; the primary is the fallback
+        let db = payload.db_id.unwrap_or(self.dbs.primary().oid);
         self.note_pending(xid, &payload.subxacts, true).await?;
         // Parent for this commit's spans; held until on_commit returns so it
         // outlives the prune below. No-op span when tracing off/unsampled.
@@ -866,9 +932,14 @@ impl ReorderSink {
             .as_ref()
             .and_then(|r| r.txn_span(xid))
             .unwrap_or_else(tracing::Span::none);
+        let stash_log = self
+            .scopes
+            .get(&db)
+            .map(|scope| scope.db.desc_log.clone())
+            .unwrap_or_else(|| self.dbs.primary().desc_log.clone());
         crate::xact::xact_buffer::resolve_stash(
             &self.buffer,
-            &self.log,
+            &stash_log,
             &self.pending,
             xid,
             &payload.subxacts,
@@ -932,17 +1003,22 @@ impl ReorderSink {
         // One route state per transaction: a mid-commit config republish
         // can't split this xact's rows across two route versions. In-walk
         // catalog events fold into the plan-time view, not shared state.
-        self.reset_route_state().await;
+        self.reset_route_state(db).await;
         let mut rows_total: u64 = 0;
         let mut published = false;
         if drain.had_states {
             let plan_path = self.plan_dir.join(format!("xact-{xid}-{commit_lsn}.plan"));
             let plan = {
+                let scope = self.scopes.get_mut(&db);
+                let row_policy = scope
+                    .as_ref()
+                    .map(|scope| scope.db.row_policy())
+                    .unwrap_or_default();
                 let mut view = ReorderRouteView::new(
                     self.route_mapping.clone(),
                     self.route_config.clone(),
-                    self.row_policy.clone(),
-                    self.applicator.as_mut(),
+                    row_policy,
+                    scope.and_then(|scope| scope.applicator.as_mut()),
                     self.stats.clone(),
                 );
                 let resolver = self.resolver.clone();
@@ -992,7 +1068,7 @@ impl ReorderSink {
             };
             plan_bytes.fetch_add(plan.size_bytes, Ordering::Relaxed);
             (rows_total, published) = self
-                .execute_plan(&plan)
+                .execute_plan(db, &plan)
                 .instrument(trace_span!(
                     !txn.is_none(),
                     parent: &txn,
@@ -1028,7 +1104,7 @@ impl ReorderSink {
         self.ack.register(seq, record.source_lsn);
         {
             let mut buf = self.buffer.lock().await;
-            buf.abort(xid, record.source_lsn, &payload.subxacts)
+            buf.abort(xid, Pos::new(record.source_lsn), &payload.subxacts)
                 .await
                 .map_err(SinkError::from)?;
         }
@@ -1192,7 +1268,7 @@ impl RecordSink for ReorderSink {
                     return Ok(());
                 }
                 self.ack.trailing(lsn);
-                buf.advance_idle(lsn);
+                buf.advance_idle(Pos::new(lsn));
             }
             // A quiet database never reaches a commit barrier, so apply
             // reloaded opt-ins here: with nothing buffered, the idle position

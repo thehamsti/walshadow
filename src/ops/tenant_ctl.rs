@@ -51,12 +51,21 @@ pub fn validate(root: &Table) -> Result<()> {
     let Some(tenants) = TenantsConfig::from_table(root)? else {
         return Ok(());
     };
+    // `[database.*]` follows extra databases through the one pipeline of the
+    // single-tenant layout; a tenant follows exactly one
     for decl in &tenants.decls {
         let eff = decl.effective_table(root);
         crate::destination::config::DestinationConfig::from_table(&eff)
             .with_context(|| format!("tenant {}: destination", decl.id))?;
-        crate::ch_emitter::EmitterConfig::from_table(&eff)
+        let cfg = crate::ch_emitter::EmitterConfig::from_table(&eff)
             .map_err(|e| anyhow::anyhow!("tenant {}: {e}", decl.id))?;
+        if cfg.databases.len() > 1 {
+            bail!(
+                "tenant {}: `[database.*]` entries belong to the single-tenant layout; \
+                 declare a tenant per database instead",
+                decl.id
+            );
+        }
     }
     ensure_distinct_destinations(root, &tenants)
 }
@@ -177,7 +186,7 @@ pub async fn put(ctx: &SharedCtx, body: &Table) -> Result<String> {
             let mut preview = root.clone();
             crate::ch_emitter::merge_tables(&mut preview, decl.to_fragment());
             validate(&preview)?;
-            let client = crate::control::pg_connect(&root).await?;
+            let client = crate::control::pg_connect(&root, None).await?;
             client.batch_execute(&registry_ddl(&schema)).await?;
             let s = crate::pg::quote_ident(&schema);
             client
@@ -215,7 +224,7 @@ pub async fn remove(ctx: &SharedCtx, body: &Table) -> Result<String> {
             write_validated(ctx, &path, None).await?
         }
         Registry::Sql { schema, .. } => {
-            let client = crate::control::pg_connect(&root).await?;
+            let client = crate::control::pg_connect(&root, None).await?;
             let s = crate::pg::quote_ident(&schema);
             client
                 .execute(&format!("DELETE FROM {s}.tenant WHERE id = $1"), &[&id])
@@ -254,7 +263,7 @@ pub async fn set_state(ctx: &SharedCtx, body: &Table) -> Result<String> {
             write_validated(ctx, &path, Some(next.to_fragment())).await?
         }
         Registry::Sql { schema, .. } => {
-            let client = crate::control::pg_connect(&root).await?;
+            let client = crate::control::pg_connect(&root, None).await?;
             let s = crate::pg::quote_ident(&schema);
             client
                 .execute(
@@ -301,7 +310,7 @@ async fn write_validated(ctx: &SharedCtx, path: &Path, fragment: Option<Table>) 
 /// Rewrite the registry mirror from the rows; returns whether it changed.
 /// The daemon polls this, so rows edited straight in SQL also take effect
 pub async fn mirror_registry(config: &Path, root: &Table, schema: &str) -> Result<bool> {
-    let client = crate::control::pg_connect(root).await?;
+    let client = crate::control::pg_connect(root, None).await?;
     client.batch_execute(&registry_ddl(schema)).await?;
     let s = crate::pg::quote_ident(schema);
     let rows = client

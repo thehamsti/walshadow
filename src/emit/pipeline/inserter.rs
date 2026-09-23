@@ -22,7 +22,7 @@ use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatchMeta;
 use crate::emit::pipeline::resolver::ResolvedBatch;
-use crate::schema::RelName;
+use crate::schema::TableKey;
 use ahash::{HashMap, HashMapExt};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -35,7 +35,7 @@ struct Inserter {
     /// Parsed column types per table, refreshed when a batch's `schema_epoch`
     /// changes. `TypeAst` is `Send` but not `Sync`, so each inserter parses
     /// its own.
-    asts: HashMap<RelName, (u64, Vec<TypeAst>)>,
+    asts: HashMap<TableKey, (u64, Vec<TypeAst>)>,
     ack: AckHandle,
     stats: Arc<EmitterStats>,
     /// Live emitter knobs. `Some` with the overlay active: retry budget +
@@ -299,7 +299,7 @@ mod tests {
             let (config, server) =
                 crate::ch::test_support::retry_server(retries, sql, true, idle).await;
             let client = ChConn::connect(&config).await.unwrap();
-            let (ack, collector) = ack::spawn(Arc::default());
+            let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
             let stats = Arc::new(EmitterStats::default());
             let mut inserter = Inserter {
                 client,
