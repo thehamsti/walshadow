@@ -236,7 +236,9 @@ fn empty_socket_path_defines_gucs_without_a_worker() {
 
     assert_eq!(
         pg.sql("SELECT count(*)::text FROM pg_settings WHERE name LIKE 'walshadow.%'"),
-        "5"
+        // socket_path, database, io/lock timeouts, bridge_workers,
+        // tenant_databases, tenant_bridge_workers
+        "7"
     );
     assert_eq!(
         pg.sql(

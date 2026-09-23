@@ -6742,7 +6742,8 @@ mod tests {
             if let Some(want) = expect {
                 assert_eq!(workers, want, "{toml:?}");
             }
-            let slots = workers + 1;
+            // Static pool plus the tenant launcher, over the floor of 1
+            let slots = workers + 1 + 1;
             let shadow = build_owned_shadow(&args, "postgres", tmp.path().to_path_buf(), workers);
             let floor = walshadow::shadow::SourceGucFloor {
                 max_worker_processes: 1,
