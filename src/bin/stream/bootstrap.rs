@@ -306,9 +306,12 @@ pub(crate) async fn run_bootstrap(
     let shadow_toast_bridge = walshadow::toast::shadow_store::LateBridge::default();
     // Shadow starts before backup WAL processing needs value lookups, so the
     // store reads through a cell this frame binds later
-    let resolver = match &ch_config {
-        Some(cfg) => ToastResolver::for_mode(
-            cfg,
+    let boot_dest = ch_config
+        .as_ref()
+        .map(|cfg| walshadow::config::DestEmitter::new(Arc::new(cfg.clone()), None));
+    let resolver = match (&ch_config, &boot_dest) {
+        (Some(cfg), Some(dest)) => ToastResolver::for_mode(
+            dest.clone(),
             bootstrap_stats.clone(),
             // Backup replay has no pump to sample xid ceilings
             Some(shadow_toast_bridge.clone().into()),
@@ -317,7 +320,7 @@ pub(crate) async fn run_bootstrap(
         .with_budget(walshadow::budget::MemoryBudget::new(
             cfg.resident_payload_max,
         )),
-        None => ToastResolver::disabled(),
+        _ => ToastResolver::disabled(),
     };
     let store_toast = resolver.stores_chunks();
 
@@ -584,6 +587,9 @@ pub(crate) async fn run_bootstrap(
             c.byte_budget = (c.byte_budget / lanes).max(8 << 20);
             c
         };
+        let lane_dest = walshadow::config::DestEmitter::new(Arc::new(lane_cfg.clone()), None);
+        let bootstrap_dest =
+            walshadow::config::DestEmitter::new(Arc::new(emitter_cfg.clone()), None);
 
         // Throwaway watermark: durability proof is `wait_through(K)`, resume
         // LSN is carried via the WAL pipeline's emitter_ack seed (see `run`),
@@ -592,7 +598,7 @@ pub(crate) async fn run_bootstrap(
         for inserters in &per_lane {
             tails.push(
                 OwnedTail::spawn(
-                    &lane_cfg,
+                    lane_dest.clone(),
                     *inserters,
                     stats.clone(),
                     fatal.clone(),
@@ -619,7 +625,7 @@ pub(crate) async fn run_bootstrap(
         window_emitter.snowflake_snapshots = Arc::default();
         let mut window_cfg = (!drain_catalog.is_empty()).then(|| {
             walshadow::backfill::bootstrap_window::WindowLegConfig {
-                emitter: window_emitter,
+                dest: walshadow::config::DestEmitter::new(Arc::new(window_emitter), None),
                 mapping: mapping.clone(),
                 config: resolved.clone(),
                 stats: stats.clone(),
@@ -644,7 +650,7 @@ pub(crate) async fn run_bootstrap(
             catalog: drain_catalog.clone(),
             mapping: routes,
             config: resolved.clone(),
-            emitter: emitter_cfg.clone(),
+            dest: bootstrap_dest.clone(),
             stats: stats.clone(),
             resolver: resolver.clone(),
             skip_initial,
@@ -1263,9 +1269,11 @@ pub(crate) async fn run_bootstrap(
             .map_err(anyhow::Error::msg)
             .context("reconcile Snowflake greenfield pending rows")?;
         if !ledger.is_empty() {
-            let mut session = walshadow::backfill_staging::StagingSession::connect(emitter)
-                .await
-                .context("open Snowflake pending settlement")?;
+            let mut session = walshadow::backfill_staging::StagingSession::connect(
+                walshadow::config::DestEmitter::new(emitter, None),
+            )
+            .await
+            .context("open Snowflake pending settlement")?;
             walshadow::visibility_pending::settle(&mut ledger, &mut session, &bootstrap_stats)
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -1291,6 +1299,7 @@ pub(crate) async fn run_bootstrap(
     Ok((
         BootstrapHandoff {
             end_lsn: outcome.end.end_lsn,
+            timeline: outcome.start.timeline,
             open_floor,
             shadow: running_shadow,
         },
@@ -1324,6 +1333,7 @@ pub(crate) struct BootstrapMetrics {
 pub(crate) struct BootstrapHandoff {
     /// Backup end and shadow state boundary
     pub(crate) end_lsn: u64,
+    pub(crate) timeline: u32,
     /// Earliest record among transactions open at window seal
     pub(crate) open_floor: Option<u64>,
     /// Shadow instance started during bootstrap
@@ -1409,19 +1419,22 @@ pub(crate) async fn bootstrap_build_mapping(
     };
     // Publish rule-adjusted targets before creating tables
     mapping.publish(merged_tables).await;
+    let dest =
+        walshadow::config::DestEmitter::new(Arc::new(emitter_cfg.clone()), Some(config_rx.clone()));
     if let Some(runtime) = &emitter_cfg.snowflake {
         use futures::{StreamExt, TryStreamExt};
         // Relations have independent storage and durable journals. Bound remote
         // setup without serializing thousands of SQL round trips on one lane.
         futures::stream::iter(catalog.descriptors())
             .map(|desc| {
+                let dest = dest.clone();
                 let ddl_cfg = ddl_cfg.clone();
                 let config_rx = config_rx.clone();
                 let mapping = mapping.clone();
                 let resolved = resolved.clone();
                 async move {
                     let mut applicator = walshadow::ch_ddl::DdlApplicator::new(
-                        emitter_cfg,
+                        dest,
                         ddl_cfg,
                         mapping.clone(),
                         config_rx,
@@ -1449,7 +1462,7 @@ pub(crate) async fn bootstrap_build_mapping(
         return Ok((mapping, resolved));
     }
     let mut applicator =
-        walshadow::ch_ddl::DdlApplicator::new(emitter_cfg, ddl_cfg, mapping.clone(), config_rx)
+        walshadow::ch_ddl::DdlApplicator::new(dest, ddl_cfg, mapping.clone(), config_rx)
             .await
             .context("bootstrap: init DDL applicator")?;
     for desc in catalog.descriptors() {
@@ -1734,6 +1747,7 @@ mod tests {
     fn bootstrap_handoff_preserves_required_history() {
         let crossing = BootstrapHandoff {
             end_lsn: 0x3000,
+            timeline: 1,
             open_floor: Some(0x1000),
             shadow: None,
         };
@@ -1741,6 +1755,7 @@ mod tests {
 
         let clean = BootstrapHandoff {
             end_lsn: 0x3000,
+            timeline: 1,
             open_floor: None,
             shadow: None,
         };
@@ -1748,6 +1763,7 @@ mod tests {
         assert_eq!(
             BootstrapHandoff {
                 end_lsn: 0x3000,
+                timeline: 1,
                 open_floor: Some(0x4000),
                 shadow: None,
             }

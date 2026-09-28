@@ -30,7 +30,7 @@
 //! using commit LSNs, up to each relation's coverage bound
 //!
 //! Follow promotions along the branch the stream proved, cross-checked against
-//! archived history by [`crate::source::archive_history`] before a gap replay
+//! archived history by [`crate::source::archive::verify_history`] before a gap replay
 //! Reject backups whose redo or finish lies outside that branch
 //!
 //! The pre-scan aborts on gap writes that would invalidate the walk: a
@@ -82,7 +82,7 @@ use crate::filter::pg_class_decoder::{
 use crate::record::{Record, RecordSink, SinkError, WAL_SEG_SIZE, segments_covering_lineage};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::RelDescriptor;
-use crate::source::archive_history;
+use crate::source::archive;
 use crate::source::timeline::TimelineHistory;
 use crate::ticker::Ticker;
 use crate::toast::ToastResolver;
@@ -158,8 +158,8 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
     // Archive from the `[backup]` config, never the source-PG overlay:
     // credentials in a source table is the wrong trust direction
     // (architecture/bootstrap.md)
-    let settings = ctx
-        .emitter
+    let emitter = ctx.dest.current();
+    let settings = emitter
         .backup
         .as_ref()
         .context("backup_backfill: object_store initial_load requires a [backup] section")?;
@@ -200,7 +200,7 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
     let (patch, gap_segments) = if b_redo < s_max {
         // Only a replay leg reads the archive's own WAL, so only it needs the
         // archive to agree on the chain serving those segments
-        archive_history::verify(settings, &storage, &history)
+        archive::verify_history(settings, &storage, &history)
             .await
             .context("backup_backfill: cross-check archived timeline history")?;
         let names =
@@ -234,7 +234,8 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
             ctx.scratch_dir.clone(),
         )
         .with_parallelism(
-            ctx.emitter
+            ctx.dest
+                .current()
                 .bootstrap
                 .object_store_parallelism
                 .map_or(8, |n| n.get()),
@@ -306,7 +307,7 @@ async fn walk_and_ship(
 
     // Use live pipeline's store, `from_config` always selects ClickHouse mirror
     let mut resolver = ToastResolver::for_mode(
-        &ctx.emitter,
+        ctx.dest.clone(),
         ctx.stats.clone(),
         ctx.oracle
             .as_deref()
@@ -319,8 +320,8 @@ async fn walk_and_ship(
     // Dedicated tail: own connections, own seq space, own fatal — the
     // live pipeline never blocks on a backfill (Regime A)
     let tail = OwnedTail::spawn(
-        &ctx.emitter,
-        ctx.emitter.inserter_pool_size.clamp(1, 3),
+        ctx.dest.clone(),
+        ctx.dest.current().inserter_pool_size.clamp(1, 3),
         ctx.stats.clone(),
         Fatal::new(),
         ctx.config_rx.clone(),
@@ -435,10 +436,10 @@ async fn walk_and_ship(
                 &tail.ack,
                 &ctx.stats,
                 &resolver,
-                &ctx.emitter.row_policy(),
+                &ctx.dest.current().row_policy(),
                 config.as_deref(),
                 next_seq,
-                ctx.emitter.snowflake.is_some(),
+                ctx.dest.current().snowflake.is_some(),
                 replay_checkpoint,
             )
             .await
@@ -493,7 +494,7 @@ async fn walk_and_ship(
     outcome.pending_tables = visibility_pending::ship(
         pending,
         &ctx.published.snapshot().await,
-        ctx.emitter.clone(),
+        ctx.dest.clone(),
         ctx.stats.clone(),
         resolver,
         ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
@@ -623,10 +624,10 @@ async fn run_walk(
         ctx.stats.clone(),
         resolver.clone(),
         bootstrap::Deferral::Handback(toast_spool),
-        ctx.emitter.row_policy(),
+        ctx.dest.current().row_policy(),
         ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
         HashSet::new(),
-        ctx.emitter.snowflake.is_some(),
+        ctx.dest.current().snowflake.is_some(),
         barrier.clone(),
     ));
 
@@ -895,10 +896,10 @@ async fn replay_gap(
         mapping: ctx.mapping.snapshot().await,
         stats: ctx.stats.clone(),
         budget: ctx.budget.clone(),
-        row_policy: ctx.emitter.row_policy(),
+        row_policy: ctx.dest.current().row_policy(),
         config: ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
-        batch_rows: ctx.emitter.drain_batch_rows,
-        batch_bytes: ctx.emitter.drain_batch_bytes,
+        batch_rows: ctx.dest.current().drain_batch_rows,
+        batch_bytes: ctx.dest.current().drain_batch_bytes,
         msg_tx: tail.msg_tx.clone(),
         ack: tail.ack.clone(),
         next_seq,

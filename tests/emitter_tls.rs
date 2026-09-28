@@ -338,11 +338,13 @@ async fn emitter_tls_round_trip() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int32".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "name".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
         ],
     });
@@ -353,9 +355,15 @@ async fn emitter_tls_round_trip() {
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());
     let fatal = Fatal::new();
-    let (msg_tx, ack, tail_parts) = tail::spawn(&cfg, 1, stats, emitter_ack, fatal.clone())
-        .await
-        .expect("spawn tail over TLS");
+    let (msg_tx, ack, tail_parts) = tail::spawn(
+        walshadow::config::DestEmitter::new(std::sync::Arc::new(cfg), None),
+        1,
+        stats,
+        emitter_ack,
+        fatal.clone(),
+    )
+    .await
+    .expect("spawn tail over TLS");
 
     let tuple = CommittedTuple {
         decoded: DecodedHeap {

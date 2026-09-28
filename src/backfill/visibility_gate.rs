@@ -24,7 +24,7 @@ use crate::decode::visibility::{
     HEAP_XMAX_IS_MULTI, PgXactPatch, PgXactView, Visibility, deferred_xids, read_pg_multixact,
     read_pg_xact, tuple_visibility,
 };
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
+use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatcherMsg;
 use crate::emit::pipeline::bootstrap::BootstrapDrainOutcome;
@@ -253,7 +253,7 @@ pub struct GreenfieldSink {
     pub catalog: CatalogMap,
     pub mapping: MappingSnapshot,
     pub config: Arc<ResolvedConfig>,
-    pub emitter: EmitterConfig,
+    pub dest: Arc<crate::config::DestEmitter>,
     pub stats: Arc<EmitterStats>,
     pub resolver: ToastResolver,
     /// Relations excluded from initial load
@@ -303,10 +303,10 @@ impl GreenfieldSink {
                         .map_err(|e| format!("bootstrap: reopen handback spool: {e}"))?,
                     None => DeferredSpool::new(spool, DEFERRED_SPOOL_MEM_MAX),
                 }),
-                self.emitter.row_policy(),
+                self.dest.current().row_policy(),
                 Some(self.config.clone()),
                 self.skip_initial.clone(),
-                self.emitter.snowflake.is_some(),
+                self.dest.current().snowflake.is_some(),
                 None,
             ));
             senders.push(tx);
@@ -327,8 +327,9 @@ impl GreenfieldSink {
             let stats = self.stats.clone();
             let resolver = self.resolver.clone();
             let config = self.config.clone();
-            let row_policy = self.emitter.row_policy();
-            let neutral_values = self.emitter.snowflake.is_some();
+            let emitter = self.dest.current();
+            let row_policy = emitter.row_policy();
+            let neutral_values = emitter.snowflake.is_some();
             async move {
                 bootstrap::drain_deferred(
                     lane.spool,
@@ -433,8 +434,8 @@ pub async fn resolve_greenfield(
     let oracle_for_pending = oracle.clone();
     let fatal = Fatal::new();
     let tail = OwnedTail::spawn(
-        &sink.emitter,
-        sink.emitter.inserter_pool_size,
+        sink.dest.clone(),
+        sink.dest.current().inserter_pool_size,
         sink.stats.clone(),
         fatal.clone(),
         None,
@@ -506,7 +507,7 @@ pub async fn resolve_greenfield(
     let pending_tables = crate::backfill::visibility_pending::ship(
         pending_spool,
         &sink.mapping,
-        Arc::new(sink.emitter.clone()),
+        sink.dest.clone(),
         sink.stats.clone(),
         sink.resolver.clone(),
         Some(sink.config.clone()),
@@ -713,7 +714,7 @@ mod tests {
             catalog: CatalogMap::new(),
             mapping: Default::default(),
             config: Arc::new(ResolvedConfig::default()),
-            emitter: EmitterConfig::default(),
+            dest: crate::config::DestEmitter::new(Arc::default(), None),
             stats: Arc::new(EmitterStats::default()),
             resolver: ToastResolver::disabled(),
             skip_initial: HashSet::new(),
@@ -772,6 +773,7 @@ mod tests {
                     src_attnum: 1,
                     target_name: "id".into(),
                     target_type: "Int32".into(),
+                    type_pinned: false,
                 }],
             },
         );
@@ -779,7 +781,7 @@ mod tests {
             catalog,
             mapping: Arc::new(tables),
             config: Arc::new(ResolvedConfig::default()),
-            emitter: EmitterConfig::default(),
+            dest: crate::config::DestEmitter::new(Arc::default(), None),
             stats: Arc::new(EmitterStats::default()),
             resolver: ToastResolver::disabled(),
             skip_initial: HashSet::new(),
@@ -918,12 +920,14 @@ mod tests {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int32".into(),
+                type_pinned: false,
             }];
             if body_mapped {
                 columns.push(ColumnMapping {
                     src_attnum: 2,
                     target_name: "body".into(),
                     target_type: "String".into(),
+                    type_pinned: false,
                 });
             }
             let mapping = TableMapping {
@@ -1129,7 +1133,7 @@ mod tests {
                 catalog: CatalogMap::new(),
                 mapping: Default::default(),
                 config: Arc::new(ResolvedConfig::default()),
-                emitter: EmitterConfig::default(),
+                dest: crate::config::DestEmitter::new(Arc::default(), None),
                 stats: Arc::new(EmitterStats::default()),
                 resolver: ToastResolver::disabled(),
                 skip_initial: HashSet::new(),

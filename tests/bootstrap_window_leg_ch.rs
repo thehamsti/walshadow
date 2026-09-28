@@ -47,11 +47,13 @@ fn emitter(port: u16) -> EmitterConfig {
                     src_attnum: 1,
                     target_name: "id".into(),
                     target_type: "Int32".into(),
+                    type_pinned: false,
                 },
                 ColumnMapping {
                     src_attnum: 2,
                     target_name: "name".into(),
                     target_type: "String".into(),
+                    type_pinned: false,
                 },
             ],
         },
@@ -109,7 +111,7 @@ async fn partial_transaction_failure_returns_from_live_and_archived_replay() {
     let cfg = WindowLegConfig {
         wind_down: Duration::from_secs(5),
         mapping: walshadow::mapping::mapping_handle(emitter.tables.clone()),
-        emitter,
+        dest: walshadow::config::DestEmitter::new(Arc::new(emitter), None),
         config: Arc::new(ResolvedConfig::default()),
         stats: stats.clone(),
         resolver: ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats),
@@ -235,7 +237,7 @@ async fn leg_reads_through_end_lsn_inside_its_first_segment() {
         let patch = Arc::new(std::sync::Mutex::new(PgXactPatch::new()));
         let cfg = WindowLegConfig {
             wind_down: Duration::from_secs(5),
-            emitter: emitter(slot.ch_tcp),
+            dest: walshadow::config::DestEmitter::new(Arc::new(emitter(slot.ch_tcp)), None),
             mapping: walshadow::mapping::mapping_handle(emitter(slot.ch_tcp).tables),
             config: Arc::new(ResolvedConfig::default()),
             stats: Arc::new(EmitterStats::default()),

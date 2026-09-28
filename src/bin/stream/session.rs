@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 use walrus::pg::backup::format_pg_lsn;
+use walshadow::archive::Archive;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::config::{CliOverrides, ConfigResolver, SourceConn};
 use walshadow::manifest;
@@ -26,7 +27,8 @@ use walshadow::segment_sink::{DirSegmentSink, SegFsync};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::timeline::TimelineHistory;
 use walshadow::transition::{
-    CrossingState, ForkGuards, Switchover, TimelineStats, load_boot_history, seed_shadow_branches,
+    CrossingState, ForkGuards, PrefixOrigin, Switchover, TimelineStats, load_boot_history,
+    seed_shadow_branches,
 };
 use walshadow::wal_stream::WalStream;
 
@@ -47,7 +49,7 @@ use crate::shadow_proc::{
 };
 use crate::sinks::DaemonSinks;
 use crate::source_recovery::{
-    BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PromotionGate, Redial,
+    BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PromotionGate, ReconnectBackoff,
     SOURCE_SWAP_RETRY, SourcePath, SourceRecovery, commit_fork_resume, connect_source_waiting,
     promotion_gate, resume_manifest, resume_source_feed, stream_branch, swap_reason,
 };
@@ -249,6 +251,7 @@ pub(crate) async fn run_session(
     let bootstrap_end_lsn: Option<u64> = bootstrap_handoff.as_ref().map(|h| h.end_lsn);
     let bootstrap_resume_lsn: Option<u64> =
         bootstrap_handoff.as_ref().map(BootstrapHandoff::resume_lsn);
+    let bootstrap_timeline: Option<u32> = bootstrap_handoff.as_ref().map(|h| h.timeline);
     // Regenerate config because shadow's port, socket, and GUC floor may change
     // Keep shadow alive until pipeline teardown finishes
     // Reuse shadow instance started during bootstrap
@@ -282,10 +285,12 @@ pub(crate) async fn run_session(
     };
     let shadow_lifecycle =
         ShadowLifecycle::spawn(owned, walsender_primary_conninfo(args.walsender_bind));
-    let backup_settings = ch_config
+    let archive = ch_config
         .as_ref()
         .or(cluster_cfg.as_ref())
-        .and_then(|c| c.backup.clone());
+        .and_then(|c| c.backup.clone())
+        .map(Archive::open)
+        .transpose()?;
     let start_lsn_override: Option<Pos<Floor>> = args
         .start_lsn
         .as_deref()
@@ -385,9 +390,8 @@ pub(crate) async fn run_session(
     // stored on an ancestor is served by that ancestor, whatever the live head
     // reports, and a floor at a fork segment's start is served by the descendant
     // whose file holds the ancestor prefix (architecture/recovery.md).
-    let stored_timeline = manifest_at_boot
-        .as_ref()
-        .map(|m| m.source.timeline)
+    let stored_timeline = bootstrap_timeline
+        .or_else(|| manifest_at_boot.as_ref().map(|m| m.source.timeline))
         .unwrap_or(ident.timeline);
     let mut history = load_boot_history(&mut feed, ident.timeline, stored_timeline).await?;
     let start_timeline = match history.resume_branch(stored_timeline, aligned.get(), WAL_SEG_SIZE) {
@@ -420,11 +424,15 @@ pub(crate) async fn run_session(
     // places a descendant, and only the switchpoint separates them. A stored
     // begin is the chain a previous run proved, carried forward
     // (architecture/recovery.md)
-    let stored_begin = manifest_at_boot
-        .as_ref()
-        .map(|m| m.source.timeline_begin.get())
-        .unwrap_or(0);
     let live_begin = history.begin_of(stored_timeline).unwrap_or(0);
+    let stored_begin = if bootstrap_timeline.is_some() {
+        live_begin
+    } else {
+        manifest_at_boot
+            .as_ref()
+            .map(|m| m.source.timeline_begin.get())
+            .unwrap_or(0)
+    };
     match stored_begin {
         0 if stored_timeline > 1 => tracing::warn!(
             target: "walshadow",
@@ -572,7 +580,11 @@ pub(crate) async fn run_session(
                 ..manifest::FloorInputs::default()
             }
             .floor(),
-            source: live_identity.clone(),
+            source: manifest::SourceIdentity {
+                system_id: live_identity.system_id,
+                timeline: start_timeline,
+                timeline_begin: Pos::new(history.begin_of(start_timeline).unwrap_or(0)),
+            },
             wal: manifest::WalBranch {
                 stream_timeline: start_timeline,
             },
@@ -897,11 +909,13 @@ pub(crate) async fn run_session(
         );
     }
 
-    let source_recovery = SourceRecovery {
+    let mut source_recovery = SourceRecovery {
+        system_id: live_identity.system_id,
         status_interval: Duration::from_secs(args.status_interval),
-        backup: backup_settings.as_ref(),
+        backup: archive.as_ref(),
         floor: &resume_floor,
         prefetch: usize::from(args.archive_prefetch),
+        backoff: ReconnectBackoff::default(),
     };
     let mut path = SourcePath::Live;
     if let Err(e) = feed
@@ -913,15 +927,8 @@ pub(crate) async fn run_session(
         .await
     {
         path = source_recovery
-            .recover(
-                e,
-                &cfg,
-                source_conn.slot.as_deref(),
-                stream_branch(&history, live_identity.system_id, &stream),
-                stream.next_lsn(),
-                &mut feed,
-            )
-            .await;
+            .attempt(Some(e), &source_conn, &history, &stream, &mut feed)
+            .await?;
     }
 
     let mut segments_shipped = 0u64;
@@ -966,6 +973,7 @@ pub(crate) async fn run_session(
         system_id: live_identity.system_id,
         out_dir: &args.out_dir,
         shadow_state: &shadow_state,
+        backup: archive.as_ref(),
     };
     let mut timeline_stats = TimelineStats {
         // Off the chain, so a restart after a crossing keeps reporting the fork
@@ -979,7 +987,8 @@ pub(crate) async fn run_session(
     let mut crossing = CrossingState::default();
     let mut barrier_logged: Option<Instant> = None;
     let shutdown_reason = 'pump: loop {
-        if matches!(path, SourcePath::Archive(_))
+        // Nothing resumes at a switchpoint, not archive nor redial, only a crossing
+        if !matches!(path, SourcePath::Live)
             && history.branch_exhausted(stream.timeline(), stream.next_lsn().get())
         {
             path = SourcePath::Live;
@@ -1008,26 +1017,11 @@ pub(crate) async fn run_session(
         }
         // Lost source redials whatever `[source]` names now, so a repoint made
         // during an outage is what the next attempt dials
-        if let SourcePath::Redial(redial) = &mut path
-            && let Some(fresh) = source_recovery
-                .redial(
-                    redial,
-                    &cfg,
-                    source_conn.slot.as_deref(),
-                    stream_branch(&history, live_identity.system_id, &stream),
-                    stream.next_lsn(),
-                )
-                .await?
-        {
-            feed = fresh;
-            path = SourcePath::Live;
+        if matches!(path, SourcePath::Redial) && source_recovery.backoff.due() {
+            path = source_recovery
+                .attempt(None, &source_conn, &history, &stream, &mut feed)
+                .await?;
             swap.settled();
-            tracing::info!(
-                target: "walshadow",
-                endpoint = source_conn.endpoint(),
-                resume_lsn = %stream.next_lsn(),
-                "source reconnected — resuming replication",
-            );
         }
         // Swap between chunks, so the resume point is the byte-contiguous
         // `next_lsn` and no WalStream state is rebuilt. Old feed stays up
@@ -1038,8 +1032,7 @@ pub(crate) async fn run_session(
         // Not while a crossing is pending: the stream sits at a switchpoint no
         // branch resumes from, and the crossing dials the live endpoint and slot
         // itself, so a repoint made mid-crossing lands there instead.
-        if swap.due(Instant::now()) && !crossing.pending() && !matches!(path, SourcePath::Redial(_))
-        {
+        if swap.due(Instant::now()) && !crossing.pending() && !matches!(path, SourcePath::Redial) {
             match resume_source_feed(
                 &cfg,
                 source_conn.slot.as_deref(),
@@ -1396,12 +1389,9 @@ pub(crate) async fn run_session(
             result = async { path.archive().expect("guarded by arm").next().await },
                 if matches!(path, SourcePath::Archive(_)) && !paused && !crossing.pending() => {
                 match result {
-                    Some(Ok((start_lsn, mut bytes))) => {
+                    Some(Ok((start_lsn, bytes))) => {
+                        source_recovery.backoff.reset();
                         anyhow::ensure!(start_lsn == stream.next_lsn().get(), "archive WAL discontinuity");
-                        if let Some(fork) = history.switchpoint_of(stream.timeline()) {
-                            anyhow::ensure!(start_lsn < fork, "archive read past timeline fork");
-                            bytes.truncate((fork - start_lsn).min(bytes.len() as u64) as usize);
-                        }
                         archived_bytes = bytes;
                         archived_segment = true;
                         Some(walshadow::source_feed::WalChunk {
@@ -1410,14 +1400,13 @@ pub(crate) async fn run_session(
                             data: &archived_bytes,
                         })
                     }
-                    result => {
-                        let reason = match result {
-                            Some(Err(e)) => format!("{e:#}"),
-                            None => "archive reader stopped".to_string(),
-                            Some(Ok(_)) => unreachable!(),
-                        };
+                    ended => {
+                        let reason = ended.and_then(Result::err).map_or_else(
+                            || "archive reader stopped".to_string(),
+                            |e| format!("{e:#}"),
+                        );
                         tracing::info!(target: "walshadow", reason, "archive ended, reconnecting source");
-                        path = SourcePath::Redial(Redial::now(reason));
+                        path = SourcePath::Redial;
                         None
                     }
                 }
@@ -1467,15 +1456,8 @@ pub(crate) async fn run_session(
                         }
                     };
                     path = source_recovery
-                        .recover(
-                            err,
-                            &cfg,
-                            source_conn.slot.as_deref(),
-                            stream_branch(&history, live_identity.system_id, &stream),
-                            stream.next_lsn(),
-                            &mut feed,
-                        )
-                        .await;
+                        .attempt(Some(err), &source_conn, &history, &stream, &mut feed)
+                        .await?;
                     // Recovery dials the live endpoint, so a queued swap is done
                     swap.settled();
                     None
@@ -1714,6 +1696,10 @@ pub(crate) async fn run_session(
                             slot = source_conn.slot.as_deref(),
                             "crossed source timeline",
                         );
+                        if crossed.prefix_origin == PrefixOrigin::Archive {
+                            source_recovery.backoff.reset();
+                            path = SourcePath::Redial;
+                        }
                         history = crossed.history;
                         history_tx.send_replace(Arc::new(history.clone()));
                         for t in &tenants {

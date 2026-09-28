@@ -82,7 +82,7 @@ use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTup
 use crate::backfill::opt_in::Backfiller;
 use crate::backfill::visibility_pending::{self, SharedPendingLedger};
 use crate::catalog::shadow_catalog::ShadowCatalog;
-use crate::config::ResolvedConfig;
+use crate::config::{DestEmitter, ResolvedConfig};
 use crate::decode::codecs::NumericKind;
 use crate::decode::heap_decoder::ColumnValue;
 use crate::destination::snowflake::runtime::SnowflakeRuntime;
@@ -754,12 +754,7 @@ pub struct CopyBackfiller {
     pg: PgConfig,
     /// Boot standby endpoint for COPY reads, `None` reads the primary
     replica_pg: Option<PgConfig>,
-    /// Boot emitter; [`Self::dest_emitter`] overlays the live CH connection
-    emitter: Arc<EmitterConfig>,
-    /// Last [`Self::dest_emitter`] snapshot, rebuilt only when the destination
-    /// moves. The mapping tables ride along in an `EmitterConfig`, so a
-    /// per-relation rebuild would deep-copy every mapped table.
-    dest: std::sync::Mutex<Arc<EmitterConfig>>,
+    dest: Arc<DestEmitter>,
     mapping: MappingHandle,
     stats: Arc<EmitterStats>,
     /// Shadow catalog for backup passes: toast-rel descriptors by name
@@ -801,7 +796,7 @@ impl CopyBackfiller {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         pg: PgConfig,
-        emitter: EmitterConfig,
+        dest: Arc<DestEmitter>,
         mapping: MappingHandle,
         stats: Arc<EmitterStats>,
         catalog: Arc<Mutex<ShadowCatalog>>,
@@ -816,8 +811,7 @@ impl CopyBackfiller {
         pending_rows: SharedPendingLedger,
     ) -> std::io::Result<Self> {
         let ledger = Ledger::load(spill_dir, system_id).await?;
-        let emitter_copy_concurrency = emitter.bootstrap.copy_concurrency.map(|n| n.get());
-        let emitter = Arc::new(emitter);
+        let emitter_copy_concurrency = dest.base().bootstrap.copy_concurrency.map(|n| n.get());
         let pending = AtomicU64::new(ledger.pending_count());
         let pending_by_mode = [
             AtomicU64::new(ledger.pending_count_for(InitialLoadMode::Copy)),
@@ -827,8 +821,7 @@ impl CopyBackfiller {
         Ok(Self {
             pg,
             replica_pg: None,
-            dest: std::sync::Mutex::new(emitter.clone()),
-            emitter,
+            dest,
             mapping,
             stats,
             catalog,
@@ -898,17 +891,6 @@ impl CopyBackfiller {
     /// pass opens. A backfill's own tail and staging session connect eagerly,
     /// so they take the moved destination at spawn rather than dialling boot's
     /// address and reconnecting off the watch at the first batch.
-    fn dest_emitter(&self) -> Arc<EmitterConfig> {
-        let mut dest = self.dest.lock().expect("dest emitter poisoned");
-        let Some(rc) = self.config_rx.as_ref().map(|rx| rx.borrow().clone()) else {
-            return dest.clone();
-        };
-        if !rc.dest_conn_eq(&dest) {
-            *dest = Arc::new(rc.overlay_dest(&self.emitter));
-        }
-        dest.clone()
-    }
-
     /// Live per-relation rules, for destination names the staging promote
     /// has to match. `None` without a resolver (tests): the boot set stands
     fn table_rules(&self) -> Option<Arc<crate::table_rules::TableRules>> {
@@ -1127,7 +1109,7 @@ impl CopyBackfiller {
                     error = %format!("{e:#}"),
                     "backup backfill pass failed",
                 );
-                if self.emitter.bootstrap.copy_fallback.unwrap_or(true) {
+                if self.dest.base().bootstrap.copy_fallback.unwrap_or(true) {
                     for req in &reqs {
                         if self.prepare_copy_fallback(mode, req).await {
                             self.clone()
@@ -1188,9 +1170,11 @@ impl CopyBackfiller {
         mode: InitialLoadMode,
         reqs: &[BackupRequest],
     ) -> anyhow::Result<PassOutcome> {
-        let dest = self.dest_emitter();
-        if let Some(runtime) = dest.snowflake.clone() {
-            return self.staged_pass_snowflake(mode, reqs, dest, runtime).await;
+        let emitter = self.dest.current();
+        if let Some(runtime) = emitter.snowflake.clone() {
+            return self
+                .staged_pass_snowflake(mode, reqs, emitter, runtime)
+                .await;
         }
         let scratch_dir = self.spill_dir.join("backup_backfill");
         let config = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
@@ -1198,14 +1182,15 @@ impl CopyBackfiller {
             mode,
             reqs,
             &self.mapping.snapshot().await,
-            &dest,
+            &emitter,
             config.as_deref(),
         );
         // Mid-walk progress names files whose rows are only in staging, so it
         // keeps the tables just as a completed walk does
         let resumed = match BackupCheckpoint::load(&scratch_dir).await? {
             Some(saved) if saved.matches(&checkpoint) && saved.resuming() => {
-                let mut session = backfill_staging::StagingSession::connect(dest.clone()).await?;
+                let mut session =
+                    backfill_staging::StagingSession::connect(self.dest.clone()).await?;
                 saved.staging_intact(&mut session).await?.then_some(saved)
             }
             _ => None,
@@ -1215,16 +1200,16 @@ impl CopyBackfiller {
             None => BackupCheckpoint::discard(&scratch_dir).await?,
         }
         let resuming = checkpoint.resuming();
-        let staging = backfill_staging::prepare(dest.clone(), &self.mapping, reqs, resuming)
+        let staging = backfill_staging::prepare(self.dest.clone(), &self.mapping, reqs, resuming)
             .await
             .context("staging prepare")?;
         if !resuming {
-            let mut session = backfill_staging::StagingSession::connect(dest.clone()).await?;
+            let mut session = backfill_staging::StagingSession::connect(self.dest.clone()).await?;
             checkpoint.capture_staging(&staging, &mut session).await?;
         }
         let ctx = PassContext {
             pg: self.source_pg(),
-            emitter: dest,
+            dest: self.dest.clone(),
             mapping: staging.mapping.clone(),
             published: self.mapping.clone(),
             stats: self.stats.clone(),
@@ -1288,7 +1273,7 @@ impl CopyBackfiller {
             );
             let ctx = PassContext {
                 pg: self.source_pg(),
-                emitter: Arc::new(pass_emitter),
+                dest: DestEmitter::new(Arc::new(pass_emitter), None),
                 mapping: plan.mapping,
                 published: self.mapping.clone(),
                 stats: self.stats.clone(),
@@ -1337,7 +1322,7 @@ impl CopyBackfiller {
         crate::backfill::backfill_bootstrap::publish_snapshot_rels(&runtime, &plan.rels).await?;
         let mut ledger = self.pending_rows.lock().await;
         if !ledger.is_empty() {
-            let mut session = StagingSession::connect(dest).await?;
+            let mut session = StagingSession::connect(self.dest.clone()).await?;
             crate::backfill::visibility_pending::settle(&mut ledger, &mut session, &self.stats)
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -1406,7 +1391,7 @@ impl CopyBackfiller {
             return Ok(());
         }
         // Connect before locking: live apply folds every commit under it
-        let mut sess = StagingSession::connect(self.dest_emitter()).await?;
+        let mut sess = StagingSession::connect(self.dest.clone()).await?;
         let mut ledger = self.pending_rows.lock().await;
         let mut settled = 0;
         for (xid, committed) in ended {
@@ -1439,7 +1424,7 @@ impl CopyBackfiller {
         if plan.rels.is_empty() {
             return;
         }
-        let mut sess = match StagingSession::connect(self.dest_emitter())
+        let mut sess = match StagingSession::connect(self.dest.clone())
             .await
             .map(|s| s.with_rules(self.table_rules()))
         {
@@ -1476,7 +1461,7 @@ impl CopyBackfiller {
         // In-flight live INSERTs that resolved the pre-swap storage finish
         // within one attempt cap (later attempts re-resolve the name to the
         // swapped-in table); copy-back may start only once they've landed
-        tokio::time::sleep(self.emitter.insert_timeout).await;
+        tokio::time::sleep(self.dest.current().insert_timeout).await;
         for rel in swapped {
             if let Err(e) = self.finish_swapped(&mut sess, rel).await {
                 tracing::error!(
@@ -1574,7 +1559,7 @@ impl CopyBackfiller {
             table: target.table,
             s_lsn: rec.s_lsn.get(),
         };
-        let mut sess = StagingSession::connect(self.dest_emitter())
+        let mut sess = StagingSession::connect(self.dest.clone())
             .await?
             .with_rules(self.table_rules());
         match sess.table_uuid(&rel.database, &rel.staging_table()).await? {
@@ -1599,7 +1584,7 @@ impl CopyBackfiller {
             }
             Some(_) => {}
         }
-        tokio::time::sleep(self.emitter.insert_timeout).await;
+        tokio::time::sleep(self.dest.current().insert_timeout).await;
         sess.copy_back(&rel).await?;
         sess.drop_staging(&rel).await?;
         self.mark_done_entry(name).await;
@@ -1691,11 +1676,24 @@ impl CopyBackfiller {
             }
             Err(e) => Err(anyhow::anyhow!("COPY slots closed: {e}")),
         };
+        let dropped = res.is_err() && self.source_dropped(desc.oid).await;
         let mut inner = self.inner.lock().await;
         inner.active.remove(&desc.rel_name);
         match res {
-            Ok(outcome) => {
-                if let Some(entry) = inner.ledger.entries.get_mut(&desc.rel_name) {
+            Err(e) if !dropped => {
+                // Regime A: a failed backfill never poisons the pump. Entry
+                // stays pending; the next boot's seed re-issues COPY at same S
+                tracing::error!(
+                    target: "walshadow::backfill",
+                    qname = %desc.rel_name,
+                    error = %format!("{e:#}"),
+                    "backfill failed; entry stays pending (re-COPY on next boot)",
+                );
+            }
+            res => {
+                if let Some(entry) = inner.ledger.entries.get_mut(&desc.rel_name)
+                    && entry.s_lsn == s_lsn
+                {
                     entry.done = true;
                     entry.copy = None;
                     if let Err(e) = inner.ledger.persist().await {
@@ -1707,28 +1705,41 @@ impl CopyBackfiller {
                         );
                     }
                 }
-                tracing::info!(
-                    target: "walshadow::backfill",
-                    qname = %desc.rel_name,
-                    rows = outcome.rows,
-                    s_lsn = %s_lsn,
-                    p_hi = %format_pg_lsn(outcome.p_hi),
-                    copied = !outcome.skipped_empty,
-                    "backfill complete; converged once WAL apply passes p_hi",
-                );
-            }
-            // Regime A: a failed backfill never poisons the pump. Entry stays
-            // pending; the next boot's seed re-issues COPY at the same S.
-            Err(e) => {
-                tracing::error!(
-                    target: "walshadow::backfill",
-                    qname = %desc.rel_name,
-                    error = %format!("{e:#}"),
-                    "backfill failed; entry stays pending (re-COPY on next boot)",
-                );
+                if let Ok(outcome) = res {
+                    tracing::info!(
+                        target: "walshadow::backfill",
+                        qname = %desc.rel_name,
+                        rows = outcome.rows,
+                        s_lsn = %s_lsn,
+                        p_hi = %format_pg_lsn(outcome.p_hi),
+                        copied = !outcome.skipped_empty,
+                        "backfill complete; converged once WAL apply passes p_hi",
+                    );
+                } else {
+                    tracing::info!(
+                        target: "walshadow::backfill",
+                        qname = %desc.rel_name,
+                        "source table dropped; skipping backfill",
+                    );
+                }
             }
         }
         self.refresh_gauges(&inner.ledger);
+    }
+
+    /// Probe failure reads as present, so entry stays pending
+    async fn source_dropped(&self, oid: u32) -> bool {
+        // The primary, so a standby's replay lag can't hide the drop
+        let Ok(client) = open_sql_client(&self.pg).await else {
+            return false;
+        };
+        client
+            .query_one(
+                "SELECT NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = $1)",
+                &[&oid],
+            )
+            .await
+            .is_ok_and(|row| row.get(0))
     }
 
     async fn copy_once(
@@ -1744,7 +1755,7 @@ impl CopyBackfiller {
         self.seed_toast(desc, s_lsn).await?;
         let client = self.open_copy_client(s_lsn).await?;
 
-        if let Some(runtime) = self.dest_emitter().snowflake.clone() {
+        if let Some(runtime) = self.dest.current().snowflake.clone() {
             return self
                 .copy_once_snowflake(&client, desc, s_lsn, runtime)
                 .await;
@@ -1785,7 +1796,8 @@ impl CopyBackfiller {
         s_lsn: Pos<Snapshot>,
     ) -> anyhow::Result<u64> {
         let chunk = self
-            .emitter
+            .dest
+            .current()
             .bootstrap
             .copy_chunk_blocks
             .map_or(COPY_CHUNK_BLOCKS, NonZeroU32::get);
@@ -1847,7 +1859,7 @@ impl CopyBackfiller {
     ) -> anyhow::Result<u64> {
         // Dedicated tail: own CH connection, own seq space, own fatal.
         let tail = OwnedTail::spawn(
-            &self.dest_emitter(),
+            self.dest.clone(),
             1,
             self.stats.clone(),
             Fatal::new(),
@@ -1870,7 +1882,7 @@ impl CopyBackfiller {
             self.stats.clone(),
             ToastResolver::disabled(),
             bootstrap::Deferral::Rejected,
-            self.emitter.row_policy(),
+            self.dest.current().row_policy(),
             self.config_rx.as_ref().map(|rx| rx.borrow().clone()),
             HashSet::new(),
             false,
@@ -1926,7 +1938,8 @@ impl CopyBackfiller {
             config
                 .as_ref()
                 .map_or_else(Arc::default, |rc| rc.column_rules.clone()),
-            self.emitter
+            self.dest
+                .current()
                 .row_policy()
                 .for_rel(config.as_deref(), &desc.rel_name),
         );
@@ -2053,7 +2066,7 @@ impl CopyBackfiller {
     /// `clickhouse` value mode only: shadow mode reads values from shadow,
     /// disabled mode keeps none
     async fn seed_toast(&self, desc: &RelDescriptor, s_lsn: Pos<Snapshot>) -> anyhow::Result<()> {
-        let emitter = self.dest_emitter();
+        let emitter = self.dest.current();
         if emitter.toast.mode != ToastMode::Clickhouse || desc.toast_oid == 0 {
             return Ok(());
         }
@@ -2068,7 +2081,7 @@ impl CopyBackfiller {
         if seeded {
             return Ok(());
         }
-        let resolver = ToastResolver::from_config(&emitter, self.stats.clone());
+        let resolver = ToastResolver::from_config(self.dest.clone(), self.stats.clone());
         let client = self.open_copy_client(s_lsn).await?;
         let chunks = copy_toast_into(&client, &resolver, desc, s_lsn.get()).await?;
         tracing::info!(

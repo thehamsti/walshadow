@@ -36,7 +36,7 @@ use crate::column_rules::{ColumnRule, ColumnRules, ColumnRulesBuilder};
 use crate::emit::ch_emitter::EmitterConfig;
 use crate::filter::shadow_relations::ShadowHeld;
 use crate::mapping::{
-    DropTableStrategy, MappingHandle, NamespaceMapping, TableMapping, TableTarget,
+    DropTableStrategy, MappingHandle, NamespaceMapping, Retype, TableMapping, TableTarget,
     derive_columns_for_mapping, fold_diff_into_mapping,
 };
 use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
@@ -206,9 +206,6 @@ pub struct ResolvedConfig {
 }
 
 impl ResolvedConfig {
-    /// True when `cfg` already dials this destination. Pairs with
-    /// [`Self::overlay_dest`] for callers caching the overlay: they rebuild
-    /// only once this goes false, so every field written there is read here.
     pub fn dest_conn_eq(&self, cfg: &EmitterConfig) -> bool {
         cfg.host == self.host
             && cfg.port == self.port
@@ -216,22 +213,57 @@ impl ResolvedConfig {
             && cfg.user == self.user
             && cfg.password == self.password
             && cfg.secure == self.secure
+            && cfg.compression == self.compression
+            && cfg.retry.max_attempts == self.retry_max_attempts
     }
 
-    /// `base` pointed at the live destination, tuning and mapping untouched.
-    /// For sessions that connect eagerly off a boot config — a backfill tail
-    /// or staging session — so they take a moved endpoint at spawn instead of
-    /// dialling the old address first.
-    pub fn overlay_dest(&self, base: &EmitterConfig) -> EmitterConfig {
-        EmitterConfig {
+    fn overlay_dest(&self, base: &EmitterConfig) -> EmitterConfig {
+        let mut out = EmitterConfig {
             host: self.host.clone(),
             port: self.port,
             database: self.database.clone(),
             user: self.user.clone(),
             password: self.password.clone(),
             secure: self.secure,
+            compression: self.compression,
             ..base.clone()
+        };
+        out.retry.max_attempts = self.retry_max_attempts;
+        out
+    }
+}
+
+pub struct DestEmitter {
+    base: Arc<EmitterConfig>,
+    live: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    current: std::sync::Mutex<Arc<EmitterConfig>>,
+}
+
+impl DestEmitter {
+    pub fn new(
+        base: Arc<EmitterConfig>,
+        live: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            current: std::sync::Mutex::new(base.clone()),
+            base,
+            live,
+        })
+    }
+
+    pub fn current(&self) -> Arc<EmitterConfig> {
+        let mut current = self.current.lock().expect("dest emitter poisoned");
+        let Some(live) = self.live.as_ref().map(|rx| rx.borrow().clone()) else {
+            return current.clone();
+        };
+        if !live.dest_conn_eq(&current) {
+            *current = Arc::new(live.overlay_dest(&self.base));
         }
+        current.clone()
+    }
+
+    pub fn base(&self) -> &Arc<EmitterConfig> {
+        &self.base
     }
 }
 
@@ -650,7 +682,12 @@ impl ConfigResolver {
     /// `base` at resolve, so a SIGHUP TOML re-read can't revert the fold).
     /// Unmapped or excluded rels no-op without republish, mirroring
     /// `mutate_mapping_for_diff`'s early return.
-    pub async fn apply_schema_diff(&self, new: &RelDescriptor, diff: &SchemaDiff) {
+    pub async fn apply_schema_diff(
+        &self,
+        new: &RelDescriptor,
+        diff: &SchemaDiff,
+        retypes: &[Retype],
+    ) {
         let mut inner = self.inner.lock().await;
         let rel = &new.rel_name;
         if inner.opt_in.excluded.contains(rel) {
@@ -658,12 +695,12 @@ impl ConfigResolver {
         }
         let rules = self.tx.borrow().column_rules.clone();
         if let Some(m) = inner.opt_in.mappings.get_mut(rel) {
-            fold_diff_into_mapping(m, new, diff, &rules);
+            fold_diff_into_mapping(m, new, diff, retypes, &rules);
         } else if let Some(m) = inner.opt_in.derived.get_mut(rel) {
-            fold_diff_into_mapping(m, new, diff, &rules);
+            fold_diff_into_mapping(m, new, diff, retypes, &rules);
         } else if let Some(base) = inner.base.tables.get(rel) {
             let mut m = base.clone();
-            fold_diff_into_mapping(&mut m, new, diff, &rules);
+            fold_diff_into_mapping(&mut m, new, diff, retypes, &rules);
             inner.opt_in.derived.insert(rel.clone(), m);
         } else {
             return;
@@ -762,7 +799,7 @@ impl ConfigResolver {
                 continue;
             };
             // Validate syntax now, validate wire compatibility with descriptor
-            let accepted = if TypeAst::parse(ty, Allocator::stdlib()).is_ok() {
+            let accepted = if TypeAst::parse(ty, Allocator::global(&mimalloc::MiMalloc)).is_ok() {
                 Some(ty.as_str())
             } else {
                 column_rules.bump_rejections();
@@ -1797,7 +1834,7 @@ mod tests {
             renamed_columns: vec![],
             type_changes: vec![],
         };
-        resolver.apply_schema_diff(&desc, &diff).await;
+        resolver.apply_schema_diff(&desc, &diff, &[]).await;
         let has_note = |m: &HashMap<RelName, TableMapping>| {
             m.get(&RelName::new("public", "events"))
                 .is_some_and(|t| t.columns.iter().any(|c| c.src_attnum == 2))

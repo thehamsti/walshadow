@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::ch::EmitterError;
+use crate::config::DestEmitter;
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::HeapOp;
 use crate::destination::snowflake::runtime::SnowflakeRuntime;
@@ -139,7 +140,7 @@ impl OwnedTail {
     }
 
     pub async fn spawn(
-        emitter: &EmitterConfig,
+        dest: Arc<DestEmitter>,
         inserter_pool_size: usize,
         stats: Arc<EmitterStats>,
         fatal: Fatal,
@@ -148,7 +149,7 @@ impl OwnedTail {
         context: &'static str,
     ) -> Result<Self, String> {
         let (msg_tx, ack, parts) = spawn_with_config(
-            emitter,
+            dest,
             inserter_pool_size,
             stats,
             Arc::new(Monotone::<EmitterAck>::default()),
@@ -200,14 +201,14 @@ impl OwnedTail {
 /// open — inserters spin up first (consume-only) so a connect failure aborts
 /// before any other stage starts.
 pub async fn spawn(
-    emitter: &EmitterConfig,
+    dest: Arc<DestEmitter>,
     inserter_pool_size: usize,
     stats: Arc<EmitterStats>,
     emitter_ack: Arc<Monotone<EmitterAck>>,
     fatal: Fatal,
 ) -> Result<(mpsc::Sender<BatcherMsg>, AckHandle, TailParts), EmitterError> {
     spawn_with_config(
-        emitter,
+        dest,
         inserter_pool_size,
         stats,
         emitter_ack,
@@ -264,7 +265,7 @@ pub fn spawn_null(
 /// budgets/flush and the inserter pool re-reads compression/retry from it on
 /// each republish. `None` == boot values only (bootstrap + tests use [`spawn`]).
 pub async fn spawn_with_config(
-    emitter: &EmitterConfig,
+    dest: Arc<DestEmitter>,
     inserter_pool_size: usize,
     stats: Arc<EmitterStats>,
     emitter_ack: Arc<Monotone<EmitterAck>>,
@@ -272,9 +273,10 @@ pub async fn spawn_with_config(
     config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
     oracle: Option<Arc<crate::ops::oracle::Oracle>>,
 ) -> Result<(mpsc::Sender<BatcherMsg>, AckHandle, TailParts), EmitterError> {
+    let emitter = dest.current();
     if let Some(runtime) = emitter.snowflake.clone() {
         return Ok(spawn_snowflake_tail(
-            emitter,
+            &emitter,
             runtime,
             stats,
             emitter_ack,
@@ -296,14 +298,11 @@ pub async fn spawn_with_config(
 
     let inserters = inserter::spawn_pool(
         n,
-        emitter,
+        dest,
         resolved_rx,
         ack.clone(),
         stats.clone(),
         fatal.clone(),
-        inserter::PoolOptions {
-            config_rx: config_rx.clone(),
-        },
     )
     .await?;
 

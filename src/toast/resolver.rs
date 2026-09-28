@@ -573,7 +573,7 @@ struct ChState {
 ///
 /// Fetch aggregates version history explicitly, independent of merge state
 pub struct ClickHouseChunkStore {
-    conn: EmitterConfig,
+    dest: Arc<crate::config::DestEmitter>,
     alloc: Allocator,
     /// Taken round-robin: a restore is often one relid, so keying on it
     /// would serialize the whole thing
@@ -582,7 +582,8 @@ pub struct ClickHouseChunkStore {
 }
 
 impl ClickHouseChunkStore {
-    pub fn new(conn: EmitterConfig) -> Self {
+    pub fn new(dest: Arc<crate::config::DestEmitter>) -> Self {
+        let conn = dest.current();
         let slots = conn
             .toast
             .connections
@@ -592,13 +593,13 @@ impl ClickHouseChunkStore {
             states: (0..slots)
                 .map(|_| {
                     Mutex::new(ChState {
-                        client: ChConn::default(),
+                        client: ChConn::deferred(dest.clone()),
                         created: HashSet::new(),
                     })
                 })
                 .collect(),
             next: AtomicUsize::new(0),
-            conn,
+            dest,
         }
     }
 
@@ -621,7 +622,7 @@ impl ClickHouseChunkStore {
     fn toast_table(&self, toast_relid: u32) -> String {
         format!(
             "{}.{}",
-            quote_ident(&self.conn.database),
+            quote_ident(&self.dest.current().database),
             quote_ident(&format!("pg_toast_{toast_relid}"))
         )
     }
@@ -708,13 +709,12 @@ impl ClickHouseChunkStore {
         sql: &str,
         bb: Option<&BlockBuilder<'_>>,
     ) -> Result<(), EmitterError> {
+        let insert_timeout = self.dest.current().insert_timeout;
         state
             .client
             .retry(
-                &self.conn,
-                self.conn.retry.backoff(),
                 |mut client| async move {
-                    let result = with_timeout(self.conn.insert_timeout, async {
+                    let result = with_timeout(insert_timeout, async {
                         client.send_query(sql, None).await?;
                         if let Some(bb) = bb {
                             client.send_data(Some(bb)).await?;
@@ -797,14 +797,13 @@ impl ClickHouseChunkStore {
         sql: &str,
         parse: impl Fn(&Block, &mut A) -> Result<(), EmitterError>,
     ) -> Result<A, EmitterError> {
+        let insert_timeout = self.dest.current().insert_timeout;
         state
             .client
             .retry_when(
-                &self.conn,
-                self.conn.retry.backoff(),
                 |e| is_retryable(e) && !is_missing_mirror(e),
                 |mut client| async {
-                    let result = with_timeout(self.conn.insert_timeout, async {
+                    let result = with_timeout(insert_timeout, async {
                         client.send_query(sql, None).await?;
                         let mut out = A::default();
                         loop {
@@ -1027,24 +1026,26 @@ impl ToastResolver {
     /// Build resolver without a bridge
     ///
     /// Disabled mode keeps no store, other modes use the destination's mirror
-    pub fn from_config(emitter: &EmitterConfig, stats: Arc<EmitterStats>) -> Self {
+    pub fn from_config(dest: Arc<crate::config::DestEmitter>, stats: Arc<EmitterStats>) -> Self {
+        let emitter = dest.current();
         let store: Option<Arc<dyn ChunkStore>> = match (emitter.toast.mode, &emitter.snowflake) {
             (ToastMode::Disabled, _) => None,
             (_, Some(snowflake)) => Some(Arc::new(snowflake.state.toast_store())),
-            (_, None) => Some(Arc::new(ClickHouseChunkStore::new(emitter.clone()))),
+            (_, None) => Some(Arc::new(ClickHouseChunkStore::new(dest))),
         };
-        Self::with_limits(store, emitter, stats)
+        Self::with_limits(store, &emitter, stats)
     }
 
     /// Build resolver for configured mode. Shadow requires `read`
     /// Bootstrap binds its bridge after starting PostgreSQL
     pub fn for_mode(
-        emitter: &EmitterConfig,
+        dest: Arc<crate::config::DestEmitter>,
         stats: Arc<EmitterStats>,
         read: Option<crate::toast::shadow_store::ShadowRead>,
     ) -> Result<Self, String> {
+        let emitter = dest.current();
         if !emitter.toast.mode.is_shadow() {
-            return Ok(Self::from_config(emitter, stats));
+            return Ok(Self::from_config(dest, stats));
         }
         let read = read.ok_or_else(|| {
             "[toast] mode = \"shadow\" needs the pgext bridge; \
@@ -1055,7 +1056,7 @@ impl ToastResolver {
             Some(Arc::new(
                 crate::toast::shadow_store::ShadowToastStore::late(read),
             )),
-            emitter,
+            &emitter,
             stats,
         ))
     }
@@ -1416,6 +1417,10 @@ impl ToastResolver {
 
 #[cfg(test)]
 mod tests {
+    fn fixed(cfg: EmitterConfig) -> Arc<crate::config::DestEmitter> {
+        crate::config::DestEmitter::new(Arc::new(cfg), None)
+    }
+
     use super::*;
 
     fn row(value_id: u32, seq: u32, tid: (u32, u16), lsn: u64, body: &[u8]) -> ToastRow {
@@ -1887,7 +1892,8 @@ mod tests {
         let stats = || Arc::new(EmitterStats::default());
         let ch = EmitterConfig::from_toml_str("[toast]\nmode = \"clickhouse\"\n").unwrap();
         assert!(!ch.toast.mode.is_shadow());
-        let r = ToastResolver::for_mode(&ch, stats(), None).expect("clickhouse needs no bridge");
+        let r =
+            ToastResolver::for_mode(fixed(ch), stats(), None).expect("clickhouse needs no bridge");
         assert!(r.stores_chunks(), "the mirror takes writes");
 
         let default = EmitterConfig::from_toml_str("").unwrap();
@@ -1895,7 +1901,7 @@ mod tests {
 
         let shadow = EmitterConfig::from_toml_str("[toast]\nmode = \"shadow\"\n").unwrap();
         assert!(shadow.toast.mode.is_shadow());
-        let err = match ToastResolver::for_mode(&shadow, stats(), None) {
+        let err = match ToastResolver::for_mode(fixed(shadow), stats(), None) {
             Err(e) => e,
             Ok(_) => panic!("shadow without a bridge must be a config error"),
         };
@@ -1907,8 +1913,9 @@ mod tests {
         .unwrap();
         assert_eq!(disabled.toast.mode, ToastMode::Disabled);
         for r in [
-            ToastResolver::for_mode(&disabled, stats(), None).expect("disabled needs no bridge"),
-            ToastResolver::from_config(&disabled, stats()),
+            ToastResolver::for_mode(fixed(disabled.clone()), stats(), None)
+                .expect("disabled needs no bridge"),
+            ToastResolver::from_config(fixed(disabled), stats()),
         ] {
             assert!(!r.stores_chunks() && r.fill_on_miss());
             assert_eq!(
@@ -2041,10 +2048,10 @@ mod tests {
     /// A restore is often one relid, so slots must not be keyed on it
     #[tokio::test]
     async fn chunk_store_slots_are_concurrent_for_one_relid() {
-        let store = ClickHouseChunkStore::new(EmitterConfig {
+        let store = ClickHouseChunkStore::new(fixed(EmitterConfig {
             inserter_pool_size: 4,
             ..EmitterConfig::default()
-        });
+        }));
         assert_eq!(store.states.len(), 4);
 
         let mut held = Vec::new();
@@ -2092,7 +2099,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.inserter_pool_size, 8);
-        assert_eq!(ClickHouseChunkStore::new(cfg).states.len(), 2);
+        assert_eq!(ClickHouseChunkStore::new(fixed(cfg)).states.len(), 2);
         for key in ["put_batch_rows", "put_batch_bytes", "connections"] {
             assert!(
                 EmitterConfig::from_toml_str(&format!("[toast]\n{key} = 0\n")).is_err(),
@@ -2122,7 +2129,7 @@ mod tests {
             for referenced in [false, true] {
                 let store = Arc::new(MemChunkStore::new());
                 let stats = Arc::new(EmitterStats::default());
-                let mut resolver = ToastResolver::from_config(&cfg, stats.clone());
+                let mut resolver = ToastResolver::from_config(fixed(cfg.clone()), stats.clone());
                 resolver.store = Some(store.clone());
                 if referenced {
                     resolver.put_row_refs(None, &refs).await.unwrap();
@@ -2161,7 +2168,7 @@ mod tests {
             database: "wh".into(),
             ..Default::default()
         };
-        let store = ClickHouseChunkStore::new(cfg);
+        let store = ClickHouseChunkStore::new(fixed(cfg));
 
         assert_eq!(store.toast_table(16500), "`wh`.`pg_toast_16500`");
 
@@ -2226,7 +2233,7 @@ mod tests {
     #[test]
     fn ch_mode_builds_a_store() {
         let cfg = EmitterConfig::default();
-        let r = ToastResolver::from_config(&cfg, Arc::new(EmitterStats::default()));
+        let r = ToastResolver::from_config(fixed(cfg), Arc::new(EmitterStats::default()));
         assert!(r.stores_chunks());
         assert!(!r.fill_on_miss());
     }

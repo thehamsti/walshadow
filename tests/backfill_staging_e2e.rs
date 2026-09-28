@@ -94,11 +94,13 @@ impl Fixture {
                             src_attnum: 1,
                             target_name: "id".into(),
                             target_type: "Int32".into(),
+                            type_pinned: false,
                         },
                         ColumnMapping {
                             src_attnum: 2,
                             target_name: "name".into(),
                             target_type: "String".into(),
+                            type_pinned: false,
                         },
                     ],
                 },
@@ -130,7 +132,7 @@ impl Fixture {
         Arc::new(
             CopyBackfiller::new(
                 fx::pg_cfg(&self.source, "backfill-staging"),
-                self.emitter.clone(),
+                walshadow::config::DestEmitter::new(Arc::new(self.emitter.clone()), None),
                 self.mapping.clone(),
                 self.stats.clone(),
                 self.catalog.clone(),
@@ -162,7 +164,7 @@ impl Fixture {
 
     async fn prepare_staging(&self) -> StagingRel {
         let mut plan = backfill_staging::prepare(
-            Arc::new(self.emitter.clone()),
+            walshadow::config::DestEmitter::new(Arc::new(self.emitter.clone()), None),
             &self.mapping,
             &[BackupRequest {
                 desc: self.desc.clone(),
@@ -282,9 +284,12 @@ async fn staged_backfill_resumes_each_publish_phase() {
         return;
     }
     let fx = Fixture::new().await;
-    let mut session = StagingSession::connect(Arc::new(fx.emitter.clone()))
-        .await
-        .unwrap();
+    let mut session = StagingSession::connect(walshadow::config::DestEmitter::new(
+        Arc::new(fx.emitter.clone()),
+        None,
+    ))
+    .await
+    .unwrap();
     for phase in [
         "before_exchange",
         "after_exchange",
@@ -380,9 +385,12 @@ async fn staged_schema_change_discards_load_and_keeps_retry_pending() {
     fx.ch
         .query("INSERT INTO default.t__wsstg (id, name, _lsn) VALUES (8, 'discard', 100)")
         .unwrap();
-    let mut session = StagingSession::connect(Arc::new(fx.emitter.clone()))
-        .await
-        .unwrap();
+    let mut session = StagingSession::connect(walshadow::config::DestEmitter::new(
+        Arc::new(fx.emitter.clone()),
+        None,
+    ))
+    .await
+    .unwrap();
     let uuid = session
         .table_uuid("default", "t__wsstg")
         .await
@@ -466,6 +474,22 @@ swapped = false
     let ledger = read_ledger(dir.path());
     assert_eq!(ledger["backfill"][0]["mode"].as_str(), Some("copy"));
     assert_eq!(ledger["backfill"][0]["s_lsn"].as_str(), Some("0/64"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_table_backfill_finishes() {
+    if !fx::requirements_available() {
+        return;
+    }
+    for mode in [InitialLoadMode::Copy, InitialLoadMode::ObjectStore] {
+        let fx = Fixture::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let backfiller = fx.backfiller(dir.path()).await;
+        fx.source.psql_one("DROP TABLE public.t").unwrap();
+        backfiller.note_opt_in(&fx.desc, mode, 100).await;
+        wait_done(&backfiller, dir.path()).await;
+        assert_eq!(fx.backfiller(dir.path()).await.pending_count(), 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

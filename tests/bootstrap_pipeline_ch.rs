@@ -78,6 +78,7 @@ fn id_mapping(target_table: &str) -> TableMapping {
             src_attnum: 1,
             target_name: "id".into(),
             target_type: "Int32".into(),
+            type_pinned: false,
         }],
     }
 }
@@ -148,7 +149,7 @@ async fn bootstrap_tail_fans_out_n2() {
     let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());
     let fatal = Fatal::new();
     let (msg_tx, ack, tail) = tail::spawn(
-        &cfg,
+        walshadow::config::DestEmitter::new(std::sync::Arc::new(cfg.clone()), None),
         INSERTERS,
         stats.clone(),
         emitter_ack.clone(),

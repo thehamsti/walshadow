@@ -1123,6 +1123,7 @@ mod tests {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int32".into(),
+                type_pinned: false,
             }],
         }
     }
@@ -1184,6 +1185,7 @@ mod tests {
                 src_attnum: 1,
                 target_name: "b".into(),
                 target_type: "String".into(),
+                type_pinned: false,
             }],
         }
     }

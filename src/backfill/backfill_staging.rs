@@ -17,7 +17,6 @@
 //! differs) from "already copied back" (staging name gone).
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clickhouse_c::{Block, Event};
@@ -25,10 +24,10 @@ use futures::{StreamExt, TryStreamExt};
 
 use crate::backfill::backfill_types::BackupRequest;
 use crate::ch::{ChConn, EmitterError, exec_drain, quote_ident, with_timeout};
-use crate::config::ResolvedConfig;
+use crate::config::{DestEmitter, ResolvedConfig};
 use crate::destination::snowflake::runtime::SnowflakeRuntime;
 use crate::destination::snowflake::state::GenerationPhase;
-use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
+use crate::emit::ch_emitter::EmitterConfig;
 use crate::emit::route::RouteSnapshot;
 use crate::mapping::{MappingHandle, MappingSnapshot, TableMapping, TableTarget};
 use crate::runtime_config::InitialLoadMode;
@@ -238,12 +237,12 @@ pub async fn prepare_snowflake_with_kind(
 /// `reuse` keeps the existing tables: a resumed pass is vouched for by rows
 /// already in them, so rebuilding would throw its own progress away
 pub async fn prepare(
-    emitter: Arc<EmitterConfig>,
+    dest: Arc<DestEmitter>,
     live: &MappingHandle,
     reqs: &[BackupRequest],
     reuse: bool,
 ) -> Result<StagingPlan> {
-    let mut sess = StagingSession::connect(emitter).await?;
+    let mut sess = StagingSession::connect(dest).await?;
     // Freeze routing for entire staging plan
     let live_map = live.snapshot().await;
     let mut staged: HashMap<RelName, TableMapping> = HashMap::with_capacity(reqs.len());
@@ -287,41 +286,35 @@ pub async fn prepare(
 /// One CH control connection for staging DDL + swap statements, with the
 /// inserter pool's bounded per-attempt timeout.
 pub struct StagingSession {
+    /// `None` for Snowflake, which stages through its own runtime
     client: Option<ChConn>,
-    /// Kept whole for reconnect; shared with the pass that opened the session
-    conn: Arc<EmitterConfig>,
+    dest: Arc<DestEmitter>,
     /// Per-relation destination rules, for the promote's `_lsn` predicate when
     /// a `[table.*]` block or `config_table` row renamed that column
     rules: Option<Arc<crate::table_rules::TableRules>>,
-    retry: RetryConfig,
-    timeout: Duration,
 }
 
 impl StagingSession {
-    pub async fn connect(emitter: Arc<EmitterConfig>) -> Result<Self> {
-        if emitter.snowflake.is_some() {
+    pub async fn connect(dest: Arc<DestEmitter>) -> Result<Self> {
+        if dest.base().snowflake.is_some() {
             return Ok(Self {
                 client: None,
-                retry: emitter.retry.clone(),
-                timeout: emitter.insert_timeout,
-                conn: emitter,
+                dest,
                 rules: None,
             });
         }
-        let client = ChConn::connect(&*emitter)
+        let client = ChConn::connect(dest.clone())
             .await
             .map_err(|e| anyhow::anyhow!("backfill_staging: connect: {e}"))?;
         Ok(Self {
             client: Some(client),
-            retry: emitter.retry.clone(),
-            timeout: emitter.insert_timeout,
-            conn: emitter,
+            dest,
             rules: None,
         })
     }
 
     pub fn snowflake_runtime(&self) -> Option<&Arc<SnowflakeRuntime>> {
-        self.conn.snowflake.as_ref()
+        self.dest.base().snowflake.as_ref()
     }
 
     pub fn with_rules(mut self, rules: Option<Arc<crate::table_rules::TableRules>>) -> Self {
@@ -334,22 +327,22 @@ impl StagingSession {
         match &self.rules {
             Some(rules) => rules
                 .settings(rel)
-                .system_columns(&self.conn.system_columns)
+                .system_columns(&self.dest.current().system_columns)
                 .lsn
                 .clone(),
-            None => self.conn.system_columns.lsn.clone(),
+            None => self.dest.current().system_columns.lsn.clone(),
         }
     }
 
     async fn attempt_write(&mut self, sql: &str) -> Result<(), EmitterError> {
-        let timeout = self.timeout;
+        let timeout = self.dest.current().insert_timeout;
         let client = self
             .client
             .as_mut()
             .ok_or_else(|| {
                 EmitterError::Config("ClickHouse staging SQL is unavailable for Snowflake".into())
             })?
-            .ready(&*self.conn)
+            .ready()
             .await?;
         exec_drain(client, sql, timeout).await
     }
@@ -357,13 +350,11 @@ impl StagingSession {
     /// Statement safe to re-apply (DROP/CREATE IF NOT EXISTS, dedup-absorbed
     /// INSERT..SELECT): reconnect + resend on retryable failure.
     pub(crate) async fn exec_retry(&mut self, sql: &str) -> Result<()> {
-        let timeout = self.timeout;
+        let timeout = self.dest.current().insert_timeout;
         self.client
             .as_mut()
             .context("ClickHouse staging SQL is unavailable for Snowflake")?
             .retry(
-                &*self.conn,
-                self.retry.backoff(),
                 |mut client| async move {
                     let result = exec_drain(&mut client, sql, timeout).await;
                     (client, result)
@@ -390,12 +381,12 @@ impl StagingSession {
 
     /// Single-column String SELECT, one attempt under the timeout.
     pub(crate) async fn query_strings(&mut self, sql: &str) -> Result<Vec<String>> {
-        let timeout = self.timeout;
+        let timeout = self.dest.current().insert_timeout;
         let client = self
             .client
             .as_mut()
             .context("ClickHouse staging SQL is unavailable for Snowflake")?
-            .ready(&*self.conn)
+            .ready()
             .await
             .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))?;
         with_timeout(timeout, async {
@@ -602,7 +593,9 @@ mod tests {
         for retries in 0..=2 {
             let (config, server) =
                 crate::ch::test_support::retry_server(retries, sql, false, false).await;
-            let mut session = StagingSession::connect(Arc::new(config)).await.unwrap();
+            let mut session = StagingSession::connect(DestEmitter::new(Arc::new(config), None))
+                .await
+                .unwrap();
             assert_eq!(session.exec_retry(sql).await.is_ok(), retries == 2);
             server.await.unwrap();
         }
@@ -612,7 +605,9 @@ mod tests {
     async fn exchange_ambiguity_does_not_retry() {
         let sql = "EXCHANGE TABLES staging AND live";
         let (config, server) = crate::ch::test_support::retry_server(2, sql, false, false).await;
-        let mut session = StagingSession::connect(Arc::new(config)).await.unwrap();
+        let mut session = StagingSession::connect(DestEmitter::new(Arc::new(config), None))
+            .await
+            .unwrap();
         assert!(session.exec_once(sql).await.is_err());
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());

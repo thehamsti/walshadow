@@ -4,9 +4,9 @@
 //! |---|---|
 //! | `Added` | `CREATE TABLE IF NOT EXISTS …` (namespace `auto_create = true`; a mapped rel re-creates its dest when strategy = drop, then `ALTER TABLE … ADD COLUMN IF NOT EXISTS …` per mapped column so a dest predating the mapping gains columns routed since) |
 //! | `Changed.added_columns` | `ALTER TABLE … ADD COLUMN IF NOT EXISTS …` per column in attnum order |
-//! | `Changed.renamed_columns` | `ALTER TABLE … RENAME COLUMN IF EXISTS … TO …` first |
+//! | `Changed.renamed_columns` | `ALTER TABLE … RENAME COLUMN IF EXISTS … TO …` after retypes |
 //! | `Changed.dropped_columns` | `ALTER TABLE … DROP COLUMN IF EXISTS …` |
-//! | `Changed.type_changes` | rejected — logged, not applied (open question) |
+//! | `Changed.type_changes` | `MODIFY COLUMN` before renames; `DROP` then `ADD` for fallible casts during rewrite |
 //! | `Dropped` | `DROP TABLE IF EXISTS …` gated on [`DropTableStrategy`] |
 //!
 //! Opens its own `BoxedAsyncClient` (separate from the INSERT pump) so DDL
@@ -22,24 +22,27 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Duration;
 
+use clickhouse_c::Kind;
 use tokio::sync::watch;
 
 use crate::catalog::type_bridge::{self, ResolvedColumn};
-use crate::ch::{ChConn, EmitterError, connect_client, exec_drain, quote_ident};
+use crate::ch::{
+    ChConn, EmitterError, connect_client, exec_drain, is_retryable, quote_ident, types,
+};
 use crate::column_rules::ColumnRules;
-use crate::config::{ConfigResolver, ResolvedConfig};
+use crate::config::{ConfigResolver, DestEmitter, ResolvedConfig};
 use crate::decode::heap_decoder::{self, ColumnValue};
-use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
+use crate::emit::ch_emitter::EmitterConfig;
 use crate::mapping::{
-    ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NamespaceMapping,
-    SystemColumns, TableMapping, TableTarget, TargetOwners, apply_column_rule,
-    derive_columns_for_mapping, fold_diff_into_mapping,
+    ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NamespaceMapping, Retype,
+    RetypeKind, SystemColumns, TableMapping, TableTarget, TargetOwners, apply_column_rule,
+    derive_columns_for_mapping, fold_diff_into_mapping, retyped_target,
 };
 use crate::ops::oracle::{Oracle, OracleCell};
 use crate::schema::{
-    MissingDefault, RelAttr, RelDescriptor, RelName, SchemaDiff, SchemaEvent, replident_key_attnums,
+    INT2OID, INT4OID, INT8OID, MissingDefault, RelAttr, RelDescriptor, RelName, SchemaDiff,
+    SchemaEvent, replident_key_attnums,
 };
 use crate::table_rules::{TableRule, TableRules};
 use ahash::{HashMap, HashSet, HashSetExt};
@@ -195,20 +198,15 @@ pub fn is_system_namespace(ns: &str, runtime_config_schema: Option<&str>) -> boo
 
 /// CH-side DDL writer. Owns one BoxedAsyncClient over its own TCP.
 pub struct DdlApplicator {
+    /// `None` for Snowflake, which applies DDL through `snowflake`
     client: Option<ChConn>,
+    snowflake: Option<Arc<crate::destination::snowflake::runtime::SnowflakeRuntime>>,
     config: DdlConfig,
     /// Live config layers. `refresh_config` folds a republished snapshot
     /// into `config` (namespaces + drop strategy) at each apply, so SIGHUP
     /// and the future overlay retarget DDL without a restart.
     config_rx: watch::Receiver<Arc<ResolvedConfig>>,
     mapping: MappingHandle,
-    /// Reconnect params; `refresh_config` updates the connection fields live
-    /// from a republished snapshot and re-dials on change.
-    conn_cfg: EmitterConfig,
-    retry: RetryConfig,
-    /// Per-attempt cap (shares `EmitterConfig::insert_timeout`); a
-    /// half-open CH socket can't park the reorder barrier past this
-    query_timeout: Duration,
     /// Owner of runtime-derived mapping state. Set: auto-created mappings,
     /// diff folds, and DROP forgets record into the resolver so the
     /// republish full-swap preserves them. Unset (bootstrap drain, tests
@@ -230,31 +228,28 @@ pub struct DdlStats {
     pub alters_applied: u64,
     pub creates_applied: u64,
     pub drops_applied: u64,
-    /// Events received but skipped (no mapping, no auto_create, type
-    /// change rejected, drop strategy = Retain)
+    /// Events received but skipped (no mapping, no auto_create, drop
+    /// strategy = Retain)
     pub skipped: u64,
-    pub type_changes_rejected: u64,
 }
 
 impl DdlApplicator {
     pub async fn new(
-        emitter_cfg: &EmitterConfig,
+        dest: Arc<DestEmitter>,
         ddl_cfg: DdlConfig,
         mapping: MappingHandle,
         config_rx: watch::Receiver<Arc<ResolvedConfig>>,
     ) -> Result<Self, EmitterError> {
         Ok(Self {
-            client: if emitter_cfg.snowflake.is_some() {
+            client: if dest.base().snowflake.is_some() {
                 None
             } else {
-                Some(ChConn::connect(emitter_cfg).await?)
+                Some(ChConn::connect(dest.clone()).await?)
             },
+            snowflake: dest.base().snowflake.clone(),
             config: ddl_cfg,
             config_rx,
             mapping,
-            conn_cfg: emitter_cfg.clone(),
-            retry: emitter_cfg.retry.clone(),
-            query_timeout: emitter_cfg.insert_timeout,
             resolver: None,
             oracle: None,
             ensured_databases: HashSet::new(),
@@ -315,8 +310,8 @@ impl DdlApplicator {
         db_override: Option<&str>,
         table_override: Option<&str>,
     ) -> Result<Option<TableMapping>, EmitterError> {
-        self.refresh_config().await?;
-        let Some(runtime) = self.conn_cfg.snowflake.as_ref() else {
+        self.refresh_config();
+        let Some(runtime) = self.snowflake.as_ref() else {
             return Ok(None);
         };
         let expected = snowflake_target(desc, runtime);
@@ -346,7 +341,7 @@ impl DdlApplicator {
     }
 
     pub fn defer_snowflake_publication(&self, desc: &RelDescriptor) -> Result<(), EmitterError> {
-        if let Some(runtime) = &self.conn_cfg.snowflake {
+        if let Some(runtime) = &self.snowflake {
             runtime
                 .defer_publication(desc)
                 .map_err(|e| EmitterError::Config(e.to_string()))?;
@@ -359,50 +354,19 @@ impl DdlApplicator {
     /// system-column names are boot-only, so they carry over. No-op until the
     /// resolver sends a new value; called at each apply so DDL runs against
     /// the current config.
-    async fn refresh_config(&mut self) -> Result<(), EmitterError> {
+    fn refresh_config(&mut self) {
         if !self.config_rx.has_changed().unwrap_or(false) {
-            return Ok(());
+            return;
         }
-        let (cfg, conn) = {
-            let snap = self.config_rx.borrow_and_update();
-            let cfg = DdlConfig::from_resolved(
-                &snap,
-                self.config.target_database.clone(),
-                self.config.soft_delete,
-                self.config.system.clone(),
-                snap.replicate_all,
-                self.config.runtime_config_schema.clone(),
-            );
-            let conn = (
-                snap.host.clone(),
-                snap.port,
-                snap.database.clone(),
-                snap.user.clone(),
-                snap.password.clone(),
-                snap.secure,
-            );
-            (cfg, conn)
-        };
-        self.config = cfg;
-        let (host, port, database, user, password, secure) = conn;
-        if host != self.conn_cfg.host
-            || port != self.conn_cfg.port
-            || database != self.conn_cfg.database
-            || user != self.conn_cfg.user
-            || password != self.conn_cfg.password
-            || secure != self.conn_cfg.secure
-        {
-            self.conn_cfg.host = host;
-            self.conn_cfg.port = port;
-            self.conn_cfg.database = database;
-            self.conn_cfg.user = user;
-            self.conn_cfg.password = password;
-            self.conn_cfg.secure = secure;
-            if let Some(client) = self.client.as_mut() {
-                client.dial(&self.conn_cfg).await?;
-            }
-        }
-        Ok(())
+        let snap = self.config_rx.borrow_and_update();
+        self.config = DdlConfig::from_resolved(
+            &snap,
+            self.config.target_database.clone(),
+            self.config.soft_delete,
+            self.config.system.clone(),
+            snap.replicate_all,
+            self.config.runtime_config_schema.clone(),
+        );
     }
 
     /// Errors propagate; the worker task turns them into
@@ -420,9 +384,9 @@ impl DdlApplicator {
         frozen: Option<&ResolvedConfig>,
         commit_lsn: u64,
     ) -> Result<(), EmitterError> {
-        self.refresh_config().await?;
+        self.refresh_config();
         let cfg = self.plan_config(frozen);
-        if let Some(snowflake) = self.conn_cfg.snowflake.clone() {
+        if let Some(snowflake) = self.snowflake.clone() {
             return self
                 .apply_snowflake(event, &snowflake, commit_lsn, &cfg)
                 .await;
@@ -474,7 +438,7 @@ impl DdlApplicator {
                         columns: snowflake_columns(new, &cfg.column_rules)?,
                     };
                 } else {
-                    fold_diff_into_mapping(&mut mapped, new, diff, &cfg.column_rules);
+                    fold_diff_into_mapping(&mut mapped, new, diff, &[], &cfg.column_rules);
                 }
                 validate_snowflake_route(new, &mapped, snowflake)?;
                 snowflake
@@ -496,7 +460,7 @@ impl DdlApplicator {
                             .await;
                     }
                 } else {
-                    self.fold_mapping_diff(new, diff, cfg).await;
+                    self.fold_mapping_diff(new, diff, &[], cfg).await;
                 }
                 self.stats.alters_applied += 1;
                 Ok(())
@@ -530,7 +494,7 @@ impl DdlApplicator {
         // Mapped dest created from the mapping when missing; IF NOT EXISTS
         // no-ops an operator-managed table and re-creates after strategy=drop.
         if let Some(m) = self.mapping_for(&desc.rel_name).await {
-            if let Some(snowflake) = &self.conn_cfg.snowflake {
+            if let Some(snowflake) = &self.snowflake {
                 validate_snowflake_route(desc, &m, snowflake)?;
                 snowflake
                     .ensure_table(desc)
@@ -561,7 +525,7 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(());
         }
-        if let Some(snowflake) = &self.conn_cfg.snowflake {
+        if let Some(snowflake) = &self.snowflake {
             if !cfg.auto_creates(&desc.rel_name) {
                 self.stats.skipped += 1;
                 return Ok(());
@@ -611,8 +575,8 @@ impl DdlApplicator {
     /// has no bridgeable shape (nothing created; caller should not map it).
     /// Idempotent: `IF NOT EXISTS` no-ops a re-create.
     pub async fn ensure_ch_table(&mut self, desc: &RelDescriptor) -> Result<bool, EmitterError> {
-        self.refresh_config().await?;
-        if let Some(snowflake) = self.conn_cfg.snowflake.clone() {
+        self.refresh_config();
+        if let Some(snowflake) = self.snowflake.clone() {
             snowflake_columns(desc, &self.config.column_rules)?;
             if let Some(mapping) = self.mapping_for(&desc.rel_name).await {
                 validate_snowflake_route(desc, &mapping, &snowflake)?;
@@ -649,7 +613,7 @@ impl DdlApplicator {
 
     async fn apply_changed(
         &mut self,
-        _old: &RelDescriptor,
+        old: &RelDescriptor,
         new: &RelDescriptor,
         diff: &SchemaDiff,
         cfg: &DdlConfig,
@@ -662,6 +626,23 @@ impl DdlApplicator {
             return Ok(());
         };
         let target = target.sql();
+        // ClickHouse can reject key retypes; defer renames, additions, and drops
+        let columns = mapping_columns_at(&self.mapping, &key, &mapped_at).await?;
+        let retypes = plan_retypes(old, new, diff, &columns, &cfg.column_rules);
+        for clause in retypes.iter().flat_map(retype_clauses) {
+            let sql = format!("ALTER TABLE {target} {clause}");
+            self.execute(&sql).await.map_err(|e| match e {
+                EmitterError::ServerException {
+                    code: ALTER_OF_COLUMN_IS_FORBIDDEN,
+                    message,
+                } => EmitterError::Config(format!(
+                    "`{key}`: destination refused column type change, likely a \
+                     sorting key column; rebuild destination manually: {message}"
+                )),
+                e => e,
+            })?;
+            self.stats.alters_applied += 1;
+        }
         // RENAME before ADD/DROP so position-matched renames don't trip
         // a later diff into a drop+add pair
         for (_attnum, old_name, new_name) in &diff.renamed_columns {
@@ -706,7 +687,7 @@ impl DdlApplicator {
         }
         for attnum in &diff.dropped_columns {
             // diff lists attnums only; resolve CH column name from old descriptor
-            let name = _old
+            let name = old
                 .attributes
                 .iter()
                 .find(|a| a.attnum == *attnum)
@@ -725,21 +706,11 @@ impl DdlApplicator {
             self.execute(&sql).await?;
             self.stats.alters_applied += 1;
         }
-        if !diff.type_changes.is_empty() {
-            self.stats.type_changes_rejected += diff.type_changes.len() as u64;
-            tracing::warn!(
-                target: "walshadow::ch_ddl",
-                relation = %new.rel_name,
-                type_changes = diff.type_changes.len(),
-                "unsupported schema change: type widening / domain change \
-                 (manual operator migration required)"
-            );
-        }
         // Auto-extend the TableMapping so the emitter ships post-DDL
         // rows against the new shape without TOML edits; operator-pinned
         // `target_name` overrides survive (only touch entries the
         // applicator could have produced, by src_attnum match)
-        self.fold_mapping_diff(new, diff, cfg).await;
+        self.fold_mapping_diff(new, diff, &retypes, cfg).await;
         Ok(())
     }
 
@@ -792,7 +763,7 @@ impl DdlApplicator {
         let Some((_, target)) = self.mapping_target(rel).await else {
             return Ok(());
         };
-        if let Some(snowflake) = &self.conn_cfg.snowflake {
+        if let Some(snowflake) = &self.snowflake {
             return snowflake
                 .truncate(rel)
                 .await
@@ -812,7 +783,7 @@ impl DdlApplicator {
         if self.mapping_target(&desc.rel_name).await.is_none() {
             return Ok(());
         }
-        if let Some(snowflake) = &self.conn_cfg.snowflake {
+        if let Some(snowflake) = &self.snowflake {
             return snowflake
                 .truncate_at(desc, record_lsn)
                 .await
@@ -869,7 +840,7 @@ impl DdlApplicator {
             _ => false,
         };
         let cfg = self.plan_config(config);
-        if let Some(snowflake) = &self.conn_cfg.snowflake {
+        if let Some(snowflake) = &self.snowflake {
             return predict_snowflake_route_effect(&cfg, mapping, event, excluded, snowflake);
         }
         let effect = predict_route_effect(&cfg, mapping, event, excluded)?;
@@ -890,8 +861,7 @@ impl DdlApplicator {
         mapping: &MappingSnapshot,
         config: Option<&ResolvedConfig>,
     ) -> Result<Vec<(RelName, Option<TableMapping>)>, EmitterError> {
-        if let (Some(runtime), SchemaEvent::Changed { old, new, diff }) =
-            (&self.conn_cfg.snowflake, event)
+        if let (Some(runtime), SchemaEvent::Changed { old, new, diff }) = (&self.snowflake, event)
             && old.rel_name != new.rel_name
             && mapping.contains_key(&old.rel_name)
         {
@@ -940,11 +910,17 @@ impl DdlApplicator {
             .unwrap_or_else(|| self.config.clone())
     }
 
-    async fn fold_mapping_diff(&mut self, new: &RelDescriptor, diff: &SchemaDiff, cfg: &DdlConfig) {
+    async fn fold_mapping_diff(
+        &mut self,
+        new: &RelDescriptor,
+        diff: &SchemaDiff,
+        retypes: &[Retype],
+        cfg: &DdlConfig,
+    ) {
         if let Some(r) = &self.resolver {
-            r.apply_schema_diff(new, diff).await;
+            r.apply_schema_diff(new, diff, retypes).await;
         } else {
-            mutate_mapping_for_diff(&self.mapping, new, diff, &cfg.column_rules).await;
+            mutate_mapping_for_diff(&self.mapping, new, diff, retypes, &cfg.column_rules).await;
         }
     }
 
@@ -977,15 +953,22 @@ impl DdlApplicator {
 
     async fn execute(&mut self, sql: &str) -> Result<(), EmitterError> {
         tracing::debug!(target: "walshadow::ch_ddl", sql = %sql, "applying");
-        let query_timeout = self.query_timeout;
-        self.client
-            .as_mut()
-            .ok_or_else(|| {
-                EmitterError::Config("ClickHouse DDL attempted in Snowflake mode".into())
-            })?
-            .retry(
-                &self.conn_cfg,
-                self.retry.backoff(),
+        let client = self.client.as_mut().ok_or_else(|| {
+            EmitterError::Config("ClickHouse DDL attempted in Snowflake mode".into())
+        })?;
+        let query_timeout = client.config().insert_timeout;
+        client
+            .retry_when(
+                |e| {
+                    is_retryable(e)
+                        && !matches!(
+                            e,
+                            EmitterError::ServerException {
+                                code: ALTER_OF_COLUMN_IS_FORBIDDEN,
+                                ..
+                            }
+                        )
+                },
                 |mut client| async move {
                     let result = exec_drain(&mut client, sql, query_timeout).await;
                     (client, result)
@@ -1028,6 +1011,7 @@ fn snowflake_columns(
             target_name,
             target_type: crate::destination::snowflake::types::type_for(attr.type_oid, attr.typmod)
                 .sql(),
+            type_pinned: false,
         });
     }
     Ok(columns)
@@ -1145,11 +1129,12 @@ fn predict_route_effect(
             }
             Ok(derive_added(cfg, desc)?.map(|(_, m)| (desc.rel_name.clone(), Some(m))))
         }
-        SchemaEvent::Changed { new, diff, .. } => {
+        SchemaEvent::Changed { old, new, diff } => {
             let Some(mut m) = mapping.get(&new.rel_name).cloned() else {
                 return Ok(None);
             };
-            fold_diff_into_mapping(&mut m, new, diff, &cfg.column_rules);
+            let retypes = plan_retypes(old, new, diff, &m.columns, &cfg.column_rules);
+            fold_diff_into_mapping(&mut m, new, diff, &retypes, &cfg.column_rules);
             Ok(Some((new.rel_name.clone(), Some(m))))
         }
         SchemaEvent::Dropped { rel_name, .. } => {
@@ -1186,6 +1171,66 @@ fn derive_added(
     Ok(Some((sql, TableMapping { target, columns })))
 }
 
+/// ClickHouse `ALTER_OF_COLUMN_IS_FORBIDDEN`, including rejected key retypes
+const ALTER_OF_COLUMN_IS_FORBIDDEN: i32 = 524;
+
+/// PostgreSQL rewrite rows supersede stored values by `_lsn`.
+/// Avoid fallible ClickHouse mutations: one unparseable value can stall them.
+fn plan_retypes(
+    old_desc: &RelDescriptor,
+    new: &RelDescriptor,
+    diff: &SchemaDiff,
+    columns: &[ColumnMapping],
+    rules: &ColumnRules,
+) -> Vec<Retype> {
+    let rewritten = old_desc.rfn != new.rfn;
+    let is_int = |a: &RelAttr| matches!(a.type_oid, INT2OID | INT4OID | INT8OID);
+    let mut retypes = Vec::new();
+    for (old, attr) in &diff.type_changes {
+        let Some(column) = columns.iter().find(|c| c.src_attnum == attr.attnum) else {
+            continue;
+        };
+        if column.type_pinned {
+            tracing::warn!(
+                target: "walshadow::ch_ddl",
+                relation = %new.rel_name,
+                column = %column.target_name,
+                "source type change keeps pinned destination type"
+            );
+            continue;
+        }
+        let key = replident_key_attnums(new).contains(&attr.attnum);
+        let Some(target_type) = retyped_target(&new.rel_name, column, attr, key, rules) else {
+            continue;
+        };
+        let infallible =
+            (is_int(old) && is_int(attr)) || types::inner_kind(&target_type) == Some(Kind::String);
+        retypes.push(Retype {
+            src_attnum: attr.attnum,
+            target_name: column.target_name.clone(),
+            target_type,
+            kind: if rewritten && !infallible {
+                RetypeKind::Readd
+            } else {
+                RetypeKind::Modify
+            },
+        });
+    }
+    retypes
+}
+
+fn retype_clauses(retype: &Retype) -> Vec<String> {
+    let name = quote_ident(&retype.target_name);
+    let ty = &retype.target_type;
+    match retype.kind {
+        RetypeKind::Modify => vec![format!("MODIFY COLUMN IF EXISTS {name} {ty}")],
+        RetypeKind::Readd => vec![
+            format!("DROP COLUMN IF EXISTS {name}"),
+            format!("ADD COLUMN IF NOT EXISTS {name} {ty}"),
+        ],
+    }
+}
+
 /// Reject ALTER continuation after concurrent route republish
 async fn mapping_columns_at(
     mapping: &MappingHandle,
@@ -1208,12 +1253,13 @@ async fn mutate_mapping_for_diff(
     mapping: &MappingHandle,
     new: &RelDescriptor,
     diff: &SchemaDiff,
+    retypes: &[Retype],
     rules: &ColumnRules,
 ) {
     mapping
         .mutate(|m| {
             if let Some(target_mapping) = Arc::make_mut(m).get_mut(&new.rel_name) {
-                fold_diff_into_mapping(target_mapping, new, diff, rules);
+                fold_diff_into_mapping(target_mapping, new, diff, retypes, rules);
             }
         })
         .await;
@@ -1395,11 +1441,6 @@ fn orderable_system<'a>(sys: &'a SystemColumns, orderable: &mut HashMap<&'a str,
     }
 }
 
-/// ClickHouse rejects Nullable columns in a sorting key
-fn is_nullable(ch_type: &str) -> bool {
-    ch_type.starts_with("Nullable(")
-}
-
 /// `CREATE TABLE IF NOT EXISTS` for an autodiscovered relation. `None`
 /// when a column's type can't be bridged; caller logs + skips.
 pub fn render_create_table(
@@ -1441,14 +1482,14 @@ pub fn render_create_table(
     let mut orderable: HashMap<&str, bool> = HashMap::default();
     orderable_system(&shape.system, &mut orderable);
     for (_, name, r) in &cols {
-        orderable.insert(name, is_nullable(&r.ch_type));
+        orderable.insert(name, types::is_nullable(&r.ch_type));
     }
     // ClickHouse rejects Nullable columns in ORDER BY
     let derived: Vec<String> = pk_attnums
         .iter()
         .filter_map(|a| {
             cols.iter()
-                .find(|(attnum, _, r)| attnum == a && !is_nullable(&r.ch_type))
+                .find(|(attnum, _, r)| attnum == a && !types::is_nullable(&r.ch_type))
                 .map(|(_, name, _)| quote_ident(name))
         })
         .collect();
@@ -1507,7 +1548,7 @@ pub fn render_create_table_from_mapping(
     let mut orderable: HashMap<&str, bool> = HashMap::default();
     orderable_system(&shape.system, &mut orderable);
     for c in &mapping.columns {
-        orderable.insert(&c.target_name, is_nullable(&c.target_type));
+        orderable.insert(&c.target_name, types::is_nullable(&c.target_type));
     }
     let derived: Vec<String> = replident_key_attnums(desc)
         .iter()
@@ -1515,7 +1556,7 @@ pub fn render_create_table_from_mapping(
             mapping
                 .columns
                 .iter()
-                .find(|c| c.src_attnum == *a && !is_nullable(&c.target_type))
+                .find(|c| c.src_attnum == *a && !types::is_nullable(&c.target_type))
                 .map(|c| quote_ident(&c.target_name))
         })
         .collect();
@@ -1548,7 +1589,7 @@ mod tests {
                 None,
             );
             let mut applicator = DdlApplicator::new(
-                &config,
+                DestEmitter::new(Arc::new(config), None),
                 ddl,
                 crate::mapping::mapping_handle(HashMap::default()),
                 watch::channel(resolved).1,
@@ -1841,11 +1882,13 @@ mod tests {
                     src_attnum: 1,
                     target_name: "order_id".into(),
                     target_type: "Int64".into(),
+                    type_pinned: false,
                 },
                 ColumnMapping {
                     src_attnum: 2,
                     target_name: "description".into(),
                     target_type: "Nullable(String)".into(),
+                    type_pinned: false,
                 },
             ],
         };
@@ -2174,11 +2217,13 @@ mod tests {
                     src_attnum: 1,
                     target_name: "order_id".into(),
                     target_type: "Int64".into(),
+                    type_pinned: false,
                 },
                 ColumnMapping {
                     src_attnum: 2,
                     target_name: "payload".into(),
                     target_type: "Nullable(String)".into(),
+                    type_pinned: false,
                 },
             ],
         };
@@ -2203,6 +2248,7 @@ mod tests {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Nullable(Int32)".into(),
+                type_pinned: false,
             }],
         };
         let sql = render_create_table_from_mapping(&d, &m, &shape(false));
@@ -2372,11 +2418,13 @@ mod tests {
                     src_attnum: 1,
                     target_name: "order_id".into(),
                     target_type: "Int32".into(),
+                    type_pinned: false,
                 },
                 ColumnMapping {
                     src_attnum: 2,
                     target_name: "tenant".into(),
                     target_type: "Int32".into(),
+                    type_pinned: false,
                 },
             ],
         };
@@ -2439,6 +2487,90 @@ mod tests {
         assert_eq!(diff.dropped_columns[0], 2);
     }
 
+    #[test]
+    fn plan_retypes_modifies_or_readds() {
+        use crate::schema::{TEXTOID, VARCHAROID, compute_schema_diff};
+        let old = desc(
+            "t",
+            vec![
+                att(1, "id", INT4OID, true, None),
+                att(2, "n", INT8OID, false, None),
+                att(3, "m", INT4OID, true, None),
+                att(4, "s", VARCHAROID, false, None),
+                att(5, "p", INT4OID, true, None),
+            ],
+            Some(vec![1]),
+        );
+        let rules = ColumnRules::default();
+        let mut columns = derive_columns_for_mapping(&old, &rules);
+        columns[4].type_pinned = true;
+        let new = desc(
+            "t",
+            vec![
+                att(1, "id", INT8OID, true, None),
+                att(2, "n", INT4OID, false, None),
+                att(3, "m", INT4OID, false, None),
+                att(4, "s", TEXTOID, true, None),
+                att(5, "p", INT8OID, true, None),
+            ],
+            Some(vec![1]),
+        );
+        let diff = compute_schema_diff(&old, &new);
+        let clauses = |retypes: &[Retype]| -> Vec<String> {
+            retypes.iter().flat_map(retype_clauses).collect()
+        };
+        let retypes = plan_retypes(&old, &new, &diff, &columns, &rules);
+        assert_eq!(
+            clauses(&retypes),
+            [
+                "MODIFY COLUMN IF EXISTS `id` Int64",
+                "MODIFY COLUMN IF EXISTS `n` Nullable(Int32)",
+                "MODIFY COLUMN IF EXISTS `m` Nullable(Int32)",
+            ],
+            "SET NOT NULL keeps Nullable, varchar to text and pinned type stay"
+        );
+        let mut mapping = TableMapping {
+            target: TableTarget::new("default", "t"),
+            columns: columns.clone(),
+        };
+        fold_diff_into_mapping(&mut mapping, &new, &diff, &retypes, &rules);
+        let types: Vec<&str> = mapping
+            .columns
+            .iter()
+            .map(|c| c.target_type.as_str())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "Int64",
+                "Nullable(Int32)",
+                "Nullable(Int32)",
+                "Nullable(String)",
+                "Int32"
+            ]
+        );
+        let mut retyped = desc(
+            "t",
+            vec![
+                att(1, "id", INT4OID, true, None),
+                att(3, "m", TEXTOID, true, None),
+                att(4, "s", INT4OID, false, None),
+            ],
+            Some(vec![1]),
+        );
+        retyped.rfn.rel_node += 1;
+        let diff = compute_schema_diff(&old, &retyped);
+        assert_eq!(
+            clauses(&plan_retypes(&old, &retyped, &diff, &columns, &rules)),
+            [
+                "MODIFY COLUMN IF EXISTS `m` String",
+                "DROP COLUMN IF EXISTS `s`",
+                "ADD COLUMN IF NOT EXISTS `s` Nullable(Int32)",
+            ],
+            "rewrite rows restore values a fallible cast would lose"
+        );
+    }
+
     fn orders_mapping() -> (RelName, ahash::HashMap<RelName, TableMapping>) {
         let rel = RelName::new("public", "orders");
         let map = [(
@@ -2449,6 +2581,7 @@ mod tests {
                     src_attnum: 1,
                     target_name: "id".into(),
                     target_type: "Int32".into(),
+                    type_pinned: false,
                 }],
             },
         )]
@@ -2578,7 +2711,7 @@ mod tests {
             renamed_columns: vec![],
             type_changes: vec![],
         };
-        mutate_mapping_for_diff(&handle, &new, &diff, &ColumnRules::default()).await;
+        mutate_mapping_for_diff(&handle, &new, &diff, &[], &ColumnRules::default()).await;
         let folded = handle
             .with(|m| {
                 m.get(&RelName::new("public", "orders"))
@@ -2592,6 +2725,6 @@ mod tests {
 
         // Unmapped relation: early return
         let ghost = desc("ghost", vec![att(1, "id", INT4OID, true, None)], None);
-        mutate_mapping_for_diff(&handle, &ghost, &diff, &ColumnRules::default()).await;
+        mutate_mapping_for_diff(&handle, &ghost, &diff, &[], &ColumnRules::default()).await;
     }
 }
