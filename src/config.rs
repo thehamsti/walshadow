@@ -450,9 +450,15 @@ impl Activation {
             base.table_entries.clear();
         }
         for (rel, row) in &self.opt_ins {
-            base.table_opt_ins
+            let entry = base
+                .table_opt_ins
                 .entry(rel.clone())
                 .or_insert_with(|| row.clone());
+            // A table rule naming no initial load takes the start scope's,
+            // so `[tenant.<id>] initial_load` covers explicit tables too
+            if entry.initial_load.is_none() {
+                entry.initial_load.clone_from(&row.initial_load);
+            }
         }
     }
 }
@@ -1177,6 +1183,38 @@ mod tests {
 
     fn dummy_handles() -> MappingHandle {
         crate::mapping::mapping_handle(HashMap::new())
+    }
+
+    /// A tenant's start scope carries its initial load onto a table rule that
+    /// names none, and leaves one that does alone
+    #[test]
+    fn activation_fills_a_missing_initial_load_only() {
+        let mut base = EmitterConfig::from_toml_str(
+            "[ch]\n[table.public.early]\nreplicate = true\ntarget_table = \"early\"\n\
+             [table.public.kept]\nreplicate = true\ninitial_load = \"none\"\n",
+        )
+        .unwrap();
+        let row = |load: &str| TableRow {
+            replicate: Some(true),
+            initial_load: Some(load.into()),
+            ..TableRow::default()
+        };
+        let early = RelName::new("public", "early");
+        let kept = RelName::new("public", "kept");
+        Activation {
+            priming: false,
+            opt_ins: [(early.clone(), row("copy")), (kept.clone(), row("copy"))]
+                .into_iter()
+                .collect(),
+        }
+        .apply(&mut base);
+        let load = |rel: &RelName| base.table_opt_ins[rel].initial_load.clone();
+        assert_eq!(load(&early).as_deref(), Some("copy"));
+        assert_eq!(load(&kept).as_deref(), Some("none"));
+        assert_eq!(
+            base.table_opt_ins[&early].target_table.as_deref(),
+            Some("early")
+        );
     }
 
     #[test]
@@ -2853,7 +2891,7 @@ mod tests {
 
     /// A reload republishes each database's own entries, not the primary's
     #[tokio::test]
-    async fn reload_keeps_the_resolver_scoped_to_its_database() {
+    async fn reload_refuses_database_sections_and_keeps_the_snapshot() {
         const DOC: &str = "[ch]\nhost = \"ch\"\n[source]\ndbname = \"app\"\n\
              [table.public.orders]\nreplicate = true\n\
              [database.billing.table.public.ledger]\nreplicate = true\n";
@@ -2878,11 +2916,11 @@ mod tests {
             billing_rels(&mut rx),
             vec![crate::schema::RelName::new("public", "ledger")]
         );
-        resolver.reload().await.unwrap();
-        assert_eq!(
-            billing_rels(&mut rx),
-            vec![crate::schema::RelName::new("public", "ledger")],
-            "a reload must not hand app's tables to billing"
+        let err = resolver.reload().await.unwrap_err().to_string();
+        assert!(err.contains("[tenant.<id>]"), "{err}");
+        assert!(
+            !rx.has_changed().unwrap(),
+            "a refused reload leaves the last snapshot in effect"
         );
     }
 

@@ -883,7 +883,7 @@ mod tests {
 
     /// A reload cannot add a database: shadow registers its workers at startup
     #[tokio::test]
-    async fn reload_reports_databases_it_cannot_follow() {
+    async fn reload_refuses_database_sections() {
         const DOC: &str = "[ch]\nhost = \"ch\"\n[source]\ndbname = \"app\"\n\
              [table.public.orders]\nreplicate = true\n\
              [database.billing.table.public.ledger]\nreplicate = true\n";
@@ -902,11 +902,8 @@ mod tests {
         );
         let reloader = Reloader::default();
         reloader.set_resolvers(vec![resolver]).await;
-        assert_eq!(
-            reloader.reload().await.unwrap(),
-            vec!["billing".to_string()],
-            "`app` is followed, `billing` needs a restart"
-        );
+        let err = reloader.reload().await.unwrap_err().to_string();
+        assert!(err.contains("[tenant.<id>]"), "{err}");
         assert!(
             ok_note(&["billing".to_string()]).starts_with("OK config names billing"),
             "ctl prints the note on the OK line"

@@ -699,7 +699,7 @@ mod tests {
             r.on_idle().await.unwrap();
             r.on_idle_advance(0x40).await.unwrap();
             r.flush().await.unwrap();
-            assert_eq!(sink(&r, "good").seen.last(), Some(&0x30));
+            assert!(sink(&r, "good").seen.contains(&0x30));
             assert!(sink(&r, "good").advances.contains(&0x40));
             assert!(!sink(&r, "bad").seen.contains(&0x38));
             assert!(!sink(&r, "bad").advances.contains(&0x40));

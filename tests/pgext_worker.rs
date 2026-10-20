@@ -273,7 +273,7 @@ fn worker_serves_a_connection_whose_buffers_cannot_widen() {
 /// without disturbing the pools already running
 #[test]
 fn tenant_launcher_starts_pools_and_refuses_bad_lists() {
-    if !pgext::pg_available() {
+    if !pgext::tools::pg_available() {
         eprintln!("skip: no initdb on PATH");
         return;
     }

@@ -874,7 +874,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(watermark.get(), 200);
-        drop(ack);
+        drop((ack, seqs));
         collector.await.unwrap();
     }
 
@@ -914,7 +914,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(watermark.get(), 200);
-        drop(ack);
+        drop((ack, seqs));
         collector.await.unwrap();
     }
 }

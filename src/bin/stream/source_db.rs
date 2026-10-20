@@ -83,9 +83,14 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         cfg.table_entries.clear();
     }
     for (rel, row) in &input.activation.opt_ins {
-        cfg.table_opt_ins
+        let entry = cfg
+            .table_opt_ins
             .entry(rel.clone())
             .or_insert_with(|| row.clone());
+        // Same fill as `Activation`: a rule naming no load takes the start's
+        if entry.initial_load.is_none() {
+            entry.initial_load.clone_from(&row.initial_load);
+        }
     }
     // Live routing map shared by DDL applicator + route planning. The
     // refresher below rewrites it on every republished snapshot.

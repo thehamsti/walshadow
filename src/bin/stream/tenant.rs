@@ -509,11 +509,13 @@ pub(crate) async fn open_tenant(
     // pre-flight read the tenant's database, not the admin one the pump
     // connects to
     if !args.skip_preflight {
+        // The source holds the root database even while the shadow follows
+        // a stand-in for it
         let mut primary_cfg = source_conn.to_pg_config();
-        primary_cfg.database = dbname.clone();
+        primary_cfg.database = root_db.clone();
         let source_sql = open_sql_client_waiting(&primary_cfg, connect_budget)
             .await
-            .with_context(|| format!("tenant {id}: source SQL session on database {dbname}"))?;
+            .with_context(|| format!("tenant {id}: source SQL session on database {root_db}"))?;
         let shadow_sql = open_shadow_sql_client(
             &args.shadow_socket_dir,
             args.shadow_port,

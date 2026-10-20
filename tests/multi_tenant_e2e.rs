@@ -256,13 +256,14 @@ impl Harness {
             .with_context(|| format!("daemon did not come back\n{}", self.stderr()))
     }
 
-    /// Wait until `tenant_<id>.orders` holds exactly `rows` live rows, all
+    /// Wait until `tenant_<id>.app_orders`, the default `$schema$_$table$`
+    /// name, holds exactly `rows` live rows, all
     /// from `db`
     async fn wait_rows(&self, id: &str, db: &str, rows: u64, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let sql = format!(
             "SELECT count(), countIf(startsWith(note, '{db}-')) \
-             FROM tenant_{id}.orders FINAL WHERE _is_deleted = 0"
+             FROM tenant_{id}.app_orders FINAL WHERE _is_deleted = 0"
         );
         loop {
             let got = self.ch.query(&sql).unwrap_or_default();
@@ -376,7 +377,7 @@ fn spawn_daemon(bin: &str, args: &[String], stderr_path: &Path) -> Result<Child>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tenants_share_one_slot_attach_live_detach_and_resume() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let ports = fx::Ports::alloc();
@@ -501,7 +502,7 @@ async fn tenants_share_one_slot_attach_live_detach_and_resume() {
     h.wait_rows("a", "app_a", 72, t).await.unwrap();
     h.wait_rows("c", "app_c", 53, t).await.unwrap();
     let note =
-        h.ch.query("SELECT note FROM tenant_c.orders FINAL WHERE _is_deleted = 0 AND id = 1")
+        h.ch.query("SELECT note FROM tenant_c.app_orders FINAL WHERE _is_deleted = 0 AND id = 1")
             .unwrap();
     assert_eq!(note.trim(), "app_c-updated");
     assert_eq!(
@@ -532,7 +533,7 @@ fn spec_of(id: &str, db: &str, ch_port: u16) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_registry_manages_tenants_and_a_broken_tenant_stays_isolated() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let ports = fx::Ports::alloc();

@@ -275,7 +275,7 @@ fn native_looks_through_target_wrappers() {
 
 #[test]
 fn render_text_is_type_native_and_rejects_bad_cells() {
-    if !pgext::pg_available() {
+    if !pgext::tools::pg_available() {
         eprintln!("skip: no initdb on PATH");
         return;
     }
@@ -329,7 +329,7 @@ fn render_text_is_type_native_and_rejects_bad_cells() {
 /// per bit, so a 34 MiB body renders past the 256 MiB response cap
 #[test]
 fn render_text_refuses_output_past_the_response_cap() {
-    if !pgext::pg_available() {
+    if !pgext::tools::pg_available() {
         eprintln!("skip: no initdb on PATH");
         return;
     }
@@ -358,7 +358,7 @@ fn render_text_refuses_output_past_the_response_cap() {
 
 #[test]
 fn render_text_handles_array_and_domain_input() {
-    if !pgext::pg_available() {
+    if !pgext::tools::pg_available() {
         eprintln!("skip: no initdb on PATH");
         return;
     }
