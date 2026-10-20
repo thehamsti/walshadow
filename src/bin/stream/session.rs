@@ -841,6 +841,9 @@ async fn session_body(
                     emitter,
                 });
             }
+            // Records of a database the shadow lacks reach this tenant too,
+            // so its pending gate attaches at the first one, as before tenants
+            let pending_oids: Vec<u32> = pending_dbs.iter().map(|p| p.oid).collect();
             let boot = tenant::TenantBoot {
                 args,
                 id: walshadow::tenants::LEGACY_TENANT.into(),
@@ -901,7 +904,7 @@ async fn session_body(
             }
             router.attach(walshadow::tenant_router::RoutedTenant::new(
                 t.id.clone(),
-                t.db_oids.clone(),
+                t.db_oids.iter().copied().chain(pending_oids).collect(),
                 0,
                 sink,
             ));
