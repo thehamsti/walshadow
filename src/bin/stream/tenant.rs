@@ -1015,6 +1015,8 @@ struct Priming {
 pub(crate) struct Supervisor {
     attach_queue: std::collections::VecDeque<String>,
     priming: std::collections::HashMap<String, Priming>,
+    /// Attaches waiting on shadow replay, not retried before their instant
+    retry_at: std::collections::HashMap<String, Instant>,
 }
 
 impl Supervisor {
@@ -1024,12 +1026,29 @@ impl Supervisor {
         }
     }
 
+    /// Queue `id` again once `after` passes: each attempt flushes the router
+    /// and dials shadow, so a database replay has yet to create is not
+    /// retried every chunk
+    pub fn retry_attach(&mut self, id: &str, after: Duration) {
+        self.retry_at.insert(id.to_string(), Instant::now() + after);
+        self.queue_attach(id);
+    }
+
+    /// First queued tenant whose retry, if any, is due
     pub fn next_attach(&mut self) -> Option<String> {
-        self.attach_queue.pop_front()
+        let now = Instant::now();
+        let at = self
+            .attach_queue
+            .iter()
+            .position(|id| self.retry_at.get(id).is_none_or(|t| *t <= now))?;
+        let id = self.attach_queue.remove(at)?;
+        self.retry_at.remove(&id);
+        Some(id)
     }
 
     pub fn forget(&mut self, id: &str) {
         self.attach_queue.retain(|q| q != id);
+        self.retry_at.remove(id);
         self.priming.remove(id);
     }
 

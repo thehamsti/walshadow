@@ -1464,7 +1464,7 @@ async fn session_body(
                 }
                 .await;
                 match attached {
-                    Ok(None) => supervisor.queue_attach(&id),
+                    Ok(None) => supervisor.retry_attach(&id, Duration::from_secs(1)),
                     Ok(Some((t, sink, p0))) => {
                         for db in &t.db_oids {
                             stream.filter_mut().add_target_db(*db);
