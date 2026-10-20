@@ -1534,6 +1534,23 @@ pub(crate) fn wanted_databases(tenants: &walshadow::tenants::TenantsConfig) -> V
         .collect()
 }
 
+/// A bridge cannot start until replay creates the source database. Refuse a
+/// nonexistent source name, but let the pump advance while shadow catches up
+pub(crate) async fn attachment_ready(
+    source: &tokio_postgres::Client,
+    shadow: &tokio_postgres::Client,
+    dbname: &str,
+) -> Result<bool> {
+    let sql =
+        "SELECT oid FROM pg_database WHERE datname = $1 AND datallowconn AND NOT datistemplate";
+    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&dbname];
+    let (source, shadow) =
+        tokio::try_join!(source.query_opt(sql, params), shadow.query_opt(sql, params),)?;
+    let source =
+        source.with_context(|| format!("database {dbname} is configured but not on the source"))?;
+    Ok(shadow.is_some_and(|row| row.get::<_, u32>(0) == source.get::<_, u32>(0)))
+}
+
 /// Wait until shadow replayed through `lsn`: a tenant's descriptor history
 /// is seeded from shadow's catalog, which must already show every catalog
 /// change before the attachment

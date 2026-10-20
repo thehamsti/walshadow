@@ -77,7 +77,8 @@ name = "ACME.WALSHADOW_INTERNAL.WALSHADOW_STAGE"
 replicate_all = true
 ```
 
-Tenant ids are 1–63 characters of `[a-z0-9_-]`. Two tenants may not follow
+Tenant ids are 1–63 characters of `[a-z0-9_-]`; `default` is reserved for
+the implicit single-database tenant. Two tenants may not follow
 one database. With no `[tenants]` and no `[tenant.*]` the daemon runs the
 single-database layout unchanged.
 
@@ -95,8 +96,11 @@ lock is ever shared. The daemon and `ctl` refuse a config where two tenants:
   tee. Two tenants left at the default database collide, so give each its own
 
 A route a tenant's runtime config rows (`config_table`, `config_namespace`)
-resolve outside its own ClickHouse databases fails that tenant's DDL, which
-evicts it, rather than writing another tenant's tables.
+resolve outside its reserved ClickHouse databases is refused before publishing
+an existing mapping. The prior snapshot remains in effect and the rejection is
+logged. Creating a new destination outside these scopes fails the tenant's DDL
+and evicts it. Reservations are fixed at attachment: detach and re-attach to
+expand them after updating the tenant config.
 
 Snowflake replicates each declarative partition as a table of its own, as
 before partition routing existed; `route`, `tee`, `target_instance` and

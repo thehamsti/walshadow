@@ -417,6 +417,7 @@ pub struct ConfigResolver {
     tenant: std::sync::OnceLock<String>,
     /// Scope a tenant attached mid-stream holds over what the file says
     activation: std::sync::Mutex<Activation>,
+    reserved: std::sync::OnceLock<Arc<crate::tenants::ChScopes>>,
 }
 
 /// State fixed before the pump consumes WAL
@@ -501,6 +502,7 @@ impl ConfigResolver {
             shadow_toast,
             tenant: std::sync::OnceLock::new(),
             activation: std::sync::Mutex::new(Activation::default()),
+            reserved: std::sync::OnceLock::new(),
         });
         (this, rx)
     }
@@ -523,6 +525,53 @@ impl ConfigResolver {
     /// Serve tenant `id`: reloads see only its effective config
     pub fn bind_tenant(&self, id: &str) {
         let _ = self.tenant.set(id.to_string());
+    }
+
+    /// Bind before any mapping is published; seeded runtime rows obey the
+    /// same destination reservations as later WAL updates
+    pub fn reserve_destinations(
+        &self,
+        scopes: Arc<crate::tenants::ChScopes>,
+    ) -> Result<(), EmitterError> {
+        let _ = self.reserved.set(scopes);
+        self.check_destinations(&self.tx.borrow())
+    }
+
+    fn check_destinations(&self, resolved: &ResolvedConfig) -> Result<(), EmitterError> {
+        let Some(scopes) = self.reserved.get() else {
+            return Ok(());
+        };
+        // TOAST mirrors use each connection's default database even before
+        // any user relation is mapped
+        for conn in std::iter::once(&resolved.conn).chain(resolved.instances.values()) {
+            if !scopes.contains(&crate::tenants::ch_scope(conn, &conn.database)) {
+                return Err(EmitterError::Config(format!(
+                    "{}:{} database {} is outside this tenant's reserved destinations; \
+                     detach and re-attach after reserving it in the tenant config",
+                    conn.host, conn.port, conn.database,
+                )));
+            }
+        }
+        for mapping in resolved.tables.values() {
+            for target in mapping.targets() {
+                let conn = match target.instance.as_deref() {
+                    Some(name) => resolved.instances.get(name).ok_or_else(|| {
+                        EmitterError::Config(format!("unknown ClickHouse instance `{name}`"))
+                    })?,
+                    None => &resolved.conn,
+                };
+                if !scopes.contains(&crate::tenants::ch_scope(conn, &target.database)) {
+                    return Err(EmitterError::Config(format!(
+                        "{} on {}:{} is outside this tenant's reserved destinations; \
+                         detach and re-attach after reserving it in the tenant config",
+                        target.sql(),
+                        conn.host,
+                        conn.port,
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn tenant(&self) -> Option<&str> {
@@ -811,6 +860,11 @@ impl ConfigResolver {
             &inner.opt_in,
             &prev.column_rules,
         );
+        if let Err(e) = self.check_destinations(&resolved) {
+            self.rejections.store(rejections + 1, Ordering::Relaxed);
+            tracing::warn!(target: "walshadow::config", error = %e, "routing update rejected; keeping prior snapshot");
+            return;
+        }
         self.rejections.store(rejections, Ordering::Relaxed);
         self.mapping
             .publish(Arc::new(crate::mapping::shared(resolved.tables.clone())))
@@ -1116,6 +1170,10 @@ impl ConfigResolver {
         let mut merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
         crate::tenants::reject_database_sections(&merged)
             .map_err(|e| EmitterError::Config(format!("{e:#}")))?;
+        if merged.contains_key("tenants") || merged.contains_key("tenant") {
+            crate::ops::tenant_ctl::validate(&merged)
+                .map_err(|e| EmitterError::Config(format!("{e:#}")))?;
+        }
         if let Some(id) = self.tenant.get() {
             let tenants = crate::tenants::TenantsConfig::from_table(&merged)
                 .map_err(|e| EmitterError::Config(format!("{e:#}")))?
@@ -1138,6 +1196,8 @@ impl ConfigResolver {
                 }
                 // Credentials, role, warehouse and timing apply live; what
                 // durable state is bound to, and pool sizes, do not
+                crate::destination::config::check_snowflake_routing(&base)
+                    .map_err(|e| EmitterError::Config(e.to_string()))?;
                 runtime
                     .update_settings(&config)
                     .map_err(|e| EmitterError::Config(format!("{e:#}")))?;
@@ -1162,6 +1222,9 @@ impl ConfigResolver {
             }
         }
         self.activation.lock().unwrap().apply(&mut base);
+        let prev = self.tx.borrow().column_rules.clone();
+        let (resolved, _) = Self::resolve(&base, &inner.overlay, &self.cli, &inner.opt_in, &prev);
+        self.check_destinations(&resolved)?;
         inner.base = base;
         self.republish(&inner).await;
         Ok(())
@@ -1938,6 +2001,110 @@ mod tests {
             !r.tables.contains_key(&RelName::new("public", "keep")),
             "excluded rel dropped even when TOML-mapped"
         );
+    }
+
+    #[tokio::test]
+    async fn tenant_runtime_retarget_keeps_both_published_maps_in_reserved_scope() {
+        let base = base_with("retain");
+        let mapping = dummy_handles();
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            mapping.clone(),
+            ResolverBoot::default(),
+        );
+        resolver
+            .reserve_destinations(Arc::new(crate::tenants::clickhouse_scopes(&base)))
+            .unwrap();
+        let desc = rel_desc("public", "events");
+        resolver.materialize_opt_in(&desc, None, None).await;
+        let prior = rx.borrow().clone();
+        resolver
+            .apply_config_event(ConfigEvent::TableUpserted {
+                rel: desc.rel_name.clone(),
+                row: TableRow {
+                    target_database: Some("another_tenant".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert!(Arc::ptr_eq(&prior, &rx.borrow()));
+        assert_eq!(resolver.rejections(), 1);
+        assert_eq!(
+            mapping.snapshot().await[&desc.rel_name].target.database,
+            "default"
+        );
+        resolver
+            .apply_config_event(ConfigEvent::TableUpserted {
+                rel: desc.rel_name.clone(),
+                row: TableRow {
+                    target_table: Some("renamed".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(rx.borrow().tables[&desc.rel_name].target.table, "renamed");
+        assert_eq!(resolver.rejections(), 0);
+    }
+
+    #[tokio::test]
+    async fn tenant_seed_and_tees_cannot_publish_unreserved_routes() {
+        let base = base_with("retain");
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        let desc = rel_desc("public", "events");
+        resolver
+            .materialize_opt_in(&desc, Some("another_tenant".into()), None)
+            .await;
+        assert!(
+            resolver
+                .reserve_destinations(Arc::new(crate::tenants::clickhouse_scopes(&base)))
+                .is_err()
+        );
+        assert_eq!(
+            rx.borrow().tables[&desc.rel_name].target.database,
+            "another_tenant"
+        );
+
+        let tee_base = EmitterConfig::from_toml_str(
+            "[ch]\n[table.public.events]\nreplicate = true\n\
+             tee = [{ database = 'another_tenant', table = 'audit' }]\n",
+        )
+        .unwrap();
+        let (resolver, rx) = ConfigResolver::new(
+            &tee_base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        resolver
+            .reserve_destinations(Arc::new(crate::tenants::clickhouse_scopes(&base)))
+            .unwrap();
+        let mapping = TableMapping {
+            target: TableTarget::new("default", "events"),
+            columns: Vec::new(),
+            tees: vec![crate::mapping::Tee {
+                database: Some("another_tenant".into()),
+                table: "audit".into(),
+                instance: None,
+                engine: None,
+                order_by: Vec::new(),
+                primary_key: Vec::new(),
+            }],
+        };
+        resolver.register_derived_mapping(&desc, mapping).await;
+        assert!(rx.borrow().tables.is_empty());
+        assert_eq!(resolver.rejections(), 1);
     }
 
     #[tokio::test]
@@ -2806,6 +2973,70 @@ mod tests {
             &ColumnRules::default(),
         );
         assert_eq!(r.source.slot.as_deref(), Some("pinned"));
+    }
+
+    #[tokio::test]
+    async fn tenant_reload_cannot_repoint_an_empty_pipeline_outside_reserved_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let base = base_with("retain");
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            Some(path.clone()),
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        resolver
+            .reserve_destinations(Arc::new(crate::tenants::clickhouse_scopes(&base)))
+            .unwrap();
+        let prior = rx.borrow().clone();
+        tokio::fs::write(&path, "[ch]\nhost = 'another_tenant'\n")
+            .await
+            .unwrap();
+        let err = resolver.reload().await.unwrap_err().to_string();
+        assert!(
+            err.contains("outside this tenant's reserved destinations"),
+            "{err}"
+        );
+        assert!(Arc::ptr_eq(&prior, &rx.borrow()));
+        assert!(rx.borrow().tables.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tenant_reload_rejects_shared_destinations_before_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = |database: &str| {
+            format!(
+                "[source]\ndbname = 'postgres'\n[tenants]\n\
+             [tenant.a]\ndbname = 'app'\n[tenant.a.ch]\nhost = 'ch'\ndatabase = 'a'\n\
+             [tenant.b]\ndbname = 'other'\n[tenant.b.ch]\nhost = 'ch'\ndatabase = '{database}'\n",
+            )
+        };
+        let root: toml::Table = toml::from_str(&config("b")).unwrap();
+        let tenants = crate::tenants::TenantsConfig::from_table(&root)
+            .unwrap()
+            .unwrap();
+        let base =
+            EmitterConfig::from_table(&tenants.get("a").unwrap().effective_table(&root)).unwrap();
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            Some(path.clone()),
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        resolver.bind_tenant("a");
+        tokio::fs::write(&path, config("b")).await.unwrap();
+        resolver.reload().await.unwrap();
+        let prior = rx.borrow().clone();
+        tokio::fs::write(&path, config("a")).await.unwrap();
+        let err = resolver.reload().await.unwrap_err().to_string();
+        assert!(err.contains("both reach ClickHouse database"), "{err}");
+        assert!(Arc::ptr_eq(&prior, &rx.borrow()));
     }
 
     #[tokio::test]

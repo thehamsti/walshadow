@@ -138,6 +138,9 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     if let Some(id) = input.tenant {
         resolver.bind_tenant(id);
     }
+    if let Some(scopes) = &reserved {
+        resolver.reserve_destinations(scopes.clone())?;
+    }
     resolver.set_activation(input.activation);
     if let Some(held) = input.shadow_toast_held {
         // Check configured tables here because they bypass opt-in

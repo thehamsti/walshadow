@@ -139,7 +139,8 @@ pub fn clickhouse_scopes(cfg: &crate::ch_emitter::EmitterConfig) -> ChScopes {
     for (_, _, rule) in &cfg.table_entries {
         let conn = conn_of(rule.target_instance.as_deref());
         if let Some(db) = &rule.target_database {
-            scopes.insert(ch_scope(conn, db));
+            // A narrower rule may select another instance
+            scopes.extend(conns.iter().map(|c| ch_scope(c, db)));
         }
         for tee in rule.tee.iter().flatten() {
             let tee_conn = tee.instance.as_deref().map_or(conn, |n| conn_of(Some(n)));
@@ -260,6 +261,10 @@ impl TenantsConfig {
 impl TenantDecl {
     pub fn parse(id: &str, body: &toml::Table) -> Result<Self> {
         validate_id(id)?;
+        ensure!(
+            id != LEGACY_TENANT,
+            "tenant id {id:?} is reserved for the single-database layout"
+        );
         let mut body = body.clone();
         let dbname = match body.remove("dbname") {
             Some(toml::Value::String(s)) if !s.is_empty() => s,
@@ -595,6 +600,13 @@ mod tests {
             .is_err()
         );
         assert!(TenantsConfig::from_table(&root("[tenant.A]\ndbname = 'x'\n")).is_err());
+        let err = TenantsConfig::from_table(&root("[tenant.default]\ndbname = 'x'\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("reserved for the single-database layout"),
+            "{err}"
+        );
         assert!(TenantsConfig::from_table(&root("[tenant.a]\n")).is_err());
         assert!(
             TenantsConfig::from_table(&root("[tenant.a]\ndbname = 'x'\nslot = 'y'\n")).is_err()

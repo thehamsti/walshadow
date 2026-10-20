@@ -50,8 +50,8 @@ use crate::metrics_publish::{
 };
 use crate::runtime_cfg::{or_signal, sighup_reload};
 use crate::shadow_proc::{
-    OwnedShadow, ShadowLifecycle, bridge_pool_size, build_owned_shadow, probe_blocking,
-    start_owned_shadow, walsender_primary_conninfo,
+    OwnedShadow, ShadowLifecycle, bridge_pool_size, build_owned_shadow, open_shadow_sql_client,
+    probe_blocking, start_owned_shadow, walsender_primary_conninfo,
 };
 use crate::sinks::DaemonSinks;
 use crate::source_db::{ATTACH_MARKER, list_databases};
@@ -151,7 +151,7 @@ async fn session_body(
         "source identified",
     );
 
-    walshadow::tenants::reject_database_sections(&merged)?;
+    walshadow::ops::tenant_ctl::validate(&merged)?;
     let mut tenants_cfg = walshadow::tenants::TenantsConfig::from_table(&merged)
         .context("parse [tenants] / [tenant.*]")?;
     if let Some(tcfg) = &tenants_cfg {
@@ -1322,8 +1322,10 @@ async fn session_body(
                 match walshadow::ch_emitter::load_effective(path, cli_base(args))
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))
-                    .and_then(|m| walshadow::tenants::TenantsConfig::from_table(&m).map(|t| (m, t)))
-                {
+                    .and_then(|m| {
+                        walshadow::ops::tenant_ctl::validate(&m)?;
+                        walshadow::tenants::TenantsConfig::from_table(&m).map(|t| (m, t))
+                    }) {
                     Ok((next_merged, Some(next))) => {
                         let old = tenants_cfg.take().expect("tenants mode");
                         let plan = tenant::reconcile_plan(
@@ -1434,6 +1436,22 @@ async fn session_body(
                         Duration::from_secs(args.catalog_hold_timeout),
                     )
                     .await?;
+                    let shadow_sql = open_shadow_sql_client(
+                        &args.shadow_socket_dir,
+                        args.shadow_port,
+                        &args.shadow_user,
+                        &primary_dbname,
+                    )
+                    .await?;
+                    if !tenant::attachment_ready(
+                        feed.sql_client().await?,
+                        &shadow_sql,
+                        &decl.dbname,
+                    )
+                    .await?
+                    {
+                        return Ok(None);
+                    }
                     tenant::publish_tenant_bridges(
                         &shadow_lifecycle,
                         tenant::wanted_databases(tcfg),
@@ -1442,11 +1460,12 @@ async fn session_body(
                     let (t, sink) = supervisor
                         .attach(&shared, args, &merged, tcfg, decl, p0, reloader)
                         .await?;
-                    anyhow::Ok((t, sink, p0))
+                    anyhow::Ok(Some((t, sink, p0)))
                 }
                 .await;
                 match attached {
-                    Ok((t, sink, p0)) => {
+                    Ok(None) => supervisor.queue_attach(&id),
+                    Ok(Some((t, sink, p0))) => {
                         for db in &t.db_oids {
                             stream.filter_mut().add_target_db(*db);
                         }

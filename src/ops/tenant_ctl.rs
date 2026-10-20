@@ -487,6 +487,16 @@ name = "{database}.INTERNAL.LOAD_STAGE"
             ch("a", "database = 'a'\n"),
         )))
         .unwrap();
+        let layered_route = format!(
+            "{CLUSTER}{}[tenant.b]\ndbname = 'b_db'\n[tenant.b.ch]\nhost = 'other'\ndatabase = 'b'\n\
+             [tenant.b.ch.instances.mirror]\nhost = 'ch'\ndatabase = 'mirror'\n\
+             [tenant.b.table.public.\"*\"]\nmatch = 'glob'\ntarget_database = 'a'\n\
+             [tenant.b.table.public.orders]\nreplicate = true\ntarget_instance = 'mirror'\n\
+             tee = [{{ table = 'audit' }}]\n",
+            ch("a", "database = 'a'\n"),
+        );
+        let err = validate(&root(&layered_route)).unwrap_err().to_string();
+        assert!(err.contains("both reach ClickHouse database a"), "{err}");
         for converging in [
             // Both left at the default database
             String::new(),
