@@ -129,7 +129,7 @@ fn write_autocreate_config(path: &Path, ch_port: u16) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bootstrap_survives_extension_absent_from_oracle() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     // extension_control_path (the no-root way to give only the source a private
@@ -146,7 +146,7 @@ async fn bootstrap_survives_extension_absent_from_oracle() {
     let (ctl_dir, lib_dir) = match build_stub(tmp.path()).expect("build stub extension") {
         Some(dirs) => dirs,
         None => {
-            eprintln!("skip: no C compiler / server headers to build the stub extension");
+            fx::tools::skip("no C compiler / server headers to build the stub extension");
             return;
         }
     };
@@ -203,7 +203,7 @@ async fn bootstrap_survives_extension_absent_from_oracle() {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             let n = ch
-                .query("SELECT count() FROM default.t FINAL WHERE _is_deleted = 0")
+                .query("SELECT count() FROM default.public_t FINAL WHERE _is_deleted = 0")
                 .unwrap_or_default();
             if n == "1" {
                 break;
@@ -221,7 +221,7 @@ async fn bootstrap_survives_extension_absent_from_oracle() {
         }
         // The oracle-routed enum column must still resolve.
         let feel = ch
-            .query("SELECT feel FROM default.t FINAL WHERE id = 1")
+            .query("SELECT feel FROM default.public_t FINAL WHERE id = 1")
             .context("read enum column from CH")?;
         if feel != "happy" {
             anyhow::bail!("enum column not decoded: feel = {feel:?}");

@@ -7,25 +7,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use walshadow::ch::CompressionChoice;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::pipeline::Fatal;
 use walshadow::pipeline::tail;
 use walshadow::pos::{EmitterAck, Monotone};
 
 fn emitter(port: u16) -> EmitterConfig {
     EmitterConfig {
-        host: "127.0.0.1".into(),
-        port,
-        database: "walshadow_test".into(),
-        compression: CompressionChoice::Lz4,
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port,
+            database: "walshadow_test".into(),
+            compression: CompressionChoice::Lz4,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tail_finish_flushes_and_drains_clean() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
     let ch_tmp = tempfile::tempdir().unwrap();
@@ -55,8 +57,7 @@ async fn tail_finish_flushes_and_drains_clean() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tail_finish_returns_fatal_message() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
     let ch_tmp = tempfile::tempdir().unwrap();
@@ -88,8 +89,7 @@ async fn tail_finish_returns_fatal_message() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tail_finish_fatal_during_drain() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
     let ch_tmp = tempfile::tempdir().unwrap();

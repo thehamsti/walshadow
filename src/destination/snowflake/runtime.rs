@@ -438,7 +438,7 @@ impl SnowflakeRuntime {
             SchemaEvent::Changed { old, new, diff } => {
                 self.apply_schema_change(old, new, diff, commit_lsn).await
             }
-            SchemaEvent::Dropped { oid, rel_name } => {
+            SchemaEvent::Dropped { oid, rel_name, .. } => {
                 self.drop_relation_at(*oid, rel_name, commit_lsn).await
             }
         }

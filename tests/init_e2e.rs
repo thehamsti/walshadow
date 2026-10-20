@@ -34,12 +34,10 @@ fn socket_url(socket_dir: &std::path::Path, dbname: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn init_probes_both_ends_and_writes_a_bootable_config() {
-    if !fx::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !fx::tools::pg_available() {
         return;
     }
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
 
@@ -99,8 +97,8 @@ async fn init_probes_both_ends_and_writes_a_bootable_config() {
     assert_eq!(conn.dbname, "postgres");
 
     let cfg = EmitterConfig::from_table(&root).expect("[ch]");
-    assert_eq!(cfg.port, slot.ch_tcp);
-    assert_eq!(cfg.database, "cdc");
+    assert_eq!(cfg.conn.port, slot.ch_tcp);
+    assert_eq!(cfg.conn.database, "cdc");
 
     let users = cfg
         .table_opt_ins

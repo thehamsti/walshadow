@@ -412,7 +412,9 @@ async fn savepoint_after_ddl_rollback_discards_column_and_rows() {
         NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
+            detach_strategy: None,
             initial_load: None,
         },
     );
@@ -510,5 +512,5 @@ async fn many_subxacts_emit_assignment_record() {
 }
 
 fn skip_gate() -> bool {
-    !fx::requirements_available()
+    !fx::tools::requirements_available()
 }

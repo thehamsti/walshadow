@@ -6,10 +6,16 @@
 //! watermark advances through contiguous done seqs only
 //!
 //! One commit may span several seqs. Only the final seq publishes its
-//! `commit_lsn`, earlier slices gate contiguity via
-//! [`AckHandle::register_partial`]
+//! `commit_lsn`, earlier slices gate contiguity via [`Publish::Partial`]
 //!
-//! Inserter sends [`AckEvent::Acked`] only after draining `EndOfStream`
+//! [`SeqAlloc::open`] is the only registration path. An allocator and its
+//! seqs send only to the collector that made them, and [`OpenSeq::place`]
+//! consumes its seq. Types do not stop two allocators overlapping or a seq
+//! dropping unplaced: collector fails on a repeat registration, and an
+//! unplaced seq pins the frontier where [`AckSnapshot::stall_reason`] names it
+//!
+//! [`AckHandle::acked`] takes the [`EndOfStream`] proof, so only a drained
+//! INSERT acks
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,9 +23,13 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::ch::EndOfStream;
+#[cfg(feature = "test-support")]
+use crate::crash_test;
 use crate::emit::pipeline::Fatal;
 use crate::pos::{AckFrontier, EmitterAck, Gate, GateClosed, Monotone, Pos};
 
+#[derive(Debug)]
 pub enum AckEvent {
     /// In seq order, no gaps. `publish: false` marks a non-final slice of a
     /// multi-seq commit: done-ness gates contiguity, `commit_lsn` never
@@ -40,6 +50,8 @@ pub enum AckEvent {
     Trailing {
         lsn: u64,
     },
+    /// Events applied in order, published once
+    Batch(Vec<AckEvent>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +178,11 @@ impl AckState {
     }
 
     pub fn apply(&mut self, ev: AckEvent) {
+        self.step_event(ev);
+        self.publish();
+    }
+
+    fn step_event(&mut self, ev: AckEvent) {
         match ev {
             AckEvent::Register {
                 seq,
@@ -179,8 +196,12 @@ impl AckState {
                 }
             }
             AckEvent::Trailing { lsn } => self.trailing = self.trailing.max(lsn),
+            AckEvent::Batch(evs) => {
+                for ev in evs {
+                    self.step_event(ev);
+                }
+            }
         }
-        self.publish();
     }
 
     fn open_seq(&mut self, seq: u64, commit_lsn: u64, publish: bool) {
@@ -256,6 +277,8 @@ impl AckState {
             self.watermark
         };
         self.emitter_ack.join(Pos::new(ack));
+        #[cfg(feature = "test-support")]
+        crash_test::hit(crash_test::Point::AfterAck, ack);
         self.frontier_cell.join(Pos::new(self.frontier));
         self.probe_tx.send_replace(self.snapshot());
     }
@@ -300,31 +323,24 @@ pub struct AckHandle {
 }
 
 impl AckHandle {
-    /// Register a commit's final (or only) seq; its `commit_lsn` publishes
-    /// once the contiguous-done frontier passes it.
-    pub fn register(&self, seq: u64, commit_lsn: u64) {
-        let _ = self.tx.send(AckEvent::Register {
-            seq,
-            commit_lsn,
-            publish: true,
-        });
+    /// Rows ClickHouse confirmed durable
+    pub fn acked(&self, _: EndOfStream, counts: Vec<(u64, u64)>) {
+        self.send_acked(counts);
     }
 
-    /// Register a non-final slice of a multi-seq commit: counts toward
-    /// contiguity but never advances `emitter_ack` (see module doc).
-    pub fn register_partial(&self, seq: u64, commit_lsn: u64) {
-        let _ = self.tx.send(AckEvent::Register {
-            seq,
-            commit_lsn,
-            publish: false,
-        });
+    /// Null tail: rows dropped by design count as done
+    pub(super) fn swallowed(&self, counts: Vec<(u64, u64)>) {
+        self.send_acked(counts);
     }
 
-    pub fn placed(&self, seq: u64, rows: u64) {
-        let _ = self.tx.send(AckEvent::Placed { seq, rows });
+    /// Snowflake tail: its delivery resolves only once the rows are durable,
+    /// applied or in the outbox per `ack_after`, which stands in for the
+    /// ClickHouse [`EndOfStream`] proof
+    pub(super) fn delivered(&self, counts: Vec<(u64, u64)>) {
+        self.send_acked(counts);
     }
 
-    pub fn acked(&self, counts: Vec<(u64, u64)>) {
+    fn send_acked(&self, counts: Vec<(u64, u64)>) {
         if !counts.is_empty() {
             let _ = self.tx.send(AckEvent::Acked { counts });
         }
@@ -345,6 +361,132 @@ impl AckHandle {
     /// Wait until every seq below `seq` is durable on ClickHouse
     pub async fn wait_through(&self, seq: u64) -> Result<(), GateClosed> {
         self.frontier.wait(Pos::new(seq)).await.map(|_| ())
+    }
+
+    /// Seq source registering on this collector, opening at `first`
+    pub fn seqs(&self, first: u64) -> SeqAlloc {
+        SeqAlloc {
+            tx: self.tx.clone(),
+            next: first,
+            held: None,
+        }
+    }
+}
+
+/// Whether a done seq advances `emitter_ack` to its `commit_lsn`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Publish {
+    /// Commit's final (or only) seq
+    Commit,
+    /// Non-final slice of a multi-seq commit, gates contiguity only
+    Partial,
+}
+
+/// Dense seq source for one producer; registers in order without gaps
+#[derive(Debug)]
+pub struct SeqAlloc {
+    tx: mpsc::UnboundedSender<AckEvent>,
+    next: u64,
+    /// Events awaiting [`Self::send_registered`] / [`Self::send_placed`];
+    /// `None` sends each as it happens
+    held: Option<Held>,
+}
+
+#[derive(Debug, Default)]
+struct Held {
+    registered: Vec<AckEvent>,
+    placed: Vec<AckEvent>,
+}
+
+impl SeqAlloc {
+    /// Hold registrations and placements for bulk sends, so a run of small
+    /// commits wakes the collector once rather than twice per seq
+    pub fn held(mut self) -> Self {
+        self.held = Some(Held::default());
+        self
+    }
+
+    /// One past the last opened seq
+    pub const fn next(&self) -> u64 {
+        self.next
+    }
+
+    pub fn open(&mut self, commit_lsn: u64, publish: Publish) -> OpenSeq {
+        let seq = self.next;
+        self.next += 1;
+        let ev = AckEvent::Register {
+            seq,
+            commit_lsn,
+            publish: publish == Publish::Commit,
+        };
+        if let Some(held) = &mut self.held {
+            held.registered.push(ev);
+        } else {
+            let _ = self.tx.send(ev);
+        }
+        OpenSeq {
+            tx: self.tx.clone(),
+            seq,
+        }
+    }
+
+    /// Ordering marker carrying no rows
+    pub fn mark(&mut self, commit_lsn: u64) {
+        let seq = self.open(commit_lsn, Publish::Commit);
+        self.place(seq, 0);
+    }
+
+    /// [`OpenSeq::place`], held while this allocator holds
+    pub fn place(&mut self, seq: OpenSeq, rows: u64) {
+        let Some(held) = &mut self.held else {
+            return seq.place(rows);
+        };
+        held.placed.push(AckEvent::Placed { seq: seq.seq, rows });
+    }
+
+    /// Held registrations must reach the collector before their rows reach
+    /// the batcher, else an insert ack can beat its seq's registration
+    pub fn send_registered(&mut self) {
+        if let Some(held) = &mut self.held
+            && !held.registered.is_empty()
+        {
+            let _ = self
+                .tx
+                .send(AckEvent::Batch(std::mem::take(&mut held.registered)));
+        }
+    }
+
+    /// Held placements go once their rows are on the batcher channel
+    pub fn send_placed(&mut self) {
+        if let Some(held) = &mut self.held
+            && !held.placed.is_empty()
+        {
+            let _ = self
+                .tx
+                .send(AckEvent::Batch(std::mem::take(&mut held.placed)));
+        }
+    }
+}
+
+/// Registered seq awaiting its row count
+#[must_use = "an unplaced seq pins the ack frontier"]
+#[derive(Debug)]
+pub struct OpenSeq {
+    tx: mpsc::UnboundedSender<AckEvent>,
+    seq: u64,
+}
+
+impl OpenSeq {
+    pub const fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Every row of this seq must already be on the batcher channel
+    pub fn place(self, rows: u64) {
+        let _ = self.tx.send(AckEvent::Placed {
+            seq: self.seq,
+            rows,
+        });
     }
 }
 

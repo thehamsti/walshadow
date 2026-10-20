@@ -118,8 +118,10 @@ fn write_config(path: &Path, ch_port: u16) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn user_relation_never_materialises_on_the_shadow() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::tools::pg_available()
+        || !fx::tools::pg_basebackup_available()
+        || !fx::tools::clickhouse_available()
+    {
         return;
     }
 
@@ -221,7 +223,7 @@ async fn user_relation_never_materialises_on_the_shadow() {
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             let n = ch
-                .query("SELECT count() FROM default.big")
+                .query("SELECT count() FROM default.public_big")
                 .unwrap_or_default();
             if n == ROWS.to_string() {
                 break;
@@ -270,7 +272,7 @@ async fn user_relation_never_materialises_on_the_shadow() {
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             let n = ch
-                .query("SELECT count() FROM default.big FINAL WHERE id = 2000001")
+                .query("SELECT count() FROM default.public_big FINAL WHERE id = 2000001")
                 .unwrap_or_default();
             if n == "1" {
                 break;
@@ -294,10 +296,7 @@ async fn user_relation_never_materialises_on_the_shadow() {
         Ok(())
     })();
 
-    let _ = guard.into_inner().map(|mut c| {
-        let _ = c.kill();
-        let _ = c.wait();
-    });
+    drop(guard);
     if bootstrap_shadow_data_dir.join("postmaster.pid").exists() {
         let mut shadow_cfg =
             ShadowConfig::new(bootstrap_shadow_data_dir.clone(), shadow_filter_dir.clone());

@@ -1,9 +1,8 @@
 //! TOAST mirror retirement across pipeline restarts (`architecture/values.md`):
 //! owner DROP paths that need a rebuilt pipeline
 //!
-//! * cold-restart DROP — a rebuilt pipeline (empty `prev_known`, no chunk
-//!   decode) still retires the mirror off the `seed_baseline`-warmed
-//!   toast oid
+//! * cold-restart DROP — a rebuilt pipeline with no chunk decode still
+//!   retires the mirror off toast descriptor persisted in descriptor log
 //! * crash-replay — same-xact UPDATE (toast value untouched) + DROP,
 //!   pipeline rebuilt before the floor advances: replay must find the
 //!   mirror intact, destination bytes exact, zero fills
@@ -77,12 +76,11 @@ fn doc_mappings() -> Vec<fx::TableMappingSpec> {
 
 /// Cold-restart DROP: the mirror predates the pipeline (a prior run built
 /// it) and no chunk decode warms the toast descriptor before the owner
-/// DROP. `seed_baseline` must have put owner + toast oids in `prev_known`
-/// for the sweep to surface both; without it the toast `Dropped` never
-/// fires and the mirror leaks indefinitely.
+/// DROP. Descriptor log must hold owner + toast predecessors for replay to
+/// surface both; without them toast `Dropped` never fires and mirror leaks
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_restart_drop_retires_mirror() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -110,14 +108,17 @@ async fn cold_restart_drop_retires_mirror() {
     let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     create_doc_dest(&ch);
 
-    let toast_relid = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
-        .expect("source toast relid");
-    let chunk_table = format!("walshadow_test.pg_toast_{toast_relid}");
+    let mirror = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc'::regclass AND d.datname = current_database()",
+        )
+        .expect("source toast mirror");
+    let chunk_table = format!("walshadow_test.{mirror}");
 
     // Run 1: populate the mirror, then drain and drop the whole pipeline —
-    // the daemon-restart stand-in (catalog, prev_known, chunk caches all
-    // rebuilt from scratch below).
+    // the daemon-restart stand-in (catalog and chunk caches rebuilt from
+    // scratch below).
     let mut pipeline = fx::build_pipeline_with(
         fx::BuildPipelineArgs {
             tmp: &tmp,
@@ -157,8 +158,8 @@ async fn cold_restart_drop_retires_mirror() {
         .await
         .expect("first pipeline drains clean");
 
-    // Run 2: fresh pipeline, cold prev_known. Only seed_baseline knows the
-    // toast oid — the DROP is the first WAL this pipeline decodes.
+    // Run 2: fresh pipeline. Only descriptor log knows the toast oid, DROP
+    // is the first WAL this pipeline decodes
     let mut pipeline = fx::build_pipeline_with(
         fx::BuildPipelineArgs {
             tmp: &tmp,
@@ -186,8 +187,7 @@ async fn cold_restart_drop_retires_mirror() {
     let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
     let _ = driver.join();
     assert!(shipped >= 1, "drop segment never shipped");
-    // Queued off the seed_baseline-warmed toast oid, deferred until the
-    // floor passes.
+    // Queued off persisted toast descriptor, deferred until floor passes
     assert_eq!(
         ch.query(&format!("SELECT count() > 0 FROM {chunk_table}"))
             .expect("mirror rows"),
@@ -196,7 +196,9 @@ async fn cold_restart_drop_retires_mirror() {
     );
     pipeline
         .resume_floor
-        .join(walshadow::pos::Pos::new(u64::MAX));
+        .publish(walshadow::pos::Durable::assume_for_test(
+            walshadow::pos::Pos::new(u64::MAX),
+        ));
     let driver = fx::spawn_workload(
         &source,
         vec![
@@ -217,7 +219,7 @@ async fn cold_restart_drop_retires_mirror() {
     assert_eq!(
         ch.query(&format!(
             "SELECT count() FROM system.tables \
-             WHERE database = 'walshadow_test' AND name = 'pg_toast_{toast_relid}'"
+             WHERE database = 'walshadow_test' AND name = '{mirror}'"
         ))
         .expect("mirror existence"),
         "1",
@@ -241,7 +243,7 @@ async fn cold_restart_drop_retires_mirror() {
 /// as the durable original, equal-version rows dedup can't arbitrate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drop_crash_replay_keeps_referrer_bytes() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -269,10 +271,13 @@ async fn drop_crash_replay_keeps_referrer_bytes() {
     let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     create_doc_dest(&ch);
 
-    let toast_relid = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
-        .expect("source toast relid");
-    let chunk_table = format!("walshadow_test.pg_toast_{toast_relid}");
+    let mirror = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc'::regclass AND d.datname = current_database()",
+        )
+        .expect("source toast mirror");
+    let chunk_table = format!("walshadow_test.{mirror}");
     // Dest keys on (id, _lsn): both row versions persist as history. The
     // invariant is bodies stay full-length — a replayed fill would surface
     // as a NULL body at v2's `_lsn`.
@@ -405,7 +410,7 @@ async fn drop_crash_replay_keeps_referrer_bytes() {
 /// WAL pumped at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drop_retire_survives_restart_from_ledger() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -433,10 +438,13 @@ async fn drop_retire_survives_restart_from_ledger() {
     let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     create_doc_dest(&ch);
 
-    let toast_relid = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
-        .expect("source toast relid");
-    let chunk_table = format!("walshadow_test.pg_toast_{toast_relid}");
+    let mirror = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc'::regclass AND d.datname = current_database()",
+        )
+        .expect("source toast mirror");
+    let chunk_table = format!("walshadow_test.{mirror}");
     let spill_dir = tmp.path().join("spill");
 
     let build = |state, app_name| {
@@ -504,7 +512,7 @@ async fn drop_retire_survives_restart_from_ledger() {
     pipeline.shutdown().await.expect("first pipeline drains");
     assert_eq!(stats.toast_mirror_retires.load(Ordering::Relaxed), 0);
     assert_eq!(
-        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id)
+        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id, None)
             .await
             .expect("read ledger")
             .entries()
@@ -524,7 +532,7 @@ async fn drop_retire_survives_restart_from_ledger() {
     assert_eq!(
         ch.query(&format!(
             "SELECT count() FROM system.tables \
-             WHERE database = 'walshadow_test' AND name = 'pg_toast_{toast_relid}'"
+             WHERE database = 'walshadow_test' AND name = '{mirror}'"
         ))
         .expect("mirror existence"),
         "1",
@@ -535,7 +543,7 @@ async fn drop_retire_survives_restart_from_ledger() {
         1
     );
     assert!(
-        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id)
+        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id, None)
             .await
             .expect("read ledger")
             .is_empty(),

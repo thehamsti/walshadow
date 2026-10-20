@@ -132,6 +132,7 @@ async fn toast_and_outbound_payloads_share_the_budget() {
     let state = StateStore::open(dir.path(), identity(), 512).unwrap();
     let toast = state.toast_store();
     let row = ToastRow {
+        db_oid: 0,
         toast_relid: 3,
         blkno: 1,
         offnum: 1,
@@ -156,7 +157,7 @@ async fn toast_and_outbound_payloads_share_the_budget() {
     large.chunk_data = Bytes::from(vec![1; 512]);
     assert!(toast.put(&[large]).await.is_err());
     // A rejected write cannot overwrite the prior as-of value or consume budget.
-    assert!(toast.fetch(3, 7, 100, 4).await.is_ok());
+    assert!(toast.fetch(0, 3, 7, 100, 4).await.is_ok());
     toast.put(&[row]).await.unwrap();
 }
 
@@ -412,6 +413,7 @@ async fn toast_reopens_with_as_of_history_and_rejects_ambiguity() {
     let state = StateStore::open(dir.path(), identity(), 1024).unwrap();
     let toast = state.toast_store();
     let row = ToastRow {
+        db_oid: 0,
         toast_relid: 3,
         blkno: 5,
         offnum: 1,
@@ -435,13 +437,13 @@ async fn toast_reopens_with_as_of_history_and_rejects_ambiguity() {
     let state = StateStore::open(dir.path(), identity(), 1024).unwrap();
     let toast = state.toast_store();
     assert!(
-        matches!(toast.fetch(3,10,100,3).await.unwrap(), FetchedValue::Assembled(v) if v == b"abc")
+        matches!(toast.fetch(0, 3,10,100,3).await.unwrap(), FetchedValue::Assembled(v) if v == b"abc")
     );
     assert!(matches!(
-        toast.fetch(3, 10, 110, 3).await.unwrap(),
+        toast.fetch(0, 3, 10, 110, 3).await.unwrap(),
         FetchedValue::Missing
     ));
-    assert!(toast.truncate_mirror(3).await.is_err());
+    assert!(toast.truncate_mirror(0, 3).await.is_err());
 }
 
 #[tokio::test]
@@ -451,6 +453,7 @@ async fn corrupt_toast_value_index_blocks_restart() {
     state
         .toast_store()
         .put(&[ToastRow {
+            db_oid: 0,
             toast_relid: 3,
             blkno: 1,
             offnum: 1,
@@ -480,6 +483,7 @@ async fn orphan_toast_value_index_blocks_restart_even_when_accounted() {
     state
         .toast_store()
         .put(&[ToastRow {
+            db_oid: 0,
             toast_relid: 3,
             blkno: 1,
             offnum: 1,
@@ -517,6 +521,7 @@ async fn truncate_preserves_history_and_retirement_preserves_oid_reuse() {
     let state = StateStore::open(dir.path(), identity(), 4096).unwrap();
     let toast = state.toast_store();
     let row = ToastRow {
+        db_oid: 0,
         toast_relid: 3,
         blkno: 1,
         offnum: 1,
@@ -526,12 +531,12 @@ async fn truncate_preserves_history_and_retirement_preserves_oid_reuse() {
         lsn: 10,
     };
     toast.put(std::slice::from_ref(&row)).await.unwrap();
-    toast.truncate_at(3, 20).await.unwrap();
+    toast.truncate_at(0, 3, 20).await.unwrap();
     assert!(
-        matches!(toast.fetch(3,7,19,3).await.unwrap(), FetchedValue::Assembled(v) if v == b"old")
+        matches!(toast.fetch(0, 3,7,19,3).await.unwrap(), FetchedValue::Assembled(v) if v == b"old")
     );
     assert!(matches!(
-        toast.fetch(3, 7, 20, 3).await.unwrap(),
+        toast.fetch(0, 3, 7, 20, 3).await.unwrap(),
         FetchedValue::Missing
     ));
     let mut reused = row;
@@ -539,20 +544,20 @@ async fn truncate_preserves_history_and_retirement_preserves_oid_reuse() {
     reused.chunk_data = Bytes::from_static(b"new");
     toast.put(&[reused]).await.unwrap();
     let before = read_u64(&state.db, b"toast/occupied").unwrap();
-    toast.retire_at(3, 25).await.unwrap();
+    toast.retire_at(0, 3, 25).await.unwrap();
     assert!(read_u64(&state.db, b"toast/occupied").unwrap() < before);
     assert!(matches!(
-        toast.fetch(3, 7, 19, 3).await.unwrap(),
+        toast.fetch(0, 3, 7, 19, 3).await.unwrap(),
         FetchedValue::Missing
     ));
     assert!(
-        matches!(toast.fetch(3,7,30,3).await.unwrap(), FetchedValue::Assembled(v) if v == b"new")
+        matches!(toast.fetch(0, 3,7,30,3).await.unwrap(), FetchedValue::Assembled(v) if v == b"new")
     );
     drop(toast);
     drop(state);
     let state = StateStore::open(dir.path(), identity(), 4096).unwrap();
     assert!(
-        matches!(state.toast_store().fetch(3,7,30,3).await.unwrap(), FetchedValue::Assembled(v) if v == b"new")
+        matches!(state.toast_store().fetch(0, 3,7,30,3).await.unwrap(), FetchedValue::Assembled(v) if v == b"new")
     );
 }
 
@@ -563,6 +568,7 @@ async fn rewrite_barrier_keeps_pre_barrier_as_of_value() {
     let toast = state.toast_store();
     toast
         .put(&[ToastRow {
+            db_oid: 0,
             toast_relid: 4,
             blkno: 1,
             offnum: 1,
@@ -573,19 +579,19 @@ async fn rewrite_barrier_keeps_pre_barrier_as_of_value() {
         }])
         .await
         .unwrap();
-    toast.rewrite_barrier(4, 20, 30).await.unwrap();
+    toast.rewrite_barrier(0, 4, 20, 30).await.unwrap();
     assert!(
-        matches!(toast.fetch(4, 9, 20, 3).await.unwrap(), FetchedValue::Assembled(v) if v == b"abc")
+        matches!(toast.fetch(0, 4, 9, 20, 3).await.unwrap(), FetchedValue::Assembled(v) if v == b"abc")
     );
     assert!(matches!(
-        toast.fetch(4, 9, 30, 3).await.unwrap(),
+        toast.fetch(0, 4, 9, 30, 3).await.unwrap(),
         FetchedValue::Missing
     ));
     drop(toast);
     drop(state);
     let state = StateStore::open(dir.path(), identity(), 1024).unwrap();
     assert!(
-        matches!(state.toast_store().fetch(4, 9, 20, 3).await.unwrap(), FetchedValue::Assembled(v) if v == b"abc")
+        matches!(state.toast_store().fetch(0, 4, 9, 20, 3).await.unwrap(), FetchedValue::Assembled(v) if v == b"abc")
     );
 }
 
@@ -656,6 +662,7 @@ async fn toast_gc_keeps_only_what_reads_above_the_floor_can_see() {
     let state = StateStore::open(dir.path(), identity(), 1 << 20).unwrap();
     let toast = state.toast_store();
     let chunk = |lsn: u64, chunk_id: u32, data: &'static [u8]| ToastRow {
+        db_oid: 0,
         toast_relid: 3,
         blkno: 1,
         offnum: 1,
@@ -688,15 +695,15 @@ async fn toast_gc_keeps_only_what_reads_above_the_floor_can_see() {
     );
     // Reads at or above the floor are unchanged
     assert!(matches!(
-        toast.fetch(3, 8, 250, 3).await.unwrap(),
+        toast.fetch(0, 3, 8, 250, 3).await.unwrap(),
         crate::toast::FetchedValue::Assembled(ref v) if v == b"mid"
     ));
     assert!(matches!(
-        toast.fetch(3, 9, 300, 3).await.unwrap(),
+        toast.fetch(0, 3, 9, 300, 3).await.unwrap(),
         crate::toast::FetchedValue::Assembled(ref v) if v == b"new"
     ));
     assert!(!matches!(
-        toast.fetch(3, 5, 250, 4).await.unwrap(),
+        toast.fetch(0, 3, 5, 250, 4).await.unwrap(),
         crate::toast::FetchedValue::Assembled(_)
     ));
     assert_eq!(toast.gc_below(250).unwrap(), 0, "idempotent");

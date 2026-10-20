@@ -6,17 +6,23 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use backon::{ExponentialBuilder, Retryable};
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use walrus::pg::backup::format_pg_lsn;
 use walshadow::archive::Archive;
+use walshadow::boundary_hold::{AttachSlot, PendingDatabase, PendingDatabases};
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::config::{CliOverrides, ConfigResolver, SourceConn};
+#[cfg(feature = "test-support")]
+use walshadow::crash_test;
 use walshadow::manifest;
 use walshadow::metrics::{MetricsRegistry, RateEstimator};
 use walshadow::pg::socket_conninfo;
 use walshadow::pos::{
-    EmitterAck, FilterDurable, Floor, Monotone, Pos, ShadowFlush, ShadowReplay, SourceReceived,
+    EmitterAck, FilterDurable, Floor, Monotone, Pos, RawStart, ShadowFlush, ShadowReplay,
+    SourceReceived,
 };
 use walshadow::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
@@ -48,10 +54,12 @@ use crate::shadow_proc::{
     start_owned_shadow, walsender_primary_conninfo,
 };
 use crate::sinks::DaemonSinks;
+use crate::source_db::{ATTACH_MARKER, list_databases};
 use crate::source_recovery::{
-    BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PromotionGate, ReconnectBackoff,
-    SOURCE_SWAP_RETRY, SourcePath, SourceRecovery, commit_fork_resume, connect_source_waiting,
-    promotion_gate, resume_manifest, resume_source_feed, stream_branch, swap_reason,
+    BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PauseState, PromotionGate,
+    ReconnectBackoff, ResumePoint, SOURCE_SWAP_RETRY, SourcePath, SourceRecovery,
+    commit_fork_resume, connect_source_waiting, promotion_gate, resume_manifest,
+    resume_source_feed, stream_branch, swap_reason,
 };
 use crate::tenant;
 
@@ -59,12 +67,55 @@ use crate::tenant;
 /// to backpressure the pump indefinitely
 const NO_STALL_LIMIT: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
 
+/// Wait out an unreachable ClickHouse at boot rather than exit, which leaves
+/// a supervisor restart-looping the daemon until the destination returns
+async fn ensure_boot_database_waiting(cfg: &EmitterConfig) -> Result<()> {
+    (|| walshadow::ch_ddl::ensure_boot_database(cfg))
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_millis(200))
+                .with_max_delay(Duration::from_secs(10))
+                .without_max_times(),
+        )
+        .when(walshadow::ch::is_retryable)
+        .notify(|e, _| {
+            tracing::warn!(
+                target: "walshadow",
+                error = %e,
+                host = %cfg.conn.host,
+                port = cfg.conn.port,
+                "ClickHouse unreachable, waiting for it",
+            );
+        })
+        .await?;
+    Ok(())
+}
+
+/// Wait out tracked I/O on every exit, attach restart reopens same files
+/// in-process
 pub(crate) async fn run_session(
     args: &Args,
     metrics: &MetricsRegistry,
     reloader: &Arc<walshadow::control::Reloader>,
     sighup: tokio::signal::unix::Signal,
     shutdown: &CancellationToken,
+    attach: &AttachSlot,
+) -> Result<()> {
+    let io = TaskTracker::new();
+    let res = session_body(args, metrics, reloader, sighup, shutdown, attach, &io).await;
+    io.close();
+    io.wait().await;
+    res
+}
+
+async fn session_body(
+    args: &Args,
+    metrics: &MetricsRegistry,
+    reloader: &Arc<walshadow::control::Reloader>,
+    sighup: tokio::signal::unix::Signal,
+    shutdown: &CancellationToken,
+    attach: &AttachSlot,
+    io: &TaskTracker,
 ) -> Result<()> {
     // Clone the Arc-backed registry so the body's `&metrics` uses are unchanged.
     let metrics = metrics.clone();
@@ -100,6 +151,7 @@ pub(crate) async fn run_session(
         "source identified",
     );
 
+    walshadow::tenants::reject_database_sections(&merged)?;
     let mut tenants_cfg = walshadow::tenants::TenantsConfig::from_table(&merged)
         .context("parse [tenants] / [tenant.*]")?;
     if let Some(tcfg) = &tenants_cfg {
@@ -107,15 +159,6 @@ pub(crate) async fn run_session(
         anyhow::ensure!(
             args.start_lsn.is_none(),
             "--start-lsn applies to the single-tenant layout only"
-        );
-        anyhow::ensure!(
-            EmitterConfig::from_table(&merged)
-                .context("parse cluster config")?
-                .databases
-                .len()
-                <= 1,
-            "`[database.*]` entries belong to the single-tenant layout; \
-             declare a `[tenant.<id>]` per database instead"
         );
     }
     let sysid: u64 = ident.sysid.parse().context("source system identifier")?;
@@ -139,9 +182,7 @@ pub(crate) async fn run_session(
     // bootstrap insert tail is first, and its failure there reads as a
     // bootstrap fault rather than a missing destination
     if let Some(cfg) = ch_config.as_ref().filter(|cfg| cfg.snowflake.is_none()) {
-        walshadow::ch_ddl::ensure_boot_database(cfg)
-            .await
-            .with_context(|| format!("reach ClickHouse {}:{}", cfg.host, cfg.port))?;
+        or_signal(shutdown, ensure_boot_database_waiting(cfg)).await?;
     }
     // QueueingRecordSink knobs feed both the CH and metrics-only pipelines,
     // so resolve here while `ch_config` is still in scope (it is consumed
@@ -174,6 +215,38 @@ pub(crate) async fn run_session(
         source_databases.len(),
         walshadow::bridge::MAX_BRIDGE_DATABASES,
     );
+    // Assign older TOAST mirrors and retire entries to sole followed database
+    // TODO(0.2.0): remove with adopt_legacy_mirrors and legacy ledger load
+    let legacy_owner: Option<u32> = if source_databases.len() == 1 {
+        let row = feed
+            .sql_client()
+            .await?
+            .query_one(
+                "SELECT oid::oid FROM pg_database WHERE datname = current_database()",
+                &[],
+            )
+            .await
+            .context("source database oid")?;
+        Some(row.get(0))
+    } else {
+        None
+    };
+    if let Some(cfg) = ch_config
+        .as_ref()
+        .filter(|c| c.snowflake.is_none())
+        .filter(|c| c.toast.mode == walshadow::ch_emitter::ToastMode::Clickhouse)
+    {
+        let renamed = walshadow::toast::adopt_legacy_mirrors(cfg, legacy_owner)
+            .await
+            .context("rename TOAST mirrors")?;
+        if renamed > 0 {
+            tracing::info!(
+                target: "walshadow",
+                renamed,
+                "renamed TOAST mirrors to include source database oid",
+            );
+        }
+    }
     // Cluster-wide sections ([bootstrap], [backup], [memory]) with tenants
     let cluster_cfg = match &tenants_cfg {
         Some(_) => Some(EmitterConfig::from_table(&merged).context("parse cluster config")?),
@@ -283,6 +356,54 @@ pub(crate) async fn run_session(
             owned
         }
     };
+    let stand_in = stand_in_primary(&owned.shadow, &source_conn.dbname).await;
+    let (owned, source_databases) = if let Some(name) = &stand_in {
+        let substituted: Vec<String> = source_databases
+            .iter()
+            .map(|db| {
+                if *db == source_conn.dbname {
+                    name.clone()
+                } else {
+                    db.clone()
+                }
+            })
+            .collect();
+        tracing::warn!(
+            target: "walshadow",
+            absent = source_conn.dbname.as_str(),
+            stand_in = name.as_str(),
+            "shadow holds no such database; following {} until replay creates it",
+            name,
+        );
+        owned
+            .shadow
+            .stop()
+            .context("stop shadow to restand its bridge")?;
+        let owned = OwnedShadow::new(
+            build_owned_shadow(
+                args,
+                name,
+                &substituted,
+                shadow_start.data_dir().to_path_buf(),
+                bridge_workers,
+            ),
+            args.keep_shadow_running,
+        );
+        owned
+            .shadow
+            .write_standby_signal()
+            .context("write standby.signal")?;
+        start_owned_shadow(
+            &owned.shadow,
+            None,
+            Duration::from_secs(args.bootstrap_shadow_replay_timeout),
+            args.keep_shadow_running,
+        )
+        .await?;
+        (owned, substituted)
+    } else {
+        (owned, source_databases)
+    };
     let shadow_lifecycle =
         ShadowLifecycle::spawn(owned, walsender_primary_conninfo(args.walsender_bind));
     let archive = ch_config
@@ -291,7 +412,7 @@ pub(crate) async fn run_session(
         .and_then(|c| c.backup.clone())
         .map(Archive::open)
         .transpose()?;
-    let start_lsn_override: Option<Pos<Floor>> = args
+    let start_lsn_override: Option<Pos<RawStart>> = args
         .start_lsn
         .as_deref()
         .map(|s| walshadow::pg::parse_pg_lsn(s).context("--start-lsn"))
@@ -479,7 +600,7 @@ pub(crate) async fn run_session(
         .filter(|tli| *tli <= start_timeline)
         .collect();
 
-    let mut stream = WalStream::new(start_timeline, WAL_SEG_SIZE, aligned)?;
+    let mut stream = WalStream::builder(start_timeline, WAL_SEG_SIZE, aligned)?;
     let prefix_dirs = [args.out_dir.clone(), shadow_start.data_dir().join("pg_wal")];
     stream.preserve_resume_prefix(&prefix_dirs).await?;
     // Shadow must attach to this listener before catalog replay can advance
@@ -489,14 +610,7 @@ pub(crate) async fn run_session(
         aligned.get(),
         args.walsender_slow_threshold,
     );
-    seed_shadow_branches(
-        &mut shadow_boot,
-        &mut feed,
-        &history,
-        &args.out_dir,
-        start_timeline,
-    )
-    .await?;
+    seed_shadow_branches(&mut shadow_boot, &history, &args.out_dir, start_timeline).await?;
     let shadow_state = Arc::new(Mutex::new(shadow_boot));
     let walsender_addr = args.walsender_bind;
     let walsender_task = walshadow::shadow_stream::spawn_listener(
@@ -554,13 +668,53 @@ pub(crate) async fn run_session(
 
     // Cluster-wide shadow session (retention sweeper): the database the pump
     // connects to, the followed one or, with tenants, the admin one
+    let primary_dbname = stand_in
+        .clone()
+        .unwrap_or_else(|| source_conn.dbname.clone());
+    let connect_budget = Duration::from_secs(args.shadow_connect_timeout);
+    // `[source] dbname` created after the shadow's backup: the single-database
+    // layout follows the stand-in until replay creates it, then the session
+    // restarts to follow it. Tenants attach their databases themselves
+    let mut pending_dbs: Vec<PendingDatabase> = Vec::new();
+    if stand_in.is_some() && tenants_cfg.is_none() {
+        tokio::fs::write(args.spill_dir.join(ATTACH_MARKER), b"")
+            .await
+            .with_context(|| format!("mark {} as attaching", args.spill_dir.display()))?;
+        let source_sql = feed
+            .sql_client()
+            .await
+            .context("source sidecar sql for the absent database")?;
+        let visible_at = source_sql
+            .query_one("SELECT pg_current_wal_lsn()::text", &[])
+            .await
+            .context("source WAL position for the absent database")?;
+        let visible_at = walshadow::pg::parse_pg_lsn(visible_at.get::<_, &str>(0))
+            .context("parse source WAL position")?;
+        let oid = *list_databases(source_sql)
+            .await
+            .context("list source databases")?
+            .get(source_conn.dbname.as_str())
+            .with_context(|| {
+                format!(
+                    "database {} is configured but not on the source",
+                    source_conn.dbname
+                )
+            })?;
+        pending_dbs.push(PendingDatabase {
+            oid,
+            name: source_conn.dbname.clone(),
+            visible_at,
+            // The primary's bridge slots come first
+            bridge_socket: walshadow::bridge::slot_path(&args.bridge_socket_path(), 0),
+        });
+    }
     let shadow_conninfo = socket_conninfo(
         args.shadow_socket_dir
             .to_str()
             .context("shadow-socket-dir not UTF-8")?,
         args.shadow_port,
         &args.shadow_user,
-        &source_conn.dbname,
+        &primary_dbname,
     );
 
     // Share pump's xid samples with shadow TOAST reads to detect reused IDs
@@ -626,6 +780,7 @@ pub(crate) async fn run_session(
         );
         shadow_toast_held = Some(rels.held());
     }
+    let mut stream = stream.start();
     // Persisted resolved floor. Seed with the resolved start: aligned +
     // archive-clamped, the exact position a crash-now restart replays from.
     // Any Dropped queued during the boot re-read of [aligned, raw_start] has
@@ -649,6 +804,7 @@ pub(crate) async fn run_session(
         decoder_queue_capacity,
         span_tracing: args.otlp_endpoint.is_some()
             || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok(),
+        io: io.clone(),
     };
     drop(history_rx);
     let mut router = walshadow::tenant_router::TenantRouter::new(
@@ -718,6 +874,13 @@ pub(crate) async fn run_session(
                 min_commit_lsn: 0,
                 priming: false,
                 activation_opt_ins: Default::default(),
+                legacy_owner,
+                pending: PendingDatabases::new(
+                    std::mem::take(&mut pending_dbs),
+                    connect_budget,
+                    attach.clone(),
+                ),
+                io: io.clone(),
             };
             let (mut t, sink) = tenant::open_tenant(boot, Some(&mut tasks)).await?;
             // SIGHUP and `ctl reload` republish every database's scope
@@ -756,6 +919,7 @@ pub(crate) async fn run_session(
                 args.ch_config.clone(),
                 cli_base(args),
                 walshadow::mapping::mapping_handle(Default::default()),
+                walshadow::config::ResolverBoot::default(),
             );
             reloader.set_resolvers(vec![resolver.clone()]).await;
             cluster_resolver = Some(resolver);
@@ -815,6 +979,12 @@ pub(crate) async fn run_session(
             }
         }
     }
+    // Records the filter drops count under the boot tenant's decoder: the
+    // single-database layout's one, or the first tenant's, since the filter
+    // sees the stream before any routing
+    if let Some(t) = tenants.first() {
+        stream.filter_mut().set_skip_stats(t.decoder_stats.clone());
+    }
     let config_resolver = tenants.first().and_then(|t| t.config_resolver.clone());
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
@@ -835,7 +1005,7 @@ pub(crate) async fn run_session(
         fsync_fatal.clone(),
     );
     let mut segment_sink =
-        DirSegmentSink::with_durability(args.out_dir.clone(), WAL_SEG_SIZE, fsync_tx)
+        DirSegmentSink::with_durability(args.out_dir.clone(), WAL_SEG_SIZE, fsync_tx, io.clone())
             .context("open out-dir")?;
     // Pruners' floor for the crossing commit; each tenant's descriptor-log
     // GC follows the floors the pump publishes to it
@@ -917,6 +1087,12 @@ pub(crate) async fn run_session(
         prefetch: usize::from(args.archive_prefetch),
         backoff: ReconnectBackoff::default(),
     };
+    let mut timeline_stats = TimelineStats {
+        // Off the chain, so a restart after a crossing keeps reporting the fork
+        // it resumed across instead of zero
+        switch_lsn: history.begin_of(start_timeline).unwrap_or(0),
+        ..TimelineStats::default()
+    };
     let mut path = SourcePath::Live;
     if let Err(e) = feed
         .start_physical_replication(
@@ -927,7 +1103,14 @@ pub(crate) async fn run_session(
         .await
     {
         path = source_recovery
-            .attempt(Some(e), &source_conn, &history, &stream, &mut feed)
+            .attempt(
+                Some(e),
+                &source_conn,
+                &history,
+                &stream,
+                &mut feed,
+                &mut timeline_stats,
+            )
             .await?;
     }
 
@@ -939,9 +1122,15 @@ pub(crate) async fn run_session(
     // only delays slot advance, never overshoots it.
     let cursor_write_interval = Duration::from_secs(args.status_interval);
     let mut last_cursor_write: Option<Instant> = None;
+    // A shadow catching up through `restore_command` holds no stream, so its
+    // replay has to be polled or the floor freezes
+    let mut shadow_replay_poll = walshadow::ticker::Ticker::new(cursor_write_interval);
     // Fast metrics-refresh tick (decoupled from cursor/status): an idle source
     // would otherwise freeze the /metrics snapshot while the pipeline drains.
     let metrics_tick = Duration::from_millis(250);
+    // Streaming publish cadence; idle ticks and segment advances always publish
+    const PUBLISH_MIN_INTERVAL: Duration = Duration::from_millis(50);
+    let mut last_publish = Instant::now();
     // Inflight-stall watchdog: xacts_active > 0 with stalled
     // `emitter_ack_lsn` dumps the parked xids holding the slot. One-shot
     // per stall, re-arms when ack advances.
@@ -958,28 +1147,20 @@ pub(crate) async fn run_session(
         .or(cluster_resolver.as_ref())
         .map(|r| r.subscribe());
     let mut swap = SourceSwap::default();
-    // Frozen when the pump observes a pause, so a promotion decision reads a
-    // frontier that cannot move under it. Cleared on resume: a value left over
+    // Frontier frozen when the pump observes a pause, so a promotion decision
+    // reads one that cannot move under it. Cleared on resume: a value left over
     // from an earlier pause is as misleading as a live one
-    let mut pause_frontier: Option<(u64, u64)> = None;
-    // A restart mid-pause re-freezes both numbers, conservatively but not
-    // identically, so the pair an operator already read has to be read again
-    let mut pause_refrozen = false;
+    let mut pause = PauseState::Running;
+    let mut pause_left_stream = false;
+    let mut resume_restreams = false;
     let mut ever_unpaused = false;
     // Step 5's answer, refreshed while paused off the endpoint the pump holds
-    let mut promotion = PromotionGate::default();
-    let mut promotion_polled_at: Option<Instant> = None;
+    let mut promotion = PromotionGate::blocked("not_paused");
     let switchover = Switchover {
         system_id: live_identity.system_id,
         out_dir: &args.out_dir,
         shadow_state: &shadow_state,
         backup: archive.as_ref(),
-    };
-    let mut timeline_stats = TimelineStats {
-        // Off the chain, so a restart after a crossing keeps reporting the fork
-        // it resumed across instead of zero
-        switch_lsn: history.begin_of(start_timeline).unwrap_or(0),
-        ..TimelineStats::default()
     };
     // The ancestor ended and the descendant has not been adopted yet. Survives
     // iterations so a source error mid-crossing retries the crossing: at the
@@ -987,8 +1168,12 @@ pub(crate) async fn run_session(
     let mut crossing = CrossingState::default();
     let mut barrier_logged: Option<Instant> = None;
     let shutdown_reason = 'pump: loop {
-        // Nothing resumes at a switchpoint, not archive nor redial, only a crossing
-        if !matches!(path, SourcePath::Live)
+        // Switch timelines at a switchpoint. Reconnecting may find a switchpoint
+        // missing from `history`; use that connection to fetch updated history.
+        if matches!(path, SourcePath::AtSwitchpoint) {
+            path = SourcePath::Live;
+            crossing.ancestor_ended(false);
+        } else if !matches!(path, SourcePath::Live)
             && history.branch_exhausted(stream.timeline(), stream.next_lsn().get())
         {
             path = SourcePath::Live;
@@ -998,6 +1183,50 @@ pub(crate) async fn run_session(
             .as_ref()
             .map(|rx| rx.borrow().paused)
             .unwrap_or(false);
+        if paused && !pause_left_stream && matches!(path, SourcePath::Live) && !crossing.pending() {
+            pause_left_stream = true;
+            resume_restreams = true;
+            if let Err(e) = feed.end_stream().await {
+                tracing::warn!(
+                    target: "walshadow",
+                    error = %format!("{e:#}"),
+                    "leaving the source stream for a pause failed; resume redials",
+                );
+            } else {
+                tracing::info!(
+                    target: "walshadow",
+                    resume_lsn = %stream.next_lsn(),
+                    "pause left the source stream so the source can shut down",
+                );
+            }
+        } else if !paused && pause_left_stream {
+            pause_left_stream = false;
+            if std::mem::take(&mut resume_restreams) {
+                let restarted = feed
+                    .start_physical_replication(
+                        source_conn.slot.as_deref(),
+                        stream.next_lsn().get(),
+                        stream.timeline(),
+                    )
+                    .await;
+                if let Err(e) = restarted {
+                    tracing::warn!(
+                        target: "walshadow",
+                        error = %format!("{e:#}"),
+                        resume_lsn = %stream.next_lsn(),
+                        "resuming the source stream failed — redialing",
+                    );
+                    path = SourcePath::Redial;
+                    source_recovery.backoff.reset();
+                } else {
+                    tracing::info!(
+                        target: "walshadow",
+                        resume_lsn = %stream.next_lsn(),
+                        "resume re-entered the source stream",
+                    );
+                }
+            }
+        }
         // Slot changes require reconnect because START_REPLICATION binds slot
         if let Some(rx) = pump_config_rx.as_ref() {
             let desired = rx.borrow().source.clone();
@@ -1019,7 +1248,14 @@ pub(crate) async fn run_session(
         // during an outage is what the next attempt dials
         if matches!(path, SourcePath::Redial) && source_recovery.backoff.due() {
             path = source_recovery
-                .attempt(None, &source_conn, &history, &stream, &mut feed)
+                .attempt(
+                    None,
+                    &source_conn,
+                    &history,
+                    &stream,
+                    &mut feed,
+                    &mut timeline_stats,
+                )
                 .await?;
             swap.settled();
         }
@@ -1043,15 +1279,22 @@ pub(crate) async fn run_session(
             )
             .await
             {
-                Ok(swapped) => {
+                Ok((swapped, point)) => {
                     feed = swapped;
-                    path = SourcePath::Live;
+                    path = match point {
+                        ResumePoint::OnBranch => SourcePath::Live,
+                        ResumePoint::AtSwitchpoint => SourcePath::AtSwitchpoint,
+                    };
+                    resume_restreams = false;
                     swap.settled();
-                    swap.swaps += 1;
+                    if point == ResumePoint::OnBranch {
+                        swap.swaps += 1;
+                    }
                     tracing::info!(
                         target: "walshadow",
                         endpoint = source_conn.endpoint(),
                         resume_lsn = %stream.next_lsn(),
+                        resume_point = ?point,
                         slot = source_conn.slot.as_deref(),
                         "source feed swapped",
                     );
@@ -1261,56 +1504,59 @@ pub(crate) async fn run_session(
         // about, which the target must reach before promotion. Bytes cannot
         // have been consumed without being received, so a source that has not
         // reported a head yet reads as level with the consumed frontier
-        match (paused, pause_frontier) {
-            (true, None) => {
-                pause_frontier = Some((
-                    stream.next_lsn().get(),
-                    received.get().max(stream.next_lsn().get()),
-                ));
-                // A pause this process never saw lifted was taken before it
-                // booted, so these two numbers replace ones an operator may
-                // already hold. Both re-freeze conservatively — consumed drops
-                // back to the floor, received re-derives from the live head —
-                // but a promotion decision has to be taken from the pair on
-                // offer now (architecture/recovery.md)
-                pause_refrozen = !ever_unpaused;
-                let (consumed, head) = pause_frontier.expect("just frozen");
-                tracing::info!(
-                    target: "walshadow",
-                    pause_consumed_lsn = %format_pg_lsn(consumed),
-                    pause_received_lsn = %format_pg_lsn(head),
-                    refrozen = pause_refrozen,
-                    "pause observed — frontier frozen",
-                );
-            }
-            (false, Some(_)) => {
-                pause_frontier = None;
-                pause_refrozen = false;
-            }
-            _ => {}
+        if !paused {
+            pause = PauseState::Running;
+        } else if let PauseState::Running = pause {
+            let consumed = stream.next_lsn().get();
+            let head = received.get().max(consumed);
+            // A pause this process never saw lifted was taken before it
+            // booted, so these two numbers replace ones an operator may
+            // already hold. Both re-freeze conservatively — consumed drops
+            // back to the floor, received re-derives from the live head —
+            // but a promotion decision has to be taken from the pair on
+            // offer now (architecture/recovery.md)
+            let refrozen = !ever_unpaused;
+            tracing::info!(
+                target: "walshadow",
+                pause_consumed_lsn = %format_pg_lsn(consumed),
+                pause_received_lsn = %format_pg_lsn(head),
+                refrozen,
+                "pause observed — frontier frozen",
+            );
+            pause = PauseState::Paused {
+                frontier: (consumed, head),
+                refrozen,
+                polled_at: None,
+            };
         }
         ever_unpaused |= !paused;
         // Step 5 of the protocol, answered off the connection step 4's repoint
         // already moved onto the target: replay, receive, and recovery state
         // beside the frozen frontier they have to reach
         // (architecture/recovery.md)
-        if !paused {
+        if let PauseState::Paused {
+            frontier: (_, pause_received),
+            polled_at,
+            ..
+        } = &mut pause
+        {
+            if polled_at.is_none_or(|t| t.elapsed() >= PROMOTION_POLL) {
+                *polled_at = Some(Instant::now());
+                promotion = match tokio::time::timeout(
+                    PROMOTION_POLL,
+                    promotion_gate(&mut feed, *pause_received),
+                )
+                .await
+                {
+                    Ok(gate) => gate,
+                    Err(_) => {
+                        feed.drop_sql_client();
+                        PromotionGate::unreachable()
+                    }
+                };
+            }
+        } else {
             promotion = PromotionGate::blocked("not_paused");
-            promotion_polled_at = None;
-        } else if promotion_polled_at.is_none_or(|t| t.elapsed() >= PROMOTION_POLL) {
-            promotion_polled_at = Some(Instant::now());
-            promotion = match tokio::time::timeout(
-                PROMOTION_POLL,
-                promotion_gate(&mut feed, pause_frontier),
-            )
-            .await
-            {
-                Ok(gate) => gate,
-                Err(_) => {
-                    feed.drop_sql_client();
-                    PromotionGate::unreachable()
-                }
-            };
         }
         let (shadow_agg, shadow_served_tli) = {
             let state = shadow_state.lock().await;
@@ -1318,6 +1564,11 @@ pub(crate) async fn run_session(
         };
         if let Some(apply) = shadow_agg.min_apply_lsn {
             shadow_replay_lsn.join(apply);
+        } else if shadow_replay_poll.fire()
+            && let Some(Some(lsn)) =
+                probe_blocking(&shadow_lifecycle.guard.shadow, |s| s.last_replay_lsn()).await
+        {
+            shadow_replay_lsn.join(Pos::new(lsn));
         }
         let shadow_replay = shadow_replay_lsn.get();
         if let Some(flush) = shadow_agg.min_flush_lsn {
@@ -1344,19 +1595,19 @@ pub(crate) async fn run_session(
             },
         );
         if last_cursor_write.is_none_or(|t| t.elapsed() >= cursor_write_interval) {
-            manifest::write(&args.spill_dir, &cur)
+            let persisted = manifest::write(&args.spill_dir, &cur)
                 .await
                 .context("write resume manifest")?;
+            #[cfg(feature = "test-support")]
+            crash_test::hit(crash_test::Point::AfterManifest, cur.floor.get());
             last_cursor_write = Some(Instant::now());
-            // Publish only after persist: pruners cut against what a
-            // crash-now restart actually resumes from.
-            resume_floor.join(cur.floor);
+            resume_floor.publish(persisted);
             // Descriptor logs prune against the same floor, off this task: a
             // compaction rewrites the whole ckpt inline and would stall WAL
             // consumption past the source's wal_sender_timeout
-            gc_floor.join(cur.floor);
+            gc_floor.publish(persisted);
             for t in &tenants {
-                t.publish_floor(cur.floor);
+                t.publish_floor(persisted);
             }
         }
         // flush caps physical slot's restart_lsn.
@@ -1377,7 +1628,7 @@ pub(crate) async fn run_session(
         let chunk = tokio::select! {
             biased;
             () = shutdown.cancelled() => break "signal",
-            err = tasks.exited() => return Err(err),
+            Some(err) = tasks.exited() => return Err(err),
             res = &mut fsync_task => return Err(task_stopped("segment fsync", res, &fsync_fatal)),
             // Idle tick so metrics/cursor keep tracking, and so a `paused` flip
             // is picked up promptly.
@@ -1386,7 +1637,7 @@ pub(crate) async fn run_session(
             // arm and the pump continues from the same LSN. A pending crossing
             // also parks it — that connection is out of COPY until the
             // descendant is requested.
-            result = async { path.archive().expect("guarded by arm").next().await },
+            result = async { path.archive()?.next().await },
                 if matches!(path, SourcePath::Archive(_)) && !paused && !crossing.pending() => {
                 match result {
                     Some(Ok((start_lsn, bytes))) => {
@@ -1456,7 +1707,14 @@ pub(crate) async fn run_session(
                         }
                     };
                     path = source_recovery
-                        .attempt(Some(err), &source_conn, &history, &stream, &mut feed)
+                        .attempt(
+                            Some(err),
+                            &source_conn,
+                            &history,
+                            &stream,
+                            &mut feed,
+                            &mut timeline_stats,
+                        )
                         .await?;
                     // Recovery dials the live endpoint, so a queued swap is done
                     swap.settled();
@@ -1464,6 +1722,7 @@ pub(crate) async fn run_session(
                 }
             },
         };
+        let idle = chunk.is_none();
         let server_end = chunk
             .as_ref()
             .map(|c| c.server_wal_end)
@@ -1504,7 +1763,7 @@ pub(crate) async fn run_session(
             // Answer the backend's CopyDone now, leaving the connection in
             // simple-query mode: that is the state the crossing reads history
             // from, and the state a retry can rebuild by reconnecting
-            let ended = feed.end_historic_stream().await;
+            let ended = feed.end_stream().await;
             if let Err(e) = &ended {
                 tracing::warn!(
                     target: "walshadow",
@@ -1625,28 +1884,37 @@ pub(crate) async fn run_session(
             // so a restart from it loses nothing. The loop keeps publishing
             // meanwhile, so a wait reads as a wait rather than a stall, and the
             // source has stopped producing so nothing queues up behind it
-            let waiting_on = walshadow::transition::ForkBarrier {
+            let open = match (walshadow::transition::ForkBarrier {
                 resume_safe_lsn: resume_safe,
-                shadow_apply_lsn: shadow_agg.min_apply_lsn,
+                shadow_apply_lsn: (shadow_replay.get() != 0).then_some(shadow_replay),
                 filter_durable: durable,
                 floor: resume_floor.get(),
-            }
-            .pending(Pos::new(probed.switch_lsn), WAL_SEG_SIZE);
-            if let Some(wait) = waiting_on {
-                // Prod the walreceiver: non-forced replies fire only on flush
-                // progress, and the ancestor's tail may be the last thing left
-                shadow_state.lock().await.request_status();
-                if barrier_logged.is_none_or(|t| t.elapsed() >= BARRIER_LOG_INTERVAL) {
-                    tracing::info!(
-                        target: "walshadow",
-                        switch_lsn = %format_pg_lsn(probed.switch_lsn),
-                        waiting_on = wait.label(),
-                        "fork barrier: {wait}",
-                    );
-                    barrier_logged = Some(Instant::now());
+            })
+            .open(Pos::new(probed.switch_lsn), WAL_SEG_SIZE)
+            {
+                Ok(open) => Some(open),
+                Err(wait) => {
+                    // Prod the walreceiver: non-forced replies fire only on flush
+                    // progress, and the ancestor's tail may be the last thing left
+                    shadow_state.lock().await.request_status();
+                    if barrier_logged.is_none_or(|t| t.elapsed() >= BARRIER_LOG_INTERVAL) {
+                        tracing::info!(
+                            target: "walshadow",
+                            switch_lsn = %format_pg_lsn(probed.switch_lsn),
+                            waiting_on = wait.label(),
+                            "fork barrier: {wait}",
+                        );
+                        barrier_logged = Some(Instant::now());
+                    }
+                    None
                 }
-            } else {
+            };
+            if let Some(open) = open {
                 barrier_logged = None;
+                // Every tenant's descriptor-log pruning rebases with the session's
+                let gc_floors: Vec<&Monotone<Floor>> = std::iter::once(&gc_floor)
+                    .chain(tenants.iter().filter_map(tenant::Tenant::gc_floor))
+                    .collect();
                 let commit = async |resume: walshadow::transition::ForkResume| {
                     commit_fork_resume(
                         &args.spill_dir,
@@ -1654,7 +1922,7 @@ pub(crate) async fn run_session(
                         resume,
                         manifest::LsnSet {
                             // Fork cannot precede last observed source head
-                            source_received: received.max(resume.switch_lsn.retag()),
+                            source_received: received.max(resume.switch_lsn().retag()),
                             filter_durable: durable,
                             shadow_replay,
                             drain: guards.drain_lsn,
@@ -1662,7 +1930,7 @@ pub(crate) async fn run_session(
                             shadow_flush: shadow_flush_lsn.get(),
                         },
                         &resume_floor,
-                        &gc_floor,
+                        &gc_floors,
                     )
                     .await
                 };
@@ -1676,6 +1944,7 @@ pub(crate) async fn run_session(
                         status,
                         guards,
                         &probed,
+                        open,
                         commit,
                         &mut timeline_stats,
                     )
@@ -1702,9 +1971,6 @@ pub(crate) async fn run_session(
                         }
                         history = crossed.history;
                         history_tx.send_replace(Arc::new(history.clone()));
-                        for t in &tenants {
-                            t.rebase_floor(resume_floor.get());
-                        }
                         crossing.committed();
                         swap.settled();
                     }
@@ -1747,6 +2013,14 @@ pub(crate) async fn run_session(
                     .mark_evicted(&t.id, format!("pipeline failed: {msg}"));
             }
         }
+        let now_dispatched = stream.dispatched_lsn();
+        let advanced = now_dispatched != prev_dispatched;
+        // Streaming iterates per walsender message; publishing each time reads
+        // /proc and takes the xact buffer lock from the worker
+        if !idle && !advanced && last_publish.elapsed() < PUBLISH_MIN_INTERVAL {
+            continue;
+        }
+        last_publish = Instant::now();
         // Re-read rather than reuse the top-of-iteration pair: a crossing commits
         // a new floor and branch mid-iteration, and this is what an operator
         // watches to know the crossing is durable
@@ -1822,8 +2096,8 @@ pub(crate) async fn run_session(
                 shadow_replay_timeline: shadow_agg.replay_timeline.unwrap_or(0),
                 floor_lsn: published_floor,
                 stats: timeline_stats,
-                pause_frontier,
-                pause_refrozen,
+                pause_frontier: pause.frontier(),
+                pause_refrozen: pause.refrozen(),
                 wedge: crossing.wedge().cloned(),
                 promotion,
             },
@@ -1841,6 +2115,13 @@ pub(crate) async fn run_session(
                 .collect(),
             StageCounters {
                 emitter: emitter_stats,
+                db_name: &|oid| {
+                    tenants
+                        .iter()
+                        .find(|t| t.db_oids.contains(&oid))
+                        .map(|t| t.dbname.clone())
+                        .unwrap_or_default()
+                },
                 oracle: [oracle_stats, bootstrap_metrics.as_ref().map(|b| &*b.oracle)],
                 bootstrap: bootstrap_metrics.as_ref().map(|b| &b.progress),
                 bootstrap_attempt: 0,
@@ -1943,9 +2224,12 @@ pub(crate) async fn run_session(
     );
     let final_timeline = stream.timeline();
     let final_received = stream.next_lsn().get();
-    // Drop the sink (closes the fsync queue) and drain the fsync task so
-    // sealed segments are durable
-    drop(segment_sink);
+    // Close the sink (finishes its write, closes the fsync queue) and drain
+    // the fsync task so sealed segments are durable
+    segment_sink
+        .close()
+        .await
+        .context("write final filtered segment")?;
     let res = fsync_task.await;
     if res.is_err() || fsync_fatal.is_set() {
         return Err(task_stopped("segment fsync", res, &fsync_fatal));
@@ -2042,13 +2326,13 @@ impl SessionTasks {
         self.names.get(&id).copied().unwrap_or("session")
     }
 
-    /// First task to stop, as the error naming it. Pending while none has
-    async fn exited(&mut self) -> anyhow::Error {
-        match self.set.join_next_with_id().await {
-            Some(Ok((id, ()))) => anyhow::anyhow!("{} task exited", self.name(id)),
-            Some(Err(e)) => anyhow::anyhow!("{} task failed: {e}", self.name(e.id())),
-            None => std::future::pending().await,
-        }
+    /// First task to stop, as the error naming it. `None` once the set is empty
+    async fn exited(&mut self) -> Option<anyhow::Error> {
+        let res = self.set.join_next_with_id().await?;
+        Some(match res {
+            Ok((id, ())) => anyhow::anyhow!("{} task exited", self.name(id)),
+            Err(e) => anyhow::anyhow!("{} task failed: {e}", self.name(e.id())),
+        })
     }
 
     /// Abort what still runs, surfacing a task that panicked
@@ -2079,19 +2363,57 @@ pub(crate) fn task_stopped(
     }
 }
 
+async fn stand_in_primary(shadow: &Arc<walshadow::shadow::Shadow>, absent: &str) -> Option<String> {
+    if probe_blocking(shadow, |s| s.has_database()).await != Some(false) {
+        return None;
+    }
+    let want = absent.to_owned();
+    probe_blocking(shadow, move |s| {
+        s.probe_one(
+            "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate \
+             ORDER BY datname = 'postgres' DESC, oid LIMIT 1",
+        )
+    })
+    .await
+    .filter(|name| !name.is_empty() && *name != want)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use walshadow::ch_emitter::InstanceConfig;
+
+    #[tokio::test]
+    async fn boot_redials_clickhouse_that_drops_connections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = EmitterConfig {
+            conn: InstanceConfig {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                ..Default::default()
+            },
+            ..EmitterConfig::default()
+        };
+        let accepts = async {
+            for _ in 0..2 {
+                drop(listener.accept().await.unwrap());
+            }
+        };
+        tokio::select! {
+            _ = ensure_boot_database_waiting(&cfg) => panic!("boot proceeded without ClickHouse"),
+            () = accepts => {}
+        }
+    }
 
     #[tokio::test]
     async fn session_tasks_name_the_task_that_stopped() {
         let mut tasks = SessionTasks::default();
         tasks.spawn("idle", std::future::pending());
         tasks.spawn("quits", async {});
-        let err = tasks.exited().await.to_string();
+        let err = tasks.exited().await.unwrap().to_string();
         assert!(err.contains("quits task exited"), "{err}");
         tasks.spawn("panics", async { panic!("boom") });
-        let err = tasks.exited().await.to_string();
+        let err = tasks.exited().await.unwrap().to_string();
         assert!(
             err.contains("panics task failed") && err.contains("boom"),
             "{err}"

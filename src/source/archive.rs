@@ -180,12 +180,16 @@ fn extends(known: &TimelineHistory, next: &TimelineHistory) -> bool {
 }
 
 /// Check that archive and source have matching timeline histories, since replay
-/// uses source history to choose archived segment names.
+/// uses source history to choose archived segment names. PG writes no history
+/// file for timeline 1, so a never-promoted source has nothing to compare
 pub async fn verify_history(
     settings: &Settings,
     storage: &DynStorage,
     source: &TimelineHistory,
 ) -> Result<()> {
+    if source.target() == 1 {
+        return Ok(());
+    }
     let name = history_filename(source.target());
     let raw = walrus::pg::wal::fetch::read_segment(settings, storage, &name)
         .await
@@ -276,6 +280,15 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("00000003.history"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn timeline_one_needs_no_archived_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (settings, storage) = fs_archive(&tmp.path().join("archive"));
+        verify_history(&settings, &storage, &TimelineHistory::root(1))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -508,11 +521,8 @@ mod tests {
 
     #[tokio::test]
     async fn archive_prefetch_drop_cancels_worker() {
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let task = tokio::spawn(async move {
-            let _tx = tx;
-            std::future::pending::<()>().await;
-        });
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending::<()>());
         let abort = task.abort_handle();
         drop(ArchiveFeed {
             wait_nanos: AtomicU64::new(0),

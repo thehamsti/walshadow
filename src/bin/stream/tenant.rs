@@ -5,9 +5,9 @@
 //! and state directory, fed by the [`TenantRouter`](walshadow::tenant_router).
 //!
 //! The single-tenant layout is one tenant, [`LEGACY_TENANT`], whose
-//! directory is the spill dir itself and which follows every database the
-//! config names (`[source] dbname` plus `[database.*]`). A declared tenant
-//! follows exactly one database
+//! directory is the spill dir itself and which follows `[source] dbname`. A
+//! declared tenant follows its own database. Either way a tenant follows
+//! exactly one database
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use tokio_postgres::types::Oid;
 use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::conn::PgConfig;
 use walshadow::boundary_hold::{
-    BoundaryGateConfig, BoundaryHoldSink, BoundaryHoldStats, CatalogBoundaryGate,
+    BoundaryGateConfig, BoundaryHoldSink, BoundaryHoldStats, CatalogBoundaryGate, PendingDatabases,
 };
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::config::{ConfigResolver, SourceConn};
@@ -30,7 +30,7 @@ use walshadow::filter::shadow_relations::ShadowHeld;
 use walshadow::pg::socket_conninfo;
 use walshadow::pipeline::ack::AckSnapshot;
 use walshadow::pipeline::{Fatal, PipelineConfig, PipelineHandle, TailKind};
-use walshadow::pos::{EmitterAck, FilterDurable, Floor, Monotone, Pos};
+use walshadow::pos::{Durable, EmitterAck, FilterDurable, Floor, Monotone, Pos, RawStart};
 use walshadow::queueing_record_sink::QueueingRecordSink;
 use walshadow::record::WAL_SEG_SIZE;
 use walshadow::schema::RelName;
@@ -80,11 +80,11 @@ pub(crate) struct TenantBoot<'a> {
     pub start_timeline: u32,
     pub lineage: Vec<u32>,
     /// Where the pump resumes (boot) or the attachment position (attach)
-    pub raw_start: Pos<Floor>,
+    pub raw_start: Pos<RawStart>,
     pub aligned: Pos<Floor>,
     /// Prior progress exists, so the descriptor logs must too
     pub expect_log: bool,
-    pub start_lsn_override: Option<Pos<Floor>>,
+    pub start_lsn_override: Option<Pos<RawStart>>,
     pub history_rx: watch::Receiver<Arc<TimelineHistory>>,
     pub shadow_state: Arc<Mutex<walshadow::shadow_stream::ShadowStreamState>>,
     pub smgr_markers: Arc<std::sync::Mutex<walshadow::filter::SmgrMarkers>>,
@@ -106,6 +106,13 @@ pub(crate) struct TenantBoot<'a> {
     /// Tables the tenant started with and their initial loads, re-applied
     /// so an unfinished load resumes
     pub activation_opt_ins: ahash::HashMap<RelName, walshadow::runtime_config::TableRow>,
+    /// Database owning TOAST mirrors and retire entries written before they
+    /// carried a database oid. A declared tenant owns its own
+    pub legacy_owner: Option<u32>,
+    /// Databases the shadow has yet to replay, attached by a session restart
+    pub pending: PendingDatabases,
+    /// Session I/O tracker, waited out before an attach restart reopens files
+    pub io: tokio_util::task::TaskTracker,
 }
 
 /// Session parts every tenant shares, cloned into each [`TenantBoot`]
@@ -125,6 +132,7 @@ pub(crate) struct SessionShared {
     pub decoder_batch_size: usize,
     pub decoder_queue_capacity: usize,
     pub span_tracing: bool,
+    pub io: tokio_util::task::TaskTracker,
 }
 
 impl SessionShared {
@@ -138,7 +146,7 @@ impl SessionShared {
         db: BootDb,
         dir: PathBuf,
         emitter_stats: Arc<EmitterStats>,
-        raw_start: Pos<Floor>,
+        raw_start: Pos<RawStart>,
         aligned: Pos<Floor>,
     ) -> TenantBoot<'a> {
         let tenant_workers = TENANT_BRIDGES.get().map_or(2, |&(w, _)| w);
@@ -178,6 +186,9 @@ impl SessionShared {
             min_commit_lsn: 0,
             priming: false,
             activation_opt_ins: Default::default(),
+            legacy_owner: None,
+            pending: PendingDatabases::default(),
+            io: self.io.clone(),
         }
     }
 
@@ -217,7 +228,7 @@ impl SessionShared {
                     .with_context(|| {
                         format!(
                             "tenant {}: reach ClickHouse {}:{}",
-                            decl.id, cfg.host, cfg.port
+                            decl.id, cfg.conn.host, cfg.conn.port
                         )
                     })?;
             }
@@ -307,16 +318,15 @@ impl Tenant {
     }
 
     /// Hand a persisted resume floor to this tenant's pruners
-    pub fn publish_floor(&self, floor: Pos<Floor>) {
+    pub fn publish_floor(&self, floor: Durable<Floor>) {
         if let Some(gc) = &self.gc_floor {
-            gc.join(floor);
+            gc.publish(floor);
         }
     }
 
-    pub fn rebase_floor(&self, floor: Pos<Floor>) {
-        if let Some(gc) = &self.gc_floor {
-            gc.rebase(floor);
-        }
+    /// Floor this tenant's descriptor logs prune against, until detach
+    pub fn gc_floor(&self) -> Option<&Monotone<Floor>> {
+        self.gc_floor.as_ref()
     }
 
     /// First fatal error the tenant's pipeline or pruners raised
@@ -423,12 +433,22 @@ pub(crate) async fn open_tenant(
         min_commit_lsn,
         priming,
         activation_opt_ins,
+        legacy_owner,
+        pending,
+        io,
     } = boot;
     let mut tasks = tasks;
     tokio::fs::create_dir_all(&dir)
         .await
         .with_context(|| format!("create tenant dir {}", dir.display()))?;
     let legacy = id == LEGACY_TENANT;
+    // The database whose logs keep `dir` itself. A single-database layout
+    // following a stand-in keeps the root for `[source] dbname`
+    let root_db = if legacy {
+        source_conn.dbname.clone()
+    } else {
+        databases[primary].name.clone()
+    };
 
     // Connect bridge and shadow catalog before START_REPLICATION so the
     // tracker→drain wire is hot from the first record. One pair per followed
@@ -458,6 +478,32 @@ pub(crate) async fn open_tenant(
     }
     let primary_oid = db_conns[primary].oid;
     let dbname = db_conns[primary].name.clone();
+    let legacy_owner = if legacy {
+        legacy_owner
+    } else {
+        Some(primary_oid)
+    };
+    // Assign older TOAST mirrors to their database oid
+    // TODO(0.2.0): remove with adopt_legacy_mirrors and legacy ledger load
+    if !legacy
+        && let Some(cfg) = db_conns[primary]
+            .emitter
+            .as_ref()
+            .filter(|c| c.snowflake.is_none())
+            .filter(|c| c.toast.mode == walshadow::ch_emitter::ToastMode::Clickhouse)
+    {
+        let renamed = walshadow::toast::adopt_legacy_mirrors(cfg, legacy_owner)
+            .await
+            .with_context(|| format!("tenant {id}: rename TOAST mirrors"))?;
+        if renamed > 0 {
+            tracing::info!(
+                target: "walshadow",
+                tenant = %id,
+                renamed,
+                "renamed TOAST mirrors to include source database oid",
+            );
+        }
+    }
 
     // Every followed database's source SQL session: runtime-config seeds and
     // pre-flight read the tenant's database, not the admin one the pump
@@ -519,10 +565,14 @@ pub(crate) async fn open_tenant(
 
     // Spill dir wiped every startup: cursor file commits drains
     // atomically, so leftover spill from a prior crash is redundant or stale.
-    let xact_buf_cfg = XactBufferConfig {
+    let mut xact_buf_cfg = XactBufferConfig {
         xact_buffer_max: args.xact_buffer_max,
         ..XactBufferConfig::new(dir.clone())
     };
+    if let Some(cfg) = db_conns[primary].emitter.as_ref() {
+        xact_buf_cfg.drain_batch_rows = cfg.drain_batch_rows;
+        xact_buf_cfg.drain_batch_bytes = cfg.drain_batch_bytes;
+    }
     let mut xact_buffer = XactBuffer::new(xact_buf_cfg).context("init xact buffer / spill dir")?;
     xact_buffer
         .clear_spill_dir()
@@ -545,18 +595,18 @@ pub(crate) async fn open_tenant(
         .map(|c| c.pending_capture)
         .unwrap_or_default();
     let pending_catalog = Arc::new(walshadow::pending::PendingCatalog::default());
-    // One log per database, each in its own subdirectory; the primary keeps
-    // the tenant dir so a single-database resume reads where it wrote
-    let db_dir = |i: usize, oid: Oid| {
-        if i == primary {
+    // One log per database, each in its own subdirectory; the root database
+    // keeps the tenant dir so a single-database resume reads where it wrote
+    let db_dir = |conn: &DbLink| {
+        if conn.name == root_db {
             dir.clone()
         } else {
-            dir.join(format!("db-{oid}"))
+            dir.join(format!("db-{}", conn.oid))
         }
     };
     let mut desc_logs: Vec<Arc<DescriptorLog>> = Vec::with_capacity(db_conns.len());
-    for (i, conn) in db_conns.iter().enumerate() {
-        let log_dir = db_dir(i, conn.oid);
+    for conn in &db_conns {
+        let log_dir = db_dir(conn);
         tokio::fs::create_dir_all(&log_dir)
             .await
             .with_context(|| format!("create descriptor log dir {}", log_dir.display()))?;
@@ -595,7 +645,9 @@ pub(crate) async fn open_tenant(
     } else {
         None
     };
-    let mut decoder = BufferingDecoderSink::new(all_desc_logs, xact_buffer.clone());
+    let stash_live = xact_buffer.lock().await.stash_live();
+    let mut decoder =
+        BufferingDecoderSink::new(all_desc_logs, xact_buffer.clone()).with_stash_live(stash_live);
     if let Some(schema) = db_conns[primary]
         .emitter
         .as_ref()
@@ -616,7 +668,7 @@ pub(crate) async fn open_tenant(
     // replay their drop, so the post-spawn flush below is their only route
     // to the wipe. Loaded in metrics-only runs too (inert without a chunk
     // store), preserved for a later CH run over the same spill dir.
-    let retires = walshadow::toast_retire::RetireLedger::load(&dir, sysid_num)
+    let retires = walshadow::toast_retire::RetireLedger::load(&dir, sysid_num, legacy_owner)
         .await
         .context("load toast retire ledger")?;
     // Pending tables a bootstrap or backup pass left holding undecided rows.
@@ -642,7 +694,7 @@ pub(crate) async fn open_tenant(
             .emitter
             .clone()
             .expect("destination present");
-        let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
+        let addr = format!("{}:{}", emitter_cfg.conn.host, emitter_cfg.conn.port);
         let stats = emitter_stats.clone();
         emitter_stats_handle = Some(stats.clone());
         // One validated resident-payload pool for the pipeline and every
@@ -653,9 +705,6 @@ pub(crate) async fn open_tenant(
         let mut dbs: Vec<Arc<SourceDb>> = Vec::with_capacity(db_conns.len());
         let mut applicators: HashMap<Oid, walshadow::ch_ddl::DdlApplicator> = HashMap::new();
         let mut backfillers: HashMap<Oid, Arc<dyn walshadow::opt_in::Backfiller>> = HashMap::new();
-        // One claim per destination across every database, so `replicate_all`
-        // cannot name one ClickHouse table from two source tables
-        let targets = Arc::new(walshadow::mapping::TargetOwners::default());
         let activation = walshadow::config::Activation {
             priming,
             opt_ins: activation_opt_ins,
@@ -665,9 +714,8 @@ pub(crate) async fn open_tenant(
                 args,
                 conn,
                 primary: i == primary,
-                targets: &targets,
                 desc_log: &desc_logs[i],
-                spill_dir: db_dir(i, conn.oid),
+                spill_dir: db_dir(conn),
                 source: &source_conn,
                 oracle: &oracle,
                 history_rx: history_rx.clone(),
@@ -692,7 +740,7 @@ pub(crate) async fn open_tenant(
                 emitter_cfg.row_budget = rc.row_budget;
                 emitter_cfg.byte_budget = rc.byte_budget;
                 emitter_cfg.flush_timeout = rc.flush_timeout;
-                emitter_cfg.compression = rc.compression;
+                emitter_cfg.conn.compression = rc.conn.compression;
                 emitter_cfg.retry.max_attempts = rc.retry_max_attempts;
             }
             if let Some(applicator) = built.applicator {
@@ -794,29 +842,24 @@ pub(crate) async fn open_tenant(
             budget: None,
         }
     };
-    let (mut reorder_sink, pipeline_handle) = pcfg
+    let (booting_reorder, pipeline_handle) = pcfg
         .spawn(emitter_ack.clone())
         .await
         .context("spawn decode+insert pipeline")?;
     let ack_probe = pipeline_handle.ack_probe.clone();
-    reorder_sink
-        .flush_due_retires()
-        .await
-        .context("boot flush of due toast-mirror retires")?;
-    reorder_sink
-        .settle_pending_boot(Some(&args.bootstrap_shadow_data_dir))
-        .await
-        .context("boot settle of pending backup rows")?;
-    reorder_sink
-        .apply_boot_events(
+    let reorder_sink = booting_reorder
+        .boot(
+            Some(&args.bootstrap_shadow_data_dir),
             desc_logs
                 .iter()
                 .flat_map(|log| log.active_present_at(raw_start.get()))
                 .collect(),
             raw_start.get(),
         )
-        .await
-        .context("boot Added pass over descriptor log")?;
+        .await?;
+    // Predecode off this tenant's own decoder: its descriptor logs answer for
+    // the relations the router hands it
+    let predecode = Arc::new(decoder.predecoder());
     let decoder_xact = QueueingRecordSink::spawn(
         DecoderXactPair {
             decoder,
@@ -825,7 +868,8 @@ pub(crate) async fn open_tenant(
         decoder_batch_size,
         decoder_queue_capacity,
         span_registry.clone(),
-    );
+    )
+    .with_predecode(predecode);
     let boundary_gate = CatalogBoundaryGate::new(
         shadow_state,
         BoundaryGateConfig {
@@ -864,7 +908,9 @@ pub(crate) async fn open_tenant(
             backfiller: copy_backfillers.get(&conn.oid).cloned(),
         })
         .collect();
-    let sink = BoundaryHoldSink::new(decoder_xact, boundary_gate).with_capture(captures);
+    let sink = BoundaryHoldSink::new(decoder_xact, boundary_gate)
+        .with_capture(captures)
+        .with_pending(pending);
 
     // Descriptor-log GC off the pump task: the session publishes each
     // persisted floor, the tasks compact
@@ -872,11 +918,25 @@ pub(crate) async fn open_tenant(
     let gc_floor = Monotone::<Floor>::default();
     let gc_tasks = desc_logs
         .iter()
-        .map(|log| spawn_desc_log_gc(log.clone(), gc_floor.watch(), gc_fatal.clone()))
+        .map(|log| spawn_desc_log_gc(log.clone(), gc_floor.watch(), gc_fatal.clone(), &io))
         .collect();
     let snowflake_maintenance = snowflake
         .clone()
         .map(|runtime| spawn_snowflake_maintenance(runtime, gc_floor.watch()));
+    // `[stream] skip_attribution` follows reloads; the watch ends with the
+    // tenant's resolver
+    if let Some(mut rx) = config_resolvers.first().map(|r| r.subscribe()) {
+        let stats = decoder_stats_handle.clone();
+        tokio::spawn(async move {
+            loop {
+                let on = rx.borrow_and_update().skip_attribution;
+                stats.attribute_skips.store(on, Ordering::Relaxed);
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     Ok((
         Tenant {
@@ -982,7 +1042,7 @@ impl Supervisor {
         merged: &toml::Table,
         tenants: &walshadow::tenants::TenantsConfig,
         decl: &walshadow::tenants::TenantDecl,
-        raw_start: Pos<Floor>,
+        raw_start: Pos<RawStart>,
         aligned: Pos<Floor>,
         reloader: &Arc<walshadow::control::Reloader>,
     ) -> Result<Option<(Tenant, BoundaryHoldSink, u64)>> {
@@ -1057,15 +1117,15 @@ impl Supervisor {
                 .with_context(|| format!("clear tenant dir {}", dir.display()))?;
         }
         let emitter = shared.tenant_emitter(args, merged, tenants, decl).await?;
-        let at = Pos::new(p0);
+        // The tenant's descriptor history and floor both start at the attachment
         let mut boot = shared.boot(
             args,
             decl.id.clone(),
             emitter,
             dir.clone(),
             Arc::new(EmitterStats::default()),
-            at,
-            at,
+            Pos::new(p0),
+            Pos::new(p0),
         );
         boot.priming = true;
         let mut cfg = boot.source_conn.to_pg_config();

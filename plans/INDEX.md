@@ -16,16 +16,18 @@ publication, durable progress, physical identity, or pipeline concurrency
 ## Production readiness
 
 Start with small guards against silent divergence and tests of restart behavior
-Resolve bootstrap visibility before relying on backup loads under concurrent
+Prove pending-row recovery before relying on backup loads under concurrent
 writes. A documented limitation does not imply code rejects it
 
 | Plan | Next step |
 |---|---|
-| [Schema changes](schema.md) | Reject unsupported transitions before destination effects |
+| [Value coercion](value_coercion.md) | Reject Decimal precision loss and signedness corruption; fix String NaN defaults; prove rejection recovery |
+| [Runtime configuration](runtime_config.md) | Locate owning UI and reproduce stale/dead state; expose existing controls there |
+| [Schema changes](schema.md) | Fix routing after renames and handling of replica identity changes; define policy for sort key changes; reject unlogged tables before destination changes |
 | [Tablespaces](tablespaces.md) | Reject unsafe layouts before bootstrap, then add complete support |
 | [Catalog completeness](catalog.md) | Stop when a surviving relation has lost buffered payload |
-| [Bootstrap visibility](bootstrap.md) | Preserve tuples whose transaction outcome is still unknown |
-| [Verification](verification.md) | Enforce CI prerequisites and prove outage, restart, and WAL-version behavior |
+| [Bootstrap visibility](bootstrap.md) | Prove pending-row recovery across load modes and restart |
+| [Verification](verification.md) | Prove value fidelity and restart without skipping WAL |
 | [Snowflake](snowflake.md) | Run live correctness, restart and matched throughput/cost qualification; see [implementation evidence](snowflake-progress.md) |
 | [100% line coverage](coverage100.md) | Close fixture, live-system, CLI, and fault-path gaps, then enforce 100% |
 
@@ -33,11 +35,11 @@ writes. A documented limitation does not imply code rejects it
 
 | Plan | Reason to take it up |
 |---|---|
+| [Partitioned tables](partitions.md) | Update partition ancestors after root changes; reject schema changes during root loads |
 | [Multi-database loads and metrics](multi_database.md) | Extend heap-page bootstrap and backup loads beyond primary database, attribute metrics |
 | [Fuzzing](fuzzing.md) | Find parser and schema-transition interactions beyond fixed regressions |
-| [Performance](performance.md) | Locate bottlenecks before changing concurrency or allocation |
-| [Runtime configuration](runtime_config.md) | Configure destination DDL, codecs, and settings; add commands and explain effective config |
-| [Failover](failover.md) | Continue after unplanned promotion or across archived timeline changes |
+| [Performance](performance.md) | Establish healthy sustained WAL baseline with exact reconciliation before tuning |
+| [Failover](failover.md) | Fence unplanned promotion and prove remaining archive/restart fault cases |
 | [Shadow TOAST reclamation](shadow_toast.md) | Keep historical values readable under lag and restart |
 | [Replay callback](custom_rmgr.md) | Reduce measured command-boundary capture stalls |
 | [Dependencies](dependencies.md) | Replace generic protocol code when an adapter preserves behavior |

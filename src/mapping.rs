@@ -15,10 +15,63 @@ use tokio::sync::RwLock;
 pub struct TableMapping {
     pub target: TableTarget,
     pub columns: Vec<ColumnMapping>,
+    /// Copy rows and schema changes from `target` to these destinations
+    pub tees: Vec<Tee>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl TableMapping {
+    pub fn tee_targets(&self) -> impl Iterator<Item = TableTarget> + '_ {
+        self.tees.iter().map(|t| t.target(&self.target))
+    }
+
+    /// Return main destination followed by each tee
+    pub fn targets(&self) -> impl Iterator<Item = TableTarget> + '_ {
+        std::iter::once(self.target.clone()).chain(self.tee_targets())
+    }
+}
+
+/// Copy rows into an extra table, such as a MergeTree audit log.
+/// Share columns with main destination; apply engine and keys only
+/// when creating table
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tee {
+    pub instance: Option<String>,
+    /// When unset, use main destination database or explicit `instance` default
+    pub database: Option<String>,
+    pub table: String,
+    pub engine: Option<String>,
+    #[serde(default)]
+    pub order_by: Vec<String>,
+    #[serde(default)]
+    pub primary_key: Vec<String>,
+}
+
+impl Tee {
+    pub fn target(&self, primary: &TableTarget) -> TableTarget {
+        TableTarget {
+            instance: self
+                .instance
+                .clone()
+                .map_or_else(|| primary.instance.clone(), named_instance),
+            database: self
+                .database
+                .clone()
+                .unwrap_or_else(|| primary.database.clone()),
+            table: self.table.clone(),
+        }
+    }
+}
+
+/// Map explicit `default` to None so TableTarget spells default instance one way
+pub fn named_instance(name: String) -> Option<String> {
+    (name != "default").then_some(name)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TableTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
     pub database: String,
     pub table: String,
 }
@@ -26,6 +79,7 @@ pub struct TableTarget {
 impl TableTarget {
     pub fn new(database: &str, table: &str) -> Self {
         Self {
+            instance: None,
             database: database.into(),
             table: table.into(),
         }
@@ -40,44 +94,6 @@ impl TableTarget {
     }
 }
 
-/// ClickHouse tables claimed by one source database. `replicate_all` names a
-/// destination after its source table, so two databases holding one table name
-/// would otherwise merge their rows into one destination
-#[derive(Debug, Default)]
-pub struct TargetOwners {
-    owned: RwLock<HashMap<TableTarget, (u32, RelName)>>,
-}
-
-impl TargetOwners {
-    /// Claim `target` for one database's relation, idempotent for the owner
-    /// `Err` names the database oid and relation already writing there
-    pub async fn claim(
-        &self,
-        target: &TableTarget,
-        db_oid: u32,
-        rel: &RelName,
-    ) -> Result<(), (u32, RelName)> {
-        let mut owned = self.owned.write().await;
-        let claimant = (db_oid, rel.clone());
-        match owned.get(target) {
-            Some(owner) if *owner == claimant => Ok(()),
-            Some(owner) => Err(owner.clone()),
-            None => {
-                owned.insert(target.clone(), claimant);
-                Ok(())
-            }
-        }
-    }
-
-    /// Release what one relation claimed, so a re-created table claims again
-    pub async fn release(&self, db_oid: u32, rel: &RelName) {
-        self.owned
-            .write()
-            .await
-            .retain(|_, (oid, owner)| (*oid, &*owner) != (db_oid, rel));
-    }
-}
-
 impl std::fmt::Display for TableTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}", self.database, self.table)
@@ -88,8 +104,94 @@ impl std::fmt::Display for TableTarget {
 pub struct NamespaceMapping {
     pub target_database: Option<String>,
     pub auto_create: bool,
+    pub auto_create_name: Option<NameTemplate>,
     pub drop_table_strategy: Option<DropTableStrategy>,
+    /// What `DETACH PARTITION` does to rows the partition routed to its root
+    pub detach_strategy: Option<DropTableStrategy>,
     pub initial_load: Option<InitialLoadMode>,
+}
+
+/// Destination name for a table no `target_table` names, as `$database$` /
+/// `$schema$` / `$table$` placeholders around literal text (`$$` is a literal
+/// `$`). A template naming no `$table$` is read as a prefix, so `wh_` means
+/// `wh_$table$` and `""` means `$table$`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameTemplate(Vec<NamePart>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NamePart {
+    Literal(String),
+    Database,
+    Schema,
+    Table,
+}
+
+impl Default for NameTemplate {
+    fn default() -> Self {
+        Self(vec![
+            NamePart::Schema,
+            NamePart::Literal("_".into()),
+            NamePart::Table,
+        ])
+    }
+}
+
+impl NameTemplate {
+    pub fn parse(src: &str) -> Result<Self, String> {
+        let mut parts = Vec::new();
+        let mut literal = String::new();
+        let mut rest = src;
+        while let Some(at) = rest.find('$') {
+            literal.push_str(&rest[..at]);
+            rest = &rest[at + 1..];
+            if let Some(tail) = rest.strip_prefix('$') {
+                literal.push('$');
+                rest = tail;
+                continue;
+            }
+            let Some(end) = rest.find('$') else {
+                return Err(format!(
+                    "`{src}`: unterminated `$`; write `$$` for a literal `$`"
+                ));
+            };
+            let part = match &rest[..end] {
+                "database" => NamePart::Database,
+                "schema" => NamePart::Schema,
+                "table" => NamePart::Table,
+                unknown => {
+                    return Err(format!(
+                        "`{src}`: unknown placeholder `${unknown}$`; expected `$database$`, `$schema$` or `$table$`"
+                    ));
+                }
+            };
+            if !literal.is_empty() {
+                parts.push(NamePart::Literal(std::mem::take(&mut literal)));
+            }
+            parts.push(part);
+            rest = &rest[end + 1..];
+        }
+        literal.push_str(rest);
+        if !literal.is_empty() {
+            parts.push(NamePart::Literal(literal));
+        }
+        if !parts.contains(&NamePart::Table) {
+            parts.push(NamePart::Table);
+        }
+        Ok(Self(parts))
+    }
+
+    pub fn render(&self, database: &str, schema: &str, table: &str) -> String {
+        let mut out = String::new();
+        for part in &self.0 {
+            match part {
+                NamePart::Literal(s) => out.push_str(s),
+                NamePart::Database => out.push_str(database),
+                NamePart::Schema => out.push_str(schema),
+                NamePart::Table => out.push_str(table),
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -111,17 +213,6 @@ impl std::str::FromStr for DropTableStrategy {
             other => Err(format!(
                 "unknown drop-table-strategy {other:?} (expected retain / drop / warn)"
             )),
-        }
-    }
-}
-
-impl DropTableStrategy {
-    /// Canonical spelling for overlay and CLI values
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Retain => "retain",
-            Self::Drop => "drop",
-            Self::Warn => "warn",
         }
     }
 }
@@ -153,6 +244,10 @@ pub struct SystemColumns {
     /// `emitter_deletes_discarded`) — for append-only destinations
     #[serde(deserialize_with = "de_delete_marker")]
     pub is_deleted: Option<String>,
+    /// Source partition OID, appended only on partitioned-root destinations.
+    /// `None` leaves it out, which rules out partition-scoped row removal
+    #[serde(deserialize_with = "de_leaf")]
+    pub leaf: Option<String>,
 }
 
 impl Default for SystemColumns {
@@ -162,16 +257,29 @@ impl Default for SystemColumns {
             xid: "_xid".into(),
             commit_ts: "_commit_ts".into(),
             is_deleted: Some("_is_deleted".into()),
+            leaf: Some("_leaf_oid".into()),
         }
     }
 }
 
 /// `is_deleted = false` (or an empty name) drops the delete marker
 fn de_delete_marker<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    de_optional_column(d, SystemColumns::default().is_deleted)
+}
+
+/// `leaf = false` (or an empty name) drops the partition column
+fn de_leaf<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    de_optional_column(d, SystemColumns::default().leaf)
+}
+
+fn de_optional_column<'de, D: serde::Deserializer<'de>>(
+    d: D,
+    default: Option<String>,
+) -> Result<Option<String>, D::Error> {
     use serde::Deserialize;
     match toml::Value::deserialize(d)? {
         toml::Value::Boolean(false) => Ok(None),
-        toml::Value::Boolean(true) => Ok(SystemColumns::default().is_deleted),
+        toml::Value::Boolean(true) => Ok(default),
         toml::Value::String(name) => Ok((!name.is_empty()).then_some(name)),
         v => Err(serde::de::Error::custom(format!(
             "expected a string or false, got {}",
@@ -193,7 +301,8 @@ impl SystemColumns {
                 return Err(format!("system_columns.{key}: name must not be empty"));
             }
         }
-        let names = self.names();
+        let mut names = self.names();
+        names.extend(self.leaf.as_deref());
         for (i, a) in names.iter().enumerate() {
             if names[i + 1..].contains(a) {
                 return Err(format!("system_columns: `{a}` named twice"));
@@ -247,6 +356,18 @@ impl SystemColumns {
             Some(name) if !out.names()[..3].contains(&name) => out.is_deleted = Some(name.into()),
             _ => {}
         }
+        if out
+            .leaf
+            .as_deref()
+            .is_some_and(|l| out.names().contains(&l))
+        {
+            out.leaf = None;
+        }
+        match names.leaf.as_deref() {
+            Some("") => out.leaf = None,
+            Some(name) if !out.names().contains(&name) => out.leaf = Some(name.into()),
+            _ => {}
+        }
         out
     }
 }
@@ -262,6 +383,8 @@ pub struct SystemColumnNames {
     pub xid: Option<String>,
     pub commit_ts: Option<String>,
     pub is_deleted: Option<String>,
+    /// Blank drops the partition column, as for `is_deleted`
+    pub leaf: Option<String>,
 }
 
 impl SystemColumnNames {
@@ -270,6 +393,7 @@ impl SystemColumnNames {
             && self.xid.is_none()
             && self.commit_ts.is_none()
             && self.is_deleted.is_none()
+            && self.leaf.is_none()
     }
 
     pub fn overlay(&mut self, other: &Self) {
@@ -277,6 +401,7 @@ impl SystemColumnNames {
         set_if(&mut self.xid, &other.xid);
         set_if(&mut self.commit_ts, &other.commit_ts);
         set_if(&mut self.is_deleted, &other.is_deleted);
+        set_if(&mut self.leaf, &other.leaf);
     }
 
     /// Reject a set naming one column twice, or renaming onto a name another
@@ -299,6 +424,11 @@ impl SystemColumnNames {
                 return Err(format!("{ctx}: `{want}` names two system columns"));
             }
         }
+        if let Some(want) = self.leaf.as_deref().filter(|n| !n.is_empty())
+            && renamed.leaf.as_deref() != Some(want)
+        {
+            return Err(format!("{ctx}: `{want}` names two system columns"));
+        }
         Ok(())
     }
 }
@@ -308,10 +438,24 @@ impl SystemColumnNames {
 pub(crate) fn de_marker_override<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<String>, D::Error> {
+    de_column_override(d, SystemColumns::default().is_deleted)
+}
+
+/// Per-relation partition column, read like [`de_marker_override`]
+pub(crate) fn de_leaf_override<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    de_column_override(d, SystemColumns::default().leaf)
+}
+
+fn de_column_override<'de, D: serde::Deserializer<'de>>(
+    d: D,
+    default: Option<String>,
+) -> Result<Option<String>, D::Error> {
     use serde::Deserialize;
     match toml::Value::deserialize(d)? {
         toml::Value::Boolean(false) => Ok(Some(String::new())),
-        toml::Value::Boolean(true) => Ok(SystemColumns::default().is_deleted),
+        toml::Value::Boolean(true) => Ok(default),
         toml::Value::String(name) => Ok(Some(name)),
         v => Err(serde::de::Error::custom(format!(
             "expected a string or false, got {}",
@@ -322,7 +466,7 @@ pub(crate) fn de_marker_override<'de, D: serde::Deserializer<'de>>(
 
 /// Immutable routing-map version. Planners snapshot one per transaction so a
 /// concurrent republish can't split a transaction across mapping versions
-pub type MappingSnapshot = Arc<HashMap<RelName, TableMapping>>;
+pub type MappingSnapshot = Arc<HashMap<RelName, Arc<TableMapping>>>;
 
 pub type MappingHandle = Arc<MappingCell>;
 
@@ -375,8 +519,14 @@ impl MappingCell {
 
 pub fn mapping_handle(tables: HashMap<RelName, TableMapping>) -> MappingHandle {
     Arc::new(MappingCell {
-        inner: RwLock::new(Arc::new(tables)),
+        inner: RwLock::new(Arc::new(shared(tables))),
     })
+}
+
+/// Wrap each mapping once at publish so routing clones a refcount rather than
+/// the column vector on every commit
+pub fn shared(tables: HashMap<RelName, TableMapping>) -> HashMap<RelName, Arc<TableMapping>> {
+    tables.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()
 }
 
 /// CH name and type a rule states for an attribute, falling back to the
@@ -502,38 +652,48 @@ fn quote_ident(name: &str) -> String {
 mod tests {
     use super::*;
 
-    /// One destination belongs to one source relation of one database
-    #[tokio::test]
-    async fn target_owners_refuse_a_second_claimant() {
-        let owners = TargetOwners::default();
-        let target = TableTarget::new("cdc", "orders");
-        let app = RelName::new("public", "orders");
-        let billing = RelName::new("billing", "orders");
-        owners.claim(&target, 16384, &app).await.expect("first");
-        owners
-            .claim(&target, 16384, &app)
-            .await
-            .expect("same claimant re-claims");
+    #[test]
+    fn name_template_renders_placeholders_literals_and_escapes() {
+        let render = |t: &str| {
+            NameTemplate::parse(t)
+                .expect(t)
+                .render("app", "audit", "orders")
+        };
         assert_eq!(
-            owners.claim(&target, 5, &app).await,
-            Err((16384, app.clone())),
-            "another database writing the same table"
+            NameTemplate::default().render("app", "audit", "orders"),
+            "audit_orders"
         );
-        assert_eq!(
-            owners.claim(&target, 16384, &billing).await,
-            Err((16384, app.clone())),
-            "another schema of one database writing the same table"
-        );
-        // A different destination is free, and a dropped one frees its own
-        owners
-            .claim(&TableTarget::new("cdc", "orders_v2"), 5, &app)
-            .await
-            .expect("distinct target");
-        owners.release(16384, &app).await;
-        owners
-            .claim(&target, 5, &billing)
-            .await
-            .expect("released target is claimable");
+        assert_eq!(render("$schema$_$table$"), "audit_orders");
+        assert_eq!(render("$database$_$schema$_$table$"), "app_audit_orders");
+        assert_eq!(render("$table$_suffix"), "orders_suffix");
+        assert_eq!(render("$table$"), "orders");
+        assert_eq!(render("$table$$table$"), "ordersorders");
+        assert_eq!(render("$$"), "$orders", "`$$` is a literal `$`");
+        assert_eq!(render("a$$b_$table$"), "a$b_orders");
+        assert_eq!(render("$$table$$"), "$table$orders");
+    }
+
+    #[test]
+    fn name_template_without_table_reads_as_a_prefix() {
+        let render = |t: &str| {
+            NameTemplate::parse(t)
+                .expect(t)
+                .render("app", "audit", "orders")
+        };
+        assert_eq!(render(""), "orders");
+        assert_eq!(render("wh_"), "wh_orders");
+        assert_eq!(render("$schema$_"), "audit_orders");
+        assert_eq!(render("$database$_"), "app_orders");
+    }
+
+    #[test]
+    fn name_template_rejects_unknown_and_unterminated_placeholders() {
+        let err = NameTemplate::parse("$relname$_$table$").expect_err("unknown");
+        assert!(err.contains("`$relname$`"), "{err}");
+        assert!(err.contains("$database$"), "names the alternatives: {err}");
+        let err = NameTemplate::parse("$table$_$half").expect_err("unterminated");
+        assert!(err.contains("unterminated"), "{err}");
+        assert!(err.contains("`$$`"), "points at the escape: {err}");
     }
 
     /// Parse a `[system_columns]` body the way `ConfigDocument` does
@@ -564,6 +724,8 @@ mod tests {
         assert_eq!(off.names(), ["_lsn", "_xid", "_commit_ts"]);
         let renamed = system_columns("is_deleted = \"gone\"\n").unwrap();
         assert_eq!(renamed.is_deleted.as_deref(), Some("gone"));
+        let on = system_columns("is_deleted = true\n").unwrap();
+        assert_eq!(on.is_deleted.as_deref(), Some("_is_deleted"));
     }
 
     #[test]
@@ -572,6 +734,54 @@ mod tests {
         assert!(system_columns("lsn = \"\"\n").is_err());
         assert!(system_columns("xid = \"_lsn\"\n").is_err());
         assert!(system_columns("lsn = 7\n").is_err());
+        let err = system_columns("is_deleted = 1\n").unwrap_err();
+        assert!(err.contains("expected a string or false"), "{err}");
+    }
+
+    #[test]
+    fn partition_column_renames_disables_and_refuses_collisions() {
+        assert_eq!(
+            system_columns("").unwrap().leaf.as_deref(),
+            Some("_leaf_oid")
+        );
+        assert!(system_columns("leaf = false\n").unwrap().leaf.is_none());
+        assert_eq!(
+            system_columns("leaf = \"_part\"\n")
+                .unwrap()
+                .leaf
+                .as_deref(),
+            Some("_part")
+        );
+        assert!(system_columns("leaf = \"_lsn\"\n").is_err());
+
+        let renamed = SystemColumns::default().renamed(&SystemColumnNames {
+            leaf: Some("_p".into()),
+            ..SystemColumnNames::default()
+        });
+        assert_eq!(renamed.leaf.as_deref(), Some("_p"));
+        let dropped = SystemColumns::default().renamed(&SystemColumnNames {
+            leaf: Some(String::new()),
+            ..SystemColumnNames::default()
+        });
+        assert!(dropped.leaf.is_none());
+        let onto_lsn = SystemColumnNames {
+            leaf: Some("_lsn".into()),
+            ..SystemColumnNames::default()
+        };
+        assert!(onto_lsn.validate("table.public.t").is_err());
+        assert_eq!(
+            SystemColumns::default().renamed(&onto_lsn).leaf.as_deref(),
+            Some("_leaf_oid"),
+            "a colliding rename is skipped"
+        );
+        let lsn_takes_leaf = SystemColumns::default().renamed(&SystemColumnNames {
+            lsn: Some("_leaf_oid".into()),
+            ..SystemColumnNames::default()
+        });
+        assert!(
+            lsn_takes_leaf.leaf.is_none(),
+            "never two columns of one name"
+        );
     }
 
     #[test]
@@ -586,6 +796,36 @@ mod tests {
         assert_eq!(sys.lsn, "_peerdb_version");
         assert_eq!(sys.xid, "_xid", "unnamed column inherits");
         assert!(sys.is_deleted.is_none(), "blank marker drops it");
+
+        let sys = SystemColumns::default().renamed(&SystemColumnNames {
+            xid: Some("_txid".into()),
+            is_deleted: Some("_gone".into()),
+            ..SystemColumnNames::default()
+        });
+        assert_eq!(sys.names(), ["_lsn", "_txid", "_commit_ts", "_gone"]);
+    }
+
+    #[test]
+    fn per_relation_marker_override_parses_bool_or_name() {
+        #[derive(serde::Deserialize)]
+        struct Patch {
+            #[serde(default, deserialize_with = "de_marker_override")]
+            is_deleted: Option<String>,
+        }
+        let parse = |body: &str| {
+            toml::from_str::<Patch>(body)
+                .map(|p| p.is_deleted)
+                .map_err(crate::toml_de::message)
+        };
+        assert_eq!(parse("").unwrap(), None);
+        assert_eq!(parse("is_deleted = false").unwrap().as_deref(), Some(""));
+        assert_eq!(
+            parse("is_deleted = true").unwrap().as_deref(),
+            Some("_is_deleted")
+        );
+        assert_eq!(parse("is_deleted = \"x\"").unwrap().as_deref(), Some("x"));
+        let err = parse("is_deleted = 1").unwrap_err();
+        assert!(err.contains("expected a string or false"), "{err}");
     }
 
     #[test]
@@ -630,6 +870,7 @@ mod tests {
             TableMapping {
                 target: TableTarget::new("db", "t"),
                 columns: vec![],
+                tees: Vec::new(),
             },
         )]);
         (rel, map)
@@ -652,7 +893,7 @@ mod tests {
         // Republish shape: full inner-Arc swap
         let planned = handle.snapshot().await;
         let (rel2, map2) = one_table();
-        handle.publish(Arc::new(map2)).await;
+        handle.publish(Arc::new(shared(map2))).await;
         assert!(!planned.contains_key(&rel2), "snapshot predates the swap");
         assert!(handle.with(|m| m.contains_key(&rel2)).await);
     }
@@ -674,14 +915,20 @@ mod tests {
         writer.await.unwrap();
         assert!(handle.guard_matches(&planned, &selected).await.is_none());
 
-        let handle = mapping_handle((*planned).clone());
+        let handle = mapping_handle(
+            planned
+                .iter()
+                .map(|(rel, m)| (rel.clone(), (**m).clone()))
+                .collect(),
+        );
         let mut unrelated = (*planned).clone();
         unrelated.insert(
             RelName::new("public", "other"),
-            TableMapping {
+            Arc::new(TableMapping {
+                tees: Vec::new(),
                 target: TableTarget::new("db", "other"),
                 columns: vec![],
-            },
+            }),
         );
         handle.publish(Arc::new(unrelated)).await;
         assert!(handle.guard_matches(&planned, &selected).await.is_some());
@@ -723,6 +970,7 @@ mod tests {
             rel_name: RelName::new("app", "events"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: crate::schema::ReplIdent::Default { pk_attnums: None },
             attributes: attrs,
         }
@@ -737,7 +985,7 @@ mod tests {
             crate::table_rules::MatchKind::Exact,
             crate::column_rules::ColumnRule {
                 target_name: Some("id".into()),
-                target_type: None,
+                ..Default::default()
             },
         );
         b.add(
@@ -746,8 +994,8 @@ mod tests {
             "*_amount",
             crate::table_rules::MatchKind::Glob,
             crate::column_rules::ColumnRule {
-                target_name: None,
                 target_type: Some("Decimal(38, 9)".into()),
+                ..Default::default()
             },
         );
         b.finish().0
@@ -775,6 +1023,7 @@ mod tests {
         let mut mapping = TableMapping {
             target: TableTarget::new("db", "events"),
             columns: derive_columns_for_mapping(&old, &rules),
+            tees: Vec::new(),
         };
         let added = attr(2, "gross_amount", crate::schema::NUMERICOID);
         let new = events_desc(vec![
@@ -807,6 +1056,7 @@ mod tests {
                 target_type: "Int32".into(),
                 type_pinned: false,
             }],
+            tees: Vec::new(),
         };
         let new = events_desc(vec![attr(1, "legacy_id", crate::schema::INT4OID)]);
         fold_diff_into_mapping(

@@ -7,7 +7,7 @@ use ahash::HashSet;
 use anyhow::Context;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
-use walshadow::config::{ConfigResolver, ResolvedConfig};
+use walshadow::config::ResolvedConfig;
 use walshadow::mapping::MappingHandle;
 use walshadow::pg::quote_ident;
 use walshadow::runtime_config::InitialLoadMode;
@@ -72,15 +72,17 @@ pub(crate) async fn or_signal<T>(
     }
 }
 
-/// Seed the resolver overlay from source PG's `<schema>.config_*` tables via
-/// the sidecar libpq connection (plan §7). Refuses (Err → daemon exits) when
-/// the schema is named but not installed, or the install is newer than this
-/// daemon understands — explicit opt-in should not silently no-op.
-pub(crate) async fn seed_runtime_config(
+/// Load the resolver's boot overlay from source PG's `<schema>.config_*`
+/// tables via the sidecar libpq connection (plan §7). Refuses (Err → daemon
+/// exits) when the schema is named but not installed, or the install is newer
+/// than this daemon understands — explicit opt-in should not silently no-op.
+pub(crate) async fn load_runtime_config(
     client: &tokio_postgres::Client,
     schema: &str,
-    resolver: &ConfigResolver,
-) -> anyhow::Result<Vec<(RelName, walshadow::runtime_config::TableRow)>> {
+) -> anyhow::Result<(
+    walshadow::runtime_config::ConfigOverlay,
+    Vec<(RelName, walshadow::runtime_config::TableRow)>,
+)> {
     use walshadow::runtime_config::{ColumnRow, ConfigOverlay, GlobalRow, NamespaceRow, TableRow};
     let s = quote_ident(schema);
     let mut overlay = ConfigOverlay::default();
@@ -91,10 +93,7 @@ pub(crate) async fn seed_runtime_config(
     // 0 rows (greenfield) is fine — all TOML defaults then apply.
     if let Some(row) = client
         .query_opt(
-            &format!(
-                "SELECT row_budget, byte_budget, flush_timeout_ms, compression, \
-                 retry_max_attempts, drop_table_strategy FROM {s}.config_global WHERE id = 1"
-            ),
+            &format!("SELECT * FROM {s}.config_global WHERE id = 1"),
             &[],
         )
         .await
@@ -114,17 +113,12 @@ pub(crate) async fn seed_runtime_config(
                 .get::<_, Option<i32>>("retry_max_attempts")
                 .map(i64::from),
             drop_table_strategy: row.get("drop_table_strategy"),
+            detach_strategy: row.try_get("detach_strategy").ok().flatten(),
         });
     }
 
     for row in client
-        .query(
-            &format!(
-                "SELECT namespace, target_database, auto_create, drop_table_strategy \
-                 FROM {s}.config_namespace"
-            ),
-            &[],
-        )
+        .query(&format!("SELECT * FROM {s}.config_namespace"), &[])
         .await
         .context("read config_namespace")?
     {
@@ -134,7 +128,9 @@ pub(crate) async fn seed_runtime_config(
             NamespaceRow {
                 target_database: row.get("target_database"),
                 auto_create: row.get("auto_create"),
+                auto_create_name: row.get("auto_create_name"),
                 drop_table_strategy: row.get("drop_table_strategy"),
+                detach_strategy: row.try_get("detach_strategy").ok().flatten(),
             },
         );
     }
@@ -158,11 +154,15 @@ pub(crate) async fn seed_runtime_config(
                 initial_load: row.try_get("initial_load").ok().flatten(),
                 order_by: row.try_get("order_by").ok().flatten(),
                 primary_key: row.try_get("primary_key").ok().flatten(),
+                engine: row.try_get("engine").ok().flatten(),
+                partition_by: row.try_get("partition_by").ok().flatten(),
+                route: row.try_get("route").ok().flatten(),
                 system: walshadow::mapping::SystemColumnNames {
                     lsn: row.try_get("lsn").ok().flatten(),
                     xid: row.try_get("xid").ok().flatten(),
                     commit_ts: row.try_get("commit_ts").ok().flatten(),
                     is_deleted: row.try_get("is_deleted").ok().flatten(),
+                    leaf: row.try_get("leaf").ok().flatten(),
                 },
                 match_kind: row.try_get("match").ok().flatten(),
             },
@@ -170,12 +170,7 @@ pub(crate) async fn seed_runtime_config(
     }
 
     for row in client
-        .query(
-            &format!(
-                "SELECT namespace, relname, attname, match, target_type FROM {s}.config_column"
-            ),
-            &[],
-        )
+        .query(&format!("SELECT * FROM {s}.config_column"), &[])
         .await
         .context("read config_column")?
     {
@@ -187,6 +182,9 @@ pub(crate) async fn seed_runtime_config(
             ColumnRow {
                 target_type: row.try_get("target_type").ok().flatten(),
                 match_kind: row.try_get("match").ok().flatten(),
+                nan: row.try_get("nan").ok().flatten(),
+                pos_inf: row.try_get("pos_inf").ok().flatten(),
+                neg_inf: row.try_get("neg_inf").ok().flatten(),
             },
         );
     }
@@ -205,7 +203,6 @@ pub(crate) async fn seed_runtime_config(
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    resolver.seed_overlay(overlay).await;
     tracing::info!(
         target: "walshadow::config",
         schema,
@@ -215,7 +212,7 @@ pub(crate) async fn seed_runtime_config(
         columns = n_col,
         "runtime config overlay seeded from source PG",
     );
-    Ok(table_rows)
+    Ok((overlay, table_rows))
 }
 
 pub(crate) async fn apply_toml_initial_loads(
@@ -273,7 +270,9 @@ pub(crate) async fn refresh_mapping(
     // Boot value already seeded into `mapping`; react to republishes.
     while config_rx.changed().await.is_ok() {
         let tables = config_rx.borrow_and_update().tables.clone();
-        mapping.publish(Arc::new(tables)).await;
+        mapping
+            .publish(Arc::new(walshadow::mapping::shared(tables)))
+            .await;
         tracing::info!(
             target: "walshadow::config",
             "routing map refreshed from resolved config",

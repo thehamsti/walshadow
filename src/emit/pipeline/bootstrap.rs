@@ -8,17 +8,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
+use walrus::pg::walparser::RelFileNode;
 
 use crate::backfill::backup_page_walk::{BackfillTuple, CatalogMap};
-use crate::backfill::spool::{DeferredReader, DeferredSpool, SpoolMark};
+use crate::backfill::spool::{DeferredReader, DeferredSpool, Replayable, SpoolMark};
 use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
 use crate::emit::ch_emitter::EmitterStats;
-use crate::emit::pipeline::ack::AckHandle;
+use crate::emit::pipeline::ack::{AckHandle, OpenSeq, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk};
 use crate::emit::pipeline::decode::DECODE_CHUNK_BYTES;
-use crate::emit::route::{RouteSnapshot, RowPolicy, freeze_routes};
+use crate::emit::route::{FrozenRoutes, RouteSnapshot, RowPolicy, freeze_routes};
 use crate::mapping::{MappingSnapshot, TableMapping};
 use crate::ops::oracle::render_ext_columns;
 use crate::schema::{RelDescriptor, RelName};
@@ -66,7 +67,7 @@ impl<'a> DeferredFootprint<'a> {
     }
 
     /// Take over bytes a lane published, so replay releases them
-    fn adopt(stats: &'a EmitterStats, spool: &DeferredSpool) -> Self {
+    fn adopt(stats: &'a EmitterStats, spool: &Replayable) -> Self {
         Self {
             stats,
             resident: spool.resident_bytes() as u64,
@@ -169,14 +170,12 @@ pub enum Deferral {
 pub async fn drain(
     mut rx: mpsc::Receiver<Vec<BackfillTuple>>,
     catalog: CatalogMap,
-    mapping: MappingSnapshot,
+    routes: FrozenRoutes,
     msg_tx: mpsc::Sender<BatcherMsg>,
     ack: AckHandle,
     stats: Arc<EmitterStats>,
     resolver: ToastResolver,
     deferral: Deferral,
-    row_policy: RowPolicy,
-    config: Option<Arc<ResolvedConfig>>,
     skip_initial: HashSet<RelName>,
     neutral_values: bool,
     barrier: Option<Arc<WalkBarrier>>,
@@ -186,11 +185,10 @@ pub async fn drain(
         Deferral::Local(spool) => (Some(spool), false),
         Deferral::Handback(spool) => (Some(spool), true),
     };
-    let routes = freeze_routes(&mapping, config.as_deref(), &row_policy);
     let mut footprint = DeferredFootprint::new(&stats);
-    let mut next_seq = 0;
+    let mut seqs = ack.seqs(0);
     let mut rows_routed = 0;
-    let mut open = None;
+    let mut open: Option<(RelFileNode, OpenSeq, u64)> = None;
     let mut chunk_batch = Vec::new();
     let mut chunk_batch_bytes = 0;
     let mut out = RowBuf::default();
@@ -202,20 +200,20 @@ pub async fn drain(
             let rfn = tuple.rfn;
             let source_lsn = tuple.source_lsn;
 
-            let same = matches!(&open, Some((r, _, _)) if *r == rfn);
-            let seq = if same {
-                open.as_ref().expect("same implies open").1
+            let seq = if let Some((r, seq, _)) = &open
+                && *r == rfn
+            {
+                seq.seq()
             } else {
-                if let Some((_, prev_seq, prev_rows)) = open.take() {
+                if let Some((_, prev, prev_rows)) = open.take() {
                     // Every row of the closing seq on the channel before its
                     // expected count is published
                     out.flush(&msg_tx).await?;
-                    ack.placed(prev_seq, prev_rows);
+                    prev.place(prev_rows);
                 }
-                let s = next_seq;
-                next_seq += 1;
-                ack.register(s, source_lsn);
-                open = Some((rfn, s, 0));
+                let seq = seqs.open(source_lsn, Publish::Commit);
+                let s = seq.seq();
+                open = Some((rfn, seq, 0));
                 s
             };
 
@@ -229,7 +227,7 @@ pub async fn drain(
             }
 
             if catalog.is_toast(rfn.db_node, rfn.rel_node) {
-                if let Some(row) = row_from_columns(tuple, rel.oid) {
+                if let Some(row) = row_from_columns(tuple, rfn.db_node, rel.oid) {
                     chunk_batch_bytes += row.chunk_data.len();
                     chunk_batch.push(row);
                     if resolver.put_limit_reached(chunk_batch.len(), chunk_batch_bytes) {
@@ -240,7 +238,7 @@ pub async fn drain(
                 continue;
             }
 
-            let Some(route) = routes.get(&rel.rel_name).cloned() else {
+            let Some(route) = routes.route(&rel) else {
                 stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
@@ -281,7 +279,7 @@ pub async fn drain(
             }
             out.flush(&msg_tx).await?;
             if let Some((_, seq, rows)) = open.take() {
-                ack.placed(seq, rows);
+                seq.place(rows);
             }
             let mut mark = SpoolMark::default();
             if let Some(spool) = deferred.as_mut() {
@@ -291,13 +289,14 @@ pub async fn drain(
                     .map_err(|e| format!("bootstrap: deferred spool checkpoint: {e}"))?;
                 footprint.publish(spool);
             }
-            b.publish_drain(consumed, next_seq, mark).await;
+            b.publish_drain(consumed, seqs.next(), mark).await;
         }
     }
     out.flush(&msg_tx).await?;
     if let Some((_, seq, rows)) = open.take() {
-        ack.placed(seq, rows);
+        seq.place(rows);
     }
+    let next_seq = seqs.next();
 
     if !chunk_batch.is_empty() {
         flush_chunks(&resolver, &mut chunk_batch).await?;
@@ -315,7 +314,7 @@ pub async fn drain(
         Some(spool) => {
             footprint.hand_off();
             let resolved = resolve_spooled(
-                spool,
+                spool.into(),
                 &routes,
                 &catalog,
                 &msg_tx,
@@ -348,7 +347,7 @@ pub async fn drain(
 /// sibling's chunk files
 #[allow(clippy::too_many_arguments)]
 pub async fn drain_deferred(
-    spool: DeferredSpool,
+    spool: Replayable,
     catalog: &CatalogMap,
     mapping: &MappingSnapshot,
     msg_tx: &mpsc::Sender<BatcherMsg>,
@@ -387,8 +386,8 @@ pub struct ReplayCheckpoint<'a> {
 /// row that routes so an all-unmapped spool leaves no seq to prove
 #[allow(clippy::too_many_arguments)]
 async fn resolve_spooled(
-    spool: DeferredSpool,
-    routes: &ahash::HashMap<RelName, Arc<RouteSnapshot>>,
+    spool: Replayable,
+    routes: &FrozenRoutes,
     catalog: &CatalogMap,
     msg_tx: &mpsc::Sender<BatcherMsg>,
     ack: &AckHandle,
@@ -410,7 +409,7 @@ async fn resolve_spooled(
     let mut seq = None;
     let mut placed = 0u64;
     let total_bytes = spool.spooled_bytes();
-    let mut next_seq = first_seq;
+    let mut seqs = ack.seqs(first_seq);
     let mut total_placed = 0;
     let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
     let mut replay = spool
@@ -430,8 +429,7 @@ async fn resolve_spooled(
                 batch,
                 &mut out,
                 msg_tx,
-                ack,
-                next_seq,
+                &mut seqs,
                 &mut seq,
                 &mut placed,
                 neutral_values,
@@ -442,13 +440,12 @@ async fn resolve_spooled(
         if let Some(c) = checkpoint.as_mut() {
             out.flush(msg_tx).await?;
             if let Some(s) = seq.take() {
-                ack.placed(s, placed);
-                next_seq = s + 1;
+                s.place(placed);
             }
             total_placed += placed;
             placed = 0;
             if ticker.fire() {
-                c.tail.checkpoint(next_seq).await?;
+                c.tail.checkpoint(seqs.next()).await?;
                 c.state.offset = total_bytes - remaining;
                 c.state.rows += total_placed;
                 total_placed = 0;
@@ -460,7 +457,7 @@ async fn resolve_spooled(
     out.flush(msg_tx).await?;
     let rows_routed = match checkpoint.as_mut() {
         Some(c) => {
-            c.tail.checkpoint(next_seq).await?;
+            c.tail.checkpoint(seqs.next()).await?;
             c.state.offset = total_bytes;
             c.state.rows += total_placed;
             c.state.save(c.dir).await.map_err(|e| e.to_string())?;
@@ -475,21 +472,17 @@ async fn resolve_spooled(
             placed
         }
     };
-    let next_seq = match seq {
-        Some(s) => {
-            ack.placed(s, placed);
-            s + 1
-        }
-        None => next_seq,
-    };
+    if let Some(s) = seq {
+        s.place(placed);
+    }
     Ok(BootstrapDrainOutcome {
-        next_seq,
+        next_seq: seqs.next(),
         rows_routed,
         deferred: None,
     })
 }
 
-fn bump(open: &mut Option<(walrus::pg::walparser::RelFileNode, u64, u64)>, rows_routed: &mut u64) {
+fn bump(open: &mut Option<(RelFileNode, OpenSeq, u64)>, rows_routed: &mut u64) {
     if let Some(slot) = open.as_mut() {
         slot.2 += 1;
     }
@@ -614,7 +607,7 @@ struct ResolvedReplayBatch {
 /// Read one batch and resolve its values; `None` at spool end
 async fn prepare_batch(
     replay: &mut DeferredReader,
-    routes: &ahash::HashMap<RelName, Arc<RouteSnapshot>>,
+    routes: &FrozenRoutes,
     catalog: &CatalogMap,
     stats: &EmitterStats,
     resolver: &ToastResolver,
@@ -642,19 +635,17 @@ async fn route_batch(
     batch: ResolvedReplayBatch,
     out: &mut RowBuf,
     msg_tx: &mpsc::Sender<BatcherMsg>,
-    ack: &AckHandle,
-    first_seq: u64,
-    seq: &mut Option<u64>,
+    seqs: &mut SeqAlloc,
+    seq: &mut Option<OpenSeq>,
     placed: &mut u64,
     neutral_values: bool,
 ) -> Result<(), String> {
     let ResolvedReplayBatch { rows, permit } = batch;
     for row in rows {
         let mut tuple = row.tuple;
-        let at = *seq.get_or_insert_with(|| {
-            ack.register(first_seq, tuple.source_lsn);
-            first_seq
-        });
+        let at = seq
+            .get_or_insert_with(|| seqs.open(tuple.source_lsn, Publish::Commit))
+            .seq();
         if !neutral_values {
             render_ext_columns(&row.rel.attributes, &mut tuple.columns);
         }
@@ -669,7 +660,7 @@ async fn route_batch(
 /// mapped relation owns. Value caps are checked here, before any fetch
 async fn next_batch(
     replay: &mut DeferredReader,
-    routes: &ahash::HashMap<RelName, Arc<RouteSnapshot>>,
+    routes: &FrozenRoutes,
     catalog: &CatalogMap,
     stats: &EmitterStats,
     resolver: &ToastResolver,
@@ -691,7 +682,7 @@ async fn next_batch(
             stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        let Some(route) = routes.get(&rel.rel_name).cloned() else {
+        let Some(route) = routes.route(&rel) else {
             stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
             continue;
         };
@@ -895,11 +886,12 @@ async fn flush_chunks(resolver: &ToastResolver, batch: &mut Vec<ToastRow>) -> Re
 }
 
 /// Convert PostgreSQL TOAST tuple shape into mirror row
-fn row_from_columns(mut tuple: BackfillTuple, toast_relid: u32) -> Option<ToastRow> {
+fn row_from_columns(mut tuple: BackfillTuple, db_oid: u32, toast_relid: u32) -> Option<ToastRow> {
     let (chunk_id, chunk_seq, chunk_data) =
         crate::decode::heap_decoder::take_toast_chunk_columns(&mut tuple.columns)?;
     debug_assert_ne!(tuple.offnum, 0, "walked toast tuple without TID");
     Some(ToastRow {
+        db_oid,
         toast_relid,
         blkno: tuple.blkno,
         offnum: tuple.offnum,
@@ -972,14 +964,9 @@ mod tests {
     /// Flatten the drain's coalesced `Rows` chunks back to a row list
     async fn collect_rows(rx: &mut mpsc::Receiver<BatcherMsg>) -> Vec<RoutedRow> {
         let mut rows = Vec::new();
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                BatcherMsg::Rows(chunk) => rows.extend(chunk.rows),
-                BatcherMsg::Row(r) => rows.push(r),
-                BatcherMsg::FlushAll(reply) => {
-                    let _ = reply.send(());
-                }
-            }
+        // Any other message ends collection short of the expected rows
+        while let Some(BatcherMsg::Rows(chunk)) = rx.recv().await {
+            rows.extend(chunk.rows);
         }
         rows
     }
@@ -990,32 +977,21 @@ mod tests {
     /// read-only end-of-backup store
     #[tokio::test(flavor = "current_thread")]
     async fn a_miss_is_fatal_for_a_seeded_mirror_and_superseded_for_a_read_only_store() {
-        use crate::toast::{ChunkStore, ChunkStoreError, MemChunkStore, ToastRow};
+        use crate::toast::{ChunkStore, ChunkStoreError, MemChunkStore};
 
         struct ReadOnly;
 
         #[async_trait::async_trait]
         impl ChunkStore for ReadOnly {
-            fn accepts_writes(&self) -> bool {
-                false
-            }
-            async fn put(&self, _: &[ToastRow]) -> Result<(), ChunkStoreError> {
-                Err(ChunkStoreError::ReadOnly("put"))
-            }
             async fn fetch_many(
                 &self,
+                _: u32,
                 _: u32,
                 values: &[(u32, usize)],
                 _: u64,
             ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
                 // Incomplete value is absent from end-of-backup state
                 Ok(vec![FetchedValue::Mismatch { got: 7984 }; values.len()])
-            }
-            async fn truncate_mirror(&self, _: u32) -> Result<(), ChunkStoreError> {
-                Err(ChunkStoreError::ReadOnly("truncate_mirror"))
-            }
-            async fn rewrite_barrier(&self, _: u32, _: u64, _: u64) -> Result<(), ChunkStoreError> {
-                Err(ChunkStoreError::ReadOnly("rewrite_barrier"))
             }
         }
 
@@ -1052,7 +1028,12 @@ mod tests {
         let stats = Arc::new(EmitterStats::default());
         let read_only = ToastResolver::with_store(Arc::new(ReadOnly), stats.clone());
         assert!(!read_only.stores_chunks() && !read_only.fill_on_miss());
-        let (column, retained) = apply_fetched(short, &ptr, 25, &rel, "body", &read_only)
+        let fetched = read_only
+            .fetch_value(0, 16390, 16402, u64::MAX, 9100)
+            .await
+            .unwrap();
+        assert_eq!(fetched, short);
+        let (column, retained) = apply_fetched(fetched, &ptr, 25, &rel, "body", &read_only)
             .expect("a read-only backend fills instead of failing the load");
         assert_eq!(column, ColumnValue::Null);
         assert_eq!(retained, 0);
@@ -1098,6 +1079,7 @@ mod tests {
             rel_name: RelName::new("public", &name),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
@@ -1116,8 +1098,8 @@ mod tests {
         })
     }
 
-    fn mapping_for(rel_node: u32) -> TableMapping {
-        TableMapping {
+    fn mapping_for(rel_node: u32) -> Arc<TableMapping> {
+        Arc::new(TableMapping {
             target: TableTarget::new("default", &format!("t{rel_node}")),
             columns: vec![ColumnMapping {
                 src_attnum: 1,
@@ -1125,7 +1107,8 @@ mod tests {
                 target_type: "Int32".into(),
                 type_pinned: false,
             }],
-        }
+            tees: Vec::new(),
+        })
     }
 
     fn tuple(rel_node: u32, id: i32) -> BackfillTuple {
@@ -1160,6 +1143,7 @@ mod tests {
             rel_name: RelName::new("public", &name),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
@@ -1178,8 +1162,8 @@ mod tests {
         })
     }
 
-    fn bytea_mapping_for(rel_node: u32) -> TableMapping {
-        TableMapping {
+    fn bytea_mapping_for(rel_node: u32) -> Arc<TableMapping> {
+        Arc::new(TableMapping {
             target: TableTarget::new("default", &format!("t{rel_node}")),
             columns: vec![ColumnMapping {
                 src_attnum: 1,
@@ -1187,7 +1171,8 @@ mod tests {
                 target_type: "String".into(),
                 type_pinned: false,
             }],
-        }
+            tees: Vec::new(),
+        })
     }
 
     /// `pg_toast` rel so [`CatalogMap::is_toast`] fires; `oid` matches the
@@ -1207,6 +1192,7 @@ mod tests {
             rel_name: RelName::new("pg_toast", &name),
             kind: 't',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![],
         })
@@ -1280,14 +1266,12 @@ mod tests {
         let err = drain(
             rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack,
             stats.clone(),
             ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats),
             Deferral::Rejected,
-            Default::default(),
-            None,
             HashSet::new(),
             false,
             None,
@@ -1327,14 +1311,12 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
             ToastResolver::disabled(),
             Deferral::Local(mem_spool()),
-            Default::default(),
-            None,
             HashSet::new(),
             false,
             None,
@@ -1382,14 +1364,12 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
             ToastResolver::disabled(),
             Deferral::Local(mem_spool()),
-            Default::default(),
-            None,
             HashSet::new(),
             false,
             None,
@@ -1435,14 +1415,12 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
             resolver,
             Deferral::Local(mem_spool()),
-            Default::default(),
-            None,
             HashSet::new(),
             false,
             None,
@@ -1492,14 +1470,12 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
             resolver,
             Deferral::Local(mem_spool()),
-            Default::default(),
-            None,
             HashSet::new(),
             false,
             None,
@@ -1556,7 +1532,7 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
@@ -1566,8 +1542,6 @@ mod tests {
                 spool_tmp.path().join("bootstrap_deferred.bin"),
                 0,
             )),
-            Default::default(),
-            None,
             HashSet::new(),
             false,
             None,
@@ -1616,14 +1590,12 @@ mod tests {
         let mut outcome = drain(
             tup_rx,
             catalog.clone(),
-            mapping.clone(),
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx.clone(),
             ack.clone(),
             stats.clone(),
             resolver.clone(),
             Deferral::Handback(mem_spool()),
-            Default::default(),
-            None,
             HashSet::new(),
             false,
             None,
@@ -1640,7 +1612,7 @@ mod tests {
         );
 
         let resolved = drain_deferred(
-            spool,
+            spool.into(),
             &catalog,
             &mapping,
             &msg_tx,
@@ -1702,14 +1674,12 @@ mod tests {
             let mut outcome = drain(
                 tup_rx,
                 catalog.clone(),
-                mapping.clone(),
+                freeze_routes(&mapping, None, &RowPolicy::default()),
                 msg_tx.clone(),
                 ack.clone(),
                 stats.clone(),
                 resolver.clone(),
                 Deferral::Handback(mem_spool()),
-                Default::default(),
-                None,
                 HashSet::new(),
                 false,
                 None,
@@ -1731,7 +1701,7 @@ mod tests {
         for (spool, ack, collector, first_seq) in lanes {
             remaining -= spool.resident_bytes() as u64;
             drain_deferred(
-                spool,
+                spool.into(),
                 &catalog,
                 &mapping,
                 &msg_tx,
@@ -1786,14 +1756,12 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
             ToastResolver::with_store(store, stats.clone()),
             Deferral::Local(mem_spool()),
-            Default::default(),
-            None,
             HashSet::new(),
             false,
             None,
@@ -1850,7 +1818,7 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
@@ -1859,8 +1827,6 @@ mod tests {
                 spool_tmp.path().join("bootstrap_deferred.bin"),
                 0,
             )),
-            Default::default(),
-            None,
             HashSet::new(),
             false,
             None,
@@ -1898,18 +1864,9 @@ mod tests {
         struct FailPrefetch(AtomicU64);
         #[async_trait::async_trait]
         impl ChunkStore for FailPrefetch {
-            async fn truncate_mirror(&self, _: u32) -> Result<(), ChunkStoreError> {
-                Ok(())
-            }
-            async fn rewrite_barrier(&self, _: u32, _: u64, _: u64) -> Result<(), ChunkStoreError> {
-                Ok(())
-            }
-
-            async fn put(&self, _: &[ToastRow]) -> Result<(), ChunkStoreError> {
-                Ok(())
-            }
             async fn fetch_many(
                 &self,
+                _: u32,
                 _: u32,
                 values: &[(u32, usize)],
                 _: u64,
@@ -1958,7 +1915,7 @@ mod tests {
             .bootstrap_deferred_spool_bytes
             .store(total, Ordering::Relaxed);
         let result = drain_deferred(
-            spool,
+            spool.into(),
             &catalog,
             &mapping,
             &tail.msg_tx,
@@ -1991,7 +1948,7 @@ mod tests {
             .store(total, Ordering::Relaxed);
         let tail = OwnedTail::null();
         let result = drain_deferred(
-            spool,
+            spool.into(),
             &catalog,
             &mapping,
             &tail.msg_tx,
@@ -2031,14 +1988,14 @@ mod tests {
             let store = Arc::new(MemChunkStore::new());
             let chunk = toast_chunk_tuple(16500, 1, 0, body);
             store
-                .put(&[row_from_columns(chunk, 16500).unwrap()])
+                .put(&[row_from_columns(chunk, db_oid, 16500).unwrap()])
                 .await
                 .unwrap();
             stores.push((db_oid, store as Arc<dyn ChunkStore>));
             let mut tuple = bytea_toast_tuple(16400, 16500, 1);
             tuple.rfn.db_node = db_oid;
             let route = RouteSnapshot::freeze(
-                Arc::new(bytea_mapping_for(16400)),
+                bytea_mapping_for(16400),
                 Arc::default(),
                 RowPolicy::default(),
             );
@@ -2119,7 +2076,7 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
@@ -2128,8 +2085,6 @@ mod tests {
                 spool_tmp.path().join("bootstrap_deferred.bin"),
                 0,
             )),
-            Default::default(),
-            None,
             HashSet::new(),
             false,
             None,

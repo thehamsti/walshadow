@@ -1534,6 +1534,10 @@ impl DurableToastStore {
 
 #[async_trait]
 impl ChunkStore for DurableToastStore {
+    fn accepts_writes(&self) -> bool {
+        true
+    }
+
     async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
         let _guard = self.mutation.lock().unwrap();
         self.write_rows(rows.iter().map(StoredToastRow::from))
@@ -1541,18 +1545,20 @@ impl ChunkStore for DurableToastStore {
 
     async fn fetch(
         &self,
+        db_oid: u32,
         relid: u32,
         value_id: u32,
         max_lsn: u64,
         expected_size: usize,
     ) -> Result<FetchedValue, ChunkStoreError> {
         Ok(self
-            .fetch_many(relid, &[(value_id, expected_size)], max_lsn)
+            .fetch_many(db_oid, relid, &[(value_id, expected_size)], max_lsn)
             .await?
             .remove(0))
     }
     async fn fetch_many(
         &self,
+        db_oid: u32,
         relid: u32,
         values: &[(u32, usize)],
         max_lsn: u64,
@@ -1566,7 +1572,10 @@ impl ChunkStore for DurableToastStore {
             .map_err(toast_error)?
             .is_none()
         {
-            return Err(ChunkStoreError::MissingMirror(relid));
+            return Err(ChunkStoreError::MissingMirror {
+                db_oid,
+                toast_relid: relid,
+            });
         }
         let boundary_prefix = format!("toast-truncate/{relid:08x}/");
         let upper = format!("{boundary_prefix}{max_lsn:016x}");
@@ -1648,12 +1657,18 @@ impl ChunkStore for DurableToastStore {
             .collect()
     }
 
-    async fn truncate_mirror(&self, _relid: u32) -> Result<(), ChunkStoreError> {
+    // A store serves one tenant, hence one database: `relid` alone is unique
+    async fn truncate_mirror(&self, _db_oid: u32, _relid: u32) -> Result<(), ChunkStoreError> {
         Err(toast_error(
             "truncate lacks a generation/LSN boundary; refusing to erase history",
         ))
     }
-    async fn truncate_at(&self, relid: u32, record_lsn: u64) -> Result<(), ChunkStoreError> {
+    async fn truncate_at(
+        &self,
+        _db_oid: u32,
+        relid: u32,
+        record_lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
         let _guard = self.mutation.lock().unwrap();
         if record_lsn == 0 {
             return Err(toast_error("truncate record LSN must be positive"));
@@ -1666,7 +1681,12 @@ impl ChunkStore for DurableToastStore {
         batch.put(format!("mirror/{relid:08x}"), b"1");
         self.write(batch)
     }
-    async fn retire_at(&self, relid: u32, commit_lsn: u64) -> Result<(), ChunkStoreError> {
+    async fn retire_at(
+        &self,
+        _db_oid: u32,
+        relid: u32,
+        commit_lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
         let _guard = self.mutation.lock().unwrap();
         let Some(rows) = self.rows(relid)? else {
             return Ok(());
@@ -1696,6 +1716,7 @@ impl ChunkStore for DurableToastStore {
     }
     async fn rewrite_barrier(
         &self,
+        _db_oid: u32,
         relid: u32,
         marker_lsn: u64,
         commit_lsn: u64,

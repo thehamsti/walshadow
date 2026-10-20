@@ -1,5 +1,8 @@
 //! Replaying heap deltas after dropping their earlier images must stay filtered
 
+#[path = "common/tools.rs"]
+mod tools;
+
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -50,12 +53,7 @@ fn lsn(s: &str) -> u64 {
 
 #[tokio::test]
 async fn retained_routes_prevent_invalid_page_recovery_after_resume() {
-    if !Command::new("initdb")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        eprintln!("skip: no initdb on PATH");
+    if !tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -125,7 +123,7 @@ async fn retained_routes_prevent_invalid_page_recovery_after_resume() {
     };
     let bytes = fs::read(raw.join(seg.format())).unwrap();
     for (sh, durable) in [(&bad, false), (&good, true)] {
-        let mut stream = WalStream::new(1, WAL_SEG_SIZE, Pos::new(resume)).unwrap();
+        let mut stream = WalStream::builder(1, WAL_SEG_SIZE, Pos::new(resume)).unwrap();
         if durable {
             stream
                 .filter_mut()
@@ -145,6 +143,7 @@ async fn retained_routes_prevent_invalid_page_recovery_after_resume() {
             .unwrap();
         let mut records = CollectingRecordSink::default();
         let mut sink = DirSegmentSink::new(sh.config().filter_out_dir.clone()).unwrap();
+        let mut stream = stream.start();
         stream
             .push(resume, &bytes, &mut records, &mut sink)
             .await

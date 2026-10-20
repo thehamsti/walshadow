@@ -20,6 +20,7 @@ fn attr(n: i16, name: &str, oid: u32, not_null: bool) -> RelAttr {
 }
 fn desc() -> RelDescriptor {
     RelDescriptor {
+        ancestors: Vec::new(),
         rfn: Default::default(),
         oid: 1,
         toast_oid: 0,

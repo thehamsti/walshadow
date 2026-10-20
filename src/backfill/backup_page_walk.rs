@@ -32,6 +32,7 @@ use crate::backfill::walk_barrier::WalkBarrier;
 use crate::decode::heap_decoder::{
     ColumnValue, CommittedTuple, DecodeError, DecodedHeap, DecodedTuple, HeapOp, decode_block_data,
 };
+use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum, PgXactView, SealedPatch};
 use crate::schema::RelDescriptor;
 use ahash::{HashMap, HashMapExt, HashSet};
 
@@ -138,6 +139,8 @@ impl BackfillTuple {
 #[derive(Debug, Default, Clone)]
 pub struct CatalogMap {
     by_filenode: HashMap<(Oid, Oid), Arc<RelDescriptor>>,
+    /// Heapless, so outside the filenode index
+    partitioned: Vec<Arc<RelDescriptor>>,
 }
 
 impl CatalogMap {
@@ -150,8 +153,17 @@ impl CatalogMap {
             .insert((desc.rfn.db_node, desc.rfn.rel_node), desc);
     }
 
+    pub fn insert_partitioned(&mut self, desc: Arc<RelDescriptor>) {
+        self.partitioned.push(desc);
+    }
+
     pub fn get(&self, db_node: Oid, rel_node: Oid) -> Option<Arc<RelDescriptor>> {
         self.by_filenode.get(&(db_node, rel_node)).cloned()
+    }
+
+    /// Partitioned tables, which own destinations but no heap
+    pub fn partitioned(&self) -> impl Iterator<Item = &Arc<RelDescriptor>> {
+        self.partitioned.iter()
     }
 
     pub fn descriptors(&self) -> impl Iterator<Item = &Arc<RelDescriptor>> {
@@ -361,12 +373,13 @@ pub(crate) fn page_max_offnum(page: &[u8]) -> u16 {
 
 /// Version every tuple on the page predates. In a restored image this is
 /// the version before the carrying record: PG assembles the image inside
-/// the critical section, `PageSetLSN` runs after `XLogInsert` returns
+/// the critical section, `PageSetLSN` runs after `XLogInsert` returns.
+/// `pd_lsn` is `PageXLogRecPtr`, high word (`xlogid`) first
 pub(crate) fn page_pd_lsn(page: &[u8]) -> u64 {
     if page.len() < SIZE_OF_PAGE_HEADER {
         return 0;
     }
-    u64::from_le_bytes(page[0..8].try_into().unwrap())
+    u64::from_le_bytes(page[0..8].try_into().unwrap()).rotate_left(32)
 }
 
 /// Chunk rows a TOAST page holds, TID-keyed and dated `lsn`
@@ -390,6 +403,7 @@ pub(crate) fn toast_rows_from_page(
             continue;
         };
         rows.push(crate::toast::ToastRow {
+            db_oid: rel.rfn.db_node,
             toast_relid: rel.oid,
             blkno,
             offnum,
@@ -461,12 +475,9 @@ pub struct PageWalkSink {
     /// `None` taps everything the catalog map holds. A superset filter, not a
     /// second source of truth: the drain's `skip_initial` stays the authority
     tap_filenodes: Option<Arc<HashSet<(Oid, Oid)>>>,
-    /// `pg_xact/` segments Tap into here for backfill visibility gate
-    /// (architecture/bootstrap.md); `None` (greenfield) keeps Skip.
-    pg_xact: Option<Arc<std::sync::Mutex<crate::decode::visibility::PgXactAccum>>>,
-    /// `pg_multixact/{offsets,members}` segments, for multixact xmax
-    /// resolution in the same gate
-    pg_multixact: Option<Arc<std::sync::Mutex<crate::decode::visibility::PgMultiXactAccum>>>,
+    /// `pg_xact/` and `pg_multixact/` segments Tap into here for backfill
+    /// visibility gate (architecture/bootstrap.md); `None` (greenfield) keeps Skip
+    gate: Option<GateAccums>,
     /// Resumable walk: heap files a checkpoint already proved durable, and the
     /// barrier every other file reports completion through
     resume: Option<WalkResume>,
@@ -507,18 +518,14 @@ impl PageWalkSink {
             captured: Arc::default(),
             store_toast,
             tap_filenodes: None,
-            pg_xact: None,
-            pg_multixact: None,
+            gate: None,
             resume: None,
         }
     }
 
-    /// Collect `pg_xact/` segments for the visibility gate.
-    pub fn with_pg_xact_accum(
-        mut self,
-        accum: Arc<std::sync::Mutex<crate::decode::visibility::PgXactAccum>>,
-    ) -> Self {
-        self.pg_xact = Some(accum);
+    /// Collect `pg_xact/` and `pg_multixact/` segments for the visibility gate
+    pub fn with_gate(mut self, accums: GateAccums) -> Self {
+        self.gate = Some(accums);
         self
     }
 
@@ -553,15 +560,6 @@ impl PageWalkSink {
         entry.1 |= slru;
     }
 
-    /// Collect `pg_multixact/` segments for multixact xmax resolution.
-    pub fn with_pg_multixact_accum(
-        mut self,
-        accum: Arc<std::sync::Mutex<crate::decode::visibility::PgMultiXactAccum>>,
-    ) -> Self {
-        self.pg_multixact = Some(accum);
-        self
-    }
-
     /// Decline filenodes outside `set` at `begin`. Bytes still drain off the
     /// wire; tuples never decode
     pub fn with_tap_filenodes(mut self, set: Arc<HashSet<(Oid, Oid)>>) -> Self {
@@ -594,8 +592,7 @@ impl PageWalkSink {
             captured: Arc::default(),
             store_toast: false,
             tap_filenodes: None,
-            pg_xact: None,
-            pg_multixact: None,
+            gate: None,
             resume: None,
         }
     }
@@ -626,20 +623,15 @@ impl PageWalkSink {
         parse_base_path(&meta.path)
     }
 
-    fn classify_slru(&self, path: &std::path::Path) -> Option<SlruSegment> {
-        if self.pg_xact.is_some()
-            && let Some(segno) = crate::decode::visibility::pg_xact_segno_from_path(path)
-        {
+    fn classify_slru(path: &std::path::Path) -> Option<SlruSegment> {
+        use crate::decode::visibility::MultiXactSegment;
+        if let Some(segno) = crate::decode::visibility::pg_xact_segno_from_path(path) {
             return Some(SlruSegment::PgXact(segno));
         }
-        if self.pg_multixact.is_some() {
-            use crate::decode::visibility::MultiXactSegment;
-            return match crate::decode::visibility::pg_multixact_segno_from_path(path)? {
-                MultiXactSegment::Offsets(s) => Some(SlruSegment::MultiOffsets(s)),
-                MultiXactSegment::Members(s) => Some(SlruSegment::MultiMembers(s)),
-            };
+        match crate::decode::visibility::pg_multixact_segno_from_path(path)? {
+            MultiXactSegment::Offsets(s) => Some(SlruSegment::MultiOffsets(s)),
+            MultiXactSegment::Members(s) => Some(SlruSegment::MultiMembers(s)),
         }
-        None
     }
 }
 
@@ -665,14 +657,14 @@ impl BackupSink for PageWalkSink {
 
     async fn begin(&self, meta: &FileMeta) -> io::Result<FileAction> {
         if matches!(meta.kind, FileKind::File)
-            && let Some(slru) = self.classify_slru(&meta.path)
+            && let Some(gate) = &self.gate
+            && let Some(slru) = Self::classify_slru(&meta.path)
         {
             self.tally(meta, None, true);
             return Ok(FileAction::Tap(Box::new(SlruEntry {
                 seg: slru,
                 buf: Vec::with_capacity(meta.size as usize),
-                pg_xact: self.pg_xact.clone(),
-                pg_multixact: self.pg_multixact.clone(),
+                gate: gate.clone(),
             })));
         }
         let Some(f) = self.classify(meta) else {
@@ -696,15 +688,7 @@ impl BackupSink for PageWalkSink {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(FileAction::Skip);
         }
-        let desc = self.catalog.get(f.db, f.filenode);
-        let is_toast = self.catalog.is_toast(f.db, f.filenode);
-        if is_toast {
-            self.stats
-                .toast_files_observed
-                .fetch_add(1, Ordering::Relaxed);
-        } else if desc.is_some() {
-            self.stats.files_walked.fetch_add(1, Ordering::Relaxed);
-        } else {
+        let Some(desc) = self.catalog.get(f.db, f.filenode) else {
             // Filenode absent from map: seed race (greenfield) or non-opted
             // rel (filtered backfill pass, where this is most files). Skip
             // drains body without page buffering; mux honours the decline
@@ -712,14 +696,15 @@ impl BackupSink for PageWalkSink {
                 .files_skipped_unknown_filenode
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(FileAction::Skip);
-        }
-        let Some(desc) = desc else {
-            // TOAST heap whose descriptor the map lacks; count pages, no walk
-            return Ok(FileAction::Tap(Box::new(PageWalkEntry::counting(
-                f.segno.saturating_mul(RELSEG_BLOCKS),
-                self.stats.clone(),
-            ))));
         };
+        let is_toast = &*desc.rel_name.namespace == PG_TOAST_NS;
+        if is_toast {
+            self.stats
+                .toast_files_observed
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats.files_walked.fetch_add(1, Ordering::Relaxed);
+        }
         let lsn = self
             .lsn_overrides
             .get(&(desc.rfn.db_node, desc.rfn.rel_node))
@@ -789,20 +774,6 @@ pub struct PageWalkEntry {
 }
 
 impl PageWalkEntry {
-    /// Counts pages without decoding them
-    fn counting(block_no: u32, stats: Arc<PageWalkStats>) -> Self {
-        Self {
-            block_no,
-            slab: Vec::with_capacity(SLAB_BYTES + PAGE_BYTES),
-            spare: None,
-            walk: None,
-            out: Out::Captured(Arc::default()),
-            stats,
-            pending: None,
-            finished: None,
-        }
-    }
-
     /// Collect the in-flight walk: recover its slab and ship its tuples.
     /// Shipping here is what carries emitter backpressure back to the read
     async fn join_pending(&mut self) -> io::Result<()> {
@@ -939,8 +910,59 @@ impl EntrySink for PageWalkEntry {
 struct SlruEntry {
     seg: SlruSegment,
     buf: Vec<u8>,
-    pg_xact: Option<Arc<std::sync::Mutex<crate::decode::visibility::PgXactAccum>>>,
-    pg_multixact: Option<Arc<std::sync::Mutex<crate::decode::visibility::PgMultiXactAccum>>>,
+    gate: GateAccums,
+}
+
+/// `pg_xact` and `pg_multixact` accums one gated walk fills
+#[derive(Clone)]
+pub struct GateAccums {
+    pg_xact: Arc<std::sync::Mutex<PgXactAccum>>,
+    pg_multixact: Arc<std::sync::Mutex<PgMultiXactAccum>>,
+}
+
+impl GateAccums {
+    pub fn new(source_major: u32) -> Self {
+        Self {
+            pg_xact: Arc::default(),
+            pg_multixact: Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new(source_major))),
+        }
+    }
+
+    /// Walk reached EOF without error, so every SLRU segment landed
+    pub fn complete(self) -> CompleteAccums {
+        CompleteAccums {
+            pg_xact: std::mem::take(&mut *self.pg_xact.lock().expect("pg_xact accum lock")),
+            pg_multixact: self
+                .pg_multixact
+                .lock()
+                .expect("pg_multixact accum lock")
+                .take(),
+        }
+    }
+}
+
+/// Accums of a finished walk, the only ones deferred tuples resolve against
+pub struct CompleteAccums {
+    pg_xact: PgXactAccum,
+    pg_multixact: PgMultiXactAccum,
+}
+
+impl CompleteAccums {
+    #[cfg(test)]
+    pub(crate) fn from_parts(pg_xact: PgXactAccum, pg_multixact: PgMultiXactAccum) -> Self {
+        Self {
+            pg_xact,
+            pg_multixact,
+        }
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.pg_xact.segment_count()
+    }
+
+    pub fn view<'a>(&'a self, patch: &'a SealedPatch) -> PgXactView<'a> {
+        PgXactView::new(&self.pg_xact, patch).with_multixact(&self.pg_multixact)
+    }
 }
 
 #[async_trait]
@@ -951,34 +973,16 @@ impl EntrySink for SlruEntry {
     }
 
     async fn end(self: Box<Self>) -> io::Result<()> {
-        let SlruEntry {
-            seg,
-            buf,
-            pg_xact,
-            pg_multixact,
-        } = *self;
+        let SlruEntry { seg, buf, gate } = *self;
+        let multi = || gate.pg_multixact.lock().expect("pg_multixact accum lock");
         match seg {
-            SlruSegment::PgXact(segno) => {
-                if let Some(a) = pg_xact {
-                    a.lock()
-                        .expect("pg_xact accum lock")
-                        .insert_segment(segno, buf);
-                }
-            }
-            SlruSegment::MultiOffsets(segno) => {
-                if let Some(a) = pg_multixact {
-                    a.lock()
-                        .expect("pg_multixact accum lock")
-                        .insert_offsets_segment(segno, buf);
-                }
-            }
-            SlruSegment::MultiMembers(segno) => {
-                if let Some(a) = pg_multixact {
-                    a.lock()
-                        .expect("pg_multixact accum lock")
-                        .insert_members_segment(segno, buf);
-                }
-            }
+            SlruSegment::PgXact(segno) => gate
+                .pg_xact
+                .lock()
+                .expect("pg_xact accum lock")
+                .insert_segment(segno, buf),
+            SlruSegment::MultiOffsets(segno) => multi().insert_offsets_segment(segno, buf),
+            SlruSegment::MultiMembers(segno) => multi().insert_members_segment(segno, buf),
         }
         Ok(())
     }
@@ -1023,7 +1027,7 @@ pub(crate) fn synth_toast_chunk_page(
     pd_lsn: u64,
 ) -> [u8; PAGE_BYTES] {
     let mut page = [0u8; PAGE_BYTES];
-    page[0..8].copy_from_slice(&pd_lsn.to_le_bytes());
+    page[0..8].copy_from_slice(&pd_lsn.rotate_left(32).to_le_bytes());
     let mut upper = PAGE_BYTES;
     for (i, (chunk_id, chunk_seq, body)) in chunks.iter().enumerate() {
         let len = 24 + 4 + 4 + 1 + body.len();
@@ -1063,6 +1067,7 @@ pub(crate) fn make_rel() -> RelDescriptor {
         rel_name: RelName::new("public", "t"),
         kind: 'r',
         persistence: 'p',
+        ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: vec![RelAttr {
             attnum: 1,
@@ -1133,6 +1138,7 @@ mod tests {
     use super::*;
 
     use crate::backfill::backup_source::EndInfo;
+    use crate::backfill::backup_source::testing::expect_tap;
 
     fn ld(a: &AtomicU64) -> u64 {
         a.load(Ordering::Relaxed)
@@ -1140,10 +1146,7 @@ mod tests {
 
     /// `begin` must tap; hands back the owned entry sink
     async fn tap(sink: &PageWalkSink, meta: &FileMeta) -> Box<dyn EntrySink> {
-        match sink.begin(meta).await.unwrap() {
-            FileAction::Tap(e) => e,
-            other => panic!("expected Tap for {}, got {other:?}", meta.path.display()),
-        }
+        expect_tap(sink.begin(meta).await.unwrap())
     }
 
     fn heap_meta(path: &str) -> FileMeta {
@@ -1239,6 +1242,15 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(tally.tuples_skipped_lp_flag, 1);
         assert_eq!(tally.tuples_emitted, 0);
+    }
+
+    /// Header bytes from a PG 18 heap page that `page_header()` reports as
+    /// lsn 13/1085150
+    #[test]
+    fn page_pd_lsn_reads_xlogid_then_xrecoff() {
+        let mut page = [0u8; PAGE_BYTES];
+        page[0..8].copy_from_slice(&[0x13, 0x00, 0x00, 0x00, 0x50, 0x51, 0x08, 0x01]);
+        assert_eq!(page_pd_lsn(&page), 0x13_0108_5150);
     }
 
     /// A restored image mirrors every chunk on the page, not only the tuple
@@ -1601,9 +1613,7 @@ mod tests {
             sink.begin(&part("base/5/16400.1")).await.unwrap(),
             FileAction::Skip
         ));
-        let FileAction::Tap(entry) = sink.begin(&part("base/5/16400")).await.unwrap() else {
-            panic!("an unrecorded heap file must tap");
-        };
+        let entry = expect_tap(sink.begin(&part("base/5/16400")).await.unwrap());
         assert!(
             barrier.pop_finished().await.is_none(),
             "nothing reports before its body ends"

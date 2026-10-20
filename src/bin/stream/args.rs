@@ -235,8 +235,7 @@ pub(crate) struct Args {
     /// Startup removes transient transaction spill only
     #[arg(long)]
     pub(crate) spill_dir: PathBuf,
-    /// In-memory xact buffer budget in bytes. Default matches PG's
-    /// `logical_decoding_work_mem` (64 MiB).
+    /// In-memory xact buffer budget in bytes, shared across open transactions
     #[arg(long, default_value_t = walshadow::xact_buffer::DEFAULT_XACT_BUFFER_MAX)]
     pub(crate) xact_buffer_max: usize,
     /// Destination TOML configuration for ClickHouse or Snowflake.
@@ -279,6 +278,10 @@ pub(crate) struct Args {
     /// (see `trace::should_sample`), so per-record span cost scales with it.
     #[arg(long, default_value_t = 0.01)]
     pub(crate) trace_sample_ratio: f64,
+    /// Tokio runtime worker threads. Absent defers to tokio:
+    /// `TOKIO_WORKER_THREADS`, else one per CPU
+    #[arg(long)]
+    pub(crate) worker_threads: Option<NonZeroUsize>,
     /// WAL retention horizon in bytes. Segments older than
     /// `shadow_replay_lsn - retention_bytes` deleted every trim cycle.
     /// `0` disables trim.
@@ -482,15 +485,7 @@ pub(crate) async fn build_emitter_config(
         }
     }
     if let Some(snowflake) = destination.snowflake {
-        anyhow::ensure!(
-            cfg.column_entries.is_empty() && cfg.tables.is_empty(),
-            "Snowflake explicit column mappings are not supported; use source-shaped tables"
-        );
-        anyhow::ensure!(
-            cfg.databases.len() <= 1,
-            "Snowflake follows one source database; declare a tenant per database instead of \
-             `[database.*]` entries"
-        );
+        walshadow::destination::config::check_snowflake_routing(&cfg)?;
         cfg.row_budget = snowflake.batch_rows;
         cfg.byte_budget = snowflake.batch_bytes;
         cfg.flush_timeout = std::time::Duration::from_millis(snowflake.flush_interval_ms);

@@ -24,6 +24,7 @@ use crate::decode::wal_xact::{
 };
 use tokio_postgres::Client;
 
+use crate::decode::decoder_sink::{DecoderStats, SkipReason};
 use crate::filter::catalog_tracker::{CatalogTracker, SeedError};
 use crate::filter::classify::{Class, classify};
 use crate::filter::dirty_tree::{DirtyState, DirtyTree};
@@ -71,12 +72,10 @@ impl FilterStats {
 #[derive(Debug, Clone)]
 pub struct Verdict {
     pub route: Route,
-    /// Commit record of a catalog-mutating xact (top, subxact, or prepared
-    /// xid wrote a catalog-touching record), or a command boundary inside
-    /// one. Pump holds shadow publication here
-    /// until replay passes the record's `next_lsn`
-    pub catalog_boundary: bool,
-    /// Capture input; `Some` iff `catalog_boundary`
+    /// Capture input at a commit record of a catalog-mutating xact (top,
+    /// subxact, or prepared xid wrote a catalog-touching record), or a command
+    /// boundary inside one. Pump holds shadow publication here until replay
+    /// passes the record's `next_lsn`
     pub boundary: Option<Arc<BoundaryInfo>>,
     /// Members of a catalog-dirty tree this record aborted
     pub aborted_tree: Option<Arc<Vec<u32>>>,
@@ -152,10 +151,12 @@ pub struct Filter {
     /// Databases that need table metadata updates, empty disables capture
     /// Continue routing WAL and tracking catalog files for all databases
     targets: Vec<u32>,
+    creating_dbs: HashMap<u32, u32>,
     shadow_rels: Option<ShadowRelations>,
     /// Xid ceilings the shadow TOAST store reads. Absent for offline
     /// filters, which serve no reads
     xid_ceiling: Option<Arc<XidCeiling>>,
+    skip_stats: Option<Arc<DecoderStats>>,
 }
 
 impl Filter {
@@ -168,9 +169,42 @@ impl Filter {
             observed_from_xid: None,
             smgr_markers: Arc::new(Mutex::new(SmgrMarkers::default())),
             targets: Vec::new(),
+            creating_dbs: HashMap::default(),
             shadow_rels: None,
             xid_ceiling: None,
+            skip_stats: None,
         }
+    }
+
+    pub fn set_skip_stats(&mut self, stats: Arc<DecoderStats>) {
+        self.skip_stats = Some(stats);
+    }
+
+    fn note_index_drop(&self, record: &XLogRecord, source_lsn: u64) {
+        let Some(stats) = self
+            .skip_stats
+            .as_ref()
+            .filter(|s| s.attribute_skips.load(std::sync::atomic::Ordering::Relaxed))
+        else {
+            return;
+        };
+        let rm = record.header.resource_manager_id;
+        if !is_index_rmgr(rm) {
+            return;
+        }
+        let rel = record
+            .blocks
+            .first()
+            .map(|b| b.header.location.rel)
+            .or_else(|| main_data::relation_for_empty(record))
+            .unwrap_or_default();
+        stats.skip(
+            SkipReason::IndexDropped,
+            &record.header,
+            source_lsn,
+            rel.db_node,
+            rel.rel_node,
+        );
     }
 
     /// Feed xid ceilings for shadow TOAST generation checks
@@ -187,11 +221,6 @@ impl Filter {
     /// [`set_target_db`](Self::set_target_db) for a multi-database stream
     pub fn set_target_dbs(&mut self, db_oids: impl IntoIterator<Item = u32>) {
         self.targets = db_oids.into_iter().collect();
-    }
-
-    /// Followed databases, in the order they were set
-    pub fn target_dbs(&self) -> &[u32] {
-        &self.targets
     }
 
     /// Follow another database too: its catalog writes now dirty capture
@@ -361,6 +390,11 @@ impl Filter {
             self.observe_from_xid(next_xid);
         }
         let xid = record.header.xact_id;
+        if xid != 0
+            && let Some(db) = created_database(record)
+        {
+            self.creating_dbs.insert(xid, db);
+        }
         if let Some(ceiling) = &self.xid_ceiling {
             ceiling.observe(source_lsn, xid);
         }
@@ -374,7 +408,9 @@ impl Filter {
         // Foreign and shared catalog writes route to shadow and update the
         // cluster-wide tracker above, but feed no descriptor of the
         // followed database, so they must not dirty its capture tree
-        if let Some(db) = catalog_touch_db.filter(|db| xid != 0 && self.is_target_db(*db)) {
+        if let Some(db) = catalog_touch_db.filter(|db| {
+            xid != 0 && self.is_target_db(*db) && self.creating_dbs.get(&xid) != Some(db)
+        }) {
             let dirty = self.dirty.touch(xid, source_lsn);
             dirty.direct_write = true;
             if let Some(have) = dirty.db
@@ -398,9 +434,11 @@ impl Filter {
         let end = self.observe_xact_end(record, source_lsn, page_magic)?;
         self.stats
             .record(class, route, record.header.total_record_length as u64);
+        if route == Route::ToDecoder {
+            self.note_index_drop(record, source_lsn);
+        }
         Ok(Verdict {
             route,
-            catalog_boundary: end.boundary.is_some(),
             boundary: end.boundary,
             aborted_tree: end.aborted_tree,
             defer_catalog_decode,
@@ -453,6 +491,7 @@ impl Filter {
         let payload = parse_xact_payload(info, &record.main_data, page_magic)?;
         let xact_db = payload.db_id;
         let header_xid = record.header.xact_id;
+        self.creating_dbs.remove(&header_xid);
         let (merged, members) =
             self.dirty
                 .drain_tree(header_xid, payload.twophase_xid, &payload.subxacts);
@@ -720,6 +759,35 @@ impl Default for Filter {
     }
 }
 
+fn created_database(record: &XLogRecord) -> Option<u32> {
+    if record.header.resource_manager_id != RmId::Dbase as u8 {
+        return None;
+    }
+    let op = record.header.info & 0xF0;
+    if op != XLOG_DBASE_CREATE_FILE_COPY && op != XLOG_DBASE_CREATE_WAL_LOG {
+        return None;
+    }
+    let db = record.main_data.get(..4)?;
+    Some(u32::from_le_bytes(db.try_into().ok()?))
+}
+
+const XLOG_DBASE_CREATE_FILE_COPY: u8 = 0x00;
+const XLOG_DBASE_CREATE_WAL_LOG: u8 = 0x10;
+
+fn is_index_rmgr(rm: u8) -> bool {
+    [
+        RmId::Btree,
+        RmId::Hash,
+        RmId::Gin,
+        RmId::Gist,
+        RmId::Spgist,
+        RmId::Brin,
+        RmId::Generic,
+    ]
+    .into_iter()
+    .any(|id| id as u8 == rm)
+}
+
 fn any_block_is_catalog(tracker: &CatalogTracker, blocks: &[XLogRecordBlock]) -> bool {
     blocks.iter().any(|b| {
         let r = b.header.location.rel;
@@ -982,6 +1050,33 @@ mod tests {
     }
 
     #[test]
+    fn dropped_index_record_lands_in_skip_ledger() {
+        use crate::decode::decoder_sink::SkipKey;
+        let mut f = target_filter();
+        let stats = Arc::new(DecoderStats::default());
+        stats
+            .attribute_skips
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        f.set_skip_stats(stats.clone());
+        assert_eq!(f.decide(&rec(RmId::Btree, &[(5, 20001)])), Route::ToDecoder);
+        assert_eq!(f.decide(&rec(RmId::Btree, &[(5, 20001)])), Route::ToDecoder);
+        assert_eq!(f.decide(&rec(RmId::Heap, &[(5, 20000)])), Route::ToDecoder);
+        assert_eq!(f.decide(&rec(RmId::Btree, &[(5, 1259)])), Route::ToShadow);
+        assert_eq!(
+            stats.skipped_by_rel.snapshot(),
+            vec![(
+                SkipKey {
+                    db_oid: 5,
+                    rel_node: 20001,
+                    op: "btree",
+                    reason: SkipReason::IndexDropped,
+                },
+                2,
+            )],
+        );
+    }
+
+    #[test]
     fn special_rmgr_is_kept() {
         let mut f = target_filter();
         let r = rec(RmId::Clog, &[]);
@@ -1132,16 +1227,16 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 8, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary);
+        assert!(v.boundary.is_none());
         // Catalog-dirty xid 7 commit: boundary, drained after
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(v.catalog_boundary);
+        assert!(v.boundary.is_some());
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "dirty mark consumed once");
+        assert!(v.boundary.is_none(), "dirty mark consumed once");
     }
 
     #[test]
@@ -1152,11 +1247,11 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_ABORT, 7, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "rolled-back DDL never holds");
+        assert!(v.boundary.is_none(), "rolled-back DDL never holds");
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "abort drained the mark");
+        assert!(v.boundary.is_none(), "abort drained the mark");
     }
 
     #[test]
@@ -1172,7 +1267,7 @@ mod tests {
                 0xD116,
             )
             .unwrap();
-        assert!(v.catalog_boundary);
+        assert!(v.boundary.is_some());
     }
 
     #[test]
@@ -1212,7 +1307,7 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 100, &[], None), 200, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "aborted child never bounds");
+        assert!(v.boundary.is_none(), "aborted child never bounds");
     }
 
     #[test]
@@ -1239,7 +1334,7 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 200, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "prune-only commit never bounds");
+        assert!(v.boundary.is_none(), "prune-only commit never bounds");
         // Tuple lock and vacuum inplace stats: same treatment
         for info in [XLOG_HEAP_LOCK, XLOG_HEAP_INPLACE] {
             let mut r = rec_with_xid(RmId::Heap, &[(5, 1259)], 8);
@@ -1290,7 +1385,7 @@ mod tests {
                 0xD116,
             )
             .unwrap();
-        assert!(v.catalog_boundary);
+        assert!(v.boundary.is_some());
         assert!(!user(&mut f, 100), "commit clears the tree");
     }
 
@@ -1299,10 +1394,7 @@ mod tests {
         let mut f = target_filter();
         let mut r = xact_assignment(100, &[101]);
         // Claim two subxids, carry one
-        match &mut r.main_data {
-            std::borrow::Cow::Owned(md) => md[4..8].copy_from_slice(&2i32.to_le_bytes()),
-            _ => unreachable!(),
-        }
+        r.main_data.to_mut()[4..8].copy_from_slice(&2i32.to_le_bytes());
         assert!(f.decide_record(&r, 150, 0xD116).is_err());
     }
 
@@ -1319,7 +1411,7 @@ mod tests {
                 0xD116,
             )
             .unwrap();
-        assert!(v.catalog_boundary);
+        assert!(v.boundary.is_some());
     }
 
     #[test]
@@ -1333,7 +1425,7 @@ mod tests {
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 9, &[], None), 0, 0xD116)
             .unwrap();
         assert!(
-            v.catalog_boundary,
+            v.boundary.is_some(),
             "VACUUM FULL relmap write holds at commit"
         );
     }
@@ -1351,7 +1443,7 @@ mod tests {
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
         assert!(
-            !v.catalog_boundary,
+            v.boundary.is_none(),
             "safe-default keep is not a catalog touch"
         );
     }
@@ -1365,7 +1457,7 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(v.catalog_boundary);
+        assert!(v.boundary.is_some());
     }
 
     #[test]
@@ -1748,11 +1840,11 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_ABORT, 7, &[], None), 200, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary);
+        assert!(v.boundary.is_none());
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 300, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "abort drained the mark");
+        assert!(v.boundary.is_none(), "abort drained the mark");
     }
 
     #[test]
@@ -1839,10 +1931,7 @@ mod tests {
         let mut f = target_filter();
         let mut r = xact_invals_rec(7, &[(-2, 5, 16400)]);
         // Claim two messages, carry one
-        match &mut r.main_data {
-            std::borrow::Cow::Owned(md) => md[0..4].copy_from_slice(&2i32.to_le_bytes()),
-            _ => unreachable!(),
-        }
+        r.main_data.to_mut()[0..4].copy_from_slice(&2i32.to_le_bytes());
         assert!(f.decide_record(&r, 150, 0xD116).is_err());
     }
 
@@ -1929,31 +2018,12 @@ mod tests {
 
     /// Commit / abort carrying `xl_xact_dbinfo` (`Oid dbId; Oid tsId`), the
     /// committing backend's database
-    fn xact_end_dbinfo(
-        op: u8,
-        xid: u32,
-        db_id: u32,
-        invals: &[(i8, u32, u32)],
-    ) -> XLogRecord<'static> {
-        use crate::decode::wal_xact::{XACT_XINFO_HAS_DBINFO, XACT_XINFO_HAS_INVALS};
+    fn xact_end_dbinfo(op: u8, xid: u32, db_id: u32) -> XLogRecord<'static> {
+        use crate::decode::wal_xact::XACT_XINFO_HAS_DBINFO;
         let mut md: Vec<u8> = 0i64.to_le_bytes().to_vec();
-        let mut xinfo = XACT_XINFO_HAS_DBINFO;
-        if !invals.is_empty() {
-            xinfo |= XACT_XINFO_HAS_INVALS;
-        }
-        md.extend_from_slice(&xinfo.to_le_bytes());
+        md.extend_from_slice(&XACT_XINFO_HAS_DBINFO.to_le_bytes());
         md.extend_from_slice(&db_id.to_le_bytes());
         md.extend_from_slice(&1663u32.to_le_bytes()); // tsId
-        if !invals.is_empty() {
-            md.extend_from_slice(&(invals.len() as i32).to_le_bytes());
-            for &(id, db, rel) in invals {
-                let mut msg = [0u8; 16];
-                msg[0] = id as u8;
-                msg[4..8].copy_from_slice(&db.to_le_bytes());
-                msg[8..12].copy_from_slice(&rel.to_le_bytes());
-                md.extend_from_slice(&msg);
-            }
-        }
         let mut r = rec_with_xid(RmId::Xact, &[], xid);
         r.header.info = op | XLOG_XACT_HAS_INFO;
         r.main_data = std::borrow::Cow::Owned(md);
@@ -1982,12 +2052,12 @@ mod tests {
         );
         let v = f
             .decide_record(
-                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB),
                 200,
                 0xD116,
             )
             .unwrap();
-        assert!(!v.catalog_boundary, "foreign commit bounds nothing local");
+        assert!(v.boundary.is_none(), "foreign commit bounds nothing local");
 
         // Same oid in the followed database: dirt, fence, boundary, and a
         // first touch that owes nothing to the foreign write
@@ -2003,7 +2073,7 @@ mod tests {
         assert!(user.defer_catalog_decode, "target DDL fences its own rows");
         let b = f
             .decide_record(
-                &xact_end_dbinfo(XLOG_XACT_COMMIT, 8, TARGET_DB, &[]),
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 8, TARGET_DB),
                 400,
                 0xD116,
             )
@@ -2028,7 +2098,7 @@ mod tests {
         .unwrap();
         let v = f
             .decide_record(
-                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB),
                 200,
                 0xD116,
             )
@@ -2050,13 +2120,9 @@ mod tests {
                 "filenode tracking stays cluster-wide"
             );
             let v = f
-                .decide_record(
-                    &xact_end_dbinfo(XLOG_XACT_COMMIT, xid, db, &[]),
-                    200,
-                    0xD116,
-                )
+                .decide_record(&xact_end_dbinfo(XLOG_XACT_COMMIT, xid, db), 200, 0xD116)
                 .unwrap();
-            assert!(!v.catalog_boundary, "db {db} relmap is not target dirt");
+            assert!(v.boundary.is_none(), "db {db} relmap is not target dirt");
         }
     }
 
@@ -2069,7 +2135,7 @@ mod tests {
             .unwrap();
         let v = f
             .decide_record(
-                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB),
                 200,
                 0xD116,
             )
@@ -2080,12 +2146,51 @@ mod tests {
         );
         let v = f
             .decide_record(
-                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB),
                 300,
                 0xD116,
             )
             .unwrap();
-        assert!(!v.catalog_boundary, "commit drained the tree");
+        assert!(v.boundary.is_none(), "commit drained the tree");
+    }
+
+    fn dbase_create(db: u32, xid: u32) -> XLogRecord<'static> {
+        let mut r = rec_with_xid(RmId::Dbase, &[], xid);
+        r.header.info = XLOG_DBASE_CREATE_WAL_LOG;
+        let mut md = db.to_le_bytes().to_vec();
+        md.extend_from_slice(&1663u32.to_le_bytes());
+        r.main_data = std::borrow::Cow::Owned(md);
+        r
+    }
+
+    #[test]
+    fn creating_the_target_database_is_not_a_foreign_scope() {
+        let mut f = target_filter();
+        f.decide_record(&dbase_create(TARGET_DB, 7), 50, 0xD116)
+            .unwrap();
+        f.decide_record(&pg_class_write(TARGET_DB, 7, 16400), 100, 0xD116)
+            .unwrap();
+        let v = f
+            .decide_record(
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB),
+                200,
+                0xD116,
+            )
+            .unwrap();
+        assert!(v.boundary.is_none());
+        f.decide_record(&pg_class_write(TARGET_DB, 8, 16401), 300, 0xD116)
+            .unwrap();
+        let err = f
+            .decide_record(
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 8, FOREIGN_DB),
+                400,
+                0xD116,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, XactPayloadError::ForeignScope { .. }),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2095,25 +2200,20 @@ mod tests {
             .unwrap();
         let err = f
             .decide_record(
-                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB),
                 200,
                 0xD116,
             )
             .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                XactPayloadError::ForeignScope {
-                    db_id: FOREIGN_DB,
-                    target: TARGET_DB
-                }
-            ),
-            "{err}"
-        );
+        let want = XactPayloadError::ForeignScope {
+            db_id: FOREIGN_DB,
+            target: TARGET_DB,
+        };
+        assert_eq!(err.to_string(), want.to_string());
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 300, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "drain ran before the scope check");
+        assert!(v.boundary.is_none(), "drain ran before the scope check");
     }
 
     #[test]

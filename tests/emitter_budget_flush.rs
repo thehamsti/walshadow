@@ -23,9 +23,10 @@ use std::sync::atomic::Ordering;
 
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::CompressionChoice;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
+use walshadow::pipeline::ack::Publish;
 use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::pos::Pos;
@@ -47,6 +48,7 @@ fn rel_descriptor() -> Arc<RelDescriptor> {
         rel_name: RelName::new("public", "foo"),
         kind: 'r',
         persistence: 'p',
+        ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: vec![
             RelAttr {
@@ -98,6 +100,7 @@ fn mapping() -> Arc<TableMapping> {
                 type_pinned: false,
             },
         ],
+        tees: Vec::new(),
     })
 }
 
@@ -124,8 +127,7 @@ fn tuple(id: i32, source_lsn: u64, commit_lsn: u64) -> CommittedTuple {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn budget_trips_seal_complete_inserts() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
 
@@ -148,10 +150,13 @@ async fn budget_trips_seal_complete_inserts() {
     // Trip the batcher after every 2 rows so a 5-row seq seals 3 blocks
     // (2 budget trips + the final FlushAll).
     let cfg = EmitterConfig {
-        host: "127.0.0.1".into(),
-        port: slot.ch_tcp,
-        database: "walshadow_test".into(),
-        compression: CompressionChoice::Lz4,
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port: slot.ch_tcp,
+            database: "walshadow_test".into(),
+            compression: CompressionChoice::Lz4,
+            ..Default::default()
+        },
         row_budget: 2,
         ..Default::default()
     };
@@ -177,11 +182,11 @@ async fn budget_trips_seal_complete_inserts() {
     );
     const N: i32 = 5;
     let commit_lsn = 0xC0FFEE;
-    ack.register(0, commit_lsn);
+    let seq = ack.seqs(0).open(commit_lsn, Publish::Commit);
     for i in 0..N {
         msg_tx
             .send(BatcherMsg::Row(RoutedRow {
-                seq: 0,
+                seq: seq.seq(),
                 rel: rel.clone(),
                 route: route.clone(),
                 committed: tuple(i, 0x1000 + i as u64, commit_lsn),
@@ -190,7 +195,7 @@ async fn budget_trips_seal_complete_inserts() {
             .await
             .expect("route row");
     }
-    ack.placed(0, N as u64);
+    seq.place(N as u64);
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     msg_tx
         .send(BatcherMsg::FlushAll(reply_tx))
@@ -198,9 +203,7 @@ async fn budget_trips_seal_complete_inserts() {
         .expect("send flush");
     reply_rx.await.expect("flush ack");
     ack.wait_through(1).await.expect("ack collector alive");
-    drop(msg_tx);
-    drop(ack);
-    tail_parts.join().await;
+    tail_parts.close(msg_tx, ack).await;
     assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
 
     // The contiguous-done watermark reaches the seq's commit lsn.

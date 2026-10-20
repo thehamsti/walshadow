@@ -153,7 +153,9 @@ async fn run_boundary_ddl(held: Held<'_>, d_ddl: &str) -> Result<(), String> {
         NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
+            detach_strategy: None,
             initial_load: None,
         },
     );
@@ -251,8 +253,10 @@ async fn run_boundary_ddl(held: Held<'_>, d_ddl: &str) -> Result<(), String> {
 /// promptly. Guards the repro below against a harness-level stall.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn boundary_capture_completes_without_held_catalog_lock() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::tools::pg_available()
+        || !fx::tools::pg_basebackup_available()
+        || !fx::tools::clickhouse_available()
+    {
         return;
     }
     run_boundary(None).await.expect("control boundary");
@@ -262,8 +266,10 @@ async fn boundary_capture_completes_without_held_catalog_lock() {
 /// walshadow is withholding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn boundary_capture_survives_recovery_held_catalog_lock() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::tools::pg_available()
+        || !fx::tools::pg_basebackup_available()
+        || !fx::tools::clickhouse_available()
+    {
         return;
     }
     if let Err(e) = run_boundary(Some(PG_TYPE)).await {
@@ -279,8 +285,10 @@ async fn boundary_capture_survives_recovery_held_catalog_lock() {
 /// ship raw bytes instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn boundary_capture_survives_recovery_held_lock_with_fast_default() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::tools::pg_available()
+        || !fx::tools::pg_basebackup_available()
+        || !fx::tools::clickhouse_available()
+    {
         return;
     }
     if let Err(e) =
@@ -305,8 +313,10 @@ async fn boundary_capture_survives_recovery_held_lock_with_fast_default() {
 /// one away before the backup, and PG 19 does
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn boundary_capture_survives_recovery_held_lock_on_scoped_catalog() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::tools::pg_available()
+        || !fx::tools::pg_basebackup_available()
+        || !fx::tools::clickhouse_available()
+    {
         return;
     }
     let ddl = "ALTER TABLE demo ADD COLUMN w int, ALTER COLUMN v SET NOT NULL";

@@ -2,6 +2,10 @@
 //!
 //! Require `pgext/walshadow.so` built against `initdb` PG major
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::pg_available;
+
 #[path = "common/ports.rs"]
 mod ports;
 
@@ -9,7 +13,6 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,17 +26,7 @@ use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn
 use walshadow::pg::socket_conninfo;
 use walshadow::schema::{NUMERICOID, ReplIdent};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{CatalogError, ShadowCatalog, ShadowCatalogConfig};
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
+use walshadow::shadow_catalog::{CatalogError, ParkedAt, ShadowCatalog, ShadowCatalogConfig};
 
 /// Build tree holding `walshadow.so`, fed to shadow as `dynamic_library_path`.
 /// Module is not optional, so an unbuilt tree fails rather than skips
@@ -240,14 +233,13 @@ async fn strings_through_oracle(bridge: Arc<Bridge>, items: &[(u32, &[u8])]) -> 
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_hello_and_encode_native() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
     let bridge = dial(&guard.sh).await;
 
-    let info = bridge.info().expect("hello");
+    let info = bridge.info();
     assert_eq!(info.proto, PROTO_VERSION);
     assert_eq!(info.projection, PROJECTION_VERSION);
     assert!(info.pg_version_num >= 160000, "{info:?}");
@@ -276,7 +268,6 @@ async fn bridge_hello_and_encode_native() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_native_strings_match_typoutput() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -395,7 +386,6 @@ async fn bridge_native_strings_match_typoutput() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_scans_uncommitted_ddl() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -618,7 +608,6 @@ async fn bridge_scans_uncommitted_ddl() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_scans_null_missing_value() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -698,7 +687,6 @@ async fn bridge_scans_null_missing_value() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_reconnects_after_worker_exit() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -779,7 +767,6 @@ async fn bridge_reconnects_after_worker_exit() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_drops_bad_frames_per_connection() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -819,7 +806,6 @@ async fn bridge_drops_bad_frames_per_connection() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_overlay_descriptors_track_open_ddl() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -840,7 +826,10 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
              ALTER TABLE app.m ADD COLUMN v numeric[] DEFAULT '{1.5}';
              ALTER TABLE app.m ADD COLUMN at timestamp DEFAULT '2024-01-02 03:04:05';
              ALTER TABLE app.m ADD COLUMN ok bool DEFAULT 'yes';
-             ALTER TABLE app.m DROP COLUMN gone;",
+             ALTER TABLE app.m DROP COLUMN gone;
+             CREATE TABLE app.p (id int, r int) PARTITION BY LIST (r);
+             CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES IN (1) PARTITION BY LIST (id);
+             CREATE TABLE app.p11 PARTITION OF app.p1 FOR VALUES IN (1);",
         )
         .await
         .expect("committed setup");
@@ -855,7 +844,22 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
         .await
         .expect("mirroring statement");
     assert_eq!(stated, committed, "statement diverged from the worker");
-    assert_eq!(mirror.stats().mirror_fetches, 1);
+    let oid_leaf = oid_of(&setup, "app.p11").await;
+    let (_, leaf) = mirror
+        .fetch_descriptors_batch(&[oid_leaf])
+        .await
+        .expect("mirrored partition");
+    assert_eq!(
+        leaf,
+        cat.fetch_descriptors_batch(&[oid_leaf]).await.unwrap().1
+    );
+    let chain: Vec<&str> = leaf[0]
+        .ancestors
+        .iter()
+        .map(|a| &*a.rel_name.name)
+        .collect();
+    assert_eq!(chain, ["p1", "p"]);
+    assert_eq!(mirror.stats().mirror_fetches, 2);
     let sorted = |(_, mut descs): (u64, Vec<walshadow::schema::RelDescriptor>)| {
         descs.sort_by_key(|d| d.oid);
         descs
@@ -871,7 +875,7 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
     idle.batch_execute("BEGIN").await.expect("begin idle");
     let idle_xid = top_xid(&idle).await;
     let overlay = cat
-        .fetch_overlay_descriptors(&[oid_t], idle_xid, 0)
+        .fetch_overlay_descriptors(&[oid_t], idle_xid, &ParkedAt::assume_for_test(0))
         .await
         .expect("overlay batch");
     assert_eq!(
@@ -896,7 +900,7 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
     let oid_u = oid_of(&ddl, "fresh.u").await;
 
     let mut descs = cat
-        .fetch_overlay_descriptors(&[oid_t, oid_u], xid, 0)
+        .fetch_overlay_descriptors(&[oid_t, oid_u], xid, &ParkedAt::assume_for_test(0))
         .await
         .expect("overlay under open ddl");
     descs.sort_by_key(|d| d.oid);
@@ -944,7 +948,7 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
     // Replay off the asserted boundary is the caller's whole basis for reading
     // uncommitted rows, so it fails rather than answering
     let err = cat
-        .fetch_overlay_descriptors(&[oid_t], xid, 0x1000)
+        .fetch_overlay_descriptors(&[oid_t], xid, &ParkedAt::assume_for_test(0x1000))
         .await
         .unwrap_err();
     assert!(
@@ -957,7 +961,7 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
 
     ddl.batch_execute("ROLLBACK").await.expect("undo");
     let after = cat
-        .fetch_overlay_descriptors(&[oid_t, oid_u], xid, 0)
+        .fetch_overlay_descriptors(&[oid_t, oid_u], xid, &ParkedAt::assume_for_test(0))
         .await
         .expect("overlay after rollback");
     assert_eq!(after, committed, "aborted tree still visible");
@@ -982,7 +986,6 @@ fn parse_error_frame(body: &[u8]) -> String {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_error_frames_stay_parseable() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1025,7 +1028,6 @@ async fn bridge_error_frames_stay_parseable() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_fetch_toast_refuses_malformed_frames() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1204,7 +1206,7 @@ async fn shadow_store_read_survives_worker_restart() {
     );
     let read = tokio::spawn({
         let store = store.clone();
-        async move { store.fetch_many(16500, &[(7, 4)], 0x2000).await }
+        async move { store.fetch_many(0, 16500, &[(7, 4)], 0x2000).await }
     });
 
     // Polls see 0x1000, then worker stops accepting connections
@@ -1230,7 +1232,7 @@ async fn shadow_store_read_survives_worker_restart() {
     worker.await.ok();
     let store = ShadowToastStore::new(bridge).with_replay_wait_max(Duration::from_millis(300));
     let err = store
-        .fetch_many(16500, &[(7, 4)], 0x4000)
+        .fetch_many(0, 16500, &[(7, 4)], 0x4000)
         .await
         .expect_err("no worker ever answers");
     assert!(err.to_string().contains("unreachable"), "{err}");
@@ -1243,7 +1245,6 @@ async fn bridge_committed_read_falls_back_when_replay_moves() {
     use std::sync::atomic::Ordering;
 
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1275,7 +1276,7 @@ async fn bridge_committed_read_falls_back_when_replay_moves() {
     // The caller holds the boundary an overlay read is about, so nothing else
     // can serve that question
     let err = cat
-        .fetch_overlay_descriptors(&[oid_t], 700, 0x1000)
+        .fetch_overlay_descriptors(&[oid_t], 700, &ParkedAt::assume_for_test(0x1000))
         .await
         .unwrap_err();
     assert!(
@@ -1290,7 +1291,6 @@ async fn bridge_committed_read_falls_back_when_replay_moves() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_native_hstore_expander_requires_extension_membership() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1383,7 +1383,6 @@ async fn bridge_native_hstore_expander_requires_extension_membership() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_scans_multixact_catalog_rows() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1450,7 +1449,6 @@ async fn bridge_scans_multixact_catalog_rows() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_scan_skips_aborted_ddl_debris() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1486,7 +1484,6 @@ async fn bridge_scan_skips_aborted_ddl_debris() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_scan_skips_another_subtransactions_rows() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1533,7 +1530,6 @@ async fn bridge_scan_skips_another_subtransactions_rows() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn bridge_worker_pool_serves_concurrent_requests() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     const WORKERS: usize = 4;
@@ -1555,7 +1551,7 @@ async fn bridge_worker_pool_serves_concurrent_requests() {
     assert_eq!(pooled.pool_size(), WORKERS, "one socket per worker");
     assert_eq!(single.pool_size(), 1);
     // Every slot dialled its own HELLO; a mismatch would have failed connect
-    assert!(pooled.info().is_some());
+    assert_eq!(pooled.info(), single.info());
 
     // Wide enough that requests are still overlapping when the last one is
     // dispatched, which is the state a shared slot would have to serialize
@@ -1628,7 +1624,6 @@ async fn bridge_worker_pool_serves_concurrent_requests() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_scan_refuses_a_locked_catalog_off_the_named_boundary() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

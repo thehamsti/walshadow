@@ -216,14 +216,9 @@ mod tests {
     /// Segment-start page whose first `remaining` bytes continue a record
     /// that began in the preceding segment
     fn page(lsn: u64, remaining: u32, seg_size: u64) -> Vec<u8> {
-        let contrecord = if remaining > 0 {
-            XLP_FIRST_IS_CONT_RECORD
-        } else {
-            0
-        };
         let mut bytes = vec![0; PAGE_SIZE];
         bytes[..2].copy_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
-        bytes[2..4].copy_from_slice(&(XLP_LONG_HEADER | contrecord).to_le_bytes());
+        bytes[2..4].copy_from_slice(&(XLP_LONG_HEADER | XLP_FIRST_IS_CONT_RECORD).to_le_bytes());
         bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
         bytes[8..16].copy_from_slice(&lsn.to_le_bytes());
         bytes[XLP_REM_LEN..XLP_REM_LEN + 4].copy_from_slice(&remaining.to_le_bytes());
@@ -279,7 +274,7 @@ mod tests {
         std::fs::write(segment_path(dir.path(), 1, WAL_SEG_SIZE, start), &retained).unwrap();
 
         for chunk_size in [17, WAL_SEG_SIZE as usize] {
-            let mut stream = WalStream::new(1, WAL_SEG_SIZE, Pos::new(start)).unwrap();
+            let mut stream = WalStream::builder(1, WAL_SEG_SIZE, Pos::new(start)).unwrap();
             stream
                 .preserve_resume_prefix(&[dir.path().to_path_buf()])
                 .await
@@ -289,6 +284,7 @@ mod tests {
             let mut records = CollectingRecordSink::default();
             let mut segments = CollectingSegmentSink::default();
             let mut lsn = start;
+            let mut stream = stream.start();
             for part in [&raw[..CONT_END], &raw[CONT_END..]] {
                 for chunk in part.chunks(chunk_size) {
                     stream
@@ -318,7 +314,7 @@ mod tests {
         let mut retained = page(start, 100, WAL_SEG_SIZE);
         retained.resize(WAL_SEG_SIZE as usize, 0);
         std::fs::write(segment_path(dir.path(), 1, WAL_SEG_SIZE, start), &retained).unwrap();
-        let mut stream = WalStream::new(1, WAL_SEG_SIZE, Pos::new(start)).unwrap();
+        let mut stream = WalStream::builder(1, WAL_SEG_SIZE, Pos::new(start)).unwrap();
         stream
             .preserve_resume_prefix(&[dir.path().to_path_buf()])
             .await
@@ -327,6 +323,7 @@ mod tests {
         retained[XLP_REM_LEN..XLP_REM_LEN + 4].copy_from_slice(&101u32.to_le_bytes());
         let mut records = CollectingRecordSink::default();
         let mut segments = CollectingSegmentSink::default();
+        let mut stream = stream.start();
         let error = stream
             .push(start, &retained, &mut records, &mut segments)
             .await

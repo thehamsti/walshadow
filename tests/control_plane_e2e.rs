@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use walrus::pg::wal::segment::SegmentName;
+use walshadow::crash_test::Point;
 use walshadow::pg::parse_pg_lsn;
 use walshadow::record::WAL_SEG_SIZE;
 use walshadow::shadow::{Shadow, ShadowConfig};
@@ -120,7 +121,7 @@ impl Harness {
         let ch = fx::ChServer::spawn(ch_tmp, ports.ch_tcp, ports.ch_http).context("spawn ch")?;
         ch.query("CREATE DATABASE IF NOT EXISTS demo")?;
         ch.query(
-            "CREATE OR REPLACE TABLE demo.users (\
+            "CREATE OR REPLACE TABLE demo.demo_users (\
                 id Int64, name String, email String,\
                 _lsn UInt64, _xid UInt32,\
                 _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
@@ -263,7 +264,7 @@ impl Harness {
             .context("daemon metrics endpoint never came up")?;
         // Seed row must be on CH before any drill runs.
         h.wait_ch(
-            "SELECT email FROM demo.users FINAL WHERE _is_deleted = 0 AND id = 1",
+            "SELECT email FROM demo.demo_users FINAL WHERE _is_deleted = 0 AND id = 1",
             "alice@seed",
             Duration::from_secs(30),
         )
@@ -404,11 +405,6 @@ impl Harness {
         fs::create_dir_all(&socket_dir).context("create target socket dir")?;
         fs::create_dir_all(&filtered).context("create target filter dir")?;
 
-        // The harness source keeps no slot, so `-c fast`'s checkpoint recycles
-        // the segment the daemon still streams from
-        self.psql("ALTER SYSTEM SET wal_keep_size = '256MB'")?;
-        self.psql("SELECT pg_reload_conf()")?;
-
         let src = self.source.config();
         let out = Command::new("pg_basebackup")
             .args([
@@ -534,23 +530,8 @@ impl Harness {
     /// SIGINT → graceful drain so tracing flushes to the stderr file; SIGKILL
     /// only if it doesn't exit promptly.
     fn stop_daemon(&mut self) {
-        let Some(mut c) = self.child.take() else {
-            return;
-        };
-        let _ = Command::new("kill")
-            .args(["-INT", &c.id().to_string()])
-            .status();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            match c.try_wait() {
-                Ok(Some(_)) => break,
-                _ if Instant::now() >= deadline => {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                    break;
-                }
-                _ => std::thread::sleep(Duration::from_millis(100)),
-            }
+        if let Some(mut c) = self.child.take() {
+            fx::tools::stop_gracefully(&mut c);
         }
     }
 
@@ -666,6 +647,7 @@ fn spawn_daemon(bin: &str, args: &[String], stderr_path: &Path) -> Result<Child>
     Command::new(bin)
         .args(args)
         .env("RUST_LOG", "warn,walshadow=info")
+        .env("WALSHADOW_TEST_CRASH", stderr_path.with_extension("arm"))
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
         .process_group(0)
@@ -674,14 +656,14 @@ fn spawn_daemon(bin: &str, args: &[String], stderr_path: &Path) -> Result<Child>
 }
 
 fn gated() -> bool {
-    fx::requirements_available()
+    fx::tools::requirements_available()
 }
 
 const USER_EMAIL: &str =
-    "SELECT argMax(email, _lsn) FROM demo.users WHERE _is_deleted = 0 AND id = 1";
+    "SELECT argMax(email, _lsn) FROM demo.demo_users WHERE _is_deleted = 0 AND id = 1";
 
 const SECOND_EMAIL: &str =
-    "SELECT argMax(email, _lsn) FROM demo.users WHERE _is_deleted = 0 AND id = 2";
+    "SELECT argMax(email, _lsn) FROM demo.demo_users WHERE _is_deleted = 0 AND id = 2";
 
 /// Socket-only, so one fixed number per role is enough (see `common/ports.rs`).
 /// Distinct from source and shadow because a drill can put all three sockets
@@ -807,7 +789,7 @@ async fn live_table_opt_in_auto_creates_on_reload() {
         )?;
         h.psql("INSERT INTO demo.gizmos VALUES (1, 'alpha')")?;
         assert_eq!(
-            h.ch_get("EXISTS TABLE demo.gizmos")?,
+            h.ch_get("EXISTS TABLE demo.demo_gizmos")?,
             "0",
             "gizmos must not exist on CH before opt-in",
         );
@@ -822,19 +804,22 @@ async fn live_table_opt_in_auto_creates_on_reload() {
         let deadline = Instant::now() + Duration::from_secs(45);
         while Instant::now() < deadline {
             h.psql("UPDATE demo.users SET email = 'tick@x' WHERE id = 1")?;
-            if h.ch_get("EXISTS TABLE demo.gizmos").unwrap_or_default() == "1" {
+            if h.ch_get("EXISTS TABLE demo.demo_gizmos")
+                .unwrap_or_default()
+                == "1"
+            {
                 created = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         if !created {
-            bail!("opt-in never auto-created the CH table demo.gizmos");
+            bail!("opt-in never auto-created the CH table demo.demo_gizmos");
         }
 
         // Pre-opt-in row proves copy ran
         h.wait_ch(
-            "SELECT argMax(label, _lsn) FROM demo.gizmos WHERE _is_deleted = 0 AND id = 1",
+            "SELECT argMax(label, _lsn) FROM demo.demo_gizmos WHERE _is_deleted = 0 AND id = 1",
             "alpha",
             Duration::from_secs(20),
         )
@@ -843,7 +828,7 @@ async fn live_table_opt_in_auto_creates_on_reload() {
 
         h.psql("INSERT INTO demo.gizmos VALUES (2, 'beta')")?;
         h.wait_ch(
-            "SELECT argMax(label, _lsn) FROM demo.gizmos WHERE _is_deleted = 0 AND id = 2",
+            "SELECT argMax(label, _lsn) FROM demo.demo_gizmos WHERE _is_deleted = 0 AND id = 2",
             "beta",
             Duration::from_secs(15),
         )
@@ -900,7 +885,7 @@ async fn ch_password_rotation_via_ctl_keeps_streaming() {
         // of its own and has to carry the rotated credential too
         h.psql("UPDATE demo.users SET name = repeat('t', 200000) WHERE id = 1")?;
         h.wait_ch(
-            "SELECT length(argMax(name, _lsn)) FROM demo.users WHERE _is_deleted = 0 AND id = 1",
+            "SELECT length(argMax(name, _lsn)) FROM demo.demo_users WHERE _is_deleted = 0 AND id = 1",
             "200000",
             Duration::from_secs(30),
         )
@@ -910,10 +895,11 @@ async fn ch_password_rotation_via_ctl_keeps_streaming() {
 
         // A credential the server rejects must surface as the inserter's own
         // refusal, which is what proves the dial reads live config rather than
-        // the value it booted on.
+        // the value it booted on. No retries, so the refusal surfaces on the
+        // first dial rather than after the backoff
         h.ctl_body(
             &["apply"],
-            "[ch]\npassword = \"wrong\"\ncompression = \"lz4\"\n",
+            "[ch]\npassword = \"wrong\"\ncompression = \"lz4\"\nretry_max_attempts = 0\n",
         )?;
         h.psql("UPDATE demo.users SET email = 'wrong@x' WHERE id = 1")?;
         h.wait_log("Authentication failed", Duration::from_secs(30))
@@ -921,6 +907,50 @@ async fn ch_password_rotation_via_ctl_keeps_streaming() {
             .context("a rejected password never reached a re-dial")?;
 
         Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_names_tables_whose_wal_is_not_needed() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    h.wait_ready(Duration::from_secs(60))
+        .await
+        .expect("pump never started");
+
+    let result = async {
+        h.psql("CREATE TABLE demo.noise (id bigint PRIMARY KEY)")?;
+        h.psql("INSERT INTO demo.noise SELECT generate_series(1, 5)")?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status: toml::Table = h.ctl(&["status"])?.parse()?;
+            let unmapped = status
+                .get("unmapped_tables")
+                .and_then(toml::Value::as_array)
+                .context("no unmapped_tables in status")?;
+            let noise_rows = unmapped.iter().find_map(|row| {
+                (row.get("table")?.as_str()? == "demo.noise")
+                    .then(|| row.get("rows")?.as_integer())?
+            });
+            if noise_rows.is_some_and(|n| n >= 5) {
+                return Ok::<(), anyhow::Error>(());
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "status never counted demo.noise inserts, said {unmapped:?}",
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
     .await;
 
@@ -1153,7 +1183,7 @@ async fn pause_apply_resume_reroutes_backlog_whole() {
         h.wait_ch(USER_EMAIL, "marker1@x", Duration::from_secs(15))
             .await?;
         assert_eq!(
-            h.ch_get("EXISTS TABLE demo.widgets")?,
+            h.ch_get("EXISTS TABLE demo.demo_widgets")?,
             "0",
             "widgets must not exist on CH before opt-in",
         );
@@ -1174,7 +1204,7 @@ async fn pause_apply_resume_reroutes_backlog_whole() {
 
         // Backlog xact plans after resume → routes under the new config.
         h.wait_ch(
-            "SELECT argMax(label, _lsn) FROM demo.widgets WHERE _is_deleted = 0 AND id = 2",
+            "SELECT argMax(label, _lsn) FROM demo.demo_widgets WHERE _is_deleted = 0 AND id = 2",
             "while-paused",
             Duration::from_secs(30),
         )
@@ -1184,7 +1214,7 @@ async fn pause_apply_resume_reroutes_backlog_whole() {
         // Post-resume stream continues under the same config.
         h.psql("INSERT INTO demo.widgets VALUES (3, 'post-resume')")?;
         h.wait_ch(
-            "SELECT argMax(label, _lsn) FROM demo.widgets WHERE _is_deleted = 0 AND id = 3",
+            "SELECT argMax(label, _lsn) FROM demo.demo_widgets WHERE _is_deleted = 0 AND id = 3",
             "post-resume",
             Duration::from_secs(15),
         )
@@ -1192,7 +1222,7 @@ async fn pause_apply_resume_reroutes_backlog_whole() {
 
         // id=1 was planned pre-pause under the old config: discarded stays
         // discarded, no partial re-plan.
-        let n = h.ch_get("SELECT count() FROM demo.widgets FINAL WHERE _is_deleted = 0")?;
+        let n = h.ch_get("SELECT count() FROM demo.demo_widgets FINAL WHERE _is_deleted = 0")?;
         assert_eq!(n, "2", "exactly the backlog + post-resume rows land");
 
         assert!(h.alive(), "daemon exited during pause/apply/resume");
@@ -1281,7 +1311,7 @@ async fn pause_publishes_frozen_frontier_lsns() {
 /// Newest version of one row, without FINAL so a merge cannot hide a stale
 /// duplicate.
 fn email_of(id: u32) -> String {
-    format!("SELECT argMax(email, _lsn) FROM demo.users WHERE _is_deleted = 0 AND id = {id}")
+    format!("SELECT argMax(email, _lsn) FROM demo.demo_users WHERE _is_deleted = 0 AND id = {id}")
 }
 
 /// Steps 2 to 7 of architecture/recovery.md against standby
@@ -1330,7 +1360,7 @@ async fn pause_and_stop_writes(h: &Harness, target: &Shadow) -> Result<()> {
     // 3. A paused walshadow sends no standby status, so its walsender only exits
     //    on `wal_sender_timeout` and fast shutdown waits for that
     h.psql("INSERT INTO demo.users VALUES (2, 'bob', 'below-fork@x')")?;
-    h.psql("ALTER SYSTEM SET wal_sender_timeout = '5s'")?;
+    h.psql("ALTER SYSTEM SET wal_sender_timeout = '1s'")?;
     h.psql("SELECT pg_reload_conf()")?;
     h.source.stop().context("stop source primary")?;
 
@@ -1505,6 +1535,183 @@ async fn switchover_crosses_fork_and_keeps_every_row() {
     // fast shutdown would sit out `wal_sender_timeout` waiting for it
     let stderr = h.teardown();
     let _ = target.stop();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_source_shuts_down_promptly_and_resume_redials() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    let result = async {
+        h.wait_ch(USER_EMAIL, "alice@seed", Duration::from_secs(30))
+            .await
+            .context("seed row backfills")?;
+        h.psql("UPDATE demo.users SET email = 'pre-pause@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "pre-pause@x", Duration::from_secs(30))
+            .await
+            .context("pre-pause row never reached CH")?;
+
+        h.ctl_body(&["apply"], "[stream]\npaused = true")?;
+        ensure!(h.status_field("paused")? == "true", "apply did not pause");
+        h.wait_log(
+            "pause left the source stream so the source can shut down",
+            Duration::from_secs(30),
+        )
+        .await
+        .context("pause never left the source stream")?;
+
+        let stopping = Instant::now();
+        h.source.stop().context("stop paused source primary")?;
+        let waited = stopping.elapsed();
+        ensure!(
+            waited < Duration::from_secs(20),
+            "fast shutdown waited {waited:?} on a paused walshadow",
+        );
+
+        h.source.start().context("restart source")?;
+        h.ctl_body(&["apply"], "[stream]\npaused = false")?;
+        h.psql("UPDATE demo.users SET email = 'post-resume@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "post-resume@x", Duration::from_secs(60))
+            .await
+            .context("resume did not redial the source")?;
+        ensure!(h.alive(), "daemon exited across the paused shutdown");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unpaused_switchover_stops_promptly_and_crosses_at_the_switchpoint() {
+    check_unpaused_switchover(SwitchoverMode::Repoint).await;
+}
+
+/// With archiving enabled, shutdown starts a new segment for its checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn archiving_switchover_crosses_a_fork_segment_with_no_transactions() {
+    check_unpaused_switchover(SwitchoverMode::Archiving).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SwitchoverMode {
+    Repoint,
+    Archiving,
+    SameAddress,
+}
+
+async fn check_unpaused_switchover(mode: SwitchoverMode) {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    let mut target = None;
+    let mut moved = None;
+    let result = async {
+        h.wait_ch(USER_EMAIL, "alice@seed", Duration::from_secs(30))
+            .await
+            .context("seed row backfills")?;
+        if mode == SwitchoverMode::Archiving {
+            h.wait_log(
+                "walsender connected — starting pump",
+                Duration::from_secs(60),
+            )
+            .await
+            .context("pump never started")?;
+            h.psql("ALTER SYSTEM SET archive_mode = on")?;
+            h.psql("ALTER SYSTEM SET archive_command = 'true'")?;
+            h.source.stop().context("stop source to enable archiving")?;
+            h.source.start().context("restart source with archiving")?;
+        }
+        let promoted = target.insert(h.promotion_target()?);
+        h.psql("UPDATE demo.users SET email = 'pre-switchover@x' WHERE id = 1")?;
+        h.psql("INSERT INTO demo.users VALUES (2, 'bob', 'below-fork@x')")?;
+        h.wait_ch(SECOND_EMAIL, "below-fork@x", Duration::from_secs(60))
+            .await
+            .context("row sent through WAL never reached ClickHouse")?;
+
+        let stopping = Instant::now();
+        h.source.stop().context("stop source primary")?;
+        ensure!(
+            stopping.elapsed() < Duration::from_secs(20),
+            "fast shutdown waited {:?} on walshadow's walsender",
+            stopping.elapsed(),
+        );
+        let checkpoint = controldata_checkpoint_lsn(&h.source.config().data_dir)?;
+        if mode == SwitchoverMode::Archiving {
+            ensure!(
+                checkpoint % WAL_SEG_SIZE <= 0x28,
+                "shutdown checkpoint at {checkpoint:#X} does not open a segment",
+            );
+        }
+        // Wait until standby replays checkpoint record, so promotion cannot
+        // fork before WAL already read by walshadow.
+        promoted
+            .wait_for_replay(checkpoint + 1, Duration::from_secs(30))
+            .context("target never replayed the shutdown checkpoint")?;
+        // Promote before reusing address so reconnect sees a primary.
+        promote(promoted)?;
+        let primary = if mode == SwitchoverMode::SameAddress {
+            moved.insert(take_over_source_address(&h, promoted)?)
+        } else {
+            apply_repoint(&h, promoted)?;
+            promoted
+        };
+        h.wait_metric(
+            "walshadow_timeline_switches_total",
+            1,
+            Duration::from_secs(60),
+        )
+        .await
+        .context("reconnect at branch end did not switch timelines")?;
+        if mode == SwitchoverMode::SameAddress {
+            ensure!(
+                h.daemon_log()
+                    .lines()
+                    .any(|line| line.contains("source reconnected")
+                        && line.contains("resume_point=AtSwitchpoint")),
+                "reconnect did not reach branch end:\n{}",
+                h.daemon_log(),
+            );
+        }
+        ensure!(
+            !h.daemon_log().contains("sits past the fork"),
+            "reconnect rejected branch end:\n{}",
+            h.daemon_log(),
+        );
+        primary.psql_one("UPDATE demo.users SET email = 'after-promote@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "after-promote@x", Duration::from_secs(60))
+            .await
+            .context("write after promotion never reached ClickHouse")?;
+        ensure!(
+            h.metric("walshadow_source_timeline")? == 2,
+            "still reading previous timeline"
+        );
+        let log = h.shadow_log();
+        ensure!(
+            !log.contains("PANIC"),
+            "shadow log contains a PANIC:\n{log}"
+        );
+        ensure!(h.alive(), "daemon exited while switching timelines");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Some(primary) = moved.or(target) {
+        let _ = primary.stop();
+    }
     if let Err(e) = result {
         panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
     }
@@ -1948,12 +2155,11 @@ async fn status_answers_the_promotion_gate_before_the_promotion() {
             "an unpaused pump has no frozen frontier to gate against",
         );
         pause_and_stop_writes(&h, &target).await?;
-        // `[source]` still names the old primary, which is no standby — and now
-        // not even up
+        // `[source]` still names the old primary, which is now down
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let blocked = h.status_field("promotion_blocked_on")?;
-            if blocked == "source_unreachable" || blocked == "not_a_standby" {
+            if blocked == "source_unreachable" {
                 break;
             }
             ensure!(
@@ -1962,6 +2168,9 @@ async fn status_answers_the_promotion_gate_before_the_promotion() {
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+        // Later polls redial the sidecar rather than reuse a dead client
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        ensure!(h.status_field("promotion_blocked_on")? == "source_unreachable");
         ensure!(h.status_field("promotion_ready")? == "false");
 
         repoint(&h, &target, 1).await?;
@@ -2053,7 +2262,7 @@ async fn restart_while_paused_refreezes_the_frontier_and_still_crosses() {
         // The source is down and `[source]` still names it, so boot waits for
         // the repoint rather than exiting into a supervisor loop
         h.stop_daemon();
-        h.start_daemon(Duration::from_secs(8))
+        h.start_daemon(Duration::from_secs(3))
             .await
             .expect_err("pump must not resume while the source it is pointed at is stopped");
         ensure!(
@@ -2132,6 +2341,9 @@ async fn restart_inside_the_fork_barrier_recrosses_and_converges() {
         promote_and_repoint(&h, &target).await?;
         h.shadow_psql("SELECT pg_wal_replay_pause()")
             .context("pause shadow replay")?;
+        h.wait_log("leaving paused", Duration::from_secs(10))
+            .await
+            .context("supervisor never saw the operator pause")?;
         h.ctl_body(&["apply"], "[stream]\npaused = false")?;
         h.wait_log("fork barrier", Duration::from_secs(60))
             .await
@@ -2389,11 +2601,15 @@ async fn slot_proofs_name_the_missing_slot_and_park_the_crossing() {
         // decision back and gives it again
         h.ctl_body(&["apply"], "[source]\nslot = \"sw\"")?;
         h.ctl_body(&["apply"], "[stream]\npaused = true")?;
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        ensure!(
-            h.metric("walshadow_crossing_wedged")? == 0,
-            "pause left the crossing parked",
-        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if h.metric("walshadow_crossing_wedged")? == 0 {
+                break;
+            }
+            ensure!(h.alive(), "daemon exited while unparking the crossing");
+            ensure!(Instant::now() < deadline, "pause left the crossing parked");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
         h.ctl_body(&["apply"], "[stream]\npaused = false")?;
         h.wait_metric(
             "walshadow_timeline_switches_total",
@@ -2502,6 +2718,13 @@ async fn promotion_under_a_stable_endpoint_crosses_without_a_repoint() {
     if let Err(e) = result {
         panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
     }
+}
+
+/// Keep walshadow running through shutdown, then promote standby at same address.
+/// Reconnecting at branch end must switch timelines without restarting walshadow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconnect_at_the_switchpoint_crosses_without_a_restart() {
+    check_unpaused_switchover(SwitchoverMode::SameAddress).await;
 }
 
 /// Restart the promotion target on the stopped primary's socket path and port,
@@ -2620,4 +2843,170 @@ async fn a_sibling_timeline_two_is_refused_against_its_switchpoint() {
     if let Err(e) = result {
         panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
     }
+}
+
+async fn check_ddl_crash(point: Point, applied_columns: u64) {
+    use std::os::unix::process::ExitStatusExt;
+    use walshadow::desc_log::{DescLogIdentity, DescriptorLog};
+    use walshadow::manifest::Manifest;
+
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    let result = async {
+        h.wait_ready(Duration::from_secs(60)).await?;
+        h.ctl_body(&["apply"], "[table.demo.crash_t]\nreplicate = true")?;
+        h.ctl(&["reload"])?;
+        h.psql(
+            "CREATE TABLE demo.crash_t (id bigint PRIMARY KEY, v text); \
+             INSERT INTO demo.crash_t VALUES (1, 'before')",
+        )?;
+        h.wait_ch(
+            "SELECT v FROM demo.demo_crash_t FINAL WHERE id = 1",
+            "before",
+            Duration::from_secs(60),
+        )
+        .await?;
+        let arm = h.stderr_path.with_extension("arm");
+        fs::write(&arm, format!("{point:?}"))?;
+        h.psql(
+            "ALTER TABLE demo.crash_t ADD COLUMN a bigint, \
+                                      ADD COLUMN b text",
+        )?;
+        h.psql("INSERT INTO demo.crash_t VALUES (2, 'after', 8, 'new')")?;
+        if point == Point::AfterManifest {
+            h.psql("SELECT pg_switch_wal()")?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while h.alive() {
+            ensure!(
+                Instant::now() < deadline,
+                "crash point {point:?} never fired"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let status = h.child.take().context("daemon missing")?.wait()?;
+        ensure!(
+            status.signal() == Some(libc::SIGKILL),
+            "unexpected exit: {status}"
+        );
+        let commit: u64 = fs::read_to_string(arm.with_extension("hit"))?.parse()?;
+        let spill = h.tmp.path().join("spill");
+        let manifest: Manifest = toml::from_str(&fs::read_to_string(spill.join("manifest.toml"))?)?;
+        ensure!(
+            (manifest.floor.get() >= commit) == (point == Point::AfterManifest),
+            "unexpected durable floor {} at commit {commit} ({point:?})",
+            manifest.floor.get(),
+        );
+        if point != Point::AfterManifest {
+            ensure!(
+                manifest.lsn.emitter_ack.get() < commit,
+                "ack reached manifest before crash"
+            );
+        }
+        let log = DescriptorLog::open(
+            &spill,
+            DescLogIdentity {
+                pg_major: h.psql("SHOW server_version_num")?.parse::<u32>()? / 10000,
+                system_id: h.psql("SELECT system_identifier FROM pg_control_system()")?,
+                timeline: 1,
+                db_oid: h
+                    .psql("SELECT oid FROM pg_database WHERE datname = 'postgres'")?
+                    .parse()?,
+                wal_seg_size: WAL_SEG_SIZE as u32,
+            },
+        )
+        .await?;
+        let desc = log
+            .active_present_at(u64::MAX)
+            .into_iter()
+            .find(|desc| desc.rel_name.name.as_ref() == "crash_t")
+            .context("missing table descriptor")?;
+        let stored_columns = desc
+            .attributes
+            .iter()
+            .filter(|att| matches!(att.name.as_ref(), "a" | "b"))
+            .count();
+        ensure!(
+            stored_columns
+                == if point == Point::BeforeDescriptor {
+                    0
+                } else {
+                    2
+                },
+            "unexpected descriptor at {point:?}: {stored_columns} added columns"
+        );
+        ensure!(
+            log.floor_at_write().get() < commit,
+            "descriptor GC passed crash boundary"
+        );
+        drop(log);
+        let added = "SELECT count() FROM system.columns WHERE database = 'demo' \
+                     AND table = 'demo_crash_t' AND name IN ('a', 'b')";
+        ensure!(
+            h.ch_get(added)? == applied_columns.to_string(),
+            "wrong partial DDL at {point:?}"
+        );
+        fs::remove_file(arm)?;
+        h.start_daemon(Duration::from_secs(120)).await?;
+        h.wait_ch(added, "2", Duration::from_secs(60)).await?;
+        let rows = "SELECT id, v, a, b FROM demo.demo_crash_t FINAL ORDER BY id FORMAT TSV";
+        h.wait_ch(
+            rows,
+            "1\tbefore\t\\N\t\\N\n2\tafter\t8\tnew",
+            Duration::from_secs(60),
+        )
+        .await?;
+        h.psql("INSERT INTO demo.crash_t VALUES (3, 'live', 9, 'restart')")?;
+        h.wait_ch(
+            rows,
+            "1\tbefore\t\\N\t\\N\n2\tafter\t8\tnew\n3\tlive\t9\trestart",
+            Duration::from_secs(60),
+        )
+        .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{point:?}: {e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_before_descriptor_append() {
+    check_ddl_crash(Point::BeforeDescriptor, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_after_descriptor_fsync_before_queue() {
+    check_ddl_crash(Point::AfterDescriptor, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_after_queue_before_clickhouse() {
+    check_ddl_crash(Point::BeforeDdl, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_after_first_alter() {
+    check_ddl_crash(Point::AfterAlter, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_after_complete_ddl_before_ack() {
+    check_ddl_crash(Point::AfterDdl, 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_after_ack_before_manifest() {
+    check_ddl_crash(Point::AfterAck, 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_after_manifest_before_descriptor_gc() {
+    check_ddl_crash(Point::AfterManifest, 2).await;
 }

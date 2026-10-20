@@ -29,24 +29,6 @@ use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::toast::FetchedValue;
 
-/// Skip line plus `false` when a binary these clusters need is missing
-fn requirements(tools: &[&str]) -> bool {
-    for tool in tools {
-        let found = Command::new(tool)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !found {
-            eprintln!("skip: no {tool} on PATH");
-            return false;
-        }
-    }
-    true
-}
-
 fn wstest_module() -> PathBuf {
     let so = Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext/test/wstest.so");
     assert!(
@@ -243,7 +225,7 @@ impl PinnedHorizon {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_value_reads_back_byte_exact() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -265,7 +247,7 @@ async fn live_value_reads_back_byte_exact() {
 /// and `SnapshotToast` reads them despite a committed xmax
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dead_referrer_still_yields_its_value() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -301,7 +283,7 @@ async fn dead_referrer_still_yields_its_value() {
 /// Verify opportunistic pruning reclaims chunks without VACUUM
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pruning_reclaims_as_soon_as_the_horizon_passes() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -340,7 +322,7 @@ async fn pruning_reclaims_as_soon_as_the_horizon_passes() {
 /// pass as the value. Density plus total size is the whole check
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partly_reclaimed_run_refuses() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -364,7 +346,7 @@ async fn partly_reclaimed_run_refuses() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vacuum_rewrite_and_truncate_each_remove_the_value() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -401,7 +383,7 @@ async fn vacuum_rewrite_and_truncate_each_remove_the_value() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compressed_value_comes_back_stored_not_inflated() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -429,7 +411,7 @@ async fn compressed_value_comes_back_stored_not_inflated() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fetch_refuses_malformed_requests() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -501,7 +483,7 @@ async fn fetch_refuses_malformed_requests() {
 /// plants them
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn planted_chunk_headers_short_reads_compressed_refuses() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -571,7 +553,7 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
     use walshadow::toast::shadow_store::{ShadowRead, ShadowToastStore, bound};
     use walshadow::toast::xid_ceiling::{XidCeiling, follows};
 
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -628,7 +610,7 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
     let earlier = store(before);
     assert_eq!(
         earlier
-            .fetch(v.toast_relid, reissued, 0, 10)
+            .fetch(0, v.toast_relid, reissued, 0, 10)
             .await
             .expect("fetch under the earlier ceiling"),
         FetchedValue::Generation,
@@ -636,7 +618,7 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
     );
     assert_eq!(
         earlier
-            .fetch(v.toast_relid, reissued, 0, 9)
+            .fetch(0, v.toast_relid, reissued, 0, 9)
             .await
             .expect("fetch a torn replacement"),
         FetchedValue::Generation,
@@ -646,7 +628,7 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
     let later = store(after);
     assert_eq!(
         later
-            .fetch(v.toast_relid, reissued, 0, 10)
+            .fetch(0, v.toast_relid, reissued, 0, 10)
             .await
             .expect("fetch under the later ceiling"),
         FetchedValue::Assembled(b"helloworld".to_vec()),
@@ -654,14 +636,14 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
     );
     assert!(
         matches!(
-            later.fetch(v.toast_relid, reissued, 0, 9).await,
+            later.fetch(0, v.toast_relid, reissued, 0, 9).await,
             Ok(FetchedValue::Mismatch { got: 10 })
         ),
         "without detected reuse, wrong size remains a mismatch",
     );
     assert_eq!(
         later
-            .fetch(v.toast_relid, v.value_id, 0, v.extsize)
+            .fetch(0, v.toast_relid, v.value_id, 0, v.extsize)
             .await
             .expect("fetch the original"),
         FetchedValue::Assembled(v.raw.clone().into_bytes()),
@@ -671,7 +653,7 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batch_fetch_aligns_with_its_request() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -868,7 +850,7 @@ async fn clone_standby(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn standby_keeps_the_value_until_the_prune_record_replays() {
-    if !requirements(&["initdb", "pg_basebackup"]) {
+    if !pgext::tools::pg_available() || !pgext::tools::pg_basebackup_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -931,7 +913,7 @@ async fn shadow_store_reads_and_refuses_writes() {
     use walshadow::toast::shadow_store::ShadowToastStore;
     use walshadow::toast::{ChunkStore, ChunkStoreError, ToastRow};
 
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -943,28 +925,28 @@ async fn shadow_store_reads_and_refuses_writes() {
     let store = ShadowToastStore::new(bridge);
     assert_eq!(
         store
-            .fetch(v.toast_relid, v.value_id, 0, v.extsize)
+            .fetch(0, v.toast_relid, v.value_id, 0, v.extsize)
             .await
             .expect("fetch"),
         FetchedValue::Assembled(v.raw.clone().into_bytes()),
     );
     assert_eq!(
         store
-            .fetch(v.toast_relid, v.value_id.wrapping_add(7919), 0, 8)
+            .fetch(0, v.toast_relid, v.value_id.wrapping_add(7919), 0, 8)
             .await
             .expect("absent id"),
         FetchedValue::Missing,
     );
     assert!(matches!(
         store
-            .fetch(v.toast_relid, v.value_id, 0, v.extsize - 1)
+            .fetch(0, v.toast_relid, v.value_id, 0, v.extsize - 1)
             .await
             .expect("size disagreement"),
         FetchedValue::Mismatch { .. }
     ));
     assert!(
         store
-            .fetch_many(v.toast_relid, &[], 0)
+            .fetch_many(0, v.toast_relid, &[], 0)
             .await
             .unwrap()
             .is_empty()
@@ -972,11 +954,15 @@ async fn shadow_store_reads_and_refuses_writes() {
     // A relation shadow no longer has reads as superseded, the same as its
     // truncated chunks would
     assert_eq!(
-        store.fetch(999_999, 1, 0, 8).await.expect("gone relation"),
+        store
+            .fetch(0, 999_999, 1, 0, 8)
+            .await
+            .expect("gone relation"),
         FetchedValue::Missing,
     );
 
     let row = ToastRow {
+        db_oid: 0,
         toast_relid: v.toast_relid,
         blkno: 0,
         offnum: 1,
@@ -987,9 +973,9 @@ async fn shadow_store_reads_and_refuses_writes() {
     };
     for e in [
         store.put(&[row]).await.unwrap_err(),
-        store.truncate_mirror(v.toast_relid).await.unwrap_err(),
+        store.truncate_mirror(0, v.toast_relid).await.unwrap_err(),
         store
-            .rewrite_barrier(v.toast_relid, 1, 2)
+            .rewrite_barrier(0, v.toast_relid, 1, 2)
             .await
             .unwrap_err(),
     ] {
@@ -1027,7 +1013,7 @@ async fn replay_passed_within(standby: &Client, lsn: &str, budget: Duration) -> 
 /// its own reclamation fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pg_standby_conflicts_do_not_fence_reclamation() {
-    if !requirements(&["initdb", "pg_basebackup"]) {
+    if !pgext::tools::pg_available() || !pgext::tools::pg_basebackup_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1096,7 +1082,7 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     use walshadow::toast::shadow_store::{LateBridge, ShadowToastStore};
     use walshadow::toast::{ChunkStore, ChunkStoreError};
 
-    if !requirements(&["initdb", "pg_basebackup"]) {
+    if !pgext::tools::pg_available() || !pgext::tools::pg_basebackup_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1112,7 +1098,7 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
         ShadowToastStore::late(unbound.clone()).with_replay_wait_max(Duration::from_millis(300));
     let started = Instant::now();
     let err = parked
-        .fetch(v.toast_relid, v.value_id, 0, v.extsize)
+        .fetch(0, v.toast_relid, v.value_id, 0, v.extsize)
         .await
         .expect_err("an unbound store cannot read");
     assert!(
@@ -1132,7 +1118,7 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     );
     assert!(matches!(
         parked
-            .fetch(v.toast_relid, v.value_id, 0, v.extsize)
+            .fetch(0, v.toast_relid, v.value_id, 0, v.extsize)
             .await
             .expect("bound store reads"),
         FetchedValue::Assembled(_)
@@ -1143,7 +1129,7 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     let started = Instant::now();
     assert!(matches!(
         parked
-            .fetch(v.toast_relid, v.value_id, u64::MAX, v.extsize)
+            .fetch(0, v.toast_relid, v.value_id, u64::MAX, v.extsize)
             .await
             .expect("a primary does not wait for replay"),
         FetchedValue::Assembled(_)
@@ -1163,14 +1149,14 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
         ShadowToastStore::new(Arc::new(sb_bridge)).with_replay_wait_max(Duration::from_millis(300));
     assert!(matches!(
         on_standby
-            .fetch(v.toast_relid, v.value_id, 0, v.extsize)
+            .fetch(0, v.toast_relid, v.value_id, 0, v.extsize)
             .await
             .expect("standby reads at its own position"),
         FetchedValue::Assembled(_)
     ));
     let started = Instant::now();
     let err = on_standby
-        .fetch(v.toast_relid, v.value_id, u64::MAX, v.extsize)
+        .fetch(0, v.toast_relid, v.value_id, u64::MAX, v.extsize)
         .await
         .expect_err("a standby must honour a floor it cannot reach");
     assert!(
@@ -1187,7 +1173,7 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     let started = Instant::now();
     assert!(
         ShadowToastStore::late(LateBridge::default())
-            .fetch_many(v.toast_relid, &[], u64::MAX)
+            .fetch_many(0, v.toast_relid, &[], u64::MAX)
             .await
             .expect("empty batch short-circuits everything")
             .is_empty()

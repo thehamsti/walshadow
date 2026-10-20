@@ -13,6 +13,10 @@
 //! produce. After segments land, it re-parses one through wal-rus's
 //! `WalParser`.
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::pg_available;
+
 #[path = "common/ports.rs"]
 mod ports;
 
@@ -33,14 +37,6 @@ use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::wal_stream::WalStream;
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_source(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("source"), tmp.path().join("filtered"));
@@ -76,7 +72,6 @@ impl Drop for StopOnDrop<'_> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_pipeline_source_to_filtered_segments_on_disk() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -299,7 +294,6 @@ fn pg_class_filenode(sh: &Shadow) -> u32 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -357,7 +351,7 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
         .with_status_interval(Duration::from_millis(500));
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
+    let mut stream = WalStream::builder(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
 
     // Seed *before* START_REPLICATION. Without this line the test
     // would catch the regression: tracker would never learn the
@@ -415,6 +409,7 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let mut segments_shipped = 0u64;
+    let mut stream = stream.start();
     let mut prev = stream.dispatched_lsn();
     while segments_shipped < 1 && std::time::Instant::now() < deadline {
         let apply_lsn = stream.dispatched_lsn();
@@ -469,14 +464,6 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
         filter.stats().kept_user,
         filter.stats().dropped,
     );
-}
-
-fn openssl_available() -> bool {
-    Command::new("openssl")
-        .arg("version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 /// One-shot self-signed cert + key suitable for PG `ssl_cert_file` /
@@ -552,11 +539,9 @@ fn require_ssl_on_tcp(sh: &Shadow) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sidecar_sql_client_negotiates_tls_over_tcp() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
-    if !openssl_available() {
-        eprintln!("skip: no openssl on PATH");
+    if !tools::on_path("openssl", "version") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -624,7 +609,6 @@ async fn sidecar_sql_client_negotiates_tls_over_tcp() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_mid_segment_then_resume_from_start_lsn_continues() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

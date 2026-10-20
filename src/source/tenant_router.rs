@@ -15,8 +15,10 @@
 //! progress when the tenant holds no open transaction.
 //!
 //! One stuck destination must not stall the shared pump. A tenant whose
-//! queue refuses a record for `stall_timeout` is marked evicted and never
-//! fed again; the session tears it down and detaches it
+//! queue refuses a record, or whose flush, idle or close callback blocks,
+//! for `stall_timeout` is marked evicted and never fed again; so is one that
+//! fails any callback when tenants are isolated. The session tears it down
+//! and detaches it
 
 use std::future::Future;
 use std::pin::Pin;
@@ -107,23 +109,49 @@ fn db_scope(db: u32) -> Scope {
     }
 }
 
+/// What the router needs of a tenant's entry point beyond [`RecordSink`]:
+/// shipping its pending batch and queue depth for metrics
+pub trait TenantSink: RecordSink + Send {
+    fn flush(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send;
+    fn in_flight(&self) -> u64;
+    fn processed(&self) -> u64;
+    fn send_wait_seconds(&self) -> f64;
+}
+
+impl TenantSink for BoundaryHoldSink {
+    fn flush(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
+        BoundaryHoldSink::flush(self)
+    }
+
+    fn in_flight(&self) -> u64 {
+        BoundaryHoldSink::in_flight(self)
+    }
+
+    fn processed(&self) -> u64 {
+        BoundaryHoldSink::processed(self)
+    }
+
+    fn send_wait_seconds(&self) -> f64 {
+        self.inner.send_wait_seconds()
+    }
+}
+
 /// One tenant's entry point: its hold sink (capture + queueing worker)
-pub struct RoutedTenant {
+pub struct RoutedTenant<S = BoundaryHoldSink> {
     pub id: String,
-    /// Databases the tenant follows: one for a declared tenant, every
-    /// `[database.*]` for the single-tenant layout
+    /// Databases the tenant follows
     pub db_oids: Vec<u32>,
     /// Records before this are never routed: the tenant's descriptor
     /// history starts here
     pub from_lsn: u64,
-    pub sink: BoundaryHoldSink,
+    pub sink: S,
     /// Highest record position the tenant has been sent, real or heartbeat
     last_lsn: u64,
     evicted: Option<String>,
 }
 
-impl RoutedTenant {
-    pub fn new(id: String, db_oids: Vec<u32>, from_lsn: u64, sink: BoundaryHoldSink) -> Self {
+impl<S: TenantSink> RoutedTenant<S> {
+    pub fn new(id: String, db_oids: Vec<u32>, from_lsn: u64, sink: S) -> Self {
         Self {
             id,
             db_oids,
@@ -138,35 +166,92 @@ impl RoutedTenant {
         self.evicted.as_deref()
     }
 
-    async fn send(&mut self, record: &Record<'_>, stall: Duration) -> Result<(), SinkError> {
-        if self.evicted.is_some() || record.source_lsn < self.from_lsn {
-            return Ok(());
+    /// Fed: not evicted, and `lsn` is inside its descriptor history
+    fn takes(&self, lsn: u64) -> bool {
+        self.evicted.is_none() && lsn >= self.from_lsn
+    }
+
+    fn in_scope(&self, scope: Scope) -> bool {
+        match scope {
+            Scope::Db(db) => self.db_oids.contains(&db),
+            Scope::All => true,
         }
-        match tokio::time::timeout(stall, self.sink.on_record(record)).await {
-            Ok(Ok(())) => {
-                self.last_lsn = self.last_lsn.max(record.source_lsn);
-                Ok(())
-            }
-            Ok(Err(e)) => Err(e),
-            Err(_) => {
-                self.evicted = Some(format!(
-                    "queue refused records for {}s (destination stalled)",
-                    stall.as_secs()
-                ));
+    }
+
+    /// Settle one callback under the stall bound. A stall always evicts: it
+    /// would hold the shared pump. An error evicts with `isolate`, else it is
+    /// the session's
+    fn settle(
+        &mut self,
+        what: &str,
+        stall: Duration,
+        isolate: bool,
+        out: Result<Result<(), SinkError>, tokio::time::error::Elapsed>,
+    ) -> Result<(), SinkError> {
+        match out {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) if !isolate => Err(e),
+            Ok(Err(e)) => {
                 tracing::error!(
                     target: "walshadow::tenant",
                     tenant = %self.id,
-                    lsn = record.source_lsn,
-                    "tenant stalled the shared pump; evicting",
+                    error = %e,
+                    "tenant pipeline failed in {what}; evicting",
                 );
+                self.evicted = Some(format!("pipeline failed: {e}"));
+                Ok(())
+            }
+            Err(_) => {
+                tracing::error!(
+                    target: "walshadow::tenant",
+                    tenant = %self.id,
+                    "tenant stalled the shared pump in {what}; evicting",
+                );
+                self.evicted = Some(format!(
+                    "{what} blocked for {}s (destination stalled)",
+                    stall.as_secs()
+                ));
                 Ok(())
             }
         }
     }
+
+    async fn send(
+        &mut self,
+        record: &Record<'_>,
+        stall: Duration,
+        isolate: bool,
+    ) -> Result<(), SinkError> {
+        if !self.takes(record.source_lsn) {
+            return Ok(());
+        }
+        let out = tokio::time::timeout(stall, self.sink.on_record(record)).await;
+        if matches!(out, Ok(Ok(()))) {
+            self.last_lsn = self.last_lsn.max(record.source_lsn);
+        }
+        self.settle("record delivery", stall, isolate, out)
+    }
+
+    async fn send_owned(
+        &mut self,
+        record: Record<'static>,
+        stall: Duration,
+        isolate: bool,
+    ) -> Result<(), SinkError> {
+        let lsn = record.source_lsn;
+        if !self.takes(lsn) {
+            return Ok(());
+        }
+        let out = tokio::time::timeout(stall, self.sink.on_record_owned(record)).await;
+        if matches!(out, Ok(Ok(()))) {
+            self.last_lsn = self.last_lsn.max(lsn);
+        }
+        self.settle("record delivery", stall, isolate, out)
+    }
 }
 
-pub struct TenantRouter {
-    tenants: Vec<RoutedTenant>,
+pub struct TenantRouter<S = BoundaryHoldSink> {
+    tenants: Vec<RoutedTenant<S>>,
     stall_timeout: Duration,
     /// Last record routed anywhere: (source_lsn, next_lsn)
     last: (u64, u64),
@@ -176,7 +261,7 @@ pub struct TenantRouter {
     isolate: bool,
 }
 
-impl TenantRouter {
+impl<S: TenantSink> TenantRouter<S> {
     pub fn new(stall_timeout: Duration, isolate: bool) -> Self {
         Self {
             tenants: Vec::new(),
@@ -186,25 +271,25 @@ impl TenantRouter {
         }
     }
 
-    pub fn attach(&mut self, tenant: RoutedTenant) {
+    pub fn attach(&mut self, tenant: RoutedTenant<S>) {
         self.tenants.push(tenant);
     }
 
     /// Remove a tenant, returning its sink for the caller to drain or drop
-    pub fn detach(&mut self, id: &str) -> Option<RoutedTenant> {
+    pub fn detach(&mut self, id: &str) -> Option<RoutedTenant<S>> {
         let at = self.tenants.iter().position(|t| t.id == id)?;
         Some(self.tenants.remove(at))
     }
 
-    pub fn tenants(&self) -> &[RoutedTenant] {
+    pub fn tenants(&self) -> &[RoutedTenant<S>] {
         &self.tenants
     }
 
-    pub fn tenants_mut(&mut self) -> &mut [RoutedTenant] {
+    pub fn tenants_mut(&mut self) -> &mut [RoutedTenant<S>] {
         &mut self.tenants
     }
 
-    pub fn get_mut(&mut self, id: &str) -> Option<&mut RoutedTenant> {
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut RoutedTenant<S>> {
         self.tenants.iter_mut().find(|t| t.id == id)
     }
 
@@ -249,60 +334,61 @@ impl TenantRouter {
     pub fn send_wait_seconds(&self) -> f64 {
         self.tenants
             .iter()
-            .map(|t| t.sink.inner.send_wait_seconds())
+            .map(|t| t.sink.send_wait_seconds())
             .sum()
     }
 
     async fn deliver(&mut self, record: &Record<'_>) -> Result<(), SinkError> {
         let scope = scope_of(record);
-        let stall = self.stall_timeout;
-        let isolate = self.isolate;
-        for t in &mut self.tenants {
-            if let Scope::Db(db) = scope
-                && !t.db_oids.contains(&db)
-            {
-                continue;
-            }
-            if let Err(e) = t.send(record, stall).await {
-                if !isolate {
-                    return Err(e);
-                }
-                tracing::error!(
-                    target: "walshadow::tenant",
-                    tenant = %t.id,
-                    error = %e,
-                    "tenant pipeline failed; evicting",
-                );
-                t.evicted = Some(format!("pipeline failed: {e}"));
-            }
+        let (stall, isolate) = (self.stall_timeout, self.isolate);
+        for t in self.tenants.iter_mut().filter(|t| t.in_scope(scope)) {
+            t.send(record, stall, isolate).await?;
         }
         self.last = (record.source_lsn, record.next_lsn);
         Ok(())
+    }
+
+    /// [`Self::deliver`] for a record the pump is done with: a record one
+    /// tenant takes moves into its queue uncopied, one several take is
+    /// copied per tenant as before
+    async fn deliver_owned(&mut self, record: Record<'static>) -> Result<(), SinkError> {
+        let scope = scope_of(&record);
+        let lsn = record.source_lsn;
+        let only = {
+            let mut fed = self
+                .tenants
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.in_scope(scope) && t.takes(lsn))
+                .map(|(i, _)| i);
+            match (fed.next(), fed.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            }
+        };
+        let Some(only) = only else {
+            return self.deliver(&record).await;
+        };
+        let (stall, isolate) = (self.stall_timeout, self.isolate);
+        self.last = (record.source_lsn, record.next_lsn);
+        self.tenants[only].send_owned(record, stall, isolate).await
     }
 
     /// Ship every tenant's pending batch, first giving tenants that saw
     /// nothing of the latest stretch a position marker so their ack moves
     pub async fn flush(&mut self) -> Result<(), SinkError> {
         let (lsn, next_lsn) = self.last;
-        let stall = self.stall_timeout;
-        let isolate = self.isolate;
+        let (stall, isolate) = (self.stall_timeout, self.isolate);
         for t in &mut self.tenants {
             if t.evicted.is_some() {
                 continue;
             }
-            let mut out = Ok(());
             if lsn > t.last_lsn && lsn >= t.from_lsn {
-                let beat = heartbeat(lsn, next_lsn);
-                out = t.send(&beat, stall).await;
+                t.send(&heartbeat(lsn, next_lsn), stall, isolate).await?;
             }
-            if out.is_ok() {
-                out = t.sink.flush().await;
-            }
-            if let Err(e) = out {
-                if !isolate {
-                    return Err(e);
-                }
-                t.evicted = Some(format!("pipeline failed: {e}"));
+            if t.evicted.is_none() {
+                let out = tokio::time::timeout(stall, t.sink.flush()).await;
+                t.settle("flush", stall, isolate, out)?;
             }
         }
         Ok(())
@@ -325,7 +411,16 @@ fn heartbeat(lsn: u64, next_lsn: u64) -> Record<'static> {
     }
 }
 
-impl RecordSink for TenantRouter {
+impl<S: TenantSink> RecordSink for TenantRouter<S> {
+    /// Union over the tenants the record reaches: the pump must not ship
+    /// past a record any of them may hold on
+    fn may_park(&self, record: &Record<'_>) -> bool {
+        let scope = scope_of(record);
+        self.tenants
+            .iter()
+            .any(|t| t.in_scope(scope) && t.takes(record.source_lsn) && t.sink.may_park(record))
+    }
+
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
@@ -333,14 +428,21 @@ impl RecordSink for TenantRouter {
         Box::pin(self.deliver(record))
     }
 
+    fn on_record_owned(
+        &mut self,
+        record: Record<'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + '_>> {
+        Box::pin(self.deliver_owned(record))
+    }
+
     fn on_idle<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            for t in &mut self.tenants {
-                if t.evicted.is_none() {
-                    t.sink.on_idle().await?;
-                }
+            let (stall, isolate) = (self.stall_timeout, self.isolate);
+            for t in self.tenants.iter_mut().filter(|t| t.evicted.is_none()) {
+                let out = tokio::time::timeout(stall, t.sink.on_idle()).await;
+                t.settle("idle tick", stall, isolate, out)?;
             }
             Ok(())
         })
@@ -350,10 +452,10 @@ impl RecordSink for TenantRouter {
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            for t in &mut self.tenants {
-                if t.evicted.is_none() {
-                    t.sink.on_close().await?;
-                }
+            let (stall, isolate) = (self.stall_timeout, self.isolate);
+            for t in self.tenants.iter_mut().filter(|t| t.evicted.is_none()) {
+                let out = tokio::time::timeout(stall, t.sink.on_close()).await;
+                t.settle("close", stall, isolate, out)?;
             }
             Ok(())
         })
@@ -364,10 +466,10 @@ impl RecordSink for TenantRouter {
         lsn: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            for t in &mut self.tenants {
-                if t.evicted.is_none() && lsn >= t.from_lsn {
-                    t.sink.on_idle_advance(lsn).await?;
-                }
+            let (stall, isolate) = (self.stall_timeout, self.isolate);
+            for t in self.tenants.iter_mut().filter(|t| t.takes(lsn)) {
+                let out = tokio::time::timeout(stall, t.sink.on_idle_advance(lsn)).await;
+                t.settle("idle advance", stall, isolate, out)?;
             }
             Ok(())
         })
@@ -445,5 +547,209 @@ mod tests {
         rec.parsed.main_data = std::borrow::Cow::Owned(md);
         rec.parsed.main_data_len = 16;
         assert_eq!(scope_of(&rec), Scope::Db(11));
+    }
+
+    /// Records a tenant received, and the callback it fails or blocks in
+    #[derive(Default)]
+    struct Fake {
+        seen: Vec<u64>,
+        owned: usize,
+        idles: usize,
+        advances: Vec<u64>,
+        fail: Option<&'static str>,
+        stall: Option<&'static str>,
+        parks: bool,
+    }
+
+    impl Fake {
+        fn act(
+            &self,
+            at: &'static str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send>> {
+            let (fail, stall) = (self.fail == Some(at), self.stall == Some(at));
+            Box::pin(async move {
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+                if fail {
+                    return Err(SinkError::Other(format!("{at} failed")));
+                }
+                Ok(())
+            })
+        }
+    }
+
+    impl RecordSink for Fake {
+        fn may_park(&self, _record: &Record<'_>) -> bool {
+            self.parks
+        }
+
+        fn on_record<'a>(
+            &'a mut self,
+            record: &'a Record<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+            self.seen.push(record.source_lsn);
+            self.act("record")
+        }
+
+        fn on_record_owned(
+            &mut self,
+            record: Record<'static>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + '_>> {
+            self.owned += 1;
+            self.seen.push(record.source_lsn);
+            self.act("record")
+        }
+
+        fn on_idle<'a>(
+            &'a mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+            self.idles += 1;
+            self.act("idle")
+        }
+
+        fn on_close<'a>(
+            &'a mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+            self.act("close")
+        }
+
+        fn on_idle_advance<'a>(
+            &'a mut self,
+            lsn: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+            self.advances.push(lsn);
+            self.act("advance")
+        }
+    }
+
+    impl TenantSink for Fake {
+        fn flush(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
+            self.act("flush")
+        }
+
+        fn in_flight(&self) -> u64 {
+            0
+        }
+
+        fn processed(&self) -> u64 {
+            self.seen.len() as u64
+        }
+
+        fn send_wait_seconds(&self) -> f64 {
+            0.0
+        }
+    }
+
+    fn router(isolate: bool, tenants: Vec<(&str, u32, Fake)>) -> TenantRouter<Fake> {
+        let mut r = TenantRouter::new(Duration::from_millis(50), isolate);
+        for (id, db, sink) in tenants {
+            r.attach(RoutedTenant::new(id.into(), vec![db], 0, sink));
+        }
+        r
+    }
+
+    fn at(db: u32, lsn: u64) -> Record<'static> {
+        Record {
+            source_lsn: lsn,
+            next_lsn: lsn + 8,
+            ..heap_in(db)
+        }
+    }
+
+    fn sink<'r>(r: &'r TenantRouter<Fake>, id: &str) -> &'r Fake {
+        &r.tenants().iter().find(|t| t.id == id).unwrap().sink
+    }
+
+    /// A tenant failing or blocking in any callback is evicted; the others
+    /// keep getting records, ticks and advances
+    #[tokio::test]
+    async fn every_callback_isolates_a_failing_or_stalled_tenant() {
+        for (cb, stalls) in [
+            ("idle", false),
+            ("idle", true),
+            ("advance", false),
+            ("advance", true),
+            ("flush", false),
+            ("flush", true),
+            ("close", false),
+            ("close", true),
+        ] {
+            let bad = Fake {
+                fail: (!stalls).then_some(cb),
+                stall: stalls.then_some(cb),
+                ..Fake::default()
+            };
+            let mut r = router(true, vec![("bad", 5, bad), ("good", 6, Fake::default())]);
+            r.on_record(&at(5, 0x10)).await.unwrap();
+            r.on_record(&at(6, 0x18)).await.unwrap();
+            match cb {
+                "idle" => r.on_idle().await.unwrap(),
+                "advance" => r.on_idle_advance(0x20).await.unwrap(),
+                "flush" => r.flush().await.unwrap(),
+                _ => r.on_close().await.unwrap(),
+            }
+            let evicted = r.evictions();
+            assert_eq!(evicted.len(), 1, "{cb} stall={stalls}: {evicted:?}");
+            assert_eq!(evicted[0].0, "bad");
+            assert_eq!(evicted[0].1.contains("stalled"), stalls, "{evicted:?}");
+            // Healthy tenant keeps flowing; the evicted one gets nothing more
+            r.on_record(&at(6, 0x30)).await.unwrap();
+            r.on_record(&at(5, 0x38)).await.unwrap();
+            r.on_idle().await.unwrap();
+            r.on_idle_advance(0x40).await.unwrap();
+            r.flush().await.unwrap();
+            assert_eq!(sink(&r, "good").seen.last(), Some(&0x30));
+            assert!(sink(&r, "good").advances.contains(&0x40));
+            assert!(!sink(&r, "bad").seen.contains(&0x38));
+            assert!(!sink(&r, "bad").advances.contains(&0x40));
+        }
+    }
+
+    #[tokio::test]
+    async fn single_database_layout_keeps_callback_errors_fatal() {
+        let bad = Fake {
+            fail: Some("idle"),
+            ..Fake::default()
+        };
+        let mut r = router(false, vec![("default", 5, bad)]);
+        assert!(r.on_idle().await.is_err());
+        assert!(r.evictions().is_empty());
+    }
+
+    /// Same relation OID in two databases reaches only the tenant following
+    /// the database that wrote it, in order, and moves rather than copies
+    /// when one tenant takes the record
+    #[tokio::test]
+    async fn owned_records_route_by_database_in_order_uncopied() {
+        let mut r = router(
+            true,
+            vec![("a", 5, Fake::default()), ("b", 6, Fake::default())],
+        );
+        for (db, lsn) in [(5, 0x10), (6, 0x18), (5, 0x20), (6, 0x28)] {
+            r.on_record_owned(at(db, lsn)).await.unwrap();
+        }
+        assert_eq!(sink(&r, "a").seen, [0x10, 0x20]);
+        assert_eq!(sink(&r, "b").seen, [0x18, 0x28]);
+        assert_eq!((sink(&r, "a").owned, sink(&r, "b").owned), (2, 2));
+        // Broadcast copies to each tenant
+        let mut checkpoint = at(0, 0x30);
+        checkpoint.parsed.blocks.clear();
+        checkpoint.parsed.header.resource_manager_id = RmId::Xlog as u8;
+        r.on_record_owned(checkpoint).await.unwrap();
+        assert_eq!(sink(&r, "a").seen.last(), Some(&0x30));
+        assert_eq!(sink(&r, "b").seen.last(), Some(&0x30));
+        assert_eq!(r.last_record_start(), 0x30);
+    }
+
+    #[test]
+    fn may_park_is_the_union_over_tenants_the_record_reaches() {
+        let parks = Fake {
+            parks: true,
+            ..Fake::default()
+        };
+        let r = router(true, vec![("a", 5, parks), ("b", 6, Fake::default())]);
+        assert!(r.may_park(&at(5, 0x10)));
+        assert!(!r.may_park(&at(6, 0x10)), "b never parks");
     }
 }

@@ -276,6 +276,7 @@ mod tests {
             last_cleanup: Default::default(),
         };
         let mut desc = RelDescriptor {
+            ancestors: Vec::new(),
             rfn: RelFileNode {
                 spc_node: 1663,
                 db_node: 5,

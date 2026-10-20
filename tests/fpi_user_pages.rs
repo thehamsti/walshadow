@@ -14,12 +14,12 @@
 
 #[path = "common/inproc_harness.rs"]
 mod h;
+use h::tools::pg_available;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
 use std::pin::Pin;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use walrus::pg::replication::conn::PgConfig;
@@ -31,14 +31,6 @@ use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::wal_stream::WalStream;
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_source(tmp: &tempfile::TempDir) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("source-data"), tmp.path().join("filtered"));
@@ -164,7 +156,7 @@ async fn attach(source: &Shadow) -> (SourceFeed, WalStream) {
         .with_status_interval(Duration::from_millis(500));
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
+    let mut stream = WalStream::builder(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
     stream.filter_mut().set_target_db(current_db_oid(source));
     {
         let sql_client = feed.sql_client().await.expect("sql client");
@@ -183,13 +175,12 @@ async fn attach(source: &Shadow) -> (SourceFeed, WalStream) {
     feed.start_physical_replication(None, aligned, ident.timeline)
         .await
         .expect("START_REPLICATION");
-    (feed, stream)
+    (feed, stream.start())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_page_images_never_reach_the_shadow() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -238,11 +229,15 @@ async fn user_page_images_never_reach_the_shadow() {
              DELETE FROM big WHERE id % 7 = 0;\n\
              CHECKPOINT;\n\
              VACUUM (FREEZE) big;\n\
-             VACUUM FULL big;\n\
-             SELECT pg_switch_wal();\n",
+             VACUUM FULL big;\n",
         )
         .expect("dirty hint bits and vacuum");
+    // Taken before the switch: the next record past it is background WAL,
+    // which can be a bgwriter snapshot interval away
     let target = wal_insert_lsn(&source);
+    source
+        .psql_one("SELECT pg_switch_wal()")
+        .expect("switch wal");
 
     let deadline = Instant::now() + Duration::from_secs(60);
     while census.max_next_lsn < target && Instant::now() < deadline {

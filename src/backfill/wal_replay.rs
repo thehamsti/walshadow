@@ -15,20 +15,20 @@ use walrus::pg::walparser::{Oid, RmId};
 use crate::budget::{MemoryBudget, MemoryPermit, acquire_opt};
 use crate::catalog::desc_log::{DescriptorLog, DescriptorLogs};
 use crate::config::ResolvedConfig;
-use crate::decode::heap_decoder::CommittedTuple;
+use crate::decode::heap_decoder::{CommittedTuple, take_key_change_tombstone};
 use crate::decode::visibility::PgXactPatch;
 use crate::decode::wal_xact::{
     XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT,
     XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_OPMASK, parse_xact_assignment, parse_xact_payload,
 };
 use crate::emit::ch_emitter::EmitterStats;
-use crate::emit::pipeline::ack::AckHandle;
+use crate::emit::pipeline::ack::{AckHandle, OpenSeq, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
-use crate::emit::route::{RouteSnapshot, freeze_routes};
+use crate::emit::route::{FrozenRoutes, freeze_routes};
 use crate::mapping::MappingSnapshot;
 use crate::pos::Pos;
 use crate::record::{Record, RecordSink, SegmentSink, SinkError, WAL_SEG_SIZE};
-use crate::schema::{FIRST_NORMAL_OBJECT_ID, RelDescriptor, RelName};
+use crate::schema::{FIRST_NORMAL_OBJECT_ID, RelDescriptor};
 use crate::source::wal_stream::WalStream;
 use crate::toast::{ChunkRefMap, ToastResolver, ToastRow, ToastRowRef};
 use crate::xact::spill::BodySpoolFile;
@@ -94,17 +94,17 @@ pub struct WalReplaySink {
     /// See [`WalReplayInputs::whole_db_filter`]
     whole_db_filter: bool,
     /// Routes frozen at replay start from the mapping + config snapshots
-    routes: HashMap<RelName, Arc<RouteSnapshot>>,
+    routes: FrozenRoutes,
     stats: Arc<EmitterStats>,
     budget: Option<MemoryBudget>,
     /// Drain-slice budget, same knobs as the pipeline reorder
     batch_rows: usize,
     batch_bytes: usize,
     msg_tx: mpsc::Sender<BatcherMsg>,
-    ack: AckHandle,
     patch: Option<Arc<std::sync::Mutex<PgXactPatch>>>,
-    /// Current `(sequence, routed rows)`, registered on first row
-    open: Option<(u64, u64)>,
+    seqs: SeqAlloc,
+    /// Current seq and its routed rows, registered on first row
+    open: Option<(OpenSeq, u64)>,
     /// Rows waiting for next mirror write
     pending_rows: Vec<ToastRow>,
     pending_bytes: usize,
@@ -146,17 +146,14 @@ impl WalReplaySink {
             batch_rows: inputs.batch_rows,
             batch_bytes: inputs.batch_bytes,
             msg_tx: inputs.msg_tx,
-            ack: inputs.ack,
             patch: inputs.patch,
+            seqs: inputs.ack.seqs(inputs.next_seq),
             open: None,
             pending_rows: Vec::new(),
             pending_bytes: 0,
             pending_permits: Vec::new(),
             pending_cap,
-            replay: ReplayStats {
-                next_seq: inputs.next_seq,
-                ..Default::default()
-            },
+            replay: ReplayStats::default(),
         }
     }
 
@@ -173,14 +170,17 @@ impl WalReplaySink {
     }
 
     pub fn stats(&self) -> ReplayStats {
-        self.replay
+        ReplayStats {
+            next_seq: self.seqs.next(),
+            ..self.replay
+        }
     }
 
     /// Mirror writes flushed, seq boundary reported. Commits close their own
     /// seq, so a segment boundary leaves none open
     pub async fn segment_boundary(&mut self) -> std::result::Result<u64, SinkError> {
         self.flush_rows().await?;
-        Ok(self.replay.next_seq)
+        Ok(self.seqs.next())
     }
 
     /// Lowest first-record LSN still buffered. A resume above it would drop
@@ -333,7 +333,7 @@ impl WalReplaySink {
                 .commit(xid, &payload.subxacts);
         }
         // Resolve filenodes invisible at record time before drain
-        resolve_stash(
+        let stash = resolve_stash(
             &self.buffer,
             &self.log,
             &self.pending,
@@ -349,7 +349,7 @@ impl WalReplaySink {
             .lock()
             .await
             .drain_committed(
-                xid,
+                stash,
                 payload.xact_time,
                 record.source_lsn,
                 &payload.subxacts,
@@ -367,7 +367,7 @@ impl WalReplaySink {
         }
         drain.finish().await.map_err(SinkError::from)?;
         if let Some((seq, rows)) = self.open.take() {
-            self.ack.placed(seq, rows);
+            seq.place(rows);
         }
         self.subxact_tracker.forget_tree(xid);
         Ok(())
@@ -393,9 +393,11 @@ impl WalReplaySink {
                         rows_cursor = upto;
                     }
                 }
-                // Live stream owns DDL/config apply
+                // Live stream owns DDL/config apply. xl_heap_truncate carries
+                // no block ref, so never passes the rfn filter
                 WalkStep::Event(DrainEntry::Catalog(_))
-                | WalkStep::Event(DrainEntry::Config(_)) => {}
+                | WalkStep::Event(DrainEntry::Config(_))
+                | WalkStep::Truncate { .. } => {}
                 WalkStep::Event(DrainEntry::ToastBarrier {
                     toast_relid,
                     marker_lsn,
@@ -403,14 +405,9 @@ impl WalReplaySink {
                     // Barrier reads rows from current rewrite
                     self.flush_rows().await?;
                     self.resolver
-                        .rewrite_barrier(toast_relid, marker_lsn, commit_lsn)
+                        .rewrite_barrier(self.log.db_oid(), toast_relid, marker_lsn, commit_lsn)
                         .await
                         .map_err(|e| SinkError::Other(format!("toast rewrite barrier: {e}")))?;
-                }
-                WalkStep::Truncate(_) => {
-                    // xl_heap_truncate carries no block ref, never passes the
-                    // rfn filter
-                    debug_assert!(false, "TRUNCATE heap in gap replay");
                 }
                 WalkStep::Heap(mut heap) => {
                     let rfn = heap.decoded.rfn;
@@ -428,7 +425,7 @@ impl WalReplaySink {
                         self.replay.commits_past_through += 1;
                         continue;
                     }
-                    let Some(route) = self.routes.get(&rel.rel_name).cloned() else {
+                    let Some(route) = self.routes.route(rel) else {
                         self.stats
                             .unsupported_relations
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -456,16 +453,30 @@ impl WalReplaySink {
                     let value_permit = detoast_heap(&mut heap, spool, &ref_maps, &self.resolver)
                         .await
                         .map_err(SinkError::from)?;
-                    let seq = if let Some((seq, rows)) = &mut self.open {
+                    let (open, rows) = self
+                        .open
+                        .get_or_insert_with(|| (self.seqs.open(commit_lsn, Publish::Commit), 0));
+                    *rows += 1;
+                    let seq = open.seq();
+                    if !route.drops_deletes()
+                        && let Some(tomb) = take_key_change_tombstone(&mut heap.decoded, &rel)
+                    {
                         *rows += 1;
-                        *seq
-                    } else {
-                        let seq = self.replay.next_seq;
-                        self.replay.next_seq += 1;
-                        self.ack.register(seq, commit_lsn);
-                        self.open = Some((seq, 1));
-                        seq
-                    };
+                        self.msg_tx
+                            .send(BatcherMsg::Row(RoutedRow {
+                                seq,
+                                rel: rel.clone(),
+                                route: route.clone(),
+                                committed: CommittedTuple {
+                                    decoded: tomb,
+                                    commit_ts,
+                                    commit_lsn,
+                                },
+                                value_permit: None,
+                            }))
+                            .await
+                            .map_err(|_| SinkError::Other("wal_replay: tail closed".into()))?;
+                    }
                     self.msg_tx
                         .send(BatcherMsg::Row(RoutedRow {
                             seq,
@@ -581,7 +592,7 @@ pub struct SegmentPump {
 
 impl SegmentPump {
     pub fn start(first: &SegmentName, target_db_oid: Oid) -> Result<Self> {
-        let mut stream = WalStream::new(
+        let mut stream = WalStream::builder(
             first.timeline,
             WAL_SEG_SIZE,
             Pos::new(first.start_lsn(WAL_SEG_SIZE)),
@@ -589,7 +600,7 @@ impl SegmentPump {
         .map_err(|e| anyhow::anyhow!("wal_replay: WalStream: {e}"))?;
         stream.filter_mut().set_target_db(target_db_oid);
         Ok(Self {
-            stream,
+            stream: stream.start(),
             seg_sink: DropSegments,
         })
     }
@@ -641,7 +652,7 @@ pub async fn pump_segments_through(
 mod tests {
     use super::*;
     use crate::catalog::desc_log::DescLogIdentity;
-    use crate::decode::visibility::{PgXactAccum, PgXactView, XidStatus};
+    use crate::decode::visibility::{PgXactAccum, PgXactView, SealedPatch, XidStatus};
     use crate::decode::wal_xact::{
         XACT_XINFO_HAS_SUBXACTS, XACT_XINFO_HAS_TWOPHASE, XLOG_XACT_HAS_INFO,
     };
@@ -763,11 +774,17 @@ mod tests {
 
         // Referrer bound is the walk's `start_lsn`, above the page version
         assert_eq!(
-            store.fetch(rel.oid, 7, 0x6800, 10).await.unwrap(),
+            store
+                .fetch(rel.rfn.db_node, rel.oid, 7, 0x6800, 10)
+                .await
+                .unwrap(),
             FetchedValue::Assembled(b"firstthird".to_vec()),
         );
         assert_eq!(
-            store.fetch(rel.oid, 8, 0x6800, 4).await.unwrap(),
+            store
+                .fetch(rel.rfn.db_node, rel.oid, 8, 0x6800, 4)
+                .await
+                .unwrap(),
             FetchedValue::Assembled(b"only".to_vec()),
         );
     }
@@ -800,7 +817,10 @@ mod tests {
         assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), 1);
         for value_id in [7, 8] {
             assert_eq!(
-                store.fetch(rel.oid, value_id, 0x6800, 4).await.unwrap(),
+                store
+                    .fetch(rel.rfn.db_node, rel.oid, value_id, 0x6800, 4)
+                    .await
+                    .unwrap(),
                 FetchedValue::Assembled(b"body".to_vec()),
             );
         }
@@ -965,7 +985,7 @@ mod tests {
         })
     }
 
-    fn status(patch: &PgXactPatch, xid: u32) -> XidStatus {
+    fn status(patch: &SealedPatch, xid: u32) -> XidStatus {
         let accum = PgXactAccum::new();
         PgXactView::new(&accum, patch).xid_status(xid)
     }
@@ -984,7 +1004,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        let patch = patch.lock().unwrap();
+        let patch = std::mem::take(&mut *patch.lock().unwrap()).seal();
         assert_eq!(status(&patch, PREPARED_XID), XidStatus::Committed);
         assert_eq!(status(&patch, PREPARED_SUBXID), XidStatus::Committed);
         assert_ne!(status(&patch, FINISHER_XID), XidStatus::Committed);
@@ -1003,7 +1023,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        let patch = patch.lock().unwrap();
+        let patch = std::mem::take(&mut *patch.lock().unwrap()).seal();
         assert_eq!(status(&patch, PREPARED_XID), XidStatus::Aborted);
         assert_ne!(status(&patch, FINISHER_XID), XidStatus::Aborted);
     }

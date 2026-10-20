@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_global (
     flush_timeout_ms    bigint,
     compression         text,        -- none / lz4 / zstd
     retry_max_attempts  integer,
-    drop_table_strategy text         -- retain / drop / warn
+    drop_table_strategy text,        -- retain / drop / warn
+    detach_strategy     text         -- detached partition's existing rows:
+                                     -- retain / drop / warn
 );
 
 -- Per-namespace defaults, keyed on source PG schema name.
@@ -34,7 +36,11 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_namespace (
     namespace           text PRIMARY KEY,
     target_database     text,
     auto_create         boolean,
-    drop_table_strategy text         -- overrides config_global for this namespace
+    auto_create_name    text,        -- derived table name template over
+                                     -- $database$/$schema$/$table$; NULL
+                                     -- means '$schema$_$table$'
+    drop_table_strategy text,        -- overrides config_global for this namespace
+    detach_strategy     text         -- overrides config_global for this namespace
 );
 
 -- Per-relation destination mapping, keyed on (namespace, relname) (not
@@ -56,10 +62,18 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_table (
                                      -- inherits, empty array derives
     primary_key     text[],          -- ClickHouse PRIMARY KEY; must prefix
                                      -- order_by
+    engine          text,            -- ClickHouse engine; NULL inherits
+                                     -- ReplacingMergeTree
+    partition_by    text,            -- ClickHouse PARTITION BY expression
+    route           text,            -- partition destination: 'root' (default)
+                                     -- uses root's destination; 'self' uses
+                                     -- a separate destination
     lsn             text,            -- per-relation names for the columns
     xid             text,            -- walshadow appends; NULL inherits
     commit_ts       text,            -- [system_columns]
     is_deleted      text,            -- '' drops the marker (and DELETE rows)
+    leaf            text,            -- partition OID column on a partitioned
+                                     -- root's destination; '' drops it
     PRIMARY KEY (namespace, relname)
 );
 
@@ -70,24 +84,37 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_column (
     attname     text NOT NULL,
     match       text,
     target_type text,                -- ClickHouse type expression
+    nan         text,                -- non-finite numeric into Decimal:
+    pos_inf     text,                -- 'reject' | 'null' | 'min' | 'max' |
+    neg_inf     text,                -- decimal literal; NULL inherits
     PRIMARY KEY (namespace, relname, attname)
 );
 
 -- Additive upgrade: columns introduced after the initial config_table shape.
 -- CREATE TABLE IF NOT EXISTS above no-ops on an existing install, so an
 -- upgrading deployment re-runs this to gain the columns the newer daemon reads.
+ALTER TABLE :"walshadow_schema".config_global ADD COLUMN IF NOT EXISTS detach_strategy text;
+ALTER TABLE :"walshadow_schema".config_namespace ADD COLUMN IF NOT EXISTS auto_create_name text;
+ALTER TABLE :"walshadow_schema".config_namespace ADD COLUMN IF NOT EXISTS detach_strategy text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS replicate       boolean;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS initial_load    text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS target_database text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS target_table    text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS order_by        text[];
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS primary_key     text[];
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS engine          text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS match           text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS lsn             text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS xid             text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS commit_ts       text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS is_deleted      text;
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS partition_by    text;
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS route           text;
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS leaf            text;
 ALTER TABLE :"walshadow_schema".config_column ADD COLUMN IF NOT EXISTS match           text;
+ALTER TABLE :"walshadow_schema".config_column ADD COLUMN IF NOT EXISTS nan             text;
+ALTER TABLE :"walshadow_schema".config_column ADD COLUMN IF NOT EXISTS pos_inf         text;
+ALTER TABLE :"walshadow_schema".config_column ADD COLUMN IF NOT EXISTS neg_inf         text;
 
 -- REPLICA IDENTITY FULL logs the complete old-row image on UPDATE/DELETE, so a
 -- DELETE always carries the key columns the decoder reads (namespace/relname/

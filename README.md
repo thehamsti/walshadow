@@ -1,14 +1,3 @@
-# walshadow
-
-> [!WARNING]
-> **Experimental**
->
-> **Project status: Development Preview**
->
-> walshadow is under active development and being hardened through real-world
-> testing and feedback. We recommend validating it thoroughly with your
-> workloads. Interfaces and behavior may evolve
-
 walshadow replicates PostgreSQL rows into ClickHouse from physical WAL,
 including initial load, continuous changes, schema evolution, restarts, and
 planned source switchover
@@ -33,7 +22,7 @@ PostgreSQL major version
 - [Architecture](architecture/README.md)
 - [Configuration](docs/configuration.md)
 - [Table selection](docs/table-selection.md)
-- [Several databases](docs/multi-database.md)
+- [Several databases](docs/multi-database.md), as tenants
 - [Destination tables](docs/destination-tables.md)
 - [Schema changes](docs/schema-changes.md)
 - [Operations](docs/operations.md)

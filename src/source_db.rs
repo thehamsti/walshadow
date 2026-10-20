@@ -22,7 +22,6 @@ use crate::emit::ch_emitter::EmitterConfig;
 use crate::emit::route::RowPolicy;
 use crate::mapping::MappingHandle;
 use crate::ops::bridge::Bridge;
-use ahash::{HashMap, HashMapExt};
 
 /// Bridge pool and shadow catalog for one source database, opened before the
 /// descriptor log and routing map that complete a [`SourceDb`]
@@ -62,7 +61,11 @@ impl DbLink {
             .await
             .with_context(|| {
                 format!(
-                    "connect bridge for database {} at {}",
+                    "connect bridge for database {} at {}. The socket is registered by \
+                     the shadow's bridge worker for that database, so it is absent \
+                     while the shadow has no such database — replay creates one the \
+                     source made after the base backup, but a data dir provisioned for \
+                     another source never gains it and needs a reset",
                     cfg.name,
                     cfg.bridge_path.display()
                 )
@@ -74,8 +77,8 @@ impl DbLink {
             socket = %bridge.path().display(),
             dbname = %cfg.name,
             workers = bridge.pool_size(),
-            pg_version = info.map(|i| i.pg_version_num).unwrap_or(0),
-            in_recovery = info.map(|i| i.in_recovery).unwrap_or(false),
+            pg_version = info.pg_version_num,
+            in_recovery = info.in_recovery,
             "bridge connected",
         );
         let cat_cfg = ShadowCatalogConfig::default();
@@ -93,16 +96,14 @@ impl DbLink {
             .current_database_oid()
             .await
             .with_context(|| format!("shadow database oid for {}", cfg.name))?;
-        if let Some(hello) = info {
-            anyhow::ensure!(
-                hello.datid == oid,
-                "bridge socket {} serves database oid {}, but {} is oid {oid}; \
-                 shadow's walshadow.databases disagrees with this config",
-                bridge.path().display(),
-                hello.datid,
-                cfg.name,
-            );
-        }
+        anyhow::ensure!(
+            info.datid == oid,
+            "bridge socket {} serves database oid {}, but {} is oid {oid}; \
+             shadow's walshadow.databases disagrees with this config",
+            bridge.path().display(),
+            info.datid,
+            cfg.name,
+        );
         tracing::info!(
             target: "walshadow",
             conninfo = %cfg.shadow_conninfo,
@@ -174,12 +175,11 @@ impl std::fmt::Debug for SourceDb {
     }
 }
 
-/// Look up configured databases by OID from WAL records
+/// Databases this daemon follows
 #[derive(Debug)]
 pub struct SourceDbs {
     /// Config order, which is also bridge socket order
     order: Vec<Arc<SourceDb>>,
-    by_oid: HashMap<Oid, Arc<SourceDb>>,
     /// `[source] dbname`: probe connections, shared settings, and the one
     /// database a single-database path uses
     primary: Arc<SourceDb>,
@@ -188,18 +188,14 @@ pub struct SourceDbs {
 impl SourceDbs {
     /// Use config order, fall back to first database if primary OID is missing
     pub fn new(dbs: Vec<Arc<SourceDb>>, primary: Oid) -> Self {
-        let mut by_oid = HashMap::with_capacity(dbs.len());
-        for db in &dbs {
-            by_oid.insert(db.oid, db.clone());
-        }
-        let primary = by_oid
-            .get(&primary)
+        let primary = dbs
+            .iter()
+            .find(|db| db.oid == primary)
+            .or_else(|| dbs.first())
             .cloned()
-            .or_else(|| dbs.first().cloned())
             .expect("a daemon follows at least one database");
         Self {
             order: dbs,
-            by_oid,
             primary,
         }
     }
@@ -207,11 +203,6 @@ impl SourceDbs {
     pub fn single(db: Arc<SourceDb>) -> Self {
         let primary = db.oid;
         Self::new(vec![db], primary)
-    }
-
-    /// Return `None` for databases this daemon does not replicate
-    pub fn get(&self, oid: Oid) -> Option<&Arc<SourceDb>> {
-        self.by_oid.get(&oid)
     }
 
     pub fn primary(&self) -> &Arc<SourceDb> {
@@ -222,28 +213,7 @@ impl SourceDbs {
         &self.order
     }
 
-    pub fn len(&self) -> usize {
-        self.order.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.order.is_empty()
-    }
-
     pub fn oids(&self) -> impl Iterator<Item = Oid> + '_ {
         self.order.iter().map(|db| db.oid)
-    }
-
-    /// Select affected databases, zero means all configured databases
-    /// PostgreSQL uses `dbId == 0` to invalidate relation caches in every database
-    pub fn scoped(&self, db_oid: Oid) -> &[Arc<SourceDb>] {
-        if let Some(db) = self.by_oid.get(&db_oid) {
-            std::slice::from_ref(db)
-        } else if db_oid == 0 {
-            &self.order
-        } else {
-            // Ignore databases this daemon does not replicate
-            &[]
-        }
     }
 }

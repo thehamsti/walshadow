@@ -78,10 +78,30 @@ replicate_all = true
 ```
 
 Tenant ids are 1–63 characters of `[a-z0-9_-]`. Two tenants may not follow
-one database, write one Snowflake database and internal schema, or share a
-state directory; the daemon and `ctl` refuse such configs. With no
-`[tenants]` and no `[tenant.*]` the daemon runs the single-database layout
-unchanged.
+one database. With no `[tenants]` and no `[tenant.*]` the daemon runs the
+single-database layout unchanged.
+
+### Destinations
+
+Tenants write disjoint destinations, so no table, channel, receipt or state
+lock is ever shared. The daemon and `ctl` refuse a config where two tenants:
+
+- write one Snowflake database (account and database), whatever their
+  `internal_schema`: public views are named per database and schema, not per
+  internal schema
+- share a Snowflake state directory
+- reach one ClickHouse database on one host and port, through `[ch]
+  database`, a namespace or table `target_database`, a named instance or a
+  tee. Two tenants left at the default database collide, so give each its own
+
+A route a tenant's runtime config rows (`config_table`, `config_namespace`)
+resolve outside its own ClickHouse databases fails that tenant's DDL, which
+evicts it, rather than writing another tenant's tables.
+
+Snowflake replicates each declarative partition as a table of its own, as
+before partition routing existed; `route`, `tee`, `target_instance` and
+`[ch.instances]` are ClickHouse-only and refused with a Snowflake
+destination.
 
 The replication role needs `CONNECT` on every tenant database and the
 privileges a single-database deployment needs there (runtime-config tables,
@@ -164,11 +184,13 @@ One slot is shared, so a tenant that cannot keep up would hold WAL on the
 primary for every tenant. Three limits keep one client from affecting the
 rest:
 
-- A tenant whose queue refuses records for `stall_timeout_secs` is evicted.
+- A tenant whose queue refuses records, or whose flush, idle or close step
+  blocks, for `stall_timeout_secs` is evicted.
 - A tenant whose resume floor trails the pump by more than `max_lag_bytes`
-  is evicted.
-- A tenant whose pipeline fails is evicted. In the single-database layout a
-  pipeline error still stops the daemon, as before.
+  is evicted. Without `max_lag_bytes`, set in `[tenants]` or per tenant, a
+  slow tenant holds WAL until it catches up or stalls.
+- A tenant whose pipeline fails, in any callback, is evicted. In the
+  single-database layout a pipeline error still stops the daemon, as before.
 
 An evicted tenant is detached: it stops holding WAL, and
 `tenant.toml` records why. Fix the cause, then `ctl tenant attach`; the
@@ -211,10 +233,11 @@ module and list tenant databases itself.
 
 ## Current limits
 
-- A tenant follows exactly one database. `[database.*]` entries
-  ([several databases](multi-database.md)) belong to the single-tenant
-  layout, where every database shares one pipeline and destination; the
-  daemon and `ctl` refuse them alongside `[tenants]`.
+- A tenant follows exactly one database. `[database.*]` sections are
+  refused in either layout ([several databases](multi-database.md)).
+- Changing which ClickHouse databases a tenant's config reaches takes effect
+  when the tenant re-attaches or the daemon restarts; until then its DDL
+  stays inside the databases it opened with.
 - `[toast] mode = "shadow"` is single-database only.
 - Greenfield bootstrap with tenants builds shadow only (`direct` mode);
   tenants then initial-load with `copy`.

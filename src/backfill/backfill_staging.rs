@@ -19,11 +19,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use clickhouse_c::{Block, Event};
-use futures::{StreamExt, TryStreamExt};
 
 use crate::backfill::backfill_types::BackupRequest;
-use crate::ch::{ChConn, EmitterError, exec_drain, quote_ident, with_timeout};
+use crate::backfill::copy_backfill::SwapPermit;
+use crate::ch::{ChConn, EmitterError, exec_drain, query_strings, quote_ident};
 use crate::config::{DestEmitter, ResolvedConfig};
 use crate::destination::snowflake::runtime::SnowflakeRuntime;
 use crate::destination::snowflake::state::GenerationPhase;
@@ -33,38 +32,33 @@ use crate::mapping::{MappingHandle, MappingSnapshot, TableMapping, TableTarget};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{RelDescriptor, RelName};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use futures::{StreamExt, TryStreamExt};
 
 /// `orders` loads into `orders__wsstg`; deterministic so a retry or boot
 /// recovery finds the prior attempt's table
 pub const STAGING_SUFFIX: &str = "__wsstg";
 
-/// One rel's swap identities. `database`/`table` are the unquoted
-/// destination parts; `s_lsn` drives the copy-back filter.
+/// One rel's swap identities; `s_lsn` drives the copy-back filter
 #[derive(Debug, Clone)]
 pub struct StagingRel {
     pub rel: RelName,
-    pub database: String,
-    pub table: String,
+    pub target: TableTarget,
     pub s_lsn: u64,
 }
 
 impl StagingRel {
     pub fn staging_table(&self) -> String {
-        format!("{}{STAGING_SUFFIX}", self.table)
+        format!("{}{STAGING_SUFFIX}", self.target.table)
     }
 
     pub fn real_sql(&self) -> String {
-        format!(
-            "{}.{}",
-            quote_ident(&self.database),
-            quote_ident(&self.table)
-        )
+        self.target.sql()
     }
 
     pub fn staging_sql(&self) -> String {
         format!(
             "{}.{}",
-            quote_ident(&self.database),
+            quote_ident(&self.target.database),
             quote_ident(&self.staging_table())
         )
     }
@@ -183,7 +177,7 @@ pub async fn prepare_snowflake_with_kind(
                     return Ok::<_, anyhow::Error>(None);
                 };
                 let route = RouteSnapshot::freeze(
-                    Arc::new(mapping.clone()),
+                    mapping.clone(),
                     config.map_or_else(Arc::default, |c| c.column_rules.clone()),
                     emitter.row_policy().for_rel(config, name),
                 );
@@ -213,7 +207,7 @@ pub async fn prepare_snowflake_with_kind(
     for (req, mapping, generation) in prepared.into_iter().flatten() {
         if generation.phase != GenerationPhase::Replayed {
             operations.insert(req.desc.rel_name.clone(), generation.operation_id.clone());
-            walk_map.insert(req.desc.rel_name.clone(), mapping);
+            walk_map.insert(req.desc.rel_name.clone(), (*mapping).clone());
         }
         rels.push(SnowflakeSnapshotRel {
             desc: req.desc.clone(),
@@ -259,8 +253,7 @@ pub async fn prepare(
         };
         let rel = StagingRel {
             rel: name.clone(),
-            database: m.target.database.clone(),
-            table: m.target.table.clone(),
+            target: m.target.clone(),
             s_lsn: r.s_lsn,
         };
         if !reuse {
@@ -271,8 +264,13 @@ pub async fn prepare(
         staged.insert(
             name.clone(),
             TableMapping {
-                target: TableTarget::new(&rel.database, &rel.staging_table()),
+                target: TableTarget {
+                    table: rel.staging_table(),
+                    ..m.target.clone()
+                },
                 columns: m.columns.clone(),
+                // Write load rows directly to tees; staging swap replaces only main destination
+                tees: m.tees.clone(),
             },
         );
         rels.push(rel);
@@ -315,6 +313,14 @@ impl StagingSession {
 
     pub fn snowflake_runtime(&self) -> Option<&Arc<SnowflakeRuntime>> {
         self.dest.base().snowflake.as_ref()
+    }
+
+    pub fn select(&mut self, instance: Option<&str>) -> Result<()> {
+        self.client
+            .as_mut()
+            .context("ClickHouse staging SQL is unavailable for Snowflake")?
+            .select(instance)?;
+        Ok(())
     }
 
     pub fn with_rules(mut self, rules: Option<Arc<crate::table_rules::TableRules>>) -> Self {
@@ -385,33 +391,14 @@ impl StagingSession {
         let client = self
             .client
             .as_mut()
-            .context("ClickHouse staging SQL is unavailable for Snowflake")?
-            .ready()
+            .context("ClickHouse staging SQL is unavailable for Snowflake")?;
+        async { query_strings(client.ready().await?, sql, timeout).await }
             .await
-            .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))?;
-        with_timeout(timeout, async {
-            client.send_query(sql, None).await?;
-            let mut out = Vec::new();
-            loop {
-                match client.recv_event().await? {
-                    Event::Data(block) => read_string_column(&block, &mut out)?,
-                    Event::EndOfStream => break,
-                    Event::Exception(exc) => {
-                        return Err(EmitterError::ServerException {
-                            code: exc.code(),
-                            message: String::from_utf8_lossy(exc.display_text()).into_owned(),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            Ok::<_, EmitterError>(out)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))
+            .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))
     }
 
     pub async fn rebuild_staging(&mut self, rel: &StagingRel) -> Result<()> {
+        self.select(rel.target.instance.as_deref())?;
         self.exec_retry(&format!("DROP TABLE IF EXISTS {}", rel.staging_sql()))
             .await?;
         // IF NOT EXISTS only shields an ambiguous-timeout resend; the table
@@ -425,6 +412,7 @@ impl StagingSession {
     }
 
     pub async fn drop_staging(&mut self, rel: &StagingRel) -> Result<()> {
+        self.select(rel.target.instance.as_deref())?;
         self.exec_retry(&format!("DROP TABLE IF EXISTS {}", rel.staging_sql()))
             .await
     }
@@ -455,7 +443,9 @@ impl StagingSession {
     }
 
     /// Atomic publish; requires an Atomic/Replicated database engine.
-    pub async fn exchange(&mut self, rel: &StagingRel) -> Result<()> {
+    pub async fn exchange(&mut self, permit: SwapPermit<'_>) -> Result<()> {
+        let rel = permit.rel();
+        self.select(rel.target.instance.as_deref())?;
         self.exec_once(&format!(
             "EXCHANGE TABLES {} AND {}",
             rel.real_sql(),
@@ -470,19 +460,20 @@ impl StagingSession {
     /// back. Column list is the intersection (destination order) so DDL
     /// applied to the destination after the swap can't block the copy-back.
     pub async fn copy_back(&mut self, rel: &StagingRel) -> Result<()> {
+        self.select(rel.target.instance.as_deref())?;
         let real_cols = self
             .query_strings(&format!(
                 "SELECT name FROM system.columns WHERE database = {} AND table = {} \
                  ORDER BY position",
-                sql_str(&rel.database),
-                sql_str(&rel.table)
+                sql_str(&rel.target.database),
+                sql_str(&rel.target.table)
             ))
             .await?;
         let staging_cols: HashSet<String> = self
             .query_strings(&format!(
                 "SELECT name FROM system.columns WHERE database = {} AND table = {} \
                  ORDER BY position",
-                sql_str(&rel.database),
+                sql_str(&rel.target.database),
                 sql_str(&rel.staging_table())
             ))
             .await?
@@ -512,27 +503,6 @@ impl StagingSession {
     }
 }
 
-/// Append one Data block's single String column into `out`; the 0-row
-/// header block contributes nothing.
-fn read_string_column(block: &Block, out: &mut Vec<String>) -> Result<(), EmitterError> {
-    let n = block.n_rows();
-    if n == 0 {
-        return Ok(());
-    }
-    let col = block
-        .column(0)
-        .ok_or_else(|| EmitterError::Type("backfill_staging: missing result column".into()))?;
-    let (offsets, data) = col
-        .string()
-        .ok_or_else(|| EmitterError::Type("backfill_staging: result column not String".into()))?;
-    for i in 0..n {
-        let start = if i == 0 { 0 } else { offsets[i - 1] as usize };
-        let end = offsets[i] as usize;
-        out.push(String::from_utf8_lossy(&data[start..end]).into_owned());
-    }
-    Ok(())
-}
-
 /// CH single-quoted string literal.
 pub(crate) fn sql_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -556,6 +526,7 @@ mod tests {
         let rel = RelName::new("public", "orders");
         let other = RelName::new("public", "customers");
         let desc = RelDescriptor {
+            ancestors: Vec::new(),
             rfn: Default::default(),
             oid: 1,
             toast_oid: 0,
@@ -570,6 +541,7 @@ mod tests {
         expected.tables.insert(
             rel.clone(),
             TableMapping {
+                tees: Vec::new(),
                 target: TableTarget::new("db", "orders"),
                 columns: vec![],
             },
@@ -578,6 +550,7 @@ mod tests {
         current.tables.insert(
             other,
             TableMapping {
+                tees: Vec::new(),
                 target: TableTarget::new("db", "customers"),
                 columns: vec![],
             },
@@ -617,8 +590,7 @@ mod tests {
     fn staging_rel_renders_sql_names() {
         let rel = StagingRel {
             rel: RelName::new("public", "orders"),
-            database: "db".into(),
-            table: "orders".into(),
+            target: TableTarget::new("db", "orders"),
             s_lsn: 0x5000,
         };
         assert_eq!(rel.real_sql(), "`db`.`orders`");

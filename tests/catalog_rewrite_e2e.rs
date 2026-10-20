@@ -19,7 +19,7 @@ const PROBE: &str = "SET enable_seqscan = off; SET enable_bitmapscan = off; \
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catalog_rewrites_keep_shadow_replaying() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -55,7 +55,9 @@ async fn catalog_rewrites_keep_shadow_replaying() {
         NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
+            detach_strategy: None,
             initial_load: None,
         },
     );

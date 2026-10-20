@@ -20,7 +20,7 @@
 
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use clickhouse_c::Allocator;
@@ -32,7 +32,8 @@ use tokio::time::Instant;
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{CommittedTuple, HeapOp};
 use crate::emit::ch_emitter::{
-    Append, ColumnBuf, EmitterStats, OP_DELETE, OP_INSERT, OP_UPDATE, TableEncoder, TablePlan,
+    Append, ColumnBuf, ColumnEncoding, EmitterStats, OP_DELETE, OP_INSERT, OP_UPDATE, TableEncoder,
+    TablePlan,
 };
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::emit::route::RouteSnapshot;
@@ -67,45 +68,55 @@ pub struct RowChunk {
 pub struct ColMeta {
     pub name: String,
     pub type_repr: String,
+    pub cells_inserted: Arc<AtomicU64>,
 }
 
 /// Immutable per-table block shape, shared by every batch of that table
 /// until a barrier rebuilds it (bumping `schema_epoch`).
 pub struct BatchMeta {
     pub table_key: TableKey,
-    pub insert_sql: String,
+    pub inserts: Vec<crate::emit::ch_emitter::InsertQuery>,
     /// Order matches `InsertBatch::buffers`: mapped columns then the
     /// synthetic ones (lsn, xid, commit_ts, delete marker when configured).
     pub columns: Vec<ColMeta>,
     pub schema_epoch: u64,
+    pub rows_inserted: Arc<AtomicU64>,
 }
 
 impl BatchMeta {
-    fn from_plan(plan: &TablePlan, table_key: TableKey, schema_epoch: u64) -> Self {
+    fn from_plan(
+        plan: &TablePlan,
+        table_key: TableKey,
+        schema_epoch: u64,
+        stats: &EmitterStats,
+    ) -> Self {
+        let col_meta = |name: &String, type_repr: &String, encoding: &ColumnEncoding| ColMeta {
+            name: name.clone(),
+            type_repr: type_repr.clone(),
+            cells_inserted: stats
+                .cells_inserted_by_type
+                .counter(&(type_repr.clone(), encoding.label())),
+        };
         let mut columns = Vec::with_capacity(plan.columns.len() + 4);
         for c in &plan.columns {
-            columns.push(ColMeta {
-                name: c.name.clone(),
-                type_repr: c.type_repr.clone(),
-            });
+            columns.push(col_meta(&c.name, &c.type_repr, &c.encoding));
         }
         for synth in [
             Some(&plan.synth_lsn),
             Some(&plan.synth_xid),
             Some(&plan.synth_commit_ts),
             plan.synth_is_deleted.as_ref(),
+            plan.synth_leaf.as_ref(),
         ]
         .into_iter()
         .flatten()
         {
-            columns.push(ColMeta {
-                name: synth.name.clone(),
-                type_repr: synth.type_repr.clone(),
-            });
+            columns.push(col_meta(&synth.name, &synth.type_repr, &synth.encoding));
         }
         Self {
+            rows_inserted: stats.rows_inserted_by_table.counter(&table_key),
             table_key,
-            insert_sql: plan.insert_sql.clone(),
+            inserts: plan.inserts.clone(),
             columns,
             schema_epoch,
         }
@@ -136,6 +147,8 @@ pub enum BatcherMsg {
     /// dominant coordination cost under sustained load. Rows may carry
     /// different `seq`s; batcher routes each independently.
     Rows(RowChunk),
+    /// Placements staged across commits, one hop for the lot
+    Chunks(Vec<RowChunk>),
     /// Seal every open table, push to inserters, reply. Barrier (drain before
     /// DDL/TRUNCATE) and shutdown.
     FlushAll(oneshot::Sender<()>),
@@ -230,6 +243,21 @@ pub(crate) fn spawn(
                             break;
                         }
                     }
+                    Some(BatcherMsg::Chunks(chunks)) => {
+                        let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
+                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
+                        let mut res = Ok(());
+                        for chunk in chunks {
+                            res = handle_rows(&mut tables, &ctx, chunk).await;
+                            if res.is_err() {
+                                break;
+                            }
+                        }
+                        if let Err(e) = res {
+                            fatal.set(format!("batcher: {e}"));
+                            break;
+                        }
+                    }
                     Some(BatcherMsg::FlushAll(reply)) => {
                         if let Err(e) = flush_all(&mut tables, &out, &mut epoch, stats).await {
                             fatal.set(format!("batcher barrier flush: {e}"));
@@ -317,23 +345,26 @@ async fn handle_row(
     ctx.stats
         .insertbatch_rows_in
         .fetch_add(1, Ordering::Relaxed);
-    // Key clone is two Arc bumps, cheaper than a second hash
-    let key = TableKey::new(row.rel.rfn.db_node, row.rel.rel_name.clone());
+    // Key clone is two Arc bumps, cheaper than a second hash. A partition
+    // sharing root's destination batches with its whole tree under root
+    let key = TableKey::new(
+        row.rel.rfn.db_node,
+        row.route.batch_owner(&row.rel.rel_name).clone(),
+    );
     let t = match tables.entry(key) {
         Entry::Occupied(e) => e.into_mut(),
         Entry::Vacant(e) => {
             // Overrides ride the route frozen at planning; a `Column*` config
             // event applies under the barrier fence, whose FlushAll cleared this
             // plan cache, so post-apply rows rebuild from post-apply routes
-            let plan = TablePlan::build(
-                ctx.alloc,
-                &row.rel,
-                &row.route.mapping,
-                &row.route.column_rules,
-                row.route.system_columns(),
-            )
-            .map_err(|e| e.to_string())?;
-            let meta = Arc::new(BatchMeta::from_plan(&plan, e.key().clone(), ctx.epoch));
+            let plan =
+                TablePlan::for_route(ctx.alloc, &row.rel, &row.route).map_err(|e| e.to_string())?;
+            let meta = Arc::new(BatchMeta::from_plan(
+                &plan,
+                e.key().clone(),
+                ctx.epoch,
+                ctx.stats,
+            ));
             let enc = TableEncoder::new(plan).map_err(|e| e.to_string())?;
             e.insert(Table {
                 enc,
@@ -354,14 +385,15 @@ async fn handle_row(
         HeapOp::Truncate => return Err("TRUNCATE routed to batcher".into()),
     };
     // Seal before appending row that exceeds oracle frame threshold
+    let leaf = row.route.partition.as_ref().map(|p| p.leaf);
     let append = t
         .enc
-        .append_row(&row.committed, &row.route.mapping, op)
+        .append_routed(&row.committed, &row.route.mapping, op, leaf)
         .map_err(|e| e.to_string())?;
     if append == Append::Full {
         emit_batch(t, ctx.out, ctx.stats).await?;
         t.enc
-            .append_row(&row.committed, &row.route.mapping, op)
+            .append_routed(&row.committed, &row.route.mapping, op, leaf)
             .map_err(|e| e.to_string())?;
     }
     // Every row of a chunk shares one permit, so the tail entry settles it:
@@ -503,6 +535,7 @@ mod tests {
             rel_name: RelName::new("public", table),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
@@ -531,6 +564,7 @@ mod tests {
                     target_type: "Int32".into(),
                     type_pinned: false,
                 }],
+                tees: Vec::new(),
             }),
             Arc::default(),
             Default::default(),
@@ -542,10 +576,19 @@ mod tests {
     }
 
     fn row_for(table: &str, seq: u64, id: i32) -> RoutedRow {
+        routed_row(rel_named(table), route_named(table), seq, id)
+    }
+
+    fn routed_row(
+        rel: Arc<RelDescriptor>,
+        route: Arc<RouteSnapshot>,
+        seq: u64,
+        id: i32,
+    ) -> RoutedRow {
         RoutedRow {
             seq,
-            rel: rel_named(table),
-            route: route_named(table),
+            rel,
+            route,
             committed: CommittedTuple {
                 decoded: DecodedHeap {
                     rfn: RelFileNode {
@@ -605,21 +648,17 @@ mod tests {
         // Drop sender → final flush + graceful exit
         drop(msg_tx);
 
-        let (mut total, mut s0, mut s1) = (0u64, 0u64, 0u64);
+        let mut total = 0u64;
+        let mut per_seq = std::collections::BTreeMap::new();
         while let Ok(b) = batches_rx.recv().await {
             total += b.n_rows as u64;
             for (seq, n) in b.per_seq {
-                match seq {
-                    0 => s0 += n,
-                    1 => s1 += n,
-                    other => panic!("unexpected seq {other}"),
-                }
+                *per_seq.entry(seq).or_insert(0) += n;
             }
         }
         handle.await.expect("batcher task");
         assert_eq!(total, 5, "all rows sealed exactly once");
-        assert_eq!(s0, 3, "seq 0 rows");
-        assert_eq!(s1, 2, "seq 1 rows");
+        assert_eq!(per_seq, [(0, 3), (1, 2)].into(), "rows per seq");
         assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
     }
 
@@ -655,21 +694,17 @@ mod tests {
             .expect("send chunk");
         drop(msg_tx);
 
-        let (mut total, mut s0, mut s1) = (0u64, 0u64, 0u64);
+        let mut total = 0u64;
+        let mut per_seq = std::collections::BTreeMap::new();
         while let Ok(b) = batches_rx.recv().await {
             total += b.n_rows as u64;
             for (seq, n) in b.per_seq {
-                match seq {
-                    0 => s0 += n,
-                    1 => s1 += n,
-                    other => panic!("unexpected seq {other}"),
-                }
+                *per_seq.entry(seq).or_insert(0) += n;
             }
         }
         handle.await.expect("batcher task");
         assert_eq!(total, 5, "all rows sealed exactly once");
-        assert_eq!(s0, 3, "seq 0 rows");
-        assert_eq!(s1, 2, "seq 1 rows");
+        assert_eq!(per_seq, [(0, 3), (1, 2)].into(), "rows per seq");
         assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
     }
 
@@ -717,6 +752,7 @@ mod tests {
                     target_type: "Int32".into(),
                     type_pinned: false,
                 }],
+                tees: Vec::new(),
             }),
             Arc::new(rules.finish().0),
             Default::default(),
@@ -731,6 +767,68 @@ mod tests {
         );
         handle.await.expect("batcher task");
         assert!(fatal.message().is_none());
+    }
+
+    /// Partitions sharing root's destination batch together under root.
+    /// Partitions staged in tables of their own must not share a key, or
+    /// later siblings' rows insert into the first sibling's table
+    #[tokio::test]
+    async fn staged_partitions_batch_apart_from_shared_ones() {
+        use crate::emit::route::PartitionOf;
+        let (msg_tx, msg_rx) = mpsc::channel(8);
+        let (batches_tx, batches_rx) = async_channel::bounded(8);
+        let fatal = Fatal::new();
+        let handle = spawn(
+            msg_rx,
+            batches_tx,
+            BatcherConfig {
+                row_budget: 10,
+                inserters: 1,
+                byte_budget: 1 << 30,
+                flush_timeout: Duration::from_secs(3600),
+            },
+            Allocator::global(&mimalloc::MiMalloc),
+            fatal.clone(),
+            Arc::new(EmitterStats::default()),
+            None,
+        );
+        let root = RelName::new("public", "m");
+        for (leaf, table, shared) in [
+            (1, "m", true),
+            (2, "m", true),
+            (3, "m__wspending_3", false),
+            (4, "m__wspending_4", false),
+        ] {
+            let route = route_named(table).with_partition(PartitionOf {
+                root: root.clone(),
+                leaf,
+                shared,
+            });
+            let row = routed_row(rel_named(&format!("m_{leaf}")), route, 0, leaf as i32);
+            msg_tx.send(BatcherMsg::Row(row)).await.expect("send row");
+        }
+        drop(msg_tx);
+        let mut batches = Vec::new();
+        while let Ok(b) = batches_rx.recv().await {
+            let table = b.meta.inserts[0]
+                .sql
+                .split('`')
+                .nth(3)
+                .expect("INSERT INTO `db`.`table`")
+                .to_owned();
+            batches.push((b.meta.table_key.rel.name.to_string(), table, b.n_rows));
+        }
+        handle.await.expect("batcher task");
+        batches.sort();
+        assert_eq!(
+            batches,
+            [
+                ("m".into(), "m".into(), 2),
+                ("m_3".into(), "m__wspending_3".into(), 1),
+                ("m_4".into(), "m__wspending_4".into(), 1),
+            ]
+        );
+        assert!(fatal.message().is_none(), "{:?}", fatal.message());
     }
 
     /// FlushAll seals everything sent before it and replies, even below budget
@@ -993,6 +1091,7 @@ mod tests {
                         target_type: "String".into(),
                         type_pinned: false,
                     }],
+                    tees: Vec::new(),
                 }),
                 Arc::default(),
                 Default::default(),
@@ -1021,6 +1120,46 @@ mod tests {
         assert!(!fatal.is_set());
     }
 
+    /// Row that would push oracle cells past the seal threshold opens the next batch
+    #[tokio::test]
+    async fn oracle_seal_moves_row_to_next_batch() {
+        let (tx, rx, fatal, handle) =
+            spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(60)), None);
+        let big = "x".repeat(crate::ops::oracle::ORACLE_BATCH_SEAL_BYTES * 3 / 5);
+        for i in 0..2 {
+            let mut r = row(i, 1);
+            let attr = &mut Arc::make_mut(&mut r.rel).attributes[0];
+            attr.type_oid = 25;
+            attr.type_name = "text".into();
+            attr.type_len = -1;
+            attr.type_byval = false;
+            r.route = RouteSnapshot::freeze(
+                Arc::new(TableMapping {
+                    target: TableTarget::new("default", "t"),
+                    columns: vec![ColumnMapping {
+                        src_attnum: 1,
+                        target_name: "id".into(),
+                        target_type: "Array(Nullable(String))".into(),
+                        type_pinned: false,
+                    }],
+                    tees: Vec::new(),
+                }),
+                Arc::default(),
+                Default::default(),
+            );
+            r.committed.decoded.new.as_mut().unwrap().columns =
+                vec![Some(ColumnValue::Text(big.clone()))];
+            tx.send(BatcherMsg::Row(r)).await.unwrap();
+        }
+        drop(tx);
+        let per_seq: Vec<_> = [rx.recv().await.unwrap(), rx.recv().await.unwrap()]
+            .map(|b| b.per_seq)
+            .into();
+        assert_eq!(per_seq, [vec![(0, 1)], vec![(1, 1)]]);
+        handle.await.unwrap();
+        assert!(!fatal.is_set());
+    }
+
     /// Byte budget wins over an unreached deadline: no clock time passes.
     #[tokio::test(start_paused = true)]
     async fn byte_budget_flushes_before_deadline() {
@@ -1040,10 +1179,10 @@ mod tests {
             .expect("send row");
         let batch = batches_rx.recv().await.expect("budget batch");
         assert_eq!(batch.n_rows, 1);
+        let elapsed = start.elapsed();
         assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "byte budget sealed at {:?}, not the deadline",
-            start.elapsed()
+            elapsed < Duration::from_secs(1),
+            "byte budget sealed at {elapsed:?}, not the deadline"
         );
         drop(msg_tx);
         handle.await.expect("batcher task");

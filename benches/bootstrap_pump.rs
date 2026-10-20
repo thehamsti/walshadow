@@ -110,6 +110,7 @@ fn descriptor(filenode: u32, columns: usize) -> Arc<RelDescriptor> {
         rel_name: RelName::new("public", &format!("t{filenode}")),
         kind: 'r',
         persistence: 'p',
+        ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: (0..columns)
             .map(|i| RelAttr {
@@ -142,6 +143,7 @@ fn mapping(filenode: u32, columns: usize) -> TableMapping {
                 type_pinned: false,
             })
             .collect(),
+        tees: Vec::new(),
     }
 }
 
@@ -345,7 +347,7 @@ async fn bench_drain(shape: Shape) -> Report {
         catalog.insert(r.clone());
         tables.insert(r.rel_name.clone(), mapping(r.oid, shape.columns));
     }
-    let routes = Arc::new(tables.into_iter().collect());
+    let routes = Arc::new(walshadow::mapping::shared(tables));
 
     let (msg_tx, ack, tail) = walshadow::pipeline::tail::spawn_null(
         Arc::new(Monotone::<EmitterAck>::default()),
@@ -386,14 +388,12 @@ async fn bench_drain(shape: Shape) -> Report {
     let outcome = bootstrap::drain(
         tup_rx,
         catalog,
-        routes,
+        walshadow::emit::route::freeze_routes(&routes, None, &Default::default()),
         msg_tx.clone(),
         ack.clone(),
         stats.clone(),
         ToastResolver::disabled(),
         bootstrap::Deferral::Rejected,
-        Default::default(),
-        None,
         ahash::HashSet::default(),
         false,
         None,
@@ -402,9 +402,7 @@ async fn bench_drain(shape: Shape) -> Report {
     .unwrap();
     let elapsed = started.elapsed().as_secs_f64();
     feeder.await.unwrap();
-    drop(msg_tx);
-    drop(ack);
-    tail.join().await;
+    tail.close(msg_tx, ack).await;
 
     Report {
         label: "drain".into(),

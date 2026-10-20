@@ -169,6 +169,7 @@ mod tests {
     use crate::decode::heap_decoder::{
         ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp,
     };
+    use crate::emit::ch_emitter::Wire;
     use crate::emit::pipeline::batcher::{BatcherConfig, BatcherMsg, RoutedRow};
     use crate::emit::route::RouteSnapshot;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
@@ -194,6 +195,7 @@ mod tests {
             rel_name: RelName::new("public", "g"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
@@ -219,6 +221,7 @@ mod tests {
                     target_type: "Nullable(String)".into(),
                     type_pinned: false,
                 }],
+                tees: Vec::new(),
             }),
             Arc::default(),
             Default::default(),
@@ -312,18 +315,15 @@ mod tests {
         let stats = EmitterStats::default();
         resolve_local_columns(&mut batch, &stats);
         assert_eq!(stats.oracle_local_columns.load(Ordering::Relaxed), 1);
-        let ColumnBuf::NullableString {
-            offsets,
-            data,
-            null_map,
-            ..
-        } = &batch.buffers[0]
-        else {
-            panic!("column not built locally: {:?}", batch.buffers[0]);
-        };
-        assert_eq!(data, b"POINT(1 2)POINT(3 4)");
-        assert_eq!(offsets, &[10, 10, 10, 20]);
-        assert_eq!(null_map, &[0, 1, 0, 0]);
+        assert_eq!(
+            batch.buffers[0].wire(),
+            Wire::NullableString {
+                offsets: &[10, 10, 10, 20],
+                data: b"POINT(1 2)POINT(3 4)",
+                null_map: &[0, 1, 0, 0],
+                absent: b"",
+            }
+        );
 
         assert!(
             resolve_oracle(&None, alloc, &batch)

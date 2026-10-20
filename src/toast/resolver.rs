@@ -54,8 +54,8 @@ pub enum ChunkStoreError {
     #[error("toast store clickhouse: {0}")]
     Clickhouse(String),
     /// Mirror absence does not prove supersession, never fill
-    #[error("toast store: no mirror for toast relid {0}")]
-    MissingMirror(u32),
+    #[error("toast store: no mirror for db {db_oid} toast relid {toast_relid}")]
+    MissingMirror { db_oid: u32, toast_relid: u32 },
     /// Body spool read at row materialization
     #[error("toast store io: {0}")]
     Io(#[from] std::io::Error),
@@ -149,6 +149,7 @@ pub(crate) fn finish_value(p: &ToastPointer, stored: Vec<u8>) -> Result<Vec<u8>,
 /// Chunk birth or TID tombstone, keyed by heap TID and record LSN
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToastRow<B = Bytes> {
+    pub db_oid: u32,
     pub toast_relid: u32,
     pub blkno: u32,
     pub offnum: u16,
@@ -161,12 +162,9 @@ pub struct ToastRow<B = Bytes> {
 }
 
 impl<B: From<Bytes>> ToastRow<B> {
-    pub fn from_chunk(c: &ToastChunk) -> Self {
-        Self::with_body(c, c.chunk_data.clone().into())
-    }
-
     pub fn tombstone(d: &ToastDelete) -> Self {
         Self {
+            db_oid: d.db_oid,
             toast_relid: d.toast_relid,
             blkno: d.blkno,
             offnum: d.offnum,
@@ -181,6 +179,7 @@ impl<B: From<Bytes>> ToastRow<B> {
 impl<B> ToastRow<B> {
     pub fn with_body(c: &ToastChunk, chunk_data: B) -> Self {
         Self {
+            db_oid: c.db_oid,
             toast_relid: c.toast_relid,
             blkno: c.blkno,
             offnum: c.offnum,
@@ -292,6 +291,7 @@ impl ToastRow<Body> {
     /// Just-in-time body load for bounded store puts
     pub fn materialize(&self, spool: Option<&BodySpoolFile>) -> std::io::Result<ToastRow> {
         Ok(ToastRow {
+            db_oid: self.db_oid,
             toast_relid: self.toast_relid,
             blkno: self.blkno,
             offnum: self.offnum,
@@ -377,15 +377,17 @@ impl ChunkAssembler {
     }
 }
 
-/// Durable TID-keyed chunk store
+/// Durable TID-keyed chunk store, read-only unless it overrides the writes
 #[async_trait]
 pub trait ChunkStore: Send + Sync {
     /// Whether backend accepts decoded chunk rows
     fn accepts_writes(&self) -> bool {
-        true
+        false
     }
     /// Replay emits byte-identical rows at equal key and version
-    async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError>;
+    async fn put(&self, _rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
+        Err(ChunkStoreError::ReadOnly("put"))
+    }
     /// Assemble newest live row per sequence at `max_lsn` against each
     /// pointer's stored size (`va_extsize`) over one mirror's
     /// `(value_id, expected_size)` batch, results aligned with `values`.
@@ -395,6 +397,7 @@ pub trait ChunkStore: Send + Sync {
     /// [`ChunkStoreError::MissingMirror`] when mirror is absent
     async fn fetch_many(
         &self,
+        db_oid: u32,
         toast_relid: u32,
         values: &[(u32, usize)],
         max_lsn: u64,
@@ -402,13 +405,14 @@ pub trait ChunkStore: Send + Sync {
     /// [`Self::fetch_many`] for one value
     async fn fetch(
         &self,
+        db_oid: u32,
         toast_relid: u32,
         value_id: u32,
         max_lsn: u64,
         expected_size: usize,
     ) -> Result<FetchedValue, ChunkStoreError> {
         let mut got = self
-            .fetch_many(toast_relid, &[(value_id, expected_size)], max_lsn)
+            .fetch_many(db_oid, toast_relid, &[(value_id, expected_size)], max_lsn)
             .await?;
         Ok(got.pop().unwrap_or(FetchedValue::Missing))
     }
@@ -416,12 +420,31 @@ pub trait ChunkStore: Send + Sync {
     ///
     /// Owner TRUNCATE orders destination wipe after replayed fills. DROP callers
     /// wait until persisted replay floor passes dropping commit
-    async fn truncate_mirror(&self, toast_relid: u32) -> Result<(), ChunkStoreError>;
-    async fn truncate_at(&self, toast_relid: u32, _record_lsn: u64) -> Result<(), ChunkStoreError> {
-        self.truncate_mirror(toast_relid).await
+    async fn truncate_mirror(
+        &self,
+        _db_oid: u32,
+        _toast_relid: u32,
+    ) -> Result<(), ChunkStoreError> {
+        Err(ChunkStoreError::ReadOnly("truncate_mirror"))
     }
-    async fn retire_at(&self, toast_relid: u32, _commit_lsn: u64) -> Result<(), ChunkStoreError> {
-        self.truncate_mirror(toast_relid).await
+    /// Truncate stamped with the TRUNCATE record's LSN; stores that version
+    /// mirrors by position (Snowflake) override it
+    async fn truncate_at(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+        _record_lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
+        self.truncate_mirror(db_oid, toast_relid).await
+    }
+    /// Retire stamped with the dropping commit's LSN
+    async fn retire_at(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+        _commit_lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
+        self.truncate_mirror(db_oid, toast_relid).await
     }
     /// Rewrite-generation residual deaths `O - B`: tombstone at `commit_lsn`
     /// every TID live as of `marker_lsn` (generation's `XLOG_SMGR_CREATE`)
@@ -429,16 +452,19 @@ pub trait ChunkStore: Send + Sync {
     /// Missing mirror is a no-op: nothing lived
     async fn rewrite_barrier(
         &self,
-        toast_relid: u32,
-        marker_lsn: u64,
-        commit_lsn: u64,
-    ) -> Result<(), ChunkStoreError>;
+        _db_oid: u32,
+        _toast_relid: u32,
+        _marker_lsn: u64,
+        _commit_lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
+        Err(ChunkStoreError::ReadOnly("rewrite_barrier"))
+    }
 }
 
 /// In-memory implementation of ClickHouse as-of algorithm
 #[derive(Default)]
 pub struct MemChunkStore {
-    mirrors: std::sync::Mutex<HashMap<u32, Vec<ToastRow>>>,
+    mirrors: std::sync::Mutex<HashMap<(u32, u32), Vec<ToastRow>>>,
 }
 
 impl MemChunkStore {
@@ -449,10 +475,17 @@ impl MemChunkStore {
 
 #[async_trait]
 impl ChunkStore for MemChunkStore {
+    fn accepts_writes(&self) -> bool {
+        true
+    }
+
     async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
         let mut mirrors = self.mirrors.lock().unwrap();
         for r in rows {
-            mirrors.entry(r.toast_relid).or_default().push(r.clone());
+            mirrors
+                .entry((r.db_oid, r.toast_relid))
+                .or_default()
+                .push(r.clone());
         }
         Ok(())
     }
@@ -461,13 +494,17 @@ impl ChunkStore for MemChunkStore {
     /// query is: a per-value pass would make a batch quadratic
     async fn fetch_many(
         &self,
+        db_oid: u32,
         toast_relid: u32,
         values: &[(u32, usize)],
         max_lsn: u64,
     ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
         let mirrors = self.mirrors.lock().unwrap();
-        let Some(rows) = mirrors.get(&toast_relid) else {
-            return Err(ChunkStoreError::MissingMirror(toast_relid));
+        let Some(rows) = mirrors.get(&(db_oid, toast_relid)) else {
+            return Err(ChunkStoreError::MissingMirror {
+                db_oid,
+                toast_relid,
+            });
         };
         let wanted: HashSet<u32> = values.iter().map(|&(id, _)| id).collect();
         let mut latest: HashMap<(u32, u16), &ToastRow> = HashMap::new();
@@ -509,8 +546,8 @@ impl ChunkStore for MemChunkStore {
             .collect()
     }
 
-    async fn truncate_mirror(&self, toast_relid: u32) -> Result<(), ChunkStoreError> {
-        if let Some(rows) = self.mirrors.lock().unwrap().get_mut(&toast_relid) {
+    async fn truncate_mirror(&self, db_oid: u32, toast_relid: u32) -> Result<(), ChunkStoreError> {
+        if let Some(rows) = self.mirrors.lock().unwrap().get_mut(&(db_oid, toast_relid)) {
             rows.clear();
         }
         Ok(())
@@ -518,12 +555,13 @@ impl ChunkStore for MemChunkStore {
 
     async fn rewrite_barrier(
         &self,
+        db_oid: u32,
         toast_relid: u32,
         marker_lsn: u64,
         commit_lsn: u64,
     ) -> Result<(), ChunkStoreError> {
         let mut mirrors = self.mirrors.lock().unwrap();
-        let Some(rows) = mirrors.get_mut(&toast_relid) else {
+        let Some(rows) = mirrors.get_mut(&(db_oid, toast_relid)) else {
             return Ok(());
         };
         let mut latest_below: HashMap<(u32, u16), &ToastRow> = HashMap::new();
@@ -548,6 +586,7 @@ impl ChunkStore for MemChunkStore {
             .filter(|(tid, r)| !r.is_tombstone() && !past_marker.contains(tid))
             .map(|((blkno, offnum), _)| {
                 ToastRow::tombstone(&ToastDelete {
+                    db_oid,
                     toast_relid,
                     blkno,
                     offnum,
@@ -566,10 +605,71 @@ const CH_UNKNOWN_DATABASE: i32 = 81;
 
 struct ChState {
     client: ChConn,
-    created: HashSet<u32>,
+    created: HashSet<(u32, u32)>,
 }
 
-/// TID-keyed ClickHouse mirror, one table per TOAST relation
+/// Name TOAST mirror by database OID so database renames preserve mirror names
+pub fn mirror_table_name(db_oid: u32, toast_relid: u32) -> String {
+    format!("pg_toast_{db_oid}_{toast_relid}")
+}
+
+/// Add `owner`'s database OID to older `pg_toast_<relid>` mirror names.
+/// Require one followed database because older mirrors may mix data from several
+// TODO(0.2.0): remove after 0.1.x deployments migrate
+pub async fn adopt_legacy_mirrors(
+    cfg: &EmitterConfig,
+    owner: Option<u32>,
+) -> Result<usize, EmitterError> {
+    let mut client = crate::ch::connect_client(cfg).await?;
+    let mut legacy: Vec<u32> = crate::ch::query_strings(
+        &mut client,
+        "SELECT name FROM system.tables \
+         WHERE database = currentDatabase() AND match(name, '^pg_toast_[1-9][0-9]*$')",
+        cfg.insert_timeout,
+    )
+    .await?
+    .iter()
+    .filter_map(|n| n.strip_prefix("pg_toast_")?.parse().ok())
+    .collect();
+    legacy.sort_unstable();
+    if legacy.is_empty() {
+        return Ok(0);
+    }
+    let Some(owner) = owner else {
+        return Err(EmitterError::Config(format!(
+            "ClickHouse database `{}` contains TOAST mirrors without source database \
+             OIDs in their names (pg_toast_{}); start once following only their original \
+             source database to rename them, or drop them and bootstrap tables with \
+             external TOAST values again",
+            cfg.conn.database,
+            legacy
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", pg_toast_"),
+        )));
+    };
+    let renames = legacy
+        .iter()
+        .map(|&relid| {
+            format!(
+                "{} TO {}",
+                quote_ident(&format!("pg_toast_{relid}")),
+                quote_ident(&mirror_table_name(owner, relid))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::ch::exec_drain(
+        &mut client,
+        &format!("RENAME TABLE {renames}"),
+        cfg.insert_timeout,
+    )
+    .await?;
+    Ok(legacy.len())
+}
+
+/// Store TOAST rows by TID in a separate ClickHouse mirror per source database relation
 ///
 /// Fetch aggregates version history explicitly, independent of merge state
 pub struct ClickHouseChunkStore {
@@ -619,15 +719,15 @@ impl ClickHouseChunkStore {
         self.states[at].lock().await
     }
 
-    fn toast_table(&self, toast_relid: u32) -> String {
+    fn toast_table(&self, db_oid: u32, toast_relid: u32) -> String {
         format!(
             "{}.{}",
-            quote_ident(&self.dest.current().database),
-            quote_ident(&format!("pg_toast_{toast_relid}"))
+            quote_ident(&self.dest.current().conn.database),
+            quote_ident(&mirror_table_name(db_oid, toast_relid))
         )
     }
 
-    fn create_sql(&self, toast_relid: u32) -> String {
+    fn create_sql(&self, db_oid: u32, toast_relid: u32) -> String {
         format!(
             "CREATE TABLE IF NOT EXISTS {} (\n  \
              `blkno` UInt32,\n  `offnum` UInt16,\n  `chunk_id` UInt32,\n  `chunk_seq` UInt32,\n  \
@@ -635,20 +735,23 @@ impl ClickHouseChunkStore {
              INDEX `idx_chunk_id` `chunk_id` \
              TYPE bloom_filter({CHUNK_ID_INDEX_FP}) GRANULARITY 1\n\
              ) ENGINE = ReplacingMergeTree(`_lsn`, `_is_deleted`)\nORDER BY (`blkno`, `offnum`)",
-            self.toast_table(toast_relid)
+            self.toast_table(db_oid, toast_relid)
         )
     }
 
-    fn insert_sql(&self, toast_relid: u32) -> String {
+    fn insert_sql(&self, db_oid: u32, toast_relid: u32) -> String {
         format!(
             "INSERT INTO {} (`blkno`, `offnum`, `chunk_id`, `chunk_seq`, `chunk_data`, \
              `_lsn`, `_is_deleted`) FORMAT Native",
-            self.toast_table(toast_relid)
+            self.toast_table(db_oid, toast_relid)
         )
     }
 
-    fn truncate_sql(&self, toast_relid: u32) -> String {
-        format!("TRUNCATE TABLE IF EXISTS {}", self.toast_table(toast_relid))
+    fn truncate_sql(&self, db_oid: u32, toast_relid: u32) -> String {
+        format!(
+            "TRUNCATE TABLE IF EXISTS {}",
+            self.toast_table(db_oid, toast_relid)
+        )
     }
 
     /// `O - B` server-side in one scan: a TID survives when its newest row
@@ -656,8 +759,14 @@ impl ClickHouseChunkStore {
     /// it, generation births and residuals an earlier run inserted alike, so
     /// re-runs insert nothing. `GROUP BY` matches the table's `ORDER BY`, so
     /// aggregation streams in key order instead of hashing every mirrored TID
-    fn rewrite_barrier_sql(&self, toast_relid: u32, marker_lsn: u64, commit_lsn: u64) -> String {
-        let table = self.toast_table(toast_relid);
+    fn rewrite_barrier_sql(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+        marker_lsn: u64,
+        commit_lsn: u64,
+    ) -> String {
+        let table = self.toast_table(db_oid, toast_relid);
         format!(
             "INSERT INTO {table} (`blkno`, `offnum`, `chunk_id`, `chunk_seq`, `chunk_data`, \
              `_lsn`, `_is_deleted`)\n\
@@ -672,8 +781,8 @@ impl ClickHouseChunkStore {
     /// Break equal-version ties deterministically; TID order cannot identify
     /// newer generations. `chunk_id` leads the projection so one query
     /// assembles a batch of values, each seq-ordered
-    fn fetch_sql(&self, toast_relid: u32, ids: &[u32], max_lsn: u64) -> String {
-        let table = self.toast_table(toast_relid);
+    fn fetch_sql(&self, db_oid: u32, toast_relid: u32, ids: &[u32], max_lsn: u64) -> String {
+        let table = self.toast_table(db_oid, toast_relid);
         let ids = ids
             .iter()
             .map(u32::to_string)
@@ -712,7 +821,8 @@ impl ClickHouseChunkStore {
         let insert_timeout = self.dest.current().insert_timeout;
         state
             .client
-            .retry(
+            .retry_when(
+                |e| is_retryable(e) && !is_missing_mirror(e),
                 |mut client| async move {
                     let result = with_timeout(insert_timeout, async {
                         client.send_query(sql, None).await?;
@@ -720,7 +830,8 @@ impl ClickHouseChunkStore {
                             client.send_data(Some(bb)).await?;
                             client.send_data_end().await?;
                         }
-                        drain_to_end_of_stream(&mut client).await
+                        drain_to_end_of_stream(&mut client).await?;
+                        Ok(())
                     })
                     .await;
                     (client, result)
@@ -731,15 +842,18 @@ impl ClickHouseChunkStore {
     }
 
     async fn put_locked(&self, state: &mut ChState, rows: &[ToastRow]) -> Result<(), EmitterError> {
-        let mut by_relid: HashMap<u32, Vec<&ToastRow>> = HashMap::new();
+        let mut by_mirror: HashMap<(u32, u32), Vec<&ToastRow>> = HashMap::new();
         for r in rows {
-            by_relid.entry(r.toast_relid).or_default().push(r);
+            by_mirror
+                .entry((r.db_oid, r.toast_relid))
+                .or_default()
+                .push(r);
         }
-        for (relid, group) in by_relid {
-            if !state.created.contains(&relid) {
-                let create = self.create_sql(relid);
+        for ((db_oid, relid), group) in by_mirror {
+            if !state.created.contains(&(db_oid, relid)) {
+                let create = self.create_sql(db_oid, relid);
                 self.exec_write(state, &create, None).await?;
-                state.created.insert(relid);
+                state.created.insert((db_oid, relid));
             }
             let n = group.len();
             let mut blkno = Vec::with_capacity(n * 4);
@@ -785,7 +899,7 @@ impl ClickHouseChunkStore {
             bb.append("chunk_data", string_ast.view(), &chunk_data_col)?;
             bb.append("_lsn", u64_ast.view(), &lsn_col)?;
             bb.append("_is_deleted", u8_ast.view(), &is_deleted_col)?;
-            let insert = self.insert_sql(relid);
+            let insert = self.insert_sql(db_oid, relid);
             self.exec_write(state, &insert, Some(&bb)).await?;
         }
         Ok(())
@@ -834,12 +948,13 @@ impl ClickHouseChunkStore {
     /// `chunk_id IN (…)` scan
     async fn fetch_batch(
         &self,
+        db_oid: u32,
         toast_relid: u32,
         ids: &[u32],
         max_lsn: u64,
         expected: &HashMap<u32, usize>,
     ) -> Result<HashMap<u32, ChunkAssembler>, ChunkStoreError> {
-        let sql = self.fetch_sql(toast_relid, ids, max_lsn);
+        let sql = self.fetch_sql(db_oid, toast_relid, ids, max_lsn);
         let mut state = self.slot().await;
         self.query_locked(&mut state, &sql, |block, out| {
             read_value_block(block, expected, out)
@@ -849,7 +964,10 @@ impl ClickHouseChunkStore {
             EmitterError::ServerException { code, .. }
                 if code == CH_UNKNOWN_TABLE || code == CH_UNKNOWN_DATABASE =>
             {
-                ChunkStoreError::MissingMirror(toast_relid)
+                ChunkStoreError::MissingMirror {
+                    db_oid,
+                    toast_relid,
+                }
             }
             e => ChunkStoreError::Clickhouse(e.to_string()),
         })
@@ -908,6 +1026,10 @@ fn read_value_block(
 
 #[async_trait]
 impl ChunkStore for ClickHouseChunkStore {
+    fn accepts_writes(&self) -> bool {
+        true
+    }
+
     async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
         if rows.is_empty() {
             return Ok(());
@@ -922,6 +1044,7 @@ impl ChunkStore for ClickHouseChunkStore {
 
     async fn fetch_many(
         &self,
+        db_oid: u32,
         toast_relid: u32,
         values: &[(u32, usize)],
         max_lsn: u64,
@@ -934,7 +1057,8 @@ impl ChunkStore for ClickHouseChunkStore {
             let prev = expected.insert(id, size);
             debug_assert!(
                 prev.is_none_or(|prev| prev == size),
-                "value {id} of pg_toast_{toast_relid} batched at two stored sizes",
+                "batch contains value {id} from {} with two different stored sizes",
+                mirror_table_name(db_oid, toast_relid),
             );
         }
         let mut ids: Vec<u32> = expected.keys().copied().collect();
@@ -946,7 +1070,7 @@ impl ChunkStore for ClickHouseChunkStore {
         let concurrency = queries.min(self.states.len());
         let split: Vec<_> = ids
             .chunks(width)
-            .map(|ids| self.fetch_batch(toast_relid, ids, max_lsn, &expected))
+            .map(|ids| self.fetch_batch(db_oid, toast_relid, ids, max_lsn, &expected))
             .collect();
         let mut batches = futures::stream::iter(split).buffer_unordered(concurrency);
         while let Some(batch) = batches.next().await {
@@ -962,8 +1086,8 @@ impl ChunkStore for ClickHouseChunkStore {
             .collect())
     }
 
-    async fn truncate_mirror(&self, toast_relid: u32) -> Result<(), ChunkStoreError> {
-        let sql = self.truncate_sql(toast_relid);
+    async fn truncate_mirror(&self, db_oid: u32, toast_relid: u32) -> Result<(), ChunkStoreError> {
+        let sql = self.truncate_sql(db_oid, toast_relid);
         let mut state = self.slot_for(toast_relid).await;
         self.exec_write(&mut state, &sql, None)
             .await
@@ -972,11 +1096,12 @@ impl ChunkStore for ClickHouseChunkStore {
 
     async fn rewrite_barrier(
         &self,
+        db_oid: u32,
         toast_relid: u32,
         marker_lsn: u64,
         commit_lsn: u64,
     ) -> Result<(), ChunkStoreError> {
-        let sql = self.rewrite_barrier_sql(toast_relid, marker_lsn, commit_lsn);
+        let sql = self.rewrite_barrier_sql(db_oid, toast_relid, marker_lsn, commit_lsn);
         let mut state = self.slot_for(toast_relid).await;
         match self.exec_write(&mut state, &sql, None).await {
             Ok(()) => Ok(()),
@@ -1217,7 +1342,9 @@ impl ToastResolver {
             None => store,
         };
         let started = std::time::Instant::now();
-        let got = store.fetch_many(toast_relid, values, max_lsn).await?;
+        let got = store
+            .fetch_many(db_oid, toast_relid, values, max_lsn)
+            .await?;
         self.stats
             .toast_value_fetch_nanos
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1305,54 +1432,69 @@ impl ToastResolver {
 
     async fn clear_mirror(
         &self,
+        db_oid: u32,
         toast_relid: u32,
         metric: &AtomicU64,
     ) -> Result<(), ChunkStoreError> {
         let Some(store) = &self.store.as_ref().filter(|s| s.accepts_writes()) else {
             return Ok(());
         };
-        store.truncate_mirror(toast_relid).await?;
+        store.truncate_mirror(db_oid, toast_relid).await?;
         metric.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Empty owner mirror at TRUNCATE barrier
-    pub async fn truncate_mirror(&self, toast_relid: u32) -> Result<(), ChunkStoreError> {
-        self.clear_mirror(toast_relid, &self.stats.toast_mirror_truncates)
+    pub async fn truncate_mirror(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+    ) -> Result<(), ChunkStoreError> {
+        self.clear_mirror(db_oid, toast_relid, &self.stats.toast_mirror_truncates)
             .await
     }
 
+    /// [`Self::truncate_mirror`] stamped with the TRUNCATE record's LSN
     pub async fn truncate_mirror_at(
         &self,
+        db_oid: u32,
         toast_relid: u32,
         record_lsn: u64,
     ) -> Result<(), ChunkStoreError> {
-        if let Some(store) = &self.store {
-            store.truncate_at(toast_relid, record_lsn).await?;
-            self.stats
-                .toast_mirror_truncates
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        let Some(store) = &self.store.as_ref().filter(|s| s.accepts_writes()) else {
+            return Ok(());
+        };
+        store.truncate_at(db_oid, toast_relid, record_lsn).await?;
+        self.stats
+            .toast_mirror_truncates
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Empty retired mirror without dropping it, no-op without store
-    pub async fn retire_mirror(&self, toast_relid: u32) -> Result<(), ChunkStoreError> {
-        self.clear_mirror(toast_relid, &self.stats.toast_mirror_retires)
+    pub async fn retire_mirror(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+    ) -> Result<(), ChunkStoreError> {
+        self.clear_mirror(db_oid, toast_relid, &self.stats.toast_mirror_retires)
             .await
     }
 
+    /// [`Self::retire_mirror`] stamped with the dropping commit's LSN
     pub async fn retire_mirror_at(
         &self,
+        db_oid: u32,
         toast_relid: u32,
         commit_lsn: u64,
     ) -> Result<(), ChunkStoreError> {
-        if let Some(store) = &self.store {
-            store.retire_at(toast_relid, commit_lsn).await?;
-            self.stats
-                .toast_mirror_retires
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        let Some(store) = &self.store.as_ref().filter(|s| s.accepts_writes()) else {
+            return Ok(());
+        };
+        store.retire_at(db_oid, toast_relid, commit_lsn).await?;
+        self.stats
+            .toast_mirror_retires
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1360,6 +1502,7 @@ impl ToastResolver {
     /// put; no-op without store
     pub async fn rewrite_barrier(
         &self,
+        db_oid: u32,
         toast_relid: u32,
         marker_lsn: u64,
         commit_lsn: u64,
@@ -1368,7 +1511,7 @@ impl ToastResolver {
             return Ok(());
         };
         store
-            .rewrite_barrier(toast_relid, marker_lsn, commit_lsn)
+            .rewrite_barrier(db_oid, toast_relid, marker_lsn, commit_lsn)
             .await?;
         self.stats
             .toast_rewrite_barriers
@@ -1422,9 +1565,11 @@ mod tests {
     }
 
     use super::*;
+    use crate::emit::ch_emitter::InstanceConfig;
 
     fn row(value_id: u32, seq: u32, tid: (u32, u16), lsn: u64, body: &[u8]) -> ToastRow {
         ToastRow {
+            db_oid: 0,
             toast_relid: 16500,
             blkno: tid.0,
             offnum: tid.1,
@@ -1490,6 +1635,7 @@ mod tests {
 
     fn tomb(tid: (u32, u16), lsn: u64) -> ToastRow {
         ToastRow::tombstone(&ToastDelete {
+            db_oid: 0,
             toast_relid: 16500,
             blkno: tid.0,
             offnum: tid.1,
@@ -1501,9 +1647,12 @@ mod tests {
     async fn database_stores_isolate_colliding_value_ids() {
         let first = Arc::new(MemChunkStore::new());
         let second = Arc::new(MemChunkStore::new());
-        first.put(&[row(7, 0, (1, 1), 10, b"first")]).await.unwrap();
+        first
+            .put(&[in_db(1, row(7, 0, (1, 1), 10, b"first"))])
+            .await
+            .unwrap();
         second
-            .put(&[row(7, 0, (1, 1), 10, b"other")])
+            .put(&[in_db(2, row(7, 0, (1, 1), 10, b"other"))])
             .await
             .unwrap();
         let resolver = ToastResolver::with_store(first.clone(), Arc::default())
@@ -1523,6 +1672,40 @@ mod tests {
         ));
     }
 
+    fn in_db(db_oid: u32, row: ToastRow) -> ToastRow {
+        ToastRow { db_oid, ..row }
+    }
+
+    /// Keep source databases separate when relation OIDs and TIDs match
+    #[tokio::test]
+    async fn mirror_store_isolates_colliding_databases() {
+        let store = Arc::new(MemChunkStore::new());
+        let resolver = ToastResolver::with_store(store, Arc::default());
+        resolver
+            .put(&[
+                in_db(1, row(7, 0, (1, 1), 10, b"first")),
+                in_db(2, row(7, 0, (1, 1), 10, b"other")),
+            ])
+            .await
+            .unwrap();
+        for (db_oid, expected) in [(1, b"first"), (2, b"other")] {
+            assert_eq!(
+                resolver.fetch_value(db_oid, 16500, 7, 10, 5).await.unwrap(),
+                Some(FetchedValue::Assembled(expected.to_vec())),
+            );
+        }
+        resolver.truncate_mirror(2, 16500).await.unwrap();
+        resolver.rewrite_barrier(2, 16500, 20, 30).await.unwrap();
+        assert_eq!(
+            resolver.fetch_value(2, 16500, 7, 10, 5).await.unwrap(),
+            Some(FetchedValue::Missing),
+        );
+        assert_eq!(
+            resolver.fetch_value(1, 16500, 7, 30, 5).await.unwrap(),
+            Some(FetchedValue::Assembled(b"first".to_vec())),
+        );
+    }
+
     #[tokio::test]
     async fn mem_store_roundtrip_and_absent_value() {
         let store = MemChunkStore::new();
@@ -1534,15 +1717,18 @@ mod tests {
             ])
             .await
             .unwrap();
-        let got = store.fetch(16500, 7, u64::MAX, 5).await.unwrap();
+        let got = store.fetch(0, 16500, 7, u64::MAX, 5).await.unwrap();
         assert_eq!(got, assembled(b"abcde"));
         assert_eq!(
-            store.fetch(16500, 404, u64::MAX, 3).await.unwrap(),
+            store.fetch(0, 16500, 404, u64::MAX, 3).await.unwrap(),
             FetchedValue::Missing
         );
         assert!(matches!(
-            store.fetch(404, 7, u64::MAX, 3).await,
-            Err(ChunkStoreError::MissingMirror(404))
+            store.fetch(0, 404, 7, u64::MAX, 3).await,
+            Err(ChunkStoreError::MissingMirror {
+                db_oid: 0,
+                toast_relid: 404
+            })
         ));
     }
 
@@ -1553,14 +1739,14 @@ mod tests {
             .put(&[row(7, 0, (1, 1), 0x1000, b"abc"), tomb((1, 1), 0x2000)])
             .await
             .unwrap();
-        let live = store.fetch(16500, 7, 0x1fff, 3).await.unwrap();
+        let live = store.fetch(0, 16500, 7, 0x1fff, 3).await.unwrap();
         assert_eq!(live, assembled(b"abc"));
         assert_eq!(
-            store.fetch(16500, 7, 0x2000, 3).await.unwrap(),
+            store.fetch(0, 16500, 7, 0x2000, 3).await.unwrap(),
             FetchedValue::Missing
         );
         assert_eq!(
-            store.fetch(16500, 7, u64::MAX, 3).await.unwrap(),
+            store.fetch(0, 16500, 7, u64::MAX, 3).await.unwrap(),
             FetchedValue::Missing
         );
     }
@@ -1577,12 +1763,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.fetch(16500, 7, u64::MAX, 3).await.unwrap(),
+            store.fetch(0, 16500, 7, u64::MAX, 3).await.unwrap(),
             FetchedValue::Missing
         );
-        let new = store.fetch(16500, 9, u64::MAX, 3).await.unwrap();
+        let new = store.fetch(0, 16500, 9, u64::MAX, 3).await.unwrap();
         assert_eq!(new, assembled(b"new"));
-        let old = store.fetch(16500, 7, 0x1fff, 3).await.unwrap();
+        let old = store.fetch(0, 16500, 7, 0x1fff, 3).await.unwrap();
         assert_eq!(old, assembled(b"old"));
     }
 
@@ -1599,10 +1785,10 @@ mod tests {
             ])
             .await
             .unwrap();
-        let old = store.fetch(16500, 7, 0x1fff, 8).await.unwrap();
+        let old = store.fetch(0, 16500, 7, 0x1fff, 8).await.unwrap();
         assert_eq!(old, assembled(b"g1-0g1-1"));
         // Dead generation's seq 1 dropped: only g2's seq 0 assembles
-        let new = store.fetch(16500, 7, u64::MAX, 4).await.unwrap();
+        let new = store.fetch(0, 16500, 7, u64::MAX, 4).await.unwrap();
         assert_eq!(new, assembled(b"g2-0"));
     }
 
@@ -1616,7 +1802,7 @@ mod tests {
             ])
             .await
             .unwrap();
-        let got = store.fetch(16500, 7, u64::MAX, 6).await.unwrap();
+        let got = store.fetch(0, 16500, 7, u64::MAX, 6).await.unwrap();
         assert_eq!(got, assembled(b"copy-b"));
     }
 
@@ -1628,11 +1814,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.fetch(16500, 7, u64::MAX, 1).await.unwrap(),
+            store.fetch(0, 16500, 7, u64::MAX, 1).await.unwrap(),
             FetchedValue::Missing
         );
         assert_eq!(
-            store.fetch(16500, 7, 0x1000, 1).await.unwrap(),
+            store.fetch(0, 16500, 7, 0x1000, 1).await.unwrap(),
             assembled(b"x")
         );
     }
@@ -1648,26 +1834,29 @@ mod tests {
             }])
             .await
             .unwrap();
-        store.truncate_mirror(16500).await.unwrap();
+        store.truncate_mirror(0, 16500).await.unwrap();
         assert_eq!(
-            store.fetch(16500, 7, u64::MAX, 3).await.unwrap(),
+            store.fetch(0, 16500, 7, u64::MAX, 3).await.unwrap(),
             FetchedValue::Missing
         );
         assert_eq!(
-            store.fetch(200, 9, u64::MAX, 2).await.unwrap(),
+            store.fetch(0, 200, 9, u64::MAX, 2).await.unwrap(),
             assembled(b"zz")
         );
-        store.truncate_mirror(404).await.unwrap();
+        store.truncate_mirror(0, 404).await.unwrap();
         assert!(matches!(
-            store.fetch(404, 7, u64::MAX, 3).await,
-            Err(ChunkStoreError::MissingMirror(404))
+            store.fetch(0, 404, 7, u64::MAX, 3).await,
+            Err(ChunkStoreError::MissingMirror {
+                db_oid: 0,
+                toast_relid: 404
+            })
         ));
         store
             .put(&[row(11, 0, (0, 1), 0x2000, b"new")])
             .await
             .unwrap();
         assert_eq!(
-            store.fetch(16500, 11, u64::MAX, 3).await.unwrap(),
+            store.fetch(0, 16500, 11, u64::MAX, 3).await.unwrap(),
             assembled(b"new")
         );
     }
@@ -1692,31 +1881,40 @@ mod tests {
             .put(&[row(7, 0, (1, 1), 0x3000, b"a2")])
             .await
             .unwrap();
-        store.rewrite_barrier(16500, 0x2000, 0x4000).await.unwrap();
+        store
+            .rewrite_barrier(0, 16500, 0x2000, 0x4000)
+            .await
+            .unwrap();
         // Reused TID survives at the birth version
-        let v7 = store.fetch(16500, 7, u64::MAX, 2).await.unwrap();
+        let v7 = store.fetch(0, 16500, 7, u64::MAX, 2).await.unwrap();
         assert_eq!(v7, assembled(b"a2"));
         // Residual live TIDs (1,2) and (3,1) tombstoned; dead (2,1) untouched
         assert_eq!(
-            store.fetch(16500, 11, u64::MAX, 1).await.unwrap(),
+            store.fetch(0, 16500, 11, u64::MAX, 1).await.unwrap(),
             FetchedValue::Missing
         );
         // As-of before the rewrite still resolves the old generation whole
-        let old = store.fetch(16500, 7, 0x1fff, 2).await.unwrap();
+        let old = store.fetch(0, 16500, 7, 0x1fff, 2).await.unwrap();
         assert_eq!(old, assembled(b"ab"));
         // Re-run converges: prior residuals sit past the marker, no new rows
-        let before = store.mirrors.lock().unwrap().get(&16500).unwrap().len();
-        store.rewrite_barrier(16500, 0x2000, 0x4000).await.unwrap();
-        let after = store.mirrors.lock().unwrap().get(&16500).unwrap().len();
+        let before = store.mirrors.lock().unwrap()[&(0, 16500)].len();
+        store
+            .rewrite_barrier(0, 16500, 0x2000, 0x4000)
+            .await
+            .unwrap();
+        let after = store.mirrors.lock().unwrap()[&(0, 16500)].len();
         assert_eq!(before, after, "barrier re-run must insert nothing");
         // Empty generation: nothing past marker, every live TID dies
-        store.rewrite_barrier(16500, 0x5000, 0x6000).await.unwrap();
+        store
+            .rewrite_barrier(0, 16500, 0x5000, 0x6000)
+            .await
+            .unwrap();
         assert_eq!(
-            store.fetch(16500, 7, u64::MAX, 2).await.unwrap(),
+            store.fetch(0, 16500, 7, u64::MAX, 2).await.unwrap(),
             FetchedValue::Missing
         );
         // Missing mirror is a no-op
-        store.rewrite_barrier(404, 0x10, 0x20).await.unwrap();
+        store.rewrite_barrier(0, 404, 0x10, 0x20).await.unwrap();
     }
 
     #[tokio::test]
@@ -1724,14 +1922,14 @@ mod tests {
         let stats = Arc::new(EmitterStats::default());
         let r = ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats.clone());
         r.put(&[row(7, 0, (1, 1), 0x1000, b"x")]).await.unwrap();
-        r.truncate_mirror(16500).await.unwrap();
-        r.retire_mirror(16500).await.unwrap();
+        r.truncate_mirror(0, 16500).await.unwrap();
+        r.retire_mirror(0, 16500).await.unwrap();
         assert_eq!(stats.toast_mirror_truncates.load(Ordering::Relaxed), 1);
         assert_eq!(stats.toast_mirror_retires.load(Ordering::Relaxed), 1);
 
         let disabled = ToastResolver::disabled();
-        disabled.truncate_mirror(16500).await.unwrap();
-        disabled.retire_mirror(16500).await.unwrap();
+        disabled.truncate_mirror(0, 16500).await.unwrap();
+        disabled.retire_mirror(0, 16500).await.unwrap();
     }
 
     #[test]
@@ -1769,6 +1967,7 @@ mod tests {
         let stats = Arc::new(EmitterStats::default());
         let r = ToastResolver::with_store(store.clone(), stats);
         let mut refs = vec![ToastRowRef {
+            db_oid: 0,
             toast_relid: 16500,
             blkno: 1,
             offnum: 1,
@@ -1780,6 +1979,7 @@ mod tests {
         for seq in 1..3u32 {
             let body = [b'a' + seq as u8; 4];
             refs.push(ToastRowRef {
+                db_oid: 0,
                 toast_relid: 16500,
                 blkno: 1,
                 offnum: 1 + seq as u16,
@@ -1790,6 +1990,7 @@ mod tests {
             });
         }
         refs.push(ToastRowRef::tombstone(&ToastDelete {
+            db_oid: 0,
             toast_relid: 16500,
             blkno: 9,
             offnum: 9,
@@ -1799,7 +2000,7 @@ mod tests {
         r.put_row_refs(Some(w.shared().as_ref()), &refs)
             .await
             .unwrap();
-        let got = store.fetch(16500, 7, u64::MAX, 12).await.unwrap();
+        let got = store.fetch(0, 16500, 7, u64::MAX, 12).await.unwrap();
         assert_eq!(got, assembled(b"aaaabbbbcccc"));
         // Tombstone materializes bodiless, no spool needed
         let tomb = refs[3].materialize(None).unwrap();
@@ -1815,36 +2016,21 @@ mod tests {
 
         #[async_trait]
         impl ChunkStore for ReadOnly {
-            fn accepts_writes(&self) -> bool {
-                false
-            }
-            async fn put(&self, _rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
-                Err(ChunkStoreError::ReadOnly("put"))
-            }
             async fn fetch_many(
                 &self,
+                db_oid: u32,
                 relid: u32,
                 values: &[(u32, usize)],
                 max_lsn: u64,
             ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
-                self.0.fetch_many(relid, values, max_lsn).await
-            }
-            async fn truncate_mirror(&self, _relid: u32) -> Result<(), ChunkStoreError> {
-                Err(ChunkStoreError::ReadOnly("truncate_mirror"))
-            }
-            async fn rewrite_barrier(
-                &self,
-                _relid: u32,
-                _marker: u64,
-                _commit: u64,
-            ) -> Result<(), ChunkStoreError> {
-                Err(ChunkStoreError::ReadOnly("rewrite_barrier"))
+                self.0.fetch_many(db_oid, relid, values, max_lsn).await
             }
         }
 
         let inner = MemChunkStore::new();
         inner
             .put(&[ToastRow {
+                db_oid: 0,
                 toast_relid: 16500,
                 blkno: 1,
                 offnum: 1,
@@ -1867,6 +2053,7 @@ mod tests {
         // Reject writes instead of dropping rows
         assert!(
             r.put(&[ToastRow {
+                db_oid: 0,
                 toast_relid: 16500,
                 blkno: 2,
                 offnum: 1,
@@ -1878,10 +2065,10 @@ mod tests {
             .await
             .is_err()
         );
-        r.truncate_mirror(16500)
+        r.truncate_mirror(0, 16500)
             .await
             .expect("no mirror to empty, so a TRUNCATE barrier has nothing to do");
-        r.rewrite_barrier(16500, 1, 2)
+        r.rewrite_barrier(0, 16500, 1, 2)
             .await
             .expect("no mirror to tombstone, so a rewrite barrier has nothing to do");
     }
@@ -1901,10 +2088,9 @@ mod tests {
 
         let shadow = EmitterConfig::from_toml_str("[toast]\nmode = \"shadow\"\n").unwrap();
         assert!(shadow.toast.mode.is_shadow());
-        let err = match ToastResolver::for_mode(fixed(shadow), stats(), None) {
-            Err(e) => e,
-            Ok(_) => panic!("shadow without a bridge must be a config error"),
-        };
+        let err = ToastResolver::for_mode(fixed(shadow), stats(), None)
+            .err()
+            .expect("shadow without a bridge must be a config error");
         assert!(err.contains("bridge"), "{err}");
 
         let disabled = EmitterConfig::from_toml_str(
@@ -1940,6 +2126,7 @@ mod tests {
         let budget = crate::budget::MemoryBudget::new(1 << 10);
         let r = ToastResolver::with_store(store.clone(), stats).with_budget(budget.clone());
         let refs = [ToastRowRef {
+            db_oid: 0,
             toast_relid: 16500,
             blkno: 1,
             offnum: 1,
@@ -1950,7 +2137,7 @@ mod tests {
         }];
         r.put_row_refs(None, &refs).await.unwrap();
         assert_eq!(
-            store.fetch(16500, 7, u64::MAX, 2 << 10).await.unwrap(),
+            store.fetch(0, 16500, 7, u64::MAX, 2 << 10).await.unwrap(),
             assembled(&[0u8; 2 << 10])
         );
         assert_eq!(budget.overshoots_total(), 1);
@@ -2084,7 +2271,7 @@ mod tests {
             .collect();
         r.put_batched(&rows).await.unwrap();
         let expected = 2 * rows.len();
-        let got = store.fetch(16500, 7, u64::MAX, expected).await.unwrap();
+        let got = store.fetch(0, 16500, 7, u64::MAX, expected).await.unwrap();
         assert_eq!(
             got,
             assembled(&b"aa".repeat(rows.len())),
@@ -2112,6 +2299,7 @@ mod tests {
     async fn configured_put_limits_preserve_materialized_and_referenced_rows() {
         let refs: Vec<_> = (0..7)
             .map(|seq| ToastRowRef {
+                db_oid: 0,
                 toast_relid: 16500,
                 blkno: 1,
                 offnum: 1 + seq as u16,
@@ -2139,7 +2327,7 @@ mod tests {
                 }
                 assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), puts);
                 assert_eq!(
-                    store.fetch(16500, 7, u64::MAX, 14).await.unwrap(),
+                    store.fetch(0, 16500, 7, u64::MAX, 14).await.unwrap(),
                     assembled(&b"ab".repeat(7))
                 );
             }
@@ -2165,16 +2353,19 @@ mod tests {
     #[test]
     fn ch_store_renders_toast_schema_and_sql() {
         let cfg = EmitterConfig {
-            database: "wh".into(),
+            conn: InstanceConfig {
+                database: "wh".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let store = ClickHouseChunkStore::new(fixed(cfg));
 
-        assert_eq!(store.toast_table(16500), "`wh`.`pg_toast_16500`");
+        assert_eq!(store.toast_table(5, 16500), "`wh`.`pg_toast_5_16500`");
 
         assert_eq!(
-            store.create_sql(16500),
-            "CREATE TABLE IF NOT EXISTS `wh`.`pg_toast_16500` (\n  \
+            store.create_sql(5, 16500),
+            "CREATE TABLE IF NOT EXISTS `wh`.`pg_toast_5_16500` (\n  \
              `blkno` UInt32,\n  `offnum` UInt16,\n  `chunk_id` UInt32,\n  `chunk_seq` UInt32,\n  \
              `chunk_data` String,\n  `_lsn` UInt64,\n  `_is_deleted` UInt8,\n  \
              INDEX `idx_chunk_id` `chunk_id` \
@@ -2183,30 +2374,30 @@ mod tests {
         );
 
         assert_eq!(
-            store.insert_sql(16500),
-            "INSERT INTO `wh`.`pg_toast_16500` \
+            store.insert_sql(5, 16500),
+            "INSERT INTO `wh`.`pg_toast_5_16500` \
              (`blkno`, `offnum`, `chunk_id`, `chunk_seq`, `chunk_data`, `_lsn`, `_is_deleted`) \
              FORMAT Native"
         );
 
         assert_eq!(
-            store.truncate_sql(16500),
-            "TRUNCATE TABLE IF EXISTS `wh`.`pg_toast_16500`"
+            store.truncate_sql(5, 16500),
+            "TRUNCATE TABLE IF EXISTS `wh`.`pg_toast_5_16500`"
         );
 
         assert_eq!(
-            store.rewrite_barrier_sql(16500, 0x2000, 0x4000),
-            "INSERT INTO `wh`.`pg_toast_16500` (`blkno`, `offnum`, `chunk_id`, `chunk_seq`, \
+            store.rewrite_barrier_sql(5, 16500, 0x2000, 0x4000),
+            "INSERT INTO `wh`.`pg_toast_5_16500` (`blkno`, `offnum`, `chunk_id`, `chunk_seq`, \
              `chunk_data`, `_lsn`, `_is_deleted`)\n\
              SELECT `blkno`, `offnum`, 0, 0, '', 16384, 1\n\
-             FROM `wh`.`pg_toast_16500`\n\
+             FROM `wh`.`pg_toast_5_16500`\n\
              GROUP BY `blkno`, `offnum`\n\
              HAVING max(`_lsn`) <= 8192 AND argMax(`_is_deleted`, `_lsn`) = 0\n\
              SETTINGS optimize_aggregation_in_order = 1"
         );
 
         assert_eq!(
-            store.fetch_sql(16500, &[7, 9], 0x2000),
+            store.fetch_sql(5, 16500, &[7, 9], 0x2000),
             "SELECT `chunk_id`, `chunk_seq`, \
              argMax(`chunk_data`, (`ver`, `blkno`, `offnum`)) AS `chunk_data`\n\
              FROM (\n  \
@@ -2216,10 +2407,10 @@ mod tests {
              argMax(`chunk_data`, `_lsn`) AS `chunk_data`,\n         \
              max(`_lsn`) AS `ver`,\n         \
              argMax(`_is_deleted`, `_lsn`) AS `dead`\n  \
-             FROM `wh`.`pg_toast_16500`\n  \
+             FROM `wh`.`pg_toast_5_16500`\n  \
              WHERE `_lsn` <= 8192\n    \
              AND (`blkno`, `offnum`) IN (\n      \
-             SELECT `blkno`, `offnum` FROM `wh`.`pg_toast_16500`\n      \
+             SELECT `blkno`, `offnum` FROM `wh`.`pg_toast_5_16500`\n      \
              WHERE `chunk_id` IN (7, 9) AND `_lsn` <= 8192)\n  \
              GROUP BY `blkno`, `offnum`\n\
              )\n\

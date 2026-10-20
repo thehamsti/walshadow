@@ -10,8 +10,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use backon::{ExponentialBuilder, Retryable};
@@ -25,7 +25,7 @@ use crate::toast::FetchedValue;
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
 pub const PROTO_VERSION: u32 = 7;
 /// Catalog column plans. Must equal `WS_PROJECTION_VERSION`
-pub const PROJECTION_VERSION: u32 = 1;
+pub const PROJECTION_VERSION: u32 = 2;
 
 /// Match `WS_MAX_REQUEST_BYTES`
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024 * 1024;
@@ -90,6 +90,7 @@ pub enum Catalog {
     Index = 3,
     Namespace = 4,
     Type = 5,
+    Inherits = 6,
 }
 
 impl Catalog {
@@ -102,6 +103,7 @@ impl Catalog {
             3 => Some(Catalog::Index),
             4 => Some(Catalog::Namespace),
             5 => Some(Catalog::Type),
+            6 => Some(Catalog::Inherits),
             _ => None,
         }
     }
@@ -109,10 +111,10 @@ impl Catalog {
     /// Columns the worker projects. Bump [`PROJECTION_VERSION`] on any change
     pub fn ncols(self) -> usize {
         match self {
-            Catalog::Class => 9,
+            Catalog::Class => 10,
             Catalog::Attribute => 12,
             Catalog::Index => 5,
-            Catalog::Namespace | Catalog::Type => 2,
+            Catalog::Namespace | Catalog::Type | Catalog::Inherits => 2,
         }
     }
 }
@@ -327,10 +329,10 @@ pub struct Bridge {
     /// Stateless ops round-robin; [`Op::pinned`] ops stay on slot 0
     slots: Vec<Slot>,
     next: AtomicUsize,
-    /// Set by the first successful `HELLO`; later dials, on any slot, must
-    /// match it. A worker that came back a different build means a mixed
-    /// install and must fail closed
-    info: OnceLock<Hello>,
+    /// Slot 0's `HELLO`; later dials, on any slot, must match it. A worker
+    /// that came back a different build means a mixed install and must fail
+    /// closed
+    info: Hello,
     bufs: BufPool,
     pub stats: Arc<BridgeStats>,
 }
@@ -369,16 +371,17 @@ impl Bridge {
                 conn: Mutex::new(None),
             })
             .collect();
+        let stats = Arc::new(BridgeStats::default());
+        let (first, info) = Self::hello(&stats, &slots[0]).await?;
+        *slots[0].conn.lock().await = Some(first);
         let bridge = Self {
             bufs: BufPool::new(slots.len()),
             slots,
             next: AtomicUsize::new(0),
-            info: OnceLock::new(),
-            stats: Arc::new(BridgeStats::default()),
+            info,
+            stats,
         };
-        // Slot 0 first, so its HELLO is the identity the rest are checked
-        // against rather than whichever worker happened to answer first
-        for slot in &bridge.slots {
+        for slot in &bridge.slots[1..] {
             let stream = bridge.dial(slot).await?;
             *slot.conn.lock().await = Some(stream);
         }
@@ -398,10 +401,8 @@ impl Bridge {
         self.slots.len()
     }
 
-    /// `None` before the first successful `HELLO`, which [`connect`](Self::connect)
-    /// guarantees
-    pub fn info(&self) -> Option<Hello> {
-        self.info.get().copied()
+    pub fn info(&self) -> Hello {
+        self.info
     }
 
     pub fn is_up(&self) -> bool {
@@ -619,6 +620,19 @@ impl Bridge {
     /// Fresh socket plus `HELLO`. Takes no connection lock, so
     /// [`call`](Self::call) may hold one across it
     async fn dial(&self, slot: &Slot) -> Result<UnixStream, BridgeError> {
+        let (stream, info) = Self::hello(&self.stats, slot).await?;
+        // A worker that came back a different build must not be trusted to
+        // answer requests the daemon framed against the old one
+        if info != self.info {
+            return Err(BridgeError::Protocol(format!(
+                "worker identity changed across reconnect: {:?} then {info:?}",
+                self.info
+            )));
+        }
+        Ok(stream)
+    }
+
+    async fn hello(stats: &BridgeStats, slot: &Slot) -> Result<(UnixStream, Hello), BridgeError> {
         let mut stream = UnixStream::connect(&slot.path).await?;
         widen_sockbufs(&stream);
         let started = Instant::now();
@@ -626,7 +640,7 @@ impl Bridge {
         patch_frame(&mut hello, Op::Hello);
         let mut body = Vec::new();
         let res = round_trip(&mut stream, &hello, &mut body).await;
-        self.record(Op::Hello, started, &res);
+        record(stats, Op::Hello, started, &res);
         let len = res?;
 
         let mut c = Cursor::at(&body[..len], 1);
@@ -647,15 +661,7 @@ impl Bridge {
             in_recovery: c.u8()? != 0,
             datid: c.u32()?,
         };
-        // A worker that came back a different build must not be trusted to
-        // answer requests the daemon framed against the old one
-        let first = *self.info.get_or_init(|| info);
-        if first != info {
-            return Err(BridgeError::Protocol(format!(
-                "worker identity changed across reconnect: {first:?} then {info:?}"
-            )));
-        }
-        Ok(stream)
+        Ok((stream, info))
     }
 
     /// `frame` carries [`FRAME_PREFIX_BYTES`] of unwritten leading room,
@@ -738,20 +744,23 @@ impl Bridge {
     }
 
     fn record<T>(&self, op: Op, started: Instant, res: &Result<T, BridgeError>) {
-        let slot = op.slot();
-        self.stats.requests[slot].fetch_add(1, Ordering::Relaxed);
-        self.stats.request_nanos[slot]
-            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        if res.is_err() {
-            self.stats.errors[slot].fetch_add(1, Ordering::Relaxed);
-        }
-        // A worker that answered with an error status is still up. A frame
-        // this side refused never reached it, so it says nothing either way
-        if !matches!(res, Err(BridgeError::RequestTooLarge { .. })) {
-            self.stats
-                .up
-                .store(u64::from(!is_transport_error(res)), Ordering::Relaxed);
-        }
+        record(&self.stats, op, started, res);
+    }
+}
+
+fn record<T>(stats: &BridgeStats, op: Op, started: Instant, res: &Result<T, BridgeError>) {
+    let slot = op.slot();
+    stats.requests[slot].fetch_add(1, Ordering::Relaxed);
+    stats.request_nanos[slot].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if res.is_err() {
+        stats.errors[slot].fetch_add(1, Ordering::Relaxed);
+    }
+    // A worker that answered with an error status is still up. A frame
+    // this side refused never reached it, so it says nothing either way
+    if !matches!(res, Err(BridgeError::RequestTooLarge { .. })) {
+        stats
+            .up
+            .store(u64::from(!is_transport_error(res)), Ordering::Relaxed);
     }
 }
 
@@ -912,6 +921,7 @@ pub struct ClassRow {
     /// The column, not `pg_relation_filenode()`: that goes through relcache and
     /// would not see the overlay. User relations are never mapped
     pub relfilenode: u32,
+    pub relispartition: bool,
 }
 
 impl ScanRow for ClassRow {
@@ -928,6 +938,7 @@ impl ScanRow for ClassRow {
             reltoastrelid: field(row, 6)?.parse().map_err(|_| bad(row, 6))?,
             reltablespace: field(row, 7)?.parse().map_err(|_| bad(row, 7))?,
             relfilenode: field(row, 8)?.parse().map_err(|_| bad(row, 8))?,
+            relispartition: pg_bool(row, 9)?,
         })
     }
 }
@@ -995,6 +1006,24 @@ impl ScanRow for IndexRow {
             indisprimary: pg_bool(row, 2)?,
             indisreplident: pg_bool(row, 3)?,
             indkey,
+        })
+    }
+}
+
+/// `pg_inherits` row; a partition has exactly one
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InheritsRow {
+    pub inhrelid: u32,
+    pub inhparent: u32,
+}
+
+impl ScanRow for InheritsRow {
+    const CATALOG: Catalog = Catalog::Inherits;
+
+    fn parse(row: &[Option<String>]) -> Result<Self, BridgeError> {
+        Ok(Self {
+            inhrelid: field(row, 0)?.parse().map_err(|_| bad(row, 0))?,
+            inhparent: field(row, 1)?.parse().map_err(|_| bad(row, 1))?,
         })
     }
 }
@@ -1155,10 +1184,12 @@ mod tests {
 
     #[test]
     fn class_row_parses_projection_order() {
-        let row: Vec<Option<String>> = ["16384", "2200", "t", "r", "p", "d", "16387", "0", "16384"]
-            .iter()
-            .map(|s| Some((*s).to_string()))
-            .collect();
+        let row: Vec<Option<String>> = [
+            "16384", "2200", "t", "r", "p", "d", "16387", "0", "16384", "f",
+        ]
+        .iter()
+        .map(|s| Some((*s).to_string()))
+        .collect();
         let parsed = ClassRow::parse(&row).unwrap();
         assert_eq!(parsed.oid, 16384);
         assert_eq!(parsed.relname, "t");
@@ -1201,11 +1232,12 @@ mod tests {
             Catalog::Index,
             Catalog::Namespace,
             Catalog::Type,
+            Catalog::Inherits,
         ] {
             assert_eq!(Catalog::from_id(cat as u8), Some(cat));
         }
         assert_eq!(Catalog::from_id(0), None);
-        assert_eq!(Catalog::from_id(6), None);
+        assert_eq!(Catalog::from_id(7), None);
     }
 
     #[test]
@@ -1257,26 +1289,17 @@ mod tests {
     async fn fake_worker(listener: UnixListener, script: Vec<Option<Vec<u8>>>) {
         let mut script = script.into_iter();
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else {
-                return;
-            };
-            loop {
-                let mut hdr = [0u8; 4];
-                if sock.read_exact(&mut hdr).await.is_err() {
-                    break;
-                }
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; 4];
+            while sock.read_exact(&mut hdr).await.is_ok() {
                 let mut body = vec![0u8; u32::from_be_bytes(hdr) as usize];
-                if sock.read_exact(&mut body).await.is_err() {
-                    break;
+                if sock.read_exact(&mut body).await.is_ok()
+                    && let Some(Some(resp)) = script.next()
+                    && sock.write_all(&frame(resp)).await.is_ok()
+                {
+                    continue;
                 }
-                match script.next() {
-                    Some(Some(resp)) => {
-                        if sock.write_all(&frame(resp)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(None) | None => break,
-                }
+                break;
             }
         }
     }
@@ -1408,15 +1431,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(
-                err,
-                BridgeError::ReplayMismatch {
-                    expected: 0x4000,
-                    end: 0x5000,
-                    ..
-                }
-            ),
+            matches!(err, BridgeError::ReplayMismatch { .. }),
             "got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "bridge replayed to 4000..5000, expected boundary 4000"
         );
         assert_eq!(bridge.stats.scan_replay_moved.load(Ordering::Relaxed), 1);
     }

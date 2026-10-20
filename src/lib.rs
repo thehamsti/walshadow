@@ -34,6 +34,8 @@ pub mod catalog;
 pub mod ch;
 pub mod column_rules;
 pub mod config;
+#[cfg(feature = "test-support")]
+pub mod crash_test;
 pub mod decode;
 pub mod destination;
 pub mod dsn;
@@ -73,7 +75,8 @@ pub use emit::{ch_ddl, ch_emitter, pipeline};
 pub use filter::{catalog_tracker, classify, main_data, pg_class_decoder, rewrite};
 #[doc(hidden)]
 pub use ops::{
-    bridge, control, ctl, init, introspect, metrics, oracle, preflight, retention, trace,
+    bridge, control, ctl, init, introspect, log_events, metrics, oracle, preflight, retention,
+    trace,
 };
 #[doc(hidden)]
 pub use source::{
@@ -84,3 +87,10 @@ pub use source::{
 pub use toast::toast_retire;
 #[doc(hidden)]
 pub use xact::{spill, xact_buffer};
+
+/// Enable every callsite so coverage runs evaluate tracing field expressions
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn enable_tracing() {
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+}

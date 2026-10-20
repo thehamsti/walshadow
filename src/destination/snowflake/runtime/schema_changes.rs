@@ -943,6 +943,7 @@ mod tests {
     }
     fn desc() -> RelDescriptor {
         RelDescriptor {
+            ancestors: Vec::new(),
             rfn: Default::default(),
             oid: 7,
             toast_oid: 0,

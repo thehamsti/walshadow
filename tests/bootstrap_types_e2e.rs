@@ -17,19 +17,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use walshadow::shadow::{Shadow, ShadowConfig};
 
-fn extension_available(name: &str) -> bool {
-    let Ok(out) = Command::new("pg_config").arg("--sharedir").output() else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
-    }
-    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Path::new(&dir)
-        .join(format!("extension/{name}.control"))
-        .exists()
-}
-
 fn load_types_workload(source: &Shadow, has_postgis: bool) -> Result<()> {
     let mut cols = String::from(
         "id int PRIMARY KEY, c_bool bool, c_int2 smallint, c_int4 int, c_int8 bigint, \
@@ -92,16 +79,15 @@ fn write_autocreate_config(path: &Path, ch_port: u16) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn direct_bootstrap_all_types_end_to_end() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     for ext in ["hstore", "citext", "vector"] {
-        if !extension_available(ext) {
-            eprintln!("skip: extension {ext} not installed");
+        if !fx::tools::extension(ext) {
             return;
         }
     }
-    let has_postgis = extension_available("postgis");
+    let has_postgis = fx::tools::extension_installed("postgis");
 
     let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
@@ -190,7 +176,7 @@ async fn direct_bootstrap_all_types_end_to_end() {
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
         loop {
             let n = ch
-                .query("SELECT count() FROM default.all_types FINAL WHERE _is_deleted = 0")
+                .query("SELECT count() FROM default.public_all_types FINAL WHERE _is_deleted = 0")
                 .unwrap_or_default();
             if n == "1" {
                 break;
@@ -233,7 +219,7 @@ async fn direct_bootstrap_all_types_end_to_end() {
         for (expr, want) in &checks {
             let got = ch
                 .query(&format!(
-                    "SELECT toString({expr}) FROM default.all_types FINAL WHERE id = 1"
+                    "SELECT toString({expr}) FROM default.public_all_types FINAL WHERE id = 1"
                 ))
                 .unwrap_or_default();
             if &got != want {
@@ -246,10 +232,7 @@ async fn direct_bootstrap_all_types_end_to_end() {
         Ok(())
     })();
 
-    let _ = guard.into_inner().map(|mut c| {
-        let _ = c.kill();
-        let _ = c.wait();
-    });
+    drop(guard);
     if bootstrap_shadow_data_dir.join("postmaster.pid").exists() {
         let mut shadow_cfg =
             ShadowConfig::new(bootstrap_shadow_data_dir.clone(), shadow_filter_dir.clone());

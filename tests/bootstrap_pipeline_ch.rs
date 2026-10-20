@@ -26,7 +26,8 @@ use std::time::Duration;
 use walrus::pg::walparser::RelFileNode;
 use walshadow::backup_page_walk::{BackfillTuple, CatalogMap};
 use walshadow::ch::CompressionChoice;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
+use walshadow::emit::route::freeze_routes;
 use walshadow::heap_decoder::ColumnValue;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::batcher::BatcherMsg;
@@ -52,6 +53,7 @@ fn rel(rel_node: u32, name: &str) -> Arc<RelDescriptor> {
         rel_name: RelName::new("public", name),
         kind: 'r',
         persistence: 'p',
+        ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: vec![RelAttr {
             attnum: 1,
@@ -80,6 +82,7 @@ fn id_mapping(target_table: &str) -> TableMapping {
             target_type: "Int32".into(),
             type_pinned: false,
         }],
+        tees: Vec::new(),
     }
 }
 
@@ -102,8 +105,7 @@ fn tuple(rel_node: u32, id: i32) -> BackfillTuple {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bootstrap_tail_fans_out_n2() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
 
@@ -127,10 +129,13 @@ async fn bootstrap_tail_fans_out_n2() {
     // Small row_budget so each rfn's single seq spans many batches that
     // fan across the two inserter connections and ack out of order.
     let mut cfg = EmitterConfig {
-        host: "127.0.0.1".into(),
-        port: slot.ch_tcp,
-        database: "walshadow_test".into(),
-        compression: CompressionChoice::None,
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port: slot.ch_tcp,
+            database: "walshadow_test".into(),
+            compression: CompressionChoice::None,
+            ..Default::default()
+        },
         row_budget: 4,
         flush_timeout: Duration::from_millis(50),
         ..Default::default()
@@ -143,7 +148,7 @@ async fn bootstrap_tail_fans_out_n2() {
     let mut catalog = CatalogMap::new();
     catalog.insert(rel(16400, "foo"));
     catalog.insert(rel(16401, "baz"));
-    let mapping = std::sync::Arc::new(cfg.tables.clone());
+    let mapping = std::sync::Arc::new(walshadow::mapping::shared(cfg.tables.clone()));
 
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());
@@ -173,14 +178,12 @@ async fn bootstrap_tail_fans_out_n2() {
     let drain = tokio::spawn(bootstrap::drain(
         tup_rx,
         catalog,
-        mapping,
+        freeze_routes(&mapping, None, &Default::default()),
         msg_tx.clone(),
         ack.clone(),
         stats.clone(),
         ToastResolver::disabled(),
         bootstrap::Deferral::Rejected,
-        Default::default(),
-        None,
         ahash::HashSet::default(),
         false,
         None,
@@ -211,9 +214,7 @@ async fn bootstrap_tail_fans_out_n2() {
         "contiguous-done watermark at start_lsn",
     );
 
-    drop(msg_tx);
-    drop(ack);
-    tail.join().await;
+    tail.close(msg_tx, ack).await;
     assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
 
     // Every fed row landed; out-of-order batch completion across the two

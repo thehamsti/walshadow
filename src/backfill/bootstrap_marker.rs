@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::ch_emitter::BootstrapMode;
+use crate::visibility_pending::PendingRecorded;
 
 pub const MARKER_FILENAME: &str = "walshadow_bootstrap.incomplete";
 
@@ -68,7 +69,7 @@ impl ExtractedCheckpoint {
             .context("persist extracted checkpoint")
     }
 
-    pub async fn clear(dir: &Path) -> Result<()> {
+    async fn clear(dir: &Path) -> Result<()> {
         match tokio::fs::remove_file(dir.join(EXTRACTED_FILENAME)).await {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -120,7 +121,14 @@ impl BootstrapMarker {
             .context("persist bootstrap marker")
     }
 
-    pub async fn clear(dir: &Path) -> Result<()> {
+    /// End the attempt. Pending rows already in ClickHouse must be recorded
+    /// first, so a restart can still publish them
+    pub async fn complete(dir: &Path, _: PendingRecorded) -> Result<()> {
+        ExtractedCheckpoint::clear(dir).await?;
+        Self::clear(dir).await
+    }
+
+    async fn clear(dir: &Path) -> Result<()> {
         tokio::fs::remove_file(dir.join(MARKER_FILENAME))
             .await
             .context("clear completed bootstrap marker")?;
@@ -144,10 +152,6 @@ impl BootstrapMarker {
             .as_deref()
             .filter(|name| name.starts_with(walrus::pg::backup::BACKUP_NAME_PREFIX))
             .context("bootstrap incomplete without a resolved backup pin; use operator recovery")
-    }
-
-    pub fn pinned_backup_name(&self) -> Result<&str> {
-        self.pinned_backup()
     }
 
     fn check_retry(&self) -> Result<()> {

@@ -2,7 +2,7 @@
 //! spawned `clickhouse server` listening on a secure native port with a
 //! self-signed cert.
 //!
-//! Exercises the production `EmitterConfig { secure: true, .. }` path
+//! Exercises the production `InstanceConfig { secure: true, .. }` path
 //! through the inserter pool: `tail::spawn` → `inserter::spawn_pool` →
 //! `connect_client` → `AsyncClient::connect_tls`. The
 //! self-signed CA is pinned into the rustls root store via
@@ -18,6 +18,10 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::on_path;
+
 #[path = "common/ports.rs"]
 mod ports;
 
@@ -32,9 +36,10 @@ use std::time::{Duration, Instant};
 use clickhouse_c::tls::{self, rustls};
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::CompressionChoice;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
+use walshadow::pipeline::ack::Publish;
 use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::pos::{EmitterAck, Monotone};
@@ -46,26 +51,8 @@ const RFN: RelFileNode = RelFileNode {
     rel_node: 16385,
 };
 
-fn on_path(bin: &str, arg: &str) -> bool {
-    Command::new(bin)
-        .arg(arg)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 fn skip() -> bool {
-    if !on_path("clickhouse", "--version") {
-        eprintln!("skip: no clickhouse binary on PATH");
-        return true;
-    }
-    if !on_path("openssl", "version") {
-        eprintln!("skip: no openssl binary on PATH");
-        return true;
-    }
-    false
+    !on_path("clickhouse", "--version") || !on_path("openssl", "version")
 }
 
 fn openssl(args: &[&std::ffi::OsStr]) {
@@ -291,6 +278,7 @@ fn rel_descriptor() -> RelDescriptor {
         rel_name: RelName::new("public", "things"),
         kind: 'r',
         persistence: 'p',
+        ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: vec![],
     }
@@ -321,12 +309,15 @@ async fn emitter_tls_round_trip() {
     // tls_config pins the self-signed CA; default_config (public roots)
     // would reject it.
     let cfg = EmitterConfig {
-        host: "localhost".into(),
-        port: ch.secure_port,
-        database: "walshadow_test".into(),
-        secure: true,
+        conn: InstanceConfig {
+            host: "localhost".into(),
+            port: ch.secure_port,
+            database: "walshadow_test".into(),
+            secure: true,
+            compression: CompressionChoice::Lz4,
+            ..Default::default()
+        },
         tls_config: Some(ch.pinned_config()),
-        compression: CompressionChoice::Lz4,
         ..Default::default()
     };
     // The batcher builds its plan from the `RoutedRow`'s mapping.
@@ -347,6 +338,7 @@ async fn emitter_tls_round_trip() {
                 type_pinned: false,
             },
         ],
+        tees: Vec::new(),
     });
 
     // Every inserter in the pool connects via `connect_client` →
@@ -383,10 +375,10 @@ async fn emitter_tls_round_trip() {
         commit_ts: 1_000_000,
         commit_lsn: 0xABCD,
     };
-    ack.register(0, tuple.commit_lsn);
+    let seq = ack.seqs(0).open(tuple.commit_lsn, Publish::Commit);
     msg_tx
         .send(BatcherMsg::Row(RoutedRow {
-            seq: 0,
+            seq: seq.seq(),
             rel,
             route: walshadow::emit::route::RouteSnapshot::freeze(
                 mapping,
@@ -398,7 +390,7 @@ async fn emitter_tls_round_trip() {
         }))
         .await
         .expect("route row");
-    ack.placed(0, 1);
+    seq.place(1);
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     msg_tx
         .send(BatcherMsg::FlushAll(reply_tx))
@@ -406,9 +398,7 @@ async fn emitter_tls_round_trip() {
         .expect("send flush");
     reply_rx.await.expect("flush ack");
     ack.wait_through(1).await.expect("ack collector alive");
-    drop(msg_tx);
-    drop(ack);
-    tail_parts.join().await;
+    tail_parts.close(msg_tx, ack).await;
     assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
 
     let row = ch

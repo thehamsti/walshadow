@@ -37,7 +37,7 @@ pub const NUMERICOID: u32 = 1700;
 pub const UUIDOID: u32 = 2950;
 pub const JSONBOID: u32 = 3802;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RelName {
     pub namespace: Arc<str>,
     pub name: Arc<str>,
@@ -60,7 +60,7 @@ impl std::fmt::Display for RelName {
 
 /// Batch identity down the insert path: the same relation name in two source
 /// databases routes to two destinations, so the database is part of the key
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TableKey {
     pub db_oid: u32,
     pub rel: RelName,
@@ -90,6 +90,40 @@ pub struct RelDescriptor {
     pub persistence: char,
     pub replident: ReplIdent,
     pub attributes: Vec<RelAttr>,
+    /// Declarative partition ancestors, parent first. Each omits its own
+    /// ancestors. Empty outside partition trees and for legacy `INHERITS`
+    pub ancestors: Vec<Arc<RelDescriptor>>,
+}
+
+impl RelDescriptor {
+    pub fn is_partition(&self) -> bool {
+        !self.ancestors.is_empty()
+    }
+
+    pub fn parent_oid(&self) -> Option<Oid> {
+        self.ancestors.first().map(|a| a.oid)
+    }
+
+    pub fn live_attnum(&self, name: &str) -> Option<i16> {
+        self.attributes
+            .iter()
+            .find(|a| !a.dropped && a.name == name)
+            .map(|a| a.attnum)
+    }
+
+    pub fn live_attr(&self, attnum: i16) -> Option<&RelAttr> {
+        self.attributes
+            .iter()
+            .find(|a| !a.dropped && a.attnum == attnum)
+    }
+
+    /// Copy embedded as another relation's ancestor
+    pub fn as_ancestor(&self) -> Arc<Self> {
+        Arc::new(Self {
+            ancestors: Vec::new(),
+            ..self.clone()
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,16 +142,6 @@ pub enum ReplIdent {
 }
 
 impl ReplIdent {
-    /// `pg_class.relreplident`
-    pub fn to_char(&self) -> char {
-        match self {
-            ReplIdent::Default { .. } => 'd',
-            ReplIdent::Nothing => 'n',
-            ReplIdent::Full { .. } => 'f',
-            ReplIdent::UsingIndex { .. } => 'i',
-        }
-    }
-
     /// Build from `pg_class.relreplident` plus the `pg_index` rows it names:
     /// the primary key for `d`/`f`, the replica-identity index for `i`
     pub fn from_parts(
@@ -206,7 +230,16 @@ pub enum SchemaEvent {
     Dropped {
         oid: Oid,
         rel_name: RelName,
+        partition: Option<DroppedPartition>,
     },
+}
+
+/// Dropped partition's last captured shape
+#[derive(Debug, Clone)]
+pub struct DroppedPartition {
+    pub desc: Arc<RelDescriptor>,
+    /// Ancestors dropped at the same boundary
+    pub dropped: Vec<Oid>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -260,6 +293,46 @@ pub fn compute_schema_diff(old: &RelDescriptor, new: &RelDescriptor) -> SchemaDi
     diff
 }
 
+/// Build an int4 relation keyed on attribute 1. Use given attribute numbers;
+/// blank names mark dropped columns
+#[cfg(test)]
+pub(crate) fn int4_rel(oid: Oid, name: &str, kind: char, columns: &[(i16, &str)]) -> RelDescriptor {
+    RelDescriptor {
+        rfn: RelFileNode {
+            spc_node: 1663,
+            db_node: 5,
+            rel_node: if kind == 'p' { 0 } else { oid },
+        },
+        oid,
+        toast_oid: 0,
+        namespace_oid: 2200,
+        rel_name: RelName::new("public", name),
+        kind,
+        persistence: 'p',
+        replident: ReplIdent::Default {
+            pk_attnums: Some(vec![1]),
+        },
+        attributes: columns
+            .iter()
+            .map(|(attnum, name)| RelAttr {
+                attnum: *attnum,
+                name: (*name).into(),
+                type_oid: if name.is_empty() { 0 } else { INT4OID },
+                typmod: -1,
+                not_null: false,
+                dropped: name.is_empty(),
+                type_name: "int4".into(),
+                type_byval: true,
+                type_len: 4,
+                type_align: 'i',
+                type_storage: 'p',
+                missing_default: None,
+            })
+            .collect(),
+        ancestors: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +368,7 @@ mod tests {
             rel_name: RelName::new("public", &format!("t{oid}")),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: attrs,
         }

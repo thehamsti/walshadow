@@ -21,7 +21,7 @@ use crate::backfill::visibility_pending::{PendingManifest, PendingSpool};
 use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::config::ResolvedConfig;
 use crate::decode::visibility::{
-    HEAP_XMAX_IS_MULTI, PgXactPatch, PgXactView, Visibility, deferred_xids, read_pg_multixact,
+    HEAP_XMAX_IS_MULTI, PgXactView, SealedPatch, Visibility, deferred_xids, read_pg_multixact,
     read_pg_xact, tuple_visibility,
 };
 use crate::emit::ch_emitter::EmitterStats;
@@ -30,6 +30,7 @@ use crate::emit::pipeline::batcher::BatcherMsg;
 use crate::emit::pipeline::bootstrap::BootstrapDrainOutcome;
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
+use crate::emit::route::freeze_routes;
 use crate::mapping::MappingSnapshot;
 use crate::schema::RelName;
 use crate::ticker::Ticker;
@@ -291,7 +292,11 @@ impl GreenfieldSink {
             lanes.push(bootstrap::drain(
                 rx,
                 self.catalog.clone(),
-                self.mapping.clone(),
+                freeze_routes(
+                    &self.mapping,
+                    Some(&*self.config),
+                    &self.dest.current().row_policy(),
+                ),
                 msg_tx,
                 ack,
                 self.stats.clone(),
@@ -303,8 +308,6 @@ impl GreenfieldSink {
                         .map_err(|e| format!("bootstrap: reopen handback spool: {e}"))?,
                     None => DeferredSpool::new(spool, DEFERRED_SPOOL_MEM_MAX),
                 }),
-                self.dest.current().row_policy(),
-                Some(self.config.clone()),
                 self.skip_initial.clone(),
                 self.dest.current().snowflake.is_some(),
                 None,
@@ -332,7 +335,7 @@ impl GreenfieldSink {
             let neutral_values = emitter.snowflake.is_some();
             async move {
                 bootstrap::drain_deferred(
-                    lane.spool,
+                    lane.spool.into(),
                     &catalog,
                     &mapping,
                     &lane.msg_tx,
@@ -414,7 +417,7 @@ pub struct PendingGate {
 pub async fn resolve_greenfield(
     gate: PendingGate,
     data_dir: &Path,
-    patch: &PgXactPatch,
+    patch: &SealedPatch,
     source_major: u32,
 ) -> Result<(GateStats, Vec<PendingManifest>)> {
     let PendingGate {
@@ -525,7 +528,8 @@ mod tests {
     use crate::backfill::backup_page_walk::{
         PAGE_BYTES, PageWalkSink, make_rel, make_rel_named, synth_single_tuple_page,
     };
-    use crate::backfill::backup_source::{BackupSink, FileAction, FileMeta, StartInfo};
+    use crate::backfill::backup_source::testing::expect_tap;
+    use crate::backfill::backup_source::{BackupSink, FileMeta, StartInfo};
     use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
     use crate::backfill::spool::SpoolMark;
     use crate::decode::visibility::{
@@ -597,9 +601,7 @@ mod tests {
                 mode: 0o600,
                 ..Default::default()
             };
-            let FileAction::Tap(mut entry) = sink.begin(&meta).await.unwrap() else {
-                panic!("{path} must tap");
-            };
+            let mut entry = expect_tap(sink.begin(&meta).await.unwrap());
             for page in 0..pages {
                 entry.chunk(&visible_page(page as i32)).await.unwrap();
             }
@@ -634,13 +636,13 @@ mod tests {
         );
         barrier.publish_drain(2, 9, SpoolMark::default()).await;
         assert_eq!(
-            barrier.collect().await.unwrap().files,
+            barrier.collect().await.unwrap().files(),
             vec!["base/5/16400".to_string()],
             "the second file's tuple is still undrained"
         );
         barrier.publish_drain(3, 9, SpoolMark::default()).await;
         assert_eq!(
-            barrier.collect().await.unwrap().files,
+            barrier.collect().await.unwrap().files(),
             vec!["base/5/16400.1".to_string()],
         );
     }
@@ -688,7 +690,7 @@ mod tests {
         );
         barrier.publish_drain(2, 4, SpoolMark::default()).await;
         assert_eq!(
-            barrier.collect().await.unwrap().files,
+            barrier.collect().await.unwrap().files(),
             vec!["base/5/16400".to_string()]
         );
     }
@@ -775,11 +777,12 @@ mod tests {
                     target_type: "Int32".into(),
                     type_pinned: false,
                 }],
+                tees: Vec::new(),
             },
         );
         let sink = GreenfieldSink {
             catalog,
-            mapping: Arc::new(tables),
+            mapping: Arc::new(crate::mapping::shared(tables)),
             config: Arc::new(ResolvedConfig::default()),
             dest: crate::config::DestEmitter::new(Arc::default(), None),
             stats: Arc::new(EmitterStats::default()),
@@ -821,13 +824,8 @@ mod tests {
         for (want_seq, (ack, ack_task, mut msg_rx)) in [3u64, 7].into_iter().zip(tails) {
             let mut seqs = Vec::new();
             while let Some(msg) = msg_rx.recv().await {
-                match msg {
-                    BatcherMsg::Rows(chunk) => seqs.extend(chunk.rows.iter().map(|r| r.seq)),
-                    BatcherMsg::Row(r) => seqs.push(r.seq),
-                    BatcherMsg::FlushAll(reply) => {
-                        let _ = reply.send(());
-                    }
-                }
+                let BatcherMsg::Rows(c) = msg else { panic!() };
+                seqs.extend(c.rows.iter().map(|r| r.seq));
             }
             assert_eq!(seqs, vec![want_seq; 2], "rows rode their own lane's tail");
             drop(ack);
@@ -933,6 +931,7 @@ mod tests {
             let mapping = TableMapping {
                 target: TableTarget::new("default", "t"),
                 columns,
+                tees: Vec::new(),
             };
             let row = |value, infomask| BackfillTuple {
                 columns: vec![Some(ColumnValue::Int4(1)), Some(value)],
@@ -1002,7 +1001,7 @@ mod tests {
     #[tokio::test]
     async fn several_spools_all_replay_into_one_output() {
         let accum = PgXactAccum::new();
-        let patch = PgXactPatch::new();
+        let patch = SealedPatch::default();
         let multi = PgMultiXactAccum::new(17);
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
         let (tx, mut rx) = mpsc::channel(16);
@@ -1049,7 +1048,7 @@ mod tests {
     #[tokio::test]
     async fn in_flight_tuples_reach_pending() {
         let accum = in_progress_accum();
-        let patch = PgXactPatch::new();
+        let patch = SealedPatch::default();
         let multi = PgMultiXactAccum::new(17);
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
         let (tx, mut rx) = mpsc::channel(8);
@@ -1089,7 +1088,7 @@ mod tests {
     #[tokio::test]
     async fn in_flight_tuples_without_pending_stay_gated() {
         let accum = in_progress_accum();
-        let patch = PgXactPatch::new();
+        let patch = SealedPatch::default();
         let multi = PgMultiXactAccum::new(17);
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
         let (tx, _rx) = mpsc::channel(8);
@@ -1105,7 +1104,7 @@ mod tests {
     #[tokio::test]
     async fn undecidable_multixact_aborts_the_pass() {
         let accum = PgXactAccum::new();
-        let patch = PgXactPatch::new();
+        let patch = SealedPatch::default();
         let multi = PgMultiXactAccum::new(17);
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
         let (tx, _rx) = mpsc::channel(4);
@@ -1146,10 +1145,14 @@ mod tests {
                 ..Default::default()
             },
         };
-        let (stats, pending_tables) =
-            resolve_greenfield(pending, Path::new("/nonexistent"), &PgXactPatch::new(), 17)
-                .await
-                .unwrap();
+        let (stats, pending_tables) = resolve_greenfield(
+            pending,
+            Path::new("/nonexistent"),
+            &SealedPatch::default(),
+            17,
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.emitted, 7);
         assert!(pending_tables.is_empty());
     }

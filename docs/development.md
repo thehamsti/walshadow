@@ -19,9 +19,9 @@ RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --lib --bins
 
 Integration tests start PostgreSQL and ClickHouse instances. Put matching
 PostgreSQL tools and ClickHouse on PATH, and install extensions required by
-selected tests. Some tests return early when prerequisites are missing, so a
-passing result alone does not prove integration scenario ran. Inspect skip
-output and check module was built
+selected tests. Tests skip when a tool, extension, or generated fixture is
+missing, so a passing result alone does not prove integration scenario ran
+Set `WALSHADOW_REQUIRE_TOOLS=1` to fail them instead, as CI does
 
 [CI workflow](../.github/workflows/ci.yml) defines supported test matrix and
 dependency setup. [Nextest config](../.config/nextest.toml) bounds cluster-test
@@ -65,3 +65,6 @@ Keep operating instructions in docs, system explanations and diagrams in
 [architecture](../architecture/README.md), and unfinished work in
 [plans](../plans/INDEX.md). Remove completed plans. Link source for low-level
 behavior instead of copying implementation into prose
+
+Describe behavior in present tense. Keep release history and roadmap language
+out of operating guides. State upgrade requirements by version or capability

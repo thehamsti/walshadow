@@ -6,8 +6,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use backon::BackoffBuilder;
-use clickhouse_c::{AsyncClient, BoxedAsyncClient, ClientOpts, Codec, Compression, Event};
+use clickhouse_c::tls::rustls::pki_types::ServerName;
+use clickhouse_c::{
+    AsyncClient, Block, BoxedAsyncClient, ClientOpts, Codec, Compression, ErrorKind, Event,
+};
 use thiserror::Error;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 use crate::config::DestEmitter;
 use crate::emit::ch_emitter::EmitterConfig;
@@ -18,8 +23,12 @@ pub mod types;
 
 #[derive(Debug, Error)]
 pub enum EmitterError {
-    #[error("clickhouse-c: {0}")]
+    #[error(transparent)]
     Client(#[from] clickhouse_c::Error),
+    #[error(
+        "connection closed before ClickHouse hello reply, check service is running and its IP access list admits this host"
+    )]
+    HelloDropped(#[source] clickhouse_c::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("config: {0}")]
@@ -106,6 +115,9 @@ impl CompressionChoice {
     }
 }
 
+/// ClickHouse UNKNOWN_DATABASE
+pub const UNKNOWN_DATABASE: i32 = 81;
+
 pub trait ConnectionConfig {
     fn host(&self) -> &str;
     fn port(&self) -> u16;
@@ -113,6 +125,7 @@ pub trait ConnectionConfig {
     fn user(&self) -> &str;
     fn password(&self) -> &str;
     fn secure(&self) -> bool;
+    fn tls_server_name(&self) -> &str;
     fn tls_config(&self) -> Option<Arc<clickhouse_c::tls::rustls::ClientConfig>>;
     fn compression(&self) -> CompressionChoice;
     fn idle_reconnect(&self) -> Duration;
@@ -128,23 +141,52 @@ pub async fn connect_client(
         .user(config.user())
         .password(config.password());
     opts.compression = compression.to_wire();
-    let addr = (config.host(), config.port());
-    if config.secure() {
+    let sock = TcpStream::connect((config.host(), config.port())).await?;
+    sock.set_nodelay(true)?;
+    let client = if config.secure() {
         let tls = config
             .tls_config()
             .unwrap_or_else(clickhouse_c::tls::default_config);
-        let client = AsyncClient::connect_tls(addr, config.host(), opts, codec, tls).await?;
-        Ok(client.boxed())
+        let server_name = tls_server_name(config)?;
+        let stream = TlsConnector::from(tls)
+            .connect(server_name, sock)
+            .await
+            .map_err(|e| std::io::Error::new(e.kind(), format!("TLS handshake: {e}")))?;
+        AsyncClient::handshake_on(stream, opts, codec)
+            .await
+            .map(AsyncClient::boxed)
     } else {
-        let client = AsyncClient::connect(addr, opts, codec).await?;
-        Ok(client.boxed())
-    }
+        AsyncClient::handshake_on(sock, opts, codec)
+            .await
+            .map(AsyncClient::boxed)
+    };
+    client.map_err(|e| match e.kind {
+        ErrorKind::Io | ErrorKind::Eof => EmitterError::HelloDropped(e),
+        _ => e.into(),
+    })
 }
 
-pub async fn drain_to_end_of_stream(client: &mut BoxedAsyncClient) -> Result<(), EmitterError> {
+/// SNI + certificate name for the TLS handshake: `tls_server_name` when
+/// non-empty, else the TCP host. An IP-literal host yields an IP `ServerName`,
+/// which rustls verifies against the certificate's IP SANs and sends no SNI for.
+fn tls_server_name(config: &impl ConnectionConfig) -> Result<ServerName<'static>, EmitterError> {
+    let name = match config.tls_server_name() {
+        "" => config.host(),
+        name => name,
+    };
+    ServerName::try_from(name.to_owned())
+        .map_err(|e| EmitterError::Config(format!("TLS server name `{name}`: {e}")))
+}
+
+/// Server finished the query; an INSERT's rows are durable
+pub struct EndOfStream(());
+
+pub async fn drain_to_end_of_stream(
+    client: &mut BoxedAsyncClient,
+) -> Result<EndOfStream, EmitterError> {
     loop {
         match client.recv_event().await? {
-            Event::EndOfStream => return Ok(()),
+            Event::EndOfStream => return Ok(EndOfStream(())),
             Event::Exception(exc) => {
                 return Err(EmitterError::ServerException {
                     code: exc.code(),
@@ -176,18 +218,108 @@ pub async fn exec_drain(
 ) -> Result<(), EmitterError> {
     with_timeout(timeout, async {
         client.send_query(sql, None).await?;
-        drain_to_end_of_stream(client).await
+        drain_to_end_of_stream(client).await?;
+        Ok(())
     })
     .await
 }
 
-/// Connection owned by its retry loop. A cleared client redials on next use,
-/// so a failed reconnect spends retry budget instead of aborting the caller.
-pub struct ChConn {
-    dest: Arc<DestEmitter>,
+/// Single-column String SELECT, one attempt under `timeout`
+pub async fn query_strings(
+    client: &mut BoxedAsyncClient,
+    sql: &str,
+    timeout: Duration,
+) -> Result<Vec<String>, EmitterError> {
+    with_timeout(timeout, async {
+        client.send_query(sql, None).await?;
+        let mut out = Vec::new();
+        loop {
+            match client.recv_event().await? {
+                Event::Data(block) => read_string_column(&block, &mut out)?,
+                Event::EndOfStream => return Ok(out),
+                Event::Exception(exc) => {
+                    return Err(EmitterError::ServerException {
+                        code: exc.code(),
+                        message: String::from_utf8_lossy(exc.display_text()).into_owned(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+}
+
+/// Append one Data block's single String column into `out`; the 0-row
+/// header block contributes nothing.
+fn read_string_column(block: &Block, out: &mut Vec<String>) -> Result<(), EmitterError> {
+    let n = block.n_rows();
+    if n == 0 {
+        return Ok(());
+    }
+    let col = block
+        .column(0)
+        .ok_or_else(|| EmitterError::Type("missing result column".into()))?;
+    let (offsets, data) = col
+        .string()
+        .ok_or_else(|| EmitterError::Type("result column not String".into()))?;
+    for i in 0..n {
+        let start = if i == 0 { 0 } else { offsets[i - 1] as usize };
+        let end = offsets[i] as usize;
+        out.push(String::from_utf8_lossy(&data[start..end]).into_owned());
+    }
+    Ok(())
+}
+
+/// Connect to `cfg.database`, first creating it over a session on `default`
+/// when absent, since CH refuses a handshake naming a missing database.
+/// `true` when it was created
+pub async fn connect_creating_database(
+    cfg: &EmitterConfig,
+) -> Result<(BoxedAsyncClient, bool), EmitterError> {
+    match connect_client(cfg).await {
+        Err(EmitterError::Client(e)) if e.server_code == UNKNOWN_DATABASE => {}
+        result => return result.map(|client| (client, false)),
+    }
+    let mut on_default = cfg.clone();
+    on_default.conn.database = "default".into();
+    let mut client = connect_client(&on_default).await?;
+    exec_drain(
+        &mut client,
+        &format!(
+            "CREATE DATABASE IF NOT EXISTS {}",
+            quote_ident(&cfg.conn.database)
+        ),
+        cfg.insert_timeout,
+    )
+    .await?;
+    tracing::info!(database = %cfg.conn.database, "created destination database");
+    Ok((connect_client(cfg).await?, true))
+}
+
+struct Connection {
     client: Option<BoxedAsyncClient>,
     dialed: Option<Arc<EmitterConfig>>,
     last_used: Instant,
+}
+
+impl Default for Connection {
+    fn default() -> Self {
+        Self {
+            client: None,
+            dialed: None,
+            last_used: Instant::now(),
+        }
+    }
+}
+
+/// Cache one connection per destination; retry and idle expiry apply independently.
+pub struct ChConn {
+    instance: Option<String>,
+    selected: Option<Arc<EmitterConfig>>,
+    active: Connection,
+    parked: std::collections::HashMap<Option<String>, Connection>,
+    dest: Arc<DestEmitter>,
     dials: u64,
 }
 
@@ -196,9 +328,10 @@ impl ChConn {
     pub fn deferred(dest: Arc<DestEmitter>) -> Self {
         Self {
             dest,
-            client: None,
-            dialed: None,
-            last_used: Instant::now(),
+            instance: None,
+            selected: None,
+            active: Connection::default(),
+            parked: Default::default(),
             dials: 0,
         }
     }
@@ -213,32 +346,34 @@ impl ChConn {
 
     /// Live config this connection dials and reads its knobs from
     pub fn config(&self) -> Arc<EmitterConfig> {
-        self.dest.current()
+        self.selected.clone().unwrap_or_else(|| self.dest.current())
+    }
+
+    pub fn select(&mut self, instance: Option<&str>) -> Result<(), EmitterError> {
+        let config = instance.map(|name| self.dest.instance(name)).transpose()?;
+        if self.instance.as_deref() != instance {
+            let next = self
+                .parked
+                .remove(&instance.map(str::to_owned))
+                .unwrap_or_default();
+            let previous = std::mem::replace(&mut self.active, next);
+            self.parked.insert(self.instance.take(), previous);
+            self.instance = instance.map(str::to_owned);
+        }
+        self.selected = config;
+        Ok(())
     }
 
     /// Redial now, for settings fixed at connect (codec, host, credentials)
     pub async fn dial(&mut self) -> Result<(), EmitterError> {
-        self.client = None;
+        self.active.client = None;
         self.ready().await?;
         Ok(())
     }
 
     pub async fn ready(&mut self) -> Result<&mut BoxedAsyncClient, EmitterError> {
-        let config = self.dest.current();
-        let moved = self
-            .dialed
-            .as_ref()
-            .is_none_or(|dialed| !Arc::ptr_eq(dialed, &config));
-        if moved || self.last_used.elapsed() >= config.idle_reconnect() {
-            self.client = None;
-        }
-        if self.client.is_none() {
-            self.client = Some(connect_client(&*config).await?);
-            self.dialed = Some(config);
-            self.last_used = Instant::now();
-            self.dials += 1;
-        }
-        Ok(self.client.as_mut().expect("just connected"))
+        let client = self.take_ready().await?;
+        Ok(self.active.client.insert(client))
     }
 
     /// Dials since the last call, excluding the one at construction
@@ -274,16 +409,16 @@ impl ChConn {
     where
         Fut: Future<Output = (BoxedAsyncClient, Result<T, EmitterError>)>,
     {
-        let mut backoff = self.dest.current().retry.backoff().build();
+        let mut backoff = self.config().retry.backoff().build();
         let mut attempt = 0u32;
         loop {
             let error = match self.take_ready().await {
                 Ok(client) => {
                     let (client, result) = op(client).await;
-                    self.client = Some(client);
+                    self.active.client = Some(client);
                     match result {
                         Ok(value) => {
-                            self.last_used = Instant::now();
+                            self.active.last_used = Instant::now();
                             return Ok(value);
                         }
                         Err(e) => e,
@@ -299,14 +434,36 @@ impl ChConn {
             };
             on_retry(&error, attempt);
             attempt += 1;
-            self.client = None;
+            self.active.client = None;
             tokio::time::sleep(delay).await;
         }
     }
 
     async fn take_ready(&mut self) -> Result<BoxedAsyncClient, EmitterError> {
-        self.ready().await?;
-        Ok(self.client.take().expect("just connected"))
+        if let Some(name) = &self.instance {
+            self.selected = Some(self.dest.instance(name)?);
+        }
+        let config = self.config();
+        let moved = self
+            .active
+            .dialed
+            .as_ref()
+            .is_none_or(|dialed| !Arc::ptr_eq(dialed, &config));
+        if moved || self.active.last_used.elapsed() >= config.idle_reconnect() {
+            self.active.client = None;
+        }
+        if let Some(client) = self.active.client.take() {
+            return Ok(client);
+        }
+        let client = if self.instance.is_some() {
+            connect_creating_database(&config).await?.0
+        } else {
+            connect_client(&*config).await?
+        };
+        self.active.dialed = Some(config);
+        self.active.last_used = Instant::now();
+        self.dials += 1;
+        Ok(client)
     }
 }
 
@@ -315,6 +472,7 @@ pub fn is_retryable(error: &EmitterError) -> bool {
         error,
         EmitterError::Io(_)
             | EmitterError::Client(_)
+            | EmitterError::HelloDropped(_)
             | EmitterError::ServerException { .. }
             | EmitterError::Timeout { .. }
     )
@@ -327,6 +485,7 @@ pub fn quote_ident(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emit::ch_emitter::InstanceConfig;
 
     /// `compression = "none"` still has to decode a compressed response: the
     /// wire flag says what we send, not what the server answers in. A server
@@ -355,5 +514,95 @@ mod tests {
         assert_eq!(CompressionChoice::None.to_wire(), Compression::None);
         assert_eq!(CompressionChoice::Lz4.to_wire(), Compression::Lz4);
         assert_eq!(CompressionChoice::Zstd.to_wire(), Compression::Zstd);
+    }
+
+    /// ClickHouse Cloud's ingress drops a client its IP access list refuses
+    /// after accepting the connection, with no server exception to report
+    #[tokio::test]
+    async fn hello_drop_names_likely_causes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = EmitterConfig {
+            conn: InstanceConfig {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                ..Default::default()
+            },
+            ..EmitterConfig::default()
+        };
+        let server = tokio::spawn(async move { drop(listener.accept().await.unwrap()) });
+        let Err(e) = connect_client(&config).await else {
+            panic!("handshake succeeded against a dropped connection");
+        };
+        server.await.unwrap();
+        assert!(matches!(e, EmitterError::HelloDropped(_)), "{e:?}");
+        assert!(is_retryable(&e));
+        assert!(e.to_string().contains("IP access list"), "{e}");
+    }
+
+    #[test]
+    fn client_error_prefix_appears_once() {
+        let e = EmitterError::from(clickhouse_c::Error::from(std::io::Error::other("reset")));
+        assert_eq!(e.to_string(), "clickhouse-c: Io: reset");
+        assert!(std::error::Error::source(&e).is_none());
+    }
+
+    fn secure_config(host: &str, port: u16, tls_server_name: &str) -> EmitterConfig {
+        EmitterConfig {
+            conn: InstanceConfig {
+                host: host.into(),
+                port,
+                secure: true,
+                tls_server_name: tls_server_name.into(),
+                ..Default::default()
+            },
+            ..EmitterConfig::default()
+        }
+    }
+
+    #[test]
+    fn tls_server_name_prefers_setting_over_host() {
+        let named = tls_server_name(&secure_config("10.0.0.5", 9440, "svc.example"));
+        assert_eq!(named.unwrap(), ServerName::try_from("svc.example").unwrap());
+        // Empty string is "unset", not an empty SNI
+        let blank = tls_server_name(&secure_config("ch.example", 9440, ""));
+        assert_eq!(blank.unwrap(), ServerName::try_from("ch.example").unwrap());
+        let bad = tls_server_name(&secure_config("ch.example", 9440, "not a name"));
+        assert!(
+            matches!(&bad, Err(EmitterError::Config(m)) if m.contains("not a name")),
+            "{bad:?}"
+        );
+    }
+
+    /// Accept one connection and return the raw TLS ClientHello record, the
+    /// one handshake message that carries a hostname in clear text
+    async fn capture_client_hello(listener: tokio::net::TcpListener) -> Vec<u8> {
+        use tokio::io::AsyncReadExt as _;
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut header = [0u8; 5];
+        sock.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[0], 0x16, "not a TLS handshake record");
+        let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+        let mut body = vec![0u8; len];
+        sock.read_exact(&mut body).await.unwrap();
+        body
+    }
+
+    /// The host dialed may differ from the name on the certificate;
+    /// `tls_server_name` must be what the ClientHello carries
+    #[tokio::test]
+    async fn connect_sends_configured_sni_not_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hello = tokio::spawn(capture_client_hello(listener));
+        let sni = "svc.clickhouse.cloud";
+        let config = secure_config("127.0.0.1", port, sni);
+        // Server drops after the ClientHello, so the client errors; the
+        // bytes it already sent are what this test is about
+        assert!(connect_client(&config).await.is_err());
+        let hello = hello.await.unwrap();
+        assert!(
+            hello.windows(sni.len()).any(|w| w == sni.as_bytes()),
+            "SNI missing from ClientHello"
+        );
     }
 }

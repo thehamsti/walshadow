@@ -46,10 +46,16 @@ pub struct TailParts {
 }
 
 impl TailParts {
-    /// Await the drain cascade. Call only after every producer-held `msg_tx`
-    /// and `AckHandle` clone has dropped, else the batcher never sees its
-    /// channel close and this hangs.
-    pub async fn join(self) {
+    /// Drop the spawn-returned producer handles, then await the drain
+    /// cascade. Hangs while any clone handed to a producer stays alive
+    pub async fn close(self, msg_tx: mpsc::Sender<BatcherMsg>, ack: AckHandle) {
+        drop(msg_tx);
+        drop(ack);
+        self.join().await;
+    }
+
+    /// Await the drain cascade once every producer handle has dropped
+    pub(super) async fn join(self) {
         let _ = self.batcher.await;
         for h in self.resolvers {
             let _ = h.await;
@@ -72,9 +78,7 @@ impl TailParts {
         fatal: &Fatal,
     ) -> Result<(), String> {
         flush_and_prove(&msg_tx, &ack, through, fatal).await?;
-        drop(msg_tx);
-        drop(ack);
-        self.join().await;
+        self.close(msg_tx, ack).await;
         if let Some(msg) = fatal.message() {
             return Err(msg);
         }
@@ -189,9 +193,7 @@ impl OwnedTail {
     /// down. Bounded by the inserters' retry policy (a CH outage trips their
     /// fatal, not a hang)
     pub async fn quiesce(self) {
-        drop(self.msg_tx);
-        drop(self.ack);
-        self.parts.join().await;
+        self.parts.close(self.msg_tx, self.ack).await;
     }
 }
 
@@ -219,6 +221,17 @@ pub async fn spawn(
     .await
 }
 
+/// Ack every row of `chunks` as done, one count per seq
+fn swallow(ack: &AckHandle, chunks: impl IntoIterator<Item = batcher::RowChunk>) {
+    let mut counts: HashMap<u64, u64> = HashMap::new();
+    for chunk in chunks {
+        for r in &chunk.rows {
+            *counts.entry(r.seq).or_insert(0) += 1;
+        }
+    }
+    ack.swallowed(counts.into_iter().collect());
+}
+
 /// Metrics-only tail: ack collector + one swallow task, zero CH
 /// connections. Every routed row acks at swallow (permits release on
 /// drop) so nothing can pin the watermark; `FlushAll` replies
@@ -235,14 +248,9 @@ pub fn spawn_null(
     let batcher = tokio::spawn(async move {
         while let Some(msg) = msg_rx.recv().await {
             match msg {
-                BatcherMsg::Row(r) => swallow_ack.acked(vec![(r.seq, 1)]),
-                BatcherMsg::Rows(chunk) => {
-                    let mut counts: HashMap<u64, u64> = HashMap::new();
-                    for r in &chunk.rows {
-                        *counts.entry(r.seq).or_insert(0) += 1;
-                    }
-                    swallow_ack.acked(counts.into_iter().collect());
-                }
+                BatcherMsg::Row(r) => swallow_ack.swallowed(vec![(r.seq, 1)]),
+                BatcherMsg::Rows(chunk) => swallow(&swallow_ack, [chunk]),
+                BatcherMsg::Chunks(chunks) => swallow(&swallow_ack, chunks),
                 BatcherMsg::FlushAll(reply) => {
                     let _ = reply.send(());
                 }
@@ -418,31 +426,40 @@ fn spawn_snowflake_tail(
                         break;
                     }
                 }
-                BatcherMsg::Rows(RowChunk { rows, permit }) => {
-                    let mut error = None;
-                    for row in rows {
-                        if let Err(e) = snowflake_route(
-                            &mut senders,
-                            &mut workers,
-                            &runtime,
-                            &snapshot_operations,
-                            &stats,
-                            oracle.as_ref(),
-                            &worker_ack,
-                            &fatal,
-                            row,
-                            permit.clone(),
-                            row_budget,
-                            byte_budget,
-                            timeout,
-                        )
-                        .await
-                        {
-                            error = Some(e);
-                            break;
-                        }
+                BatcherMsg::Rows(chunk) => {
+                    if let Err(e) = route_chunks(
+                        &mut senders,
+                        &mut workers,
+                        &runtime,
+                        &snapshot_operations,
+                        &stats,
+                        oracle.as_ref(),
+                        &worker_ack,
+                        &fatal,
+                        vec![chunk],
+                        (row_budget, byte_budget, timeout),
+                    )
+                    .await
+                    {
+                        fatal.set(format!("snowflake tail route: {e}"));
+                        break;
                     }
-                    if let Some(e) = error {
+                }
+                BatcherMsg::Chunks(chunks) => {
+                    if let Err(e) = route_chunks(
+                        &mut senders,
+                        &mut workers,
+                        &runtime,
+                        &snapshot_operations,
+                        &stats,
+                        oracle.as_ref(),
+                        &worker_ack,
+                        &fatal,
+                        chunks,
+                        (row_budget, byte_budget, timeout),
+                    )
+                    .await
+                    {
                         fatal.set(format!("snowflake tail route: {e}"));
                         break;
                     }
@@ -491,6 +508,43 @@ fn spawn_snowflake_tail(
             inserters: Vec::new(),
         },
     )
+}
+
+/// Route every row of `chunks`, each sharing its chunk's memory permit
+#[allow(clippy::too_many_arguments)]
+async fn route_chunks(
+    senders: &mut HashMap<RelName, mpsc::Sender<SnowflakeTableMsg>>,
+    workers: &mut tokio::task::JoinSet<()>,
+    runtime: &Arc<SnowflakeRuntime>,
+    snapshot_operations: &HashMap<RelName, String>,
+    stats: &Arc<EmitterStats>,
+    oracle: Option<&Arc<Oracle>>,
+    ack: &AckHandle,
+    fatal: &Fatal,
+    chunks: Vec<RowChunk>,
+    (row_budget, byte_budget, timeout): (usize, usize, Duration),
+) -> Result<(), String> {
+    for RowChunk { rows, permit } in chunks {
+        for row in rows {
+            snowflake_route(
+                senders,
+                workers,
+                runtime,
+                snapshot_operations,
+                stats,
+                oracle,
+                ack,
+                fatal,
+                row,
+                permit.clone(),
+                row_budget,
+                byte_budget,
+                timeout,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -767,7 +821,7 @@ where
     F: std::future::Future<Output = anyhow::Result<()>>,
 {
     delivery.await.map_err(|e| e.to_string())?;
-    ack.acked(per_seq);
+    ack.delivered(per_seq);
     drop(permits);
     Ok(())
 }
@@ -789,10 +843,13 @@ mod tests {
     async fn snowflake_delivery_failure_does_not_advance_ack() {
         let watermark = Arc::new(Monotone::<EmitterAck>::new(crate::pos::Pos::ZERO));
         let (ack, collector) = ack::spawn(watermark.clone(), Fatal::new());
-        ack.register(0, 100);
-        ack.register(1, 200);
-        ack.placed(0, 1);
-        ack.placed(1, 1);
+        let mut seqs = ack.seqs(0);
+        let (first, second) = (
+            seqs.open(100, ack::Publish::Commit),
+            seqs.open(200, ack::Publish::Commit),
+        );
+        seqs.place(first, 1);
+        seqs.place(second, 1);
         let failed = complete_after_delivery(
             async { anyhow::bail!("warehouse rejected batch") },
             &ack,
@@ -825,10 +882,13 @@ mod tests {
     async fn concurrent_snowflake_batches_ack_contiguously() {
         let watermark = Arc::new(Monotone::<EmitterAck>::new(crate::pos::Pos::ZERO));
         let (ack, collector) = ack::spawn(watermark.clone(), Fatal::new());
-        ack.register(0, 100);
-        ack.register(1, 200);
-        ack.placed(0, 1);
-        ack.placed(1, 1);
+        let mut seqs = ack.seqs(0);
+        let (first, second) = (
+            seqs.open(100, ack::Publish::Commit),
+            seqs.open(200, ack::Publish::Commit),
+        );
+        seqs.place(first, 1);
+        seqs.place(second, 1);
         let (first_tx, first_rx) = oneshot::channel::<()>();
         let (second_tx, second_rx) = oneshot::channel::<()>();
         let mut deliveries = tokio::task::JoinSet::new();

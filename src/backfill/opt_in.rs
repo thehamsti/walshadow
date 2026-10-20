@@ -35,6 +35,7 @@ use crate::schema::{RelDescriptor, RelName};
 
 #[async_trait]
 pub trait Backfiller: Send + Sync {
+    /// No-op for `InitialLoadMode::None`
     async fn note_opt_in(
         self: Arc<Self>,
         desc: Arc<RelDescriptor>,
@@ -46,9 +47,7 @@ pub trait Backfiller: Send + Sync {
 
     /// Why this backfiller cannot serve `mode`, so callers refuse the request
     /// before creating a destination it would leave empty
-    fn refuses(&self, _mode: InitialLoadMode) -> Option<&'static str> {
-        None
-    }
+    fn refuses(&self, mode: InitialLoadMode) -> Option<&'static str>;
 }
 
 /// Dispatch one `config_table` row's inclusion intent. `opt_in_lsn` is the
@@ -233,6 +232,9 @@ async fn opt_in_known(
             reason,
             "initial_load unsupported here; table left out of scope",
         );
+        return Ok(());
+    }
+    if !applicator.owns_destination(desc).await? {
         return Ok(());
     }
     let snowflake_mapping = applicator

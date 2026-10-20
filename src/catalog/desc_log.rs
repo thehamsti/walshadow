@@ -89,7 +89,11 @@ const MAGIC: &[u8; 2] = b"WL";
 /// intervals were published for read-identical drift too and span past the
 /// layout change, so replaying them under the fence would fail closed on
 /// rows v2 decoded fine — reject the log instead
-const VERSION: u16 = 3;
+/// 4: descriptors carry partition ancestors. A v3 log decodes with none and
+/// is rewritten at open
+const VERSION: u16 = 4;
+const MIN_VERSION: u16 = 3;
+const ANCESTRY_VERSION: u16 = 4;
 /// Reject frames past this before allocating: no realistic batch (thousands
 /// of descriptors) approaches it, garbage lengths do
 const MAX_FRAME: u32 = 256 * 1024 * 1024;
@@ -359,19 +363,23 @@ impl DescriptorLog {
         lineage: &[u32],
     ) -> Result<Self> {
         let mut index = Index::default();
+        let mut legacy = false;
         let ckpt_path = dir.join(CKPT_FILE);
         if let Ok(bytes) = tokio::fs::read(&ckpt_path).await {
             // write_atomic guarantees complete-or-absent: any parse failure
             // here is corruption, never a torn write
-            load_frames(&bytes, CKPT_FILE, &identity, lineage, &mut index, false)?;
+            let (_, version) =
+                load_frames(&bytes, CKPT_FILE, &identity, lineage, &mut index, false)?;
+            legacy |= version < VERSION;
         }
 
         let tail_path = dir.join(TAIL_FILE);
         let header = encode_header(&identity);
         let (tail, tail_len) = match tokio::fs::read(&tail_path).await {
             Ok(bytes) => {
-                let good_len =
+                let (good_len, version) =
                     load_frames(&bytes, TAIL_FILE, &identity, lineage, &mut index, true)?;
+                legacy |= version < VERSION;
                 let mut f = OpenOptions::new().write(true).open(&tail_path).await?;
                 if good_len < bytes.len() as u64 {
                     f.set_len(good_len).await?;
@@ -393,6 +401,22 @@ impl DescriptorLog {
             }
             Err(e) => return Err(e.into()),
         };
+        let (tail, tail_len) = if legacy {
+            let ckpt = encode_ckpt(
+                &identity,
+                index.covered_through,
+                index.floor_at_write,
+                index.batches.values(),
+            );
+            crate::fs::write_atomic(dir, CKPT_FILE, &ckpt).await?;
+            drop(tail);
+            crate::fs::write_atomic(dir, TAIL_FILE, &header).await?;
+            let mut f = OpenOptions::new().write(true).open(&tail_path).await?;
+            f.seek(SeekFrom::End(0)).await?;
+            (f, header.len() as u64)
+        } else {
+            (tail, tail_len)
+        };
 
         Ok(Self {
             identity,
@@ -406,6 +430,25 @@ impl DescriptorLog {
             tail_bytes: AtomicU64::new(tail_len - header.len() as u64),
             stats: Arc::new(DescLogStats::default()),
         })
+    }
+
+    /// Whether a log under `dir` predates partition ancestry, which
+    /// [`open`](Self::open) rewrites without inventing ancestors
+    pub async fn predates_partitions(dir: &Path) -> Result<bool> {
+        for file in [CKPT_FILE, TAIL_FILE] {
+            let mut header = [0u8; 4];
+            let read = match File::open(dir.join(file)).await {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                f => tokio::io::AsyncReadExt::read_exact(&mut f?, &mut header).await,
+            };
+            if read.is_ok()
+                && &header[..2] == MAGIC
+                && u16::from_le_bytes([header[2], header[3]]) < ANCESTRY_VERSION
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn publish_tail_bytes(&self, w: &Writer) {
@@ -467,9 +510,19 @@ impl DescriptorLog {
         rfn: RelFileNode,
         lsn: u64,
     ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupResult> {
-        use std::sync::atomic::Ordering::Relaxed;
+        let result = self.peek_spanned(rfn, lsn);
+        self.count_spanned(&result);
+        result
+    }
+
+    /// [`Self::descriptor_at_spanned`] without lookup stats, for a speculative
+    /// caller whose answer the counted lookup confirms later
+    pub fn peek_spanned(
+        &self,
+        rfn: RelFileNode,
+        lsn: u64,
+    ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupResult> {
         if rfn.db_node != 0 && rfn.db_node != self.identity.db_oid {
-            self.stats.lookups_foreign_db.fetch_add(1, Relaxed);
             return Err(LookupResult::ForeignDb);
         }
         let idx = self.index.read().unwrap();
@@ -478,14 +531,12 @@ impl DescriptorLog {
         // the locator's own db_node, so a shared relation (db_node 0) skips
         // this database's Database-scoped intervals — shared catalogs carry
         // no descriptors, so no such interval can name their rows
-        let result = ambiguity_covering(idx.amb_rfn.get(&rfn), lsn)
+        ambiguity_covering(idx.amb_rfn.get(&rfn), lsn)
             .or_else(|| ambiguity_covering(idx.amb_db.get(&rfn.db_node), lsn))
             .map_or_else(
                 || lookup_spanned(idx.by_rfn.get(&rfn), lsn),
                 |a| Err(LookupResult::Ambiguous(a)),
-            );
-        self.count_spanned(&result);
-        result
+            )
     }
 
     /// Oid lookup for a caller that already proved the oid belongs to this
@@ -807,14 +858,12 @@ impl DescriptorLog {
     ) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         retained.floor_at_write = floor;
-        let mut bytes = encode_header(&self.identity);
-        push_frame(
-            &mut bytes,
-            &encode_meta(retained.covered_through, floor.get()),
+        let bytes = encode_ckpt(
+            &self.identity,
+            retained.covered_through,
+            floor,
+            retained.batches.values(),
         );
-        for batch in retained.batches.values() {
-            push_frame(&mut bytes, &encode_batch(batch));
-        }
         crate::fs::write_atomic(&w.dir, CKPT_FILE, &bytes).await?;
         // Crash before this truncate leaves ckpt+tail overlapping; load
         // dedupes by captured_at
@@ -997,6 +1046,20 @@ fn encode_header(id: &DescLogIdentity) -> Vec<u8> {
     out
 }
 
+fn encode_ckpt<'a>(
+    id: &DescLogIdentity,
+    covered_through: u64,
+    floor: Pos<Floor>,
+    batches: impl Iterator<Item = &'a Arc<BatchRecord>>,
+) -> Vec<u8> {
+    let mut out = encode_header(id);
+    push_frame(&mut out, &encode_meta(covered_through, floor.get()));
+    for batch in batches {
+        push_frame(&mut out, &encode_batch(batch));
+    }
+    out
+}
+
 fn encode_meta(covered_through: u64, floor_at_write: u64) -> Vec<u8> {
     let mut out = vec![TAG_META];
     push_u64(&mut out, covered_through);
@@ -1089,6 +1152,7 @@ fn encode_descriptor(out: &mut Vec<u8>, d: &RelDescriptor) {
         persistence,
         replident,
         attributes,
+        ancestors,
     } = d;
     push_u32(out, rfn.spc_node);
     push_u32(out, rfn.db_node);
@@ -1148,6 +1212,10 @@ fn encode_descriptor(out: &mut Vec<u8>, d: &RelDescriptor) {
         push_u8(out, *type_storage as u8);
         push_opt_missing(out, missing_default.as_ref());
     }
+    push_u32(out, ancestors.len() as u32);
+    for a in ancestors {
+        encode_descriptor(out, a);
+    }
 }
 
 /// Spill descriptor-dictionary reuse: same codec, byte-slice framing
@@ -1160,7 +1228,7 @@ pub(crate) fn decode_descriptor_bytes(
     buf: &[u8],
 ) -> std::result::Result<(RelDescriptor, usize), String> {
     let mut cur = Cur::new(buf, "spill", 0);
-    let d = decode_descriptor(&mut cur).map_err(|e| e.to_string())?;
+    let d = decode_descriptor(&mut cur, VERSION).map_err(|e| e.to_string())?;
     Ok((d, cur.pos))
 }
 
@@ -1270,7 +1338,7 @@ impl<'a> Cur<'a> {
 }
 
 /// Parse header + frames into `index`. Returns the byte offset after the
-/// last good frame. `repairable = true` (tail): a frame torn at EOF stops
+/// last good frame and the file's version. `repairable = true` (tail): a frame torn at EOF stops
 /// the load there for the caller to truncate; interior corruption still
 /// fails. `repairable = false` (ckpt): any malformation fails.
 fn load_frames(
@@ -1280,7 +1348,7 @@ fn load_frames(
     lineage: &[u32],
     index: &mut Index,
     repairable: bool,
-) -> Result<u64> {
+) -> Result<(u64, u16)> {
     let mut cur = Cur::new(bytes, file, 0);
     let magic = cur.need(2)?;
     if magic != MAGIC {
@@ -1291,7 +1359,7 @@ fn load_frames(
         });
     }
     let version = cur.u16()?;
-    if version != VERSION {
+    if !(MIN_VERSION..=VERSION).contains(&version) {
         return Err(DescLogError::Version(version));
     }
     check_identity(&mut cur, identity, lineage)?;
@@ -1301,9 +1369,9 @@ fn load_frames(
         if frame_start == bytes.len() {
             break;
         }
-        let torn = |detail: String| -> Result<u64> {
+        let torn = |detail: String| -> Result<(u64, u16)> {
             if repairable {
-                Ok(good)
+                Ok((good, version))
             } else {
                 Err(DescLogError::Corrupt {
                     file,
@@ -1349,7 +1417,7 @@ fn load_frames(
                 index.floor_at_write = Pos::new(body_cur.u64()?);
             }
             TAG_BATCH => {
-                let batch = decode_batch(&mut body_cur)?;
+                let batch = decode_batch(&mut body_cur, version)?;
                 match index.batches.get(&batch.captured_at) {
                     // ckpt/tail overlap from a crash between GC's ckpt
                     // write and tail truncate
@@ -1381,7 +1449,7 @@ fn load_frames(
         cur.pos = body_end as usize;
         good = body_end;
     }
-    Ok(good)
+    Ok((good, version))
 }
 
 fn check_identity(cur: &mut Cur<'_>, ours: &DescLogIdentity, lineage: &[u32]) -> Result<()> {
@@ -1430,7 +1498,7 @@ fn check_identity(cur: &mut Cur<'_>, ours: &DescLogIdentity, lineage: &[u32]) ->
     Ok(())
 }
 
-fn decode_batch(cur: &mut Cur<'_>) -> Result<BatchRecord> {
+fn decode_batch(cur: &mut Cur<'_>, version: u16) -> Result<BatchRecord> {
     let captured_at = cur.u64()?;
     let commit_lsn = cur.u64()?;
     let n = cur.u32()? as usize;
@@ -1444,7 +1512,7 @@ fn decode_batch(cur: &mut Cur<'_>) -> Result<BatchRecord> {
             rel_node: cur.u32()?,
         };
         let value = match cur.u8()? {
-            0 => LogValue::Present(Arc::new(decode_descriptor(cur)?)),
+            0 => LogValue::Present(Arc::new(decode_descriptor(cur, version)?)),
             1 => LogValue::Dropped,
             2 => LogValue::Retired,
             other => return Err(cur.corrupt(format!("unknown entry kind {other}"))),
@@ -1525,7 +1593,7 @@ fn decode_batch(cur: &mut Cur<'_>) -> Result<BatchRecord> {
     })
 }
 
-fn decode_descriptor(cur: &mut Cur<'_>) -> Result<RelDescriptor> {
+fn decode_descriptor(cur: &mut Cur<'_>, version: u16) -> Result<RelDescriptor> {
     let rfn = RelFileNode {
         spc_node: cur.u32()?,
         db_node: cur.u32()?,
@@ -1570,6 +1638,19 @@ fn decode_descriptor(cur: &mut Cur<'_>) -> Result<RelDescriptor> {
             missing_default: cur.opt_missing()?,
         });
     }
+    let n = if version < ANCESTRY_VERSION {
+        0
+    } else {
+        cur.u32()? as usize
+    };
+    let mut ancestors = Vec::with_capacity(n.min(64));
+    for _ in 0..n {
+        let ancestor = decode_descriptor(cur, version)?;
+        if ancestor.is_partition() {
+            return Err(cur.corrupt("ancestor carries ancestors of its own"));
+        }
+        ancestors.push(Arc::new(ancestor));
+    }
     Ok(RelDescriptor {
         rfn,
         oid,
@@ -1580,6 +1661,7 @@ fn decode_descriptor(cur: &mut Cur<'_>) -> Result<RelDescriptor> {
         persistence,
         replident,
         attributes,
+        ancestors,
     })
 }
 
@@ -1637,20 +1719,6 @@ impl DescriptorLogs {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         found
-    }
-
-    /// `[source] dbname`'s log, for paths that are single-database by
-    /// construction (bootstrap gap replay)
-    pub fn primary(&self) -> &Arc<DescriptorLog> {
-        &self.by_db.first().expect("at least one log").1
-    }
-
-    pub fn all(&self) -> impl Iterator<Item = &Arc<DescriptorLog>> {
-        self.by_db.iter().map(|(_, log)| log)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_db.is_empty()
     }
 }
 
@@ -1732,6 +1800,7 @@ mod tests {
             rel_name: RelName::new("public", &format!("t{oid}")),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: if extra_col {
                 ReplIdent::UsingIndex {
                     index_oid: 900,
@@ -1787,6 +1856,31 @@ mod tests {
         DescriptorLog::open(dir, ident()).await.unwrap()
     }
 
+    #[test]
+    fn partition_ancestors_round_trip_and_nest_one_deep() {
+        let root = desc(90, 0, false);
+        let mut leaf = (*desc(91, 6091, true)).clone();
+        leaf.ancestors = vec![root.as_ancestor()];
+        let mut out = Vec::new();
+        encode_descriptor_bytes(&mut out, &leaf);
+        let (decoded, used) = decode_descriptor_bytes(&out).unwrap();
+        assert_eq!(used, out.len());
+        assert_eq!(decoded, leaf);
+
+        let mut nested = (*root).clone();
+        nested.ancestors = vec![Arc::new(leaf)];
+        let mut out = Vec::new();
+        encode_descriptor_bytes(
+            &mut out,
+            &RelDescriptor {
+                ancestors: vec![Arc::new(nested)],
+                ..(*root).clone()
+            },
+        );
+        let err = decode_descriptor_bytes(&out).unwrap_err();
+        assert!(err.contains("ancestors of its own"), "{err}");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn round_trip_reopen() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1808,18 +1902,18 @@ mod tests {
         assert!(!log.is_empty());
         assert_eq!(log.covered_through(), 100);
         assert_eq!(log.head(), 300);
-        match log.descriptor_at(rfn(6001), 179) {
-            LookupResult::Present(d) => assert_eq!(d, d1),
-            other => panic!("expected d1, got {other:?}"),
-        }
-        match log.descriptor_at(rfn(6001), 180) {
-            LookupResult::Present(d) => assert_eq!(d, d2),
-            other => panic!("expected d2, got {other:?}"),
-        }
-        match log.descriptor_by_oid_at(101, u64::MAX) {
-            LookupResult::Present(d) => assert_eq!(d, d2),
-            other => panic!("expected d2 by oid, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(6001), 179),
+            LookupResult::Present(d1.clone())
+        );
+        assert_eq!(
+            log.descriptor_at(rfn(6001), 180),
+            LookupResult::Present(d2.clone())
+        );
+        assert_eq!(
+            log.descriptor_by_oid_at(101, u64::MAX),
+            LookupResult::Present(d2.clone())
+        );
         assert_eq!(log.descriptor_at(rfn(6001), 89), LookupResult::NotCovered);
         assert!(log.batch_at(300).unwrap().entries.is_empty());
         assert!(log.batch_at(150).is_none());
@@ -1947,14 +2041,14 @@ mod tests {
         log.append_batch(batch(100, vec![present(90, &a), present(90, &b)]))
             .await
             .unwrap();
-        match log.descriptor_at(a.rfn, 150) {
-            LookupResult::Present(d) => assert_eq!(d, a),
-            other => panic!("expected a, got {other:?}"),
-        }
-        match log.descriptor_at(b.rfn, 150) {
-            LookupResult::Present(d) => assert_eq!(d, b),
-            other => panic!("expected b, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(a.rfn, 150),
+            LookupResult::Present(a.clone())
+        );
+        assert_eq!(
+            log.descriptor_at(b.rfn, 150),
+            LookupResult::Present(b.clone())
+        );
         // Tombstoning one chain leaves the sibling untouched
         log.append_batch(batch(
             200,
@@ -1968,10 +2062,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(log.descriptor_at(b.rfn, 200), LookupResult::Dropped);
-        match log.descriptor_at(a.rfn, 200) {
-            LookupResult::Present(d) => assert_eq!(d, a),
-            other => panic!("expected a to survive b's drop, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(a.rfn, 200),
+            LookupResult::Present(a.clone())
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2130,10 +2224,10 @@ mod tests {
         log.force_gc(Pos::new(100)).await.unwrap();
         assert_eq!(log.floor_at_write(), 100);
         // Active-at-floor survives, superseded predecessor dropped
-        match log.descriptor_at(rfn(8400), 150) {
-            LookupResult::Present(d) => assert_eq!(d, d2),
-            other => panic!("expected d2, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(8400), 150),
+            LookupResult::Present(d2.clone())
+        );
         assert_eq!(log.descriptor_at(rfn(8400), 20), LookupResult::NotCovered);
         // Batches at/below floor exist only as entry carriers
         assert!(log.batch_at(20).is_none());
@@ -2141,10 +2235,10 @@ mod tests {
         // Survives reopen from ckpt
         drop(log);
         let log = open(tmp.path()).await;
-        match log.descriptor_at(rfn(8400), 150) {
-            LookupResult::Present(d) => assert_eq!(d, d2),
-            other => panic!("expected d2 post-reopen, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(8400), 150),
+            LookupResult::Present(d2.clone())
+        );
     }
 
     /// `maybe_gc`'s threshold counts entries compaction would actually drop,
@@ -2272,10 +2366,10 @@ mod tests {
         assert_eq!(log.batch_at(150).unwrap().entries.len(), 1);
         assert!(log.batch_at(200).unwrap().entries.is_empty());
         // At-floor active entry retained below
-        match log.descriptor_at(rfn(8700), 100) {
-            LookupResult::Present(d) => assert_eq!(d, d1),
-            other => panic!("expected d1 at floor, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(8700), 100),
+            LookupResult::Present(d1.clone())
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2419,10 +2513,10 @@ mod tests {
         b.ambiguities
             .push(amb(AmbiguityScope::Rfn(rfn(9200)), 200, 300));
         log.append_batch(b).await.unwrap();
-        match log.descriptor_at(rfn(9200), 199) {
-            LookupResult::Present(d) => assert_eq!(d, d1),
-            other => panic!("expected d1 before interval, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(9200), 199),
+            LookupResult::Present(d1.clone())
+        );
         // [from, through): from covered, through not
         assert!(matches!(
             log.descriptor_at(rfn(9200), 200),
@@ -2432,10 +2526,10 @@ mod tests {
             log.descriptor_at(rfn(9200), 299),
             LookupResult::Ambiguous(_)
         ));
-        match log.descriptor_at(rfn(9200), 300) {
-            LookupResult::Present(d) => assert_eq!(d, d2),
-            other => panic!("expected d2 at through_lsn, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(9200), 300),
+            LookupResult::Present(d2.clone())
+        );
         // Chain entry inside the interval stays shadowed even though it
         // exists: ambiguity wins over Present
         assert!(matches!(
@@ -2549,10 +2643,10 @@ mod tests {
             log.descriptor_at(rfn(9500), 120),
             LookupResult::Ambiguous(_)
         ));
-        match log.descriptor_at(rfn(9500), 160) {
-            LookupResult::Present(d2) => assert_eq!(d2, d),
-            other => panic!("expected retained Present past interval, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(9500), 160),
+            LookupResult::Present(d.clone())
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2688,6 +2782,70 @@ mod tests {
         }
         let log = open(tmp.path()).await;
         assert!(!log.is_empty());
+    }
+
+    /// v3 frame: descriptors end before ancestor count
+    fn v3_frame(b: &BatchRecord) -> Vec<u8> {
+        let mut body = encode_batch(b);
+        for entry in b.entries.iter().rev() {
+            if let LogValue::Present(d) = &entry.value {
+                let mut enc = Vec::new();
+                encode_descriptor(&mut enc, d);
+                let at = body.windows(enc.len()).rposition(|w| w == enc).unwrap();
+                body.drain(at + enc.len() - 4..at + enc.len());
+            }
+        }
+        body
+    }
+
+    fn v3_header() -> Vec<u8> {
+        let mut out = encode_header(&ident());
+        out[2] = 3;
+        out
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn v3_log_upgrades_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (d0, d1) = (desc(95, 9700, false), desc(96, 9800, true));
+        let mut ckpt = v3_header();
+        push_frame(&mut ckpt, &encode_meta(100, 50));
+        push_frame(&mut ckpt, &v3_frame(&batch(100, vec![present(90, &d0)])));
+        std::fs::write(tmp.path().join(CKPT_FILE), &ckpt).unwrap();
+        let mut tail = v3_header();
+        let dropped = tombstone(195, 95, 9700, LogValue::Dropped);
+        push_frame(
+            &mut tail,
+            &v3_frame(&batch(200, vec![present(190, &d1), dropped])),
+        );
+        std::fs::write(tmp.path().join(TAIL_FILE), &tail).unwrap();
+        assert!(
+            DescriptorLog::predates_partitions(tmp.path())
+                .await
+                .unwrap()
+        );
+
+        let log = open(tmp.path()).await;
+        assert!(
+            !DescriptorLog::predates_partitions(tmp.path())
+                .await
+                .unwrap()
+        );
+        assert_eq!(log.covered_through(), 100);
+        let d2 = desc(97, 9900, false);
+        log.append_batch(batch(300, vec![present(290, &d2)]))
+            .await
+            .unwrap();
+        drop(log);
+
+        let log = open(tmp.path()).await;
+        for (d, lsn) in [(&d0, 95), (&d1, 195), (&d2, 295)] {
+            assert_eq!(
+                log.descriptor_at(d.rfn, lsn),
+                LookupResult::Present(d.clone()),
+            );
+        }
+        assert_eq!(log.descriptor_at(d0.rfn, 196), LookupResult::Dropped);
     }
 
     #[tokio::test(flavor = "current_thread")]

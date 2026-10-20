@@ -39,7 +39,7 @@ use walshadow::schema::RelName;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn alter_add_column_replicates_without_toml_edit() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -179,7 +179,7 @@ async fn alter_add_column_replicates_without_toml_edit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_auto_replicates_in_namespace() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -215,7 +215,9 @@ async fn create_table_auto_replicates_in_namespace() {
         NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
+            detach_strategy: None,
             initial_load: None,
         },
     );
@@ -278,7 +280,7 @@ async fn create_table_auto_replicates_in_namespace() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drop_table_strategy_drop_removes_dest() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -313,7 +315,9 @@ async fn drop_table_strategy_drop_removes_dest() {
         NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
+            detach_strategy: None,
             initial_load: None,
         },
     );
@@ -376,7 +380,7 @@ async fn drop_table_strategy_drop_removes_dest() {
 /// missing table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pinned_mapping_create_drop_create_recreates_dest() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -513,7 +517,7 @@ async fn pinned_mapping_create_drop_create_recreates_dest() {
 /// the override and everything landed in the global DB.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_create_honors_per_namespace_target_database() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -552,7 +556,9 @@ async fn auto_create_honors_per_namespace_target_database() {
         NamespaceMapping {
             target_database: Some("warehouse".into()),
             auto_create: true,
+            auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
+            detach_strategy: None,
             initial_load: None,
         },
     );
@@ -616,7 +622,7 @@ async fn auto_create_honors_per_namespace_target_database() {
 /// `EmitterConfig::from_toml_str` → resolve → `CREATE TABLE` path end-to-end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_auto_replicates_from_toml_namespace() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -695,17 +701,18 @@ async fn create_table_auto_replicates_from_toml_namespace() {
 
     let tbls = ch
         .query(
-            "SELECT name FROM system.tables WHERE database = 'walshadow_test' AND name = 'new_t'",
+            "SELECT name FROM system.tables \
+             WHERE database = 'walshadow_test' AND name = 's15toml_new_t'",
         )
         .expect("ch table existence");
     assert_eq!(
-        tbls, "new_t",
-        "TOML [namespace] auto_create must create the CH table"
+        tbls, "s15toml_new_t",
+        "TOML [namespace] auto_create must create the CH table, named from the namespace"
     );
 
     let body = ch
         .query(
-            "SELECT argMax(body, _lsn) FROM walshadow_test.new_t \
+            "SELECT argMax(body, _lsn) FROM walshadow_test.s15toml_new_t \
              WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch body");

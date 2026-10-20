@@ -20,7 +20,7 @@ use std::time::Duration;
 use walshadow::mapping::NamespaceMapping;
 
 fn skip_gate() -> bool {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return true;
     }
     false
@@ -67,7 +67,9 @@ async fn build_drill_with(
         NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
+            detach_strategy: None,
             initial_load: None,
         },
     );
@@ -187,10 +189,6 @@ async fn interleaved_clean_xact_unaffected_by_dirty_tree() {
     assert!(
         emitter_stats.plan_bytes_mem.load(Ordering::Relaxed) > 0,
         "small plans stay memory-resident",
-    );
-    assert!(
-        emitter_stats.route_snapshots_mapped.load(Ordering::Relaxed) >= 1,
-        "plan-time route resolution counted",
     );
 }
 

@@ -77,7 +77,7 @@ fn live_values_sql(chunk_table: &str, max_lsn: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -112,10 +112,13 @@ async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
     // superseded-fill case), and the lagging-bound assertions below need
     // history intact. A global STOP MERGES doesn't cover tables created
     // after it. Re-enabled for the merge stage.
-    let toast_relid = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
-        .expect("source toast relid");
-    let chunk_table = format!("walshadow_test.pg_toast_{toast_relid}");
+    let mirror = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc'::regclass AND d.datname = current_database()",
+        )
+        .expect("source toast mirror");
+    let chunk_table = format!("walshadow_test.{mirror}");
     ch.query(&format!(
         "CREATE TABLE IF NOT EXISTS {chunk_table} (\
            `blkno` UInt32, `offnum` UInt16, `chunk_id` UInt32, `chunk_seq` UInt32, \
@@ -418,7 +421,9 @@ async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
     // stand-in); the next commit executes the queued retire.
     pipeline
         .resume_floor
-        .join(walshadow::pos::Pos::new(u64::MAX));
+        .publish(walshadow::pos::Durable::assume_for_test(
+            walshadow::pos::Pos::new(u64::MAX),
+        ));
     let driver = fx::spawn_workload(
         &source,
         vec![
@@ -439,7 +444,7 @@ async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
     assert_eq!(
         ch.query(&format!(
             "SELECT count() FROM system.tables \
-             WHERE database = 'walshadow_test' AND name = 'pg_toast_{toast_relid}'"
+             WHERE database = 'walshadow_test' AND name = '{mirror}'"
         ))
         .expect("mirror existence"),
         "1",

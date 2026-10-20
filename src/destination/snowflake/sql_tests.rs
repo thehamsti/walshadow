@@ -16,6 +16,7 @@ fn identifiers_are_quoted_and_literals_escaped() {
 #[test]
 fn merge_keeps_tombstones_and_records_receipt() {
     let d = RelDescriptor {
+        ancestors: Vec::new(),
         rfn: Default::default(),
         oid: 1,
         toast_oid: 0,
@@ -75,6 +76,7 @@ fn merge_keeps_tombstones_and_records_receipt() {
 #[test]
 fn copy_modes_have_distinct_error_contracts() {
     let d = RelDescriptor {
+        ancestors: Vec::new(),
         rfn: Default::default(),
         oid: 1,
         toast_oid: 0,
@@ -121,6 +123,7 @@ fn copy_modes_have_distinct_error_contracts() {
 #[test]
 fn completeness_compares_typed_rows_without_serializing_object_keys() {
     let d = RelDescriptor {
+        ancestors: Vec::new(),
         rfn: Default::default(),
         oid: 1,
         toast_oid: 0,

@@ -12,6 +12,13 @@ Every selected table needs one of:
 Tables with `REPLICA IDENTITY NOTHING`, or default identity without a primary
 key, cannot replicate deletes correctly and fail preflight
 
+`REPLICA IDENTITY FULL` without a primary key sorts destination rows by every
+column ClickHouse can sort. Rows with identical sort values become one row,
+and deleting one deletes all matches. ClickHouse rejects dropping, renaming,
+or changing types of sort key columns, so those source changes stop
+replication. Add a primary key or configure `order_by`; see
+[sort key](destination-tables.md#choose-sort-key)
+
 ## Replicate all user tables
 
 `replicate_all` defaults to `true`. It covers current and future user tables,
@@ -28,8 +35,8 @@ replicate = false
 ```
 
 Use this mode to replicate all tables by default. It covers the source database
-`dbname` in `[source]` names; entries prefixed with another database name bring
-that database in too, see [several databases](multi-database.md)
+`dbname` in `[source]` names; other databases replicate as
+[tenants](tenants.md), see [several databases](multi-database.md)
 
 ## Replicate an explicit set
 
@@ -120,6 +127,59 @@ Patterns match whole names. Exact entries apply after patterns. Explicit exact
 entry can override pattern result, while matching exclusion blocks broader
 opt-ins
 
+## Replicate partitioned tables
+
+Declarative partitions replicate into root table's destination, like
+PostgreSQL publications with `publish_via_partition_root`. Partitions have no
+separate destination. For nested partitions, root is topmost partitioned
+table. Root settings determine which tables replicate, destination name, and
+destination columns
+
+```toml
+[table.app.events]
+replicate = true
+initial_load = "copy"
+order_by = ["tenant_id", "id", "created_at"]
+partition_by = "toYYYYMM(created_at)"
+```
+
+By default, glob and regex entries skip partitions. `replicate_all` and broad
+patterns include partitions through root settings. An exact entry for a
+partition may set `replicate` and `route`; other settings stop replication
+
+| Partition entry | Effect |
+|---|---|
+| none | rows go to root's destination |
+| `replicate = false` | partition's rows are not replicated |
+| `route = "self"` | partition, and every partition below it, gets its own destination and rules |
+
+`route = "self"` on a glob entry gives matching partitions their own
+destinations:
+
+```toml
+[table.app."events_hot_*"]
+match = "glob"
+route = "self"
+```
+
+Rows carry source partition OID in `_leaf_oid`, see
+[metadata columns](destination-tables.md#generated-shape). Legacy `INHERITS`
+children stay independent tables. Foreign partitions write no WAL and are
+skipped. Unlogged partitions stop replication unless excluded with
+`replicate = false`
+
+Every partition must log all columns needed to identify deleted rows in
+root's destination. Use a primary key or `REPLICA IDENTITY USING INDEX` index
+covering those columns, or use `FULL` to log every column. `REPLICA IDENTITY`
+does not apply recursively: if root uses `FULL` without a primary key, set
+`FULL` on each partition too. Replication stops if a partition omits required
+columns
+
+Initial load of a partitioned table copies each partition separately with
+`COPY … FROM ONLY`. Backup load modes use `copy` for partitions too: replacing
+a shared destination with a staging table would discard other partitions'
+rows
+
 ## Rename targets or columns
 
 Map one table without pinning source shape:
@@ -152,3 +212,56 @@ columns = [
 Avoid `attnum` mappings unless destination projection must stay fixed. An
 `attnum` mapping pins full projection, requires explicit ClickHouse names and
 types, and will not automatically include unrelated source columns
+
+## Replace NaN and infinity
+
+ClickHouse `Decimal` cannot hold PostgreSQL `numeric` `NaN`, `Infinity`, or
+`-Infinity`. By default, encountering any of these values stops replication
+with an error identifying affected column. Map column to `String` to keep
+original text, or choose replacements with `nan`, `pos_inf`, and `neg_inf`:
+
+```toml
+[table.app."*"]
+match = "glob"
+replicate = true
+columns = [
+    { name = "*_amount", match = "glob", nan = "0", pos_inf = "max", neg_inf = "min" },
+]
+```
+
+| Value | Effect |
+|---|---|
+| `reject` | stop replication, default |
+| `null` | write NULL, destination must be `Nullable(Decimal(...))` |
+| `min`, `max` | write smallest or largest value of destination `Decimal(p,s)`, eg `-99999999.99` and `99999999.99` for `Decimal(10,2)` |
+| decimal number | write a fixed value, such as `0` or `-1.5`, that fits destination decimal type without rounding |
+
+Set each replacement independently. For example, a column rule setting only
+`nan` keeps `pos_inf` and `neg_inf` from matching broader rules. Set `reject`
+to stop on that value even when a broader rule supplies a replacement
+
+Numeric replacements apply to `Decimal` columns during initial loads and
+ongoing replication. They do not affect `String` columns or apply to column
+defaults or array elements; see [ClickHouse limits](limitations.md#clickhouse)
+
+For PostgreSQL `date`, `timestamp`, and `timestamptz`, `pos_inf` and
+`neg_inf` also accept `reject` (default) or `null`. NULL substitution requires
+`Nullable(Date32)` or `Nullable(DateTime64(...))`, for example:
+
+```toml
+columns = [
+    { name = "expires_at", type = "Nullable(DateTime64(6, 'UTC'))", pos_inf = "null", neg_inf = "null" },
+]
+```
+
+Temporal infinities stop replication by default. Temporal `min`, `max`, and
+literal substitutes are unsupported. NULL substitution covers local row
+encoding; oracle encoding and fast defaults do not support it. Finite timestamps
+rescale exactly to destination precision; discarded nonzero digits and storage
+overflow reject. Supported calendar ranges are not validated
+
+Choose replacements that fit destination column type. For example, `null`
+requires a nullable column, and `1.230` fits `Decimal(10,2)` but `1.234` does
+not. An invalid setting is rejected when loading config. A recognized
+replacement that does not fit stops replication when affected table first
+receives rows. Review replacements after changing a column's type

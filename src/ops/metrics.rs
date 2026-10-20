@@ -185,6 +185,10 @@ snapshot! {
         /// across databases. `ctl status` reads it; the scrape renders the
         /// per-database split instead
         config_backfills_pending: u64,
+        unmapped_rows_by_table: Vec<(String, String, u64)>,
+        rows_inserted_by_table: Vec<(String, String, u64)>,
+        cells_inserted_by_type: Vec<(String, &'static str, u64)>,
+        skipped_records_by_rel: Vec<SkippedRel>,
         /// Refusal a crossing parked on, rendered as `crossing_wedged`. The
         /// pump keeps publishing rather than exiting into a restart that
         /// re-crosses and re-fails, so this is how the daemon says it is
@@ -289,6 +293,13 @@ snapshot! {
     counter xacts_committed_total: u64 = "Total xacts drained as commits since daemon start.",
     counter xacts_aborted_total: u64 = "Total xacts dropped as aborts since daemon start.",
     counter decoder_decoded_total: u64 = "Heap records decoded since daemon start.",
+    counter decoder_records_by_op: [u64; 5]
+        ["op" = ["insert", "update", "hot_update", "delete", "truncate"]] =
+        "Decoded heap row changes by operation.",
+    counter decoder_buffer_lock_waits_total: u64 =
+        "Acquisitions of the shared xact-buffer mutex from the per-record decode path.",
+    counter decoder_buffer_lock_wait_seconds_total: f64 =
+        "Cumulative time the per-record decode path blocked on the xact-buffer mutex. rate() is workers' worth of time lost to it; divided by the waits counter it is per-acquire latency.",
     counter decoder_partial_total: u64 = "Decoded tuples with prefix/suffix-from-old elided columns.",
     counter decoder_toast_chunks_total: u64 =
         "TOAST chunks routed into the xact buffer's chunk slot.",
@@ -296,6 +307,12 @@ snapshot! {
         "TOAST inserts the decoder couldn't reinterpret as a chunk.",
     counter decoder_toast_deletes_total: u64 =
         "DELETE records on toast relations, buffered as tombstone rows.",
+    counter decoder_catalog_not_found_total: u64 =
+        "Heap records skipped because no descriptor covered their relfilenode.",
+    counter decoder_skipped_op_total: u64 =
+        "Heap records that decoded to no row change. LOCK, CONFIRM and heap2 page maintenance drop earlier, uncounted.",
+    counter decoder_skipped_no_block_total: u64 =
+        "Heap records skipped for carrying no block reference.",
     counter toast_chunks_stored_total: u64 =
         "TOAST chunk rows persisted to the CH store; the bootstrap's TOAST-phase progress signal.",
     counter toast_chunk_puts_total: u64 =
@@ -346,8 +363,6 @@ snapshot! {
     /// view, drain]`, rendered `reason=` labelled
     counter xact_plan_failures_by_reason: [u64; 11] ["reason" = PLAN_FAILURE_REASONS] =
         "Planning-stage failures; the whole transaction emits nothing.",
-    counter route_snapshots_by_result: [u64; 2] ["result" = ["mapped", "unmapped"]] =
-        "Plan-time route resolutions, one per relation per transaction.",
     counter raw_stash_bytes_by_storage: [u64; 2] ["storage" = ["mem", "spill"]] =
         "Cumulative raw-stash payload bytes by first landing.",
     counter raw_decode_rows_by_op: [u64; 7] ["op" = HEAP_OP_LABELS] =
@@ -365,6 +380,10 @@ snapshot! {
         "Tuples skipped because the source relation has no mapping in --ch-config.",
     counter emitter_deletes_discarded: u64 =
         "DELETE rows dropped because is_deleted = false leaves no marker column.",
+    counter emitter_retries_attempted_total: u64 =
+        "Failed ClickHouse operations retried, one per failing operation rather than per attempt.",
+    counter emitter_reconnects_total: u64 =
+        "ClickHouse client dials after the first, from retries and live endpoint or compression changes.",
     gauge pump_queue_depth: u64 = "Records buffered between the WAL pump and the queueing worker.",
     counter queue_records_out_total: u64 =
         "Records the queueing/reorder worker has dequeued and dispatched. rate() is the worker's throughput; with pump_queue_depth it tells deep-and-draining from deep-and-stalled.",
@@ -467,6 +486,15 @@ snapshot! {
         "Catalog-boundary holds woken with an error (worker death, walreceiver loss, timeout).",
     counter catalog_boundary_hold_seconds_total: f64 =
         "Cumulative seconds the pump parked in released catalog-boundary holds.",
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SkippedRel {
+    pub database: String,
+    pub rel_node: String,
+    pub op: &'static str,
+    pub reason: &'static str,
+    pub records: u64,
 }
 
 /// Declares [`DbSeries`] and the families a scrape renders off it, one
@@ -651,13 +679,11 @@ impl RateEstimator {
     pub fn observe(&mut self, now: Instant, received_lsn: u64) {
         self.samples.push_back((now, received_lsn));
         let cutoff = now.checked_sub(self.window);
-        if let Some(cutoff) = cutoff {
-            while let Some(&(t, _)) = self.samples.front()
-                && t < cutoff
-                && self.samples.len() > 1
-            {
-                self.samples.pop_front();
-            }
+        while let Some(&(t, _)) = self.samples.front()
+            && cutoff.is_some_and(|c| t < c)
+            && self.samples.len() > 1
+        {
+            self.samples.pop_front();
         }
     }
 
@@ -763,6 +789,23 @@ pub(crate) fn counter_series<'a, V: EncodeCounterValue>(
     for (label, value) in series {
         family
             .encode_family(&[(key, label)])?
+            .encode_counter::<NoLabelSet, _, u64>(&value, None)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn counter_pairs<'a, V: EncodeCounterValue, const N: usize>(
+    enc: &mut DescriptorEncoder<'_>,
+    name: &str,
+    help: &str,
+    keys: [&str; N],
+    series: impl IntoIterator<Item = ([&'a str; N], V)>,
+) -> fmt::Result {
+    let mut family = declare(enc, name, help, MetricType::Counter)?;
+    for (values, value) in series {
+        let labels: [(&str, &str); N] = std::array::from_fn(|i| (keys[i], values[i]));
+        family
+            .encode_family(&labels)?
             .encode_counter::<NoLabelSet, _, u64>(&value, None)?;
     }
     Ok(())
@@ -978,6 +1021,39 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
     encode_fields(snap, enc)?;
     encode_tenants(&snap.tenants, enc)?;
 
+    counter_pairs(
+        enc,
+        "walshadow_cells_inserted",
+        "Cells inserted per ClickHouse column type, split by whether the shadow oracle encoded them.",
+        ["type", "encoding"],
+        snap.cells_inserted_by_type
+            .iter()
+            .map(|(ty, encoding, n)| ([ty.as_str(), *encoding], *n)),
+    )?;
+
+    counter_pairs(
+        enc,
+        "walshadow_table_rows_inserted",
+        "Rows inserted per source table, initial load and CDC alike.",
+        ["database", "table"],
+        snap.rows_inserted_by_table
+            .iter()
+            .map(|(database, table, n)| ([database.as_str(), table.as_str()], *n)),
+    )?;
+
+    counter_pairs(
+        enc,
+        "walshadow_decoder_skipped_records",
+        "Records skipped by the decoder or dropped by the filter, by relfilenode, op and reason. Heaviest series only.",
+        ["database", "rel_node", "op", "reason"],
+        snap.skipped_records_by_rel.iter().map(|r| {
+            (
+                [r.database.as_str(), r.rel_node.as_str(), r.op, r.reason],
+                r.records,
+            )
+        }),
+    )?;
+
     gauge(
         enc,
         "walshadow_crossing_wedged",
@@ -1032,6 +1108,7 @@ pub fn render(snap: MetricsSnapshot) -> String {
     let mut registry = Registry::default();
     registry.register_collector(Box::new(SnapshotCollector(snap)));
     registry.register_collector(Box::new(crate::ops::stages::StageCollector));
+    registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
     let mut out = String::with_capacity(16 << 10);
     text::encode(&mut out, &registry).expect("String write cannot fail");
     out
@@ -1107,6 +1184,56 @@ async fn handle_client(
 mod tests {
     use super::*;
 
+    /// Every family encodes through `?`, so a writer that gives out partway
+    /// has to surface as an error rather than a panic or a truncated scrape
+    #[test]
+    fn encode_propagates_a_failing_writer_at_every_family() {
+        struct FailAfter {
+            writes: usize,
+            out: String,
+        }
+        impl fmt::Write for FailAfter {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                if self.writes == 0 {
+                    return Err(fmt::Error);
+                }
+                self.writes -= 1;
+                self.out.push_str(s);
+                Ok(())
+            }
+        }
+
+        let mut snap = MetricsSnapshot {
+            crossing_blocked_on: "slot_missing",
+            source_endpoint_swap_blocked_on: "slot_missing",
+            promotion_blocked_on: "not_paused",
+            unmapped_rows_by_table: vec![("app".into(), "public.noise".into(), 5)],
+            rows_inserted_by_table: vec![("app".into(), "public.orders".into(), 9)],
+            cells_inserted_by_type: vec![("String".into(), "local", 9)],
+            by_database: vec![DbSeries {
+                database: "app".into(),
+                ..DbSeries::default()
+            }],
+            ..MetricsSnapshot::default()
+        };
+        snap.records_by_rm_route
+            .insert(("Heap".into(), "to_decoder"), 3);
+
+        let full = render(snap.clone()).len();
+        for writes in 0..64 {
+            let mut w = FailAfter {
+                writes,
+                out: String::new(),
+            };
+            let mut registry = Registry::default();
+            registry.register_collector(Box::new(SnapshotCollector(snap.clone())));
+            registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
+            let failed = text::encode(&mut w, &registry).is_err();
+            assert!(failed, "prefix length {writes} must surface the failure");
+            assert!(w.out.len() < full, "a failed encode cannot be complete");
+        }
+    }
+
     #[test]
     fn render_labels_every_tenant_series() {
         let out = render(MetricsSnapshot {
@@ -1161,12 +1288,40 @@ mod tests {
     }
 
     #[test]
+    fn render_labels_per_table_and_cell_series() {
+        let body = render(MetricsSnapshot::default());
+        assert!(
+            !body.contains("walshadow_table_rows_inserted_total{"),
+            "{body}"
+        );
+
+        let body = render(MetricsSnapshot {
+            cells_inserted_by_type: vec![("Decimal(38, 9)".into(), "oracle", 7)],
+            rows_inserted_by_table: vec![("app".into(), "public.orders".into(), 4096)],
+            skipped_records_by_rel: vec![SkippedRel {
+                database: "app".into(),
+                rel_node: "16400".into(),
+                op: "update",
+                reason: "not_covered",
+                records: 3,
+            }],
+            ..MetricsSnapshot::default()
+        });
+        for want in [
+            "walshadow_cells_inserted_total{type=\"Decimal(38, 9)\",encoding=\"oracle\"} 7",
+            "walshadow_table_rows_inserted_total{database=\"app\",table=\"public.orders\"} 4096",
+            "walshadow_decoder_skipped_records_total{database=\"app\",rel_node=\"16400\",op=\"update\",reason=\"not_covered\"} 3",
+        ] {
+            assert!(body.contains(want), "{want} missing from {body}");
+        }
+    }
+
+    #[test]
     fn render_emits_plan_families_labelled() {
         let snap = MetricsSnapshot {
             xact_plan_rows: 9,
             xact_plan_bytes_by_storage: [100, 200],
             xact_plan_failures_by_reason: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-            route_snapshots_by_result: [7, 8],
             ..MetricsSnapshot::default()
         };
         let body = render(snap);
@@ -1181,8 +1336,6 @@ mod tests {
             );
             assert!(body.contains(&want), "{want}");
         }
-        assert!(body.contains("walshadow_route_snapshots_total{result=\"mapped\"} 7"));
-        assert!(body.contains("walshadow_route_snapshots_total{result=\"unmapped\"} 8"));
     }
 
     /// Bootstrap stage attribution reaches `/metrics`. `BootstrapOutcome`
@@ -1271,6 +1424,7 @@ mod tests {
         let mut snap = MetricsSnapshot {
             raw_stash_bytes_by_storage: [11, 12],
             raw_decode_rows_by_op: [1, 2, 3, 4, 5, 6, 7],
+            decoder_records_by_op: [41, 42, 43, 44, 45],
             raw_pending_rows: 13,
             raw_pending_bytes: 14,
             by_database: vec![DbSeries {
@@ -1303,6 +1457,7 @@ mod tests {
             body.contains("walshadow_raw_decode_records_total{kind=\"ordinary\",op=\"update\"} 34")
         );
         assert!(body.contains("walshadow_raw_decode_rows_total{op=\"multi_insert\"} 6"));
+        assert!(body.contains("walshadow_decoder_records_total{op=\"hot_update\"} 43"));
         assert!(body.contains("walshadow_raw_pending_rows 13"));
         assert!(body.contains("walshadow_raw_pending_bytes 14"));
         // Published intervals and lookups landing in one stay distinct

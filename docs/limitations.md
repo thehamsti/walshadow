@@ -1,4 +1,4 @@
-# Current limits
+# Limits
 
 Review these limits before production use
 
@@ -7,16 +7,21 @@ Review these limits before production use
 - PostgreSQL 16, 17, 18, and 19, daemon rejects unaudited majors
 - shadow PostgreSQL major must match source major
 - one process replicates every database its config names
-  ([several databases](multi-database.md)); adding or removing one needs a
-  restart, and existing rows load from a backup only for the database
-  `[source] dbname` names. [Tenants](tenants.md) instead give each database
-  its own destination and attach or detach live; the two layouts do not mix
+  ([several databases](multi-database.md)) as one [tenant](tenants.md) per
+  database beyond `[source] dbname`, each with its own destination, attached
+  or detached live; `[database.*]` sections are refused
 - `wal_level = logical` required
 - every replicated table needs usable replica identity
 - prepared transactions are not supported for production use; commit and abort
-  records are handled, but full restart and bootstrap cases still need validation
+  records are handled, but full restart and bootstrap cases are unvalidated
 - sequence state is not replicated, values already stored in table rows still replicate
 - non-default tablespaces are unsafe for bootstrap and managed-shadow lifecycle
+- partitions replicate through their root only; see
+  [partitioned tables](table-selection.md#replicate-partitioned-tables). Root
+  renames, root replica identity changes, and attaching a partitioned table as
+  subtree leave partitions using old root information until each
+  partition's next schema change. A deployment bootstrapped before partition
+  routing refuses to start once its database holds a partition; re-bootstrap it
 - unplanned primary promotion is not supported
 
 Unsupported behavior is not uniformly rejected at startup. Review source schema
@@ -25,16 +30,26 @@ and workload limits before attaching
 ## ClickHouse
 
 - destination uses ClickHouse Native protocol
-- source column type changes require manual ClickHouse migration
+- [key column type changes](schema-changes.md#migrate-a-rejected-key-type-change)
+  ClickHouse refuses require manual migration
 - `CREATE TABLE` omits a fast default only shadow PostgreSQL can render (raw
   arrays); the table it creates is empty, and `ADD COLUMN` resolves the
   default through the oracle
 - `time` mapping requires ClickHouse `Time64` support
-- same-named tables from different PostgreSQL schemas or databases need
-  explicit destination mapping. Config parsing rejects conflicts between
-  explicit entries; `replicate_all` names destinations after source tables, so
-  the second table to claim one destination is refused with an error and left
-  unreplicated until it names its own `target_database` or `target_table`
+- [NaN and infinity substitutes](table-selection.md#replace-nan-and-infinity)
+  for decimals do not apply to column defaults or array elements. Adding a
+  decimal column with a `NaN` default fails in ClickHouse. A decimal array
+  containing `NaN` or either infinity stops replication
+- extra decimal places are discarded without rounding. Values exceeding
+  configured decimal precision may still replicate; replication stops only
+  when a value is too large for underlying decimal storage
+- date and timestamp values are written without checking ClickHouse calendar
+  limits. Values outside supported ranges can return incorrect dates or times
+  without stopping replication
+- tenants write disjoint destinations: the daemon and `ctl` refuse two
+  tenants reaching one ClickHouse database on one host (defaults, namespace
+  and table overrides, instances and tees), or one Snowflake database, see
+  [tenants](tenants.md#destinations)
 - `base_backup` and `object_store` table loads publish with staging-table swap, database must support `EXCHANGE TABLES`
 - backup rows inserted into staging do not fire destination materialized views, live rows copied back after swap can fire twice
 
@@ -57,6 +72,7 @@ insert batch
 - committed end state converges by source row key and `_lsn`
 - updates from different tables inside one PostgreSQL transaction may become visible in ClickHouse at different moments
 - restart can resend acknowledged-nearby rows, generated table engine deduplicates them during merge or `FINAL`
+- `tee` tables using engines other than `ReplacingMergeTree` keep duplicate rows after retries
 - destination queries without `FINAL` can observe multiple row versions until background merge
 - bounded ClickHouse retry exhaustion stops daemon, supervisor restart continues from persisted floor
 

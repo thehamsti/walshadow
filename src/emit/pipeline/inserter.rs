@@ -7,17 +7,17 @@
 //! Native block over the batch's owned slabs, and runs one `send_query` +
 //! `send_data` + `send_data_end` + drain-to-`EndOfStream` INSERT.
 //!
-//! Durability invariant: [`AckHandle::acked`] fires **only after** the drain
-//! returns. Until then a connection drop replays the still-owned batch (CH
+//! Durability invariant: [`AckHandle::acked`] takes the drain's
+//! [`EndOfStream`] proof. Until then a connection drop replays the still-owned batch (CH
 //! dedups by `_lsn`). Retry-exhaustion is fatal: the watermark can't advance
 //! without this batch.
 
 use clickhouse_c::{Allocator, BlockBuilder, ColumnBuilder, TypeAst};
 use tokio::task::JoinHandle;
 
-use crate::ch::{ChConn, EmitterError, drain_to_end_of_stream, with_timeout};
+use crate::ch::{ChConn, EmitterError, EndOfStream, drain_to_end_of_stream, with_timeout};
 use crate::config::DestEmitter;
-use crate::emit::ch_emitter::{ColumnBuf, EmitterStats, build_leaf, build_root};
+use crate::emit::ch_emitter::{EmitterStats, build_leaf, build_root};
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatchMeta;
@@ -39,20 +39,19 @@ struct Inserter {
 }
 
 impl Inserter {
-    fn ensure_asts(&mut self, meta: &BatchMeta) -> Result<(), EmitterError> {
-        let fresh = self
-            .asts
-            .get(&meta.table_key)
-            .is_none_or(|(epoch, _)| *epoch != meta.schema_epoch);
-        if fresh {
-            let mut parsed = Vec::with_capacity(meta.columns.len());
-            for col in &meta.columns {
-                parsed.push(TypeAst::parse(&col.type_repr, self.alloc)?);
-            }
-            self.asts
-                .insert(meta.table_key.clone(), (meta.schema_epoch, parsed));
+    /// Owned out of the cache so no `&[TypeAst]` lives across the send
+    /// await; the caller puts them back
+    fn take_asts(&mut self, meta: &BatchMeta) -> Result<(u64, Vec<TypeAst>), EmitterError> {
+        if let Some((epoch, asts)) = self.asts.remove(&meta.table_key)
+            && epoch == meta.schema_epoch
+        {
+            return Ok((epoch, asts));
         }
-        Ok(())
+        let mut parsed = Vec::with_capacity(meta.columns.len());
+        for col in &meta.columns {
+            parsed.push(TypeAst::parse(&col.type_repr, self.alloc)?);
+        }
+        Ok((meta.schema_epoch, parsed))
     }
 
     /// Bounded reconnect+retry around one prepared INSERT. Only `bb`
@@ -63,7 +62,7 @@ impl Inserter {
         &mut self,
         sql: &str,
         bb: &BlockBuilder<'_>,
-    ) -> Result<(), EmitterError> {
+    ) -> Result<EndOfStream, EmitterError> {
         let insert_timeout = self.client.config().insert_timeout;
         let started = std::time::Instant::now();
         let result = self
@@ -74,7 +73,6 @@ impl Inserter {
                         client.send_query(sql, None).await?;
                         client.send_data(Some(bb)).await?;
                         client.send_data_end().await?;
-                        // Only after EndOfStream returns are rows durable and ackable
                         drain_to_end_of_stream(&mut client).await
                     })
                     .await;
@@ -96,18 +94,30 @@ impl Inserter {
         result
     }
 
+    /// Acknowledge after every destination receives batch. Failure can cause
+    /// replay of entire batch, including rows already delivered
+    async fn send_all(
+        &mut self,
+        meta: &BatchMeta,
+        bb: &BlockBuilder<'_>,
+    ) -> Result<EndOfStream, EmitterError> {
+        let mut durable = None;
+        for query in &meta.inserts {
+            self.client.select(query.instance.as_deref())?;
+            durable = Some(self.send_with_retry(&query.sql, bb).await?);
+        }
+        durable.ok_or_else(|| EmitterError::Config("batch has no INSERT target".into()))
+    }
+
     async fn run(mut self, rx: async_channel::Receiver<ResolvedBatch>, fatal: Fatal) {
         while let Ok(ResolvedBatch { batch, resolved }) = rx.recv().await {
-            if let Err(e) = self.ensure_asts(&batch.meta) {
-                fatal.set(format!("inserter type parse: {e}"));
-                break;
-            }
-            // Own the asts (`Vec<TypeAst>` is `Send`); index inline so no
-            // `&[TypeAst]` binding lives across the send await
-            let (epoch, asts) = self
-                .asts
-                .remove(&batch.meta.table_key)
-                .expect("ensure_asts inserted");
+            let (epoch, asts) = match self.take_asts(&batch.meta) {
+                Ok(asts) => asts,
+                Err(e) => {
+                    fatal.set(format!("inserter type parse: {e}"));
+                    break;
+                }
+            };
             let result = 'send: {
                 let encode_started = std::time::Instant::now();
                 let leaves: Vec<Option<ColumnBuilder<'_>>> = match batch
@@ -123,10 +133,7 @@ impl Inserter {
                     .buffers
                     .iter()
                     .zip(&leaves)
-                    .map(|(buf, leaf)| match buf {
-                        ColumnBuf::Oracle(_) => Ok(None),
-                        _ => build_root(buf, leaf.as_ref(), batch.n_rows).map(Some),
-                    })
+                    .map(|(buf, leaf)| build_root(buf, leaf.as_ref(), batch.n_rows))
                     .collect::<Result<_, _>>()
                 {
                     Ok(v) => v,
@@ -161,22 +168,30 @@ impl Inserter {
                     Ordering::Relaxed,
                 );
                 match appended {
-                    Ok(()) => self.send_with_retry(&batch.meta.insert_sql, &bb).await,
+                    Ok(()) => self.send_all(&batch.meta, &bb).await,
                     Err(e) => Err(e),
                 }
             };
             self.asts
                 .insert(batch.meta.table_key.clone(), (epoch, asts));
             match result {
-                Ok(()) => {
+                Ok(durable) => {
                     self.stats
                         .rows_emitted
                         .fetch_add(batch.n_rows as u64, Ordering::Relaxed);
+                    batch
+                        .meta
+                        .rows_inserted
+                        .fetch_add(batch.n_rows as u64, Ordering::Relaxed);
+                    for col in &batch.meta.columns {
+                        col.cells_inserted
+                            .fetch_add(batch.n_rows as u64, Ordering::Relaxed);
+                    }
                     self.stats.blocks_sent.fetch_add(1, Ordering::Relaxed);
                     self.stats
                         .inserter_batches_in
                         .fetch_add(1, Ordering::Relaxed);
-                    self.ack.acked(batch.per_seq);
+                    self.ack.acked(durable, batch.per_seq);
                 }
                 Err(e) => {
                     fatal.set(format!("inserter: {e}"));

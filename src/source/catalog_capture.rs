@@ -58,13 +58,15 @@ use crate::catalog::desc_log::{
     ObservationKind, RelationObservation,
 };
 use crate::catalog::pending::{DegradeReason, PendingCatalog, PendingSlot};
-use crate::catalog::shadow_catalog::{CatalogError, ShadowCatalog};
+use crate::catalog::shadow_catalog::{CatalogError, ParkedAt, ShadowCatalog};
+#[cfg(feature = "test-support")]
+use crate::crash_test;
 use crate::filter::SmgrMarkers;
 use crate::ops::bridge::BridgeError;
 use crate::record::{BoundaryInfo, BoundaryKind, SinkError};
-use crate::schema::{RelDescriptor, SchemaEvent, compute_schema_diff};
+use crate::schema::{DroppedPartition, RelDescriptor, SchemaEvent, compute_schema_diff};
 use crate::xact::xact_buffer::XactBuffer;
-use ahash::{HashMap, HashMapExt};
+use ahash::{HashMap, HashMapExt, HashSet};
 
 crate::atomic_stats! {
     pub struct CaptureStats {
@@ -118,11 +120,18 @@ impl CaptureStats {
 
 /// Cost controls on command-boundary capture. Every refusal degrades the
 /// transaction to commit-time capture, which is sound
-#[derive(Debug, Clone, Copy)]
+/// `[stream] pending_max_*` keys
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(default)]
 pub struct PendingCaptureConfig {
     /// Boundaries one transaction may hold for
+    #[serde(rename = "pending_max_boundaries_per_xact")]
     pub max_boundaries_per_xact: u32,
     /// Cumulative parked time one transaction may cost
+    #[serde(
+        rename = "pending_max_hold_ms",
+        deserialize_with = "crate::toml_de::de_millis"
+    )]
     pub max_hold_per_xact: Duration,
 }
 
@@ -256,12 +265,35 @@ impl CatalogCapture {
         &self,
         info: &BoundaryInfo,
         commit_lsn: u64,
+        parked: &ParkedAt,
+    ) -> Result<(), SinkError> {
+        self.capture(info, commit_lsn, parked.lsn(), Some(parked))
+            .await
+    }
+
+    /// Commit boundary capture declined to park for: answered from the log or
+    /// an empty batch, never a shadow read
+    pub async fn cover_unparked(
+        &self,
+        info: &BoundaryInfo,
+        commit_lsn: u64,
         next_lsn: u64,
+    ) -> Result<(), SinkError> {
+        self.capture(info, commit_lsn, next_lsn, None).await
+    }
+
+    async fn capture(
+        &self,
+        info: &BoundaryInfo,
+        commit_lsn: u64,
+        next_lsn: u64,
+        parked: Option<&ParkedAt>,
     ) -> Result<(), SinkError> {
         use std::sync::atomic::Ordering::Relaxed;
         let start = std::time::Instant::now();
         if let BoundaryKind::Command { writer_xid } = info.kind {
-            let out = self.capture_command(info, writer_xid, next_lsn).await;
+            let parked = parked.ok_or_else(|| unparked_read(next_lsn))?;
+            let out = self.capture_command(info, writer_xid, parked).await;
             self.stats
                 .capture_nanos
                 .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
@@ -283,7 +315,8 @@ impl CatalogCapture {
             self.cover_stub(commit_lsn, next_lsn).await?;
             Vec::new()
         } else {
-            self.sql_capture(info, commit_lsn, next_lsn).await?
+            let parked = parked.ok_or_else(|| unparked_read(next_lsn))?;
+            self.sql_capture(info, commit_lsn, parked).await?
         };
         if !events.is_empty() {
             let mut buf = self.buffer.lock().await;
@@ -319,6 +352,12 @@ impl CatalogCapture {
                 last_for_oid.insert(entry.oid, at);
             }
         }
+        let dropped_here: HashSet<Oid> = batch
+            .entries
+            .iter()
+            .filter(|e| matches!(e.value, LogValue::Dropped))
+            .map(|e| e.oid)
+            .collect();
         let mut out = Vec::with_capacity(last_for_oid.len());
         for (at, entry) in batch.entries.iter().enumerate() {
             if last_for_oid.get(&entry.oid) != Some(&at) {
@@ -345,6 +384,15 @@ impl CatalogCapture {
                             event: SchemaEvent::Dropped {
                                 oid: entry.oid,
                                 rel_name: old.rel_name.clone(),
+                                partition: old.is_partition().then(|| DroppedPartition {
+                                    desc: old.clone(),
+                                    dropped: old
+                                        .ancestors
+                                        .iter()
+                                        .map(|a| a.oid)
+                                        .filter(|oid| dropped_here.contains(oid))
+                                        .collect(),
+                                }),
                             },
                         });
                     }
@@ -363,15 +411,15 @@ impl CatalogCapture {
         &self,
         info: &BoundaryInfo,
         writer_xid: u32,
-        next_lsn: u64,
+        parked: &ParkedAt,
     ) -> Result<(), SinkError> {
         use std::sync::atomic::Ordering::Relaxed;
+        let next_lsn = parked.lsn();
         let top_xid = info.drain_xid;
         let oids: Vec<Oid> = info.oids.iter().map(|a| a.oid).collect();
         let read = {
             let mut cat = self.catalog.lock().await;
-            cat.fetch_overlay_descriptors(&oids, top_xid, next_lsn)
-                .await
+            cat.fetch_overlay_descriptors(&oids, top_xid, parked).await
         };
         let descs = match read {
             Ok(descs) => descs,
@@ -447,18 +495,19 @@ impl CatalogCapture {
         &self,
         info: &BoundaryInfo,
         commit_lsn: u64,
-        next_lsn: u64,
+        parked: &ParkedAt,
     ) -> Result<Vec<PendingEvent>, SinkError> {
         use std::sync::atomic::Ordering::Relaxed;
+        let next_lsn = parked.lsn();
         self.stats.sql_captures.fetch_add(1, Relaxed);
         let (replay_lsn, descs) = {
             let mut cat = self.catalog.lock().await;
             if info.capture_all {
                 self.stats.capture_all_runs.fetch_add(1, Relaxed);
-                cat.fetch_all_descriptors_at(next_lsn).await
+                cat.fetch_all_descriptors_at(parked).await
             } else {
                 let oids: Vec<Oid> = info.oids.iter().map(|a| a.oid).collect();
-                cat.fetch_descriptors_batch_at(&oids, next_lsn).await
+                cat.fetch_descriptors_batch_at(&oids, parked).await
             }
         }
         .map_err(|e| SinkError::Other(format!("descriptor capture at {commit_lsn:#X}: {e}")))?;
@@ -694,10 +743,17 @@ impl CatalogCapture {
             ambiguities,
             entries,
         };
+        #[cfg(feature = "test-support")]
+        {
+            crash_test::capture(commit_lsn);
+            crash_test::hit(crash_test::Point::BeforeDescriptor, commit_lsn);
+        }
         self.log
             .append_batch(batch.clone())
             .await
             .map_err(|e| SinkError::Other(format!("descriptor log append: {e}")))?;
+        #[cfg(feature = "test-support")]
+        crash_test::hit(crash_test::Point::AfterDescriptor, commit_lsn);
         // Events off the appended batch, the same derivation a restart runs:
         // one boundary cannot mean two schema histories.
         // `predecessor_before` reads strictly older batches, so the append
@@ -710,6 +766,12 @@ impl CatalogCapture {
     fn marker_for(&self, rfn: RelFileNode) -> Option<u64> {
         self.markers.lock().expect("smgr markers poisoned").get(rfn)
     }
+}
+
+fn unparked_read(next_lsn: u64) -> SinkError {
+    SinkError::Other(format!(
+        "catalog boundary at {next_lsn:#X} needs a shadow read but replay was not parked"
+    ))
 }
 
 /// Why an overlay read failed, as the transaction's degrade reason. A
@@ -775,7 +837,9 @@ fn in_place_verdict(
 }
 
 /// Added / Changed for heap kinds; toast shape changes are internal (chunk
-/// layout is fixed), only its Dropped feeds the retire ledger.
+/// layout is fixed), only its Dropped feeds the retire ledger. Partition
+/// trees also report `ATTACH` / `DETACH` and identity or persistence
+/// changes, which decide whether a partition may route to its root
 fn diff_event(pred: Option<&RelDescriptor>, desc: &Arc<RelDescriptor>) -> Option<SchemaEvent> {
     if desc.kind == 't' {
         return None;
@@ -784,7 +848,12 @@ fn diff_event(pred: Option<&RelDescriptor>, desc: &Arc<RelDescriptor>) -> Option
         None => Some(SchemaEvent::Added { desc: desc.clone() }),
         Some(old) => {
             let diff = compute_schema_diff(old, desc);
-            (!diff.is_empty()).then(|| SchemaEvent::Changed {
+            let tree = old.is_partition() || desc.is_partition() || desc.kind == 'p';
+            let relinked = tree
+                && (old.parent_oid() != desc.parent_oid()
+                    || old.replident != desc.replident
+                    || old.persistence != desc.persistence);
+            (!diff.is_empty() || relinked).then(|| SchemaEvent::Changed {
                 old: Arc::new(old.clone()),
                 new: desc.clone(),
                 diff,
@@ -811,6 +880,7 @@ mod tests {
             rel_name: RelName::new("public", name),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
@@ -896,6 +966,47 @@ mod tests {
         assert!(incompat.is_some_and(|i| i.is_physical()));
     }
 
+    /// `ATTACH` and identity changes alter no column, yet decide routing
+    #[test]
+    fn partition_relinks_surface_as_changed() {
+        let root = Arc::new(RelDescriptor {
+            kind: 'p',
+            ..rel(23, 4, "m")
+        });
+        let standalone = rel(23, 4, "t");
+        let attached = Arc::new(RelDescriptor {
+            ancestors: vec![root.as_ancestor()],
+            ..standalone.clone()
+        });
+        assert!(matches!(
+            diff_event(Some(&standalone), &attached),
+            Some(SchemaEvent::Changed { diff, .. }) if diff.is_empty()
+        ));
+        assert!(matches!(
+            diff_event(Some(&attached), &Arc::new(standalone.clone())),
+            Some(SchemaEvent::Changed { .. })
+        ));
+        assert!(diff_event(Some(&attached), &attached).is_none());
+        let full = Arc::new(RelDescriptor {
+            replident: crate::schema::ReplIdent::Full { pk_attnums: None },
+            ..(*attached).clone()
+        });
+        assert!(diff_event(Some(&attached), &full).is_some());
+        let unlogged = Arc::new(RelDescriptor {
+            persistence: 'u',
+            ..(*root).clone()
+        });
+        assert!(diff_event(Some(&root), &unlogged).is_some());
+        let plain_full = Arc::new(RelDescriptor {
+            replident: crate::schema::ReplIdent::Full { pk_attnums: None },
+            ..standalone.clone()
+        });
+        assert!(
+            diff_event(Some(&standalone), &plain_full).is_none(),
+            "outside partition trees identity stays silent"
+        );
+    }
+
     #[test]
     fn degrade_reason_separates_replay_mismatch_from_the_rest() {
         assert_eq!(
@@ -969,10 +1080,22 @@ impl CaptureSet {
         &self,
         info: &BoundaryInfo,
         commit_lsn: u64,
+        parked: &ParkedAt,
+    ) -> Result<(), SinkError> {
+        for capture in self.scoped(info.db_oid) {
+            capture.capture_boundary(info, commit_lsn, parked).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn cover_unparked(
+        &self,
+        info: &BoundaryInfo,
+        commit_lsn: u64,
         next_lsn: u64,
     ) -> Result<(), SinkError> {
         for capture in self.scoped(info.db_oid) {
-            capture.capture_boundary(info, commit_lsn, next_lsn).await?;
+            capture.cover_unparked(info, commit_lsn, next_lsn).await?;
         }
         Ok(())
     }

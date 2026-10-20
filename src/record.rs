@@ -9,6 +9,7 @@ use thiserror::Error;
 use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{RmId, XLogRecord};
 
+use crate::decode::heap_decoder::Predecoded;
 use crate::source::timeline::TimelineHistory;
 
 pub const WAL_SEG_SIZE: u64 = walrus::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
@@ -56,34 +57,44 @@ pub fn segments_covering_lineage(
         .collect()
 }
 
+/// Indexed by rmgr id, in PG `src/include/access/rmgrlist.h` order
+const RMGR_LABELS: [&str; RmId::LogicalMsg as usize + 1] = [
+    "xlog",
+    "xact",
+    "smgr",
+    "clog",
+    "dbase",
+    "tblspc",
+    "multixact",
+    "relmap",
+    "standby",
+    "heap2",
+    "heap",
+    "btree",
+    "hash",
+    "gin",
+    "gist",
+    "seq",
+    "spgist",
+    "brin",
+    "commit_ts",
+    "repl_origin",
+    "generic",
+    "logical_msg",
+];
+
+pub fn rmgr_name(rm: u8) -> &'static str {
+    RMGR_LABELS
+        .get(usize::from(rm))
+        .copied()
+        .unwrap_or("unknown")
+}
+
 /// Numeric id fallback for unknown rmgrs
 pub fn rmgr_label(rm: u8) -> String {
-    let named = match rm {
-        x if x == RmId::Xlog as u8 => "xlog",
-        x if x == RmId::Xact as u8 => "xact",
-        x if x == RmId::Smgr as u8 => "smgr",
-        x if x == RmId::Clog as u8 => "clog",
-        x if x == RmId::Dbase as u8 => "dbase",
-        x if x == RmId::Tblspc as u8 => "tblspc",
-        x if x == RmId::MultiXact as u8 => "multixact",
-        x if x == RmId::RelMap as u8 => "relmap",
-        x if x == RmId::Standby as u8 => "standby",
-        x if x == RmId::Heap2 as u8 => "heap2",
-        x if x == RmId::Heap as u8 => "heap",
-        x if x == RmId::Btree as u8 => "btree",
-        x if x == RmId::Hash as u8 => "hash",
-        x if x == RmId::Gin as u8 => "gin",
-        x if x == RmId::Gist as u8 => "gist",
-        x if x == RmId::Seq as u8 => "seq",
-        x if x == RmId::Spgist as u8 => "spgist",
-        x if x == RmId::Brin as u8 => "brin",
-        x if x == RmId::CommitTs as u8 => "commit_ts",
-        x if x == RmId::ReplOrigin as u8 => "repl_origin",
-        x if x == RmId::Generic as u8 => "generic",
-        x if x == RmId::LogicalMsg as u8 => "logical_msg",
-        _ => return format!("rmgr_{rm}"),
-    };
-    named.into()
+    RMGR_LABELS
+        .get(usize::from(rm))
+        .map_or_else(|| format!("rmgr_{rm}"), |label| (*label).into())
 }
 
 #[derive(
@@ -158,6 +169,22 @@ pub struct AffectedOid {
     pub pg_class_touch: Option<u64>,
 }
 
+impl Record<'_> {
+    pub fn to_static(&self) -> Record<'static> {
+        Record {
+            parsed: self.parsed.clone().into_owned(),
+            source_lsn: self.source_lsn,
+            next_lsn: self.next_lsn,
+            page_magic: self.page_magic,
+            route: self.route,
+            boundary_info: self.boundary_info.clone(),
+            aborted_tree: self.aborted_tree.clone(),
+            defer_catalog_decode: self.defer_catalog_decode,
+            xact_db: self.xact_db,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SinkError {
     #[error("io: {0}")]
@@ -177,10 +204,9 @@ pub struct Record<'a> {
     pub next_lsn: u64,
     pub page_magic: u16,
     pub route: Route,
-    /// Commit changed catalog data, so pause publication of later bytes
-    /// until shadow replays through `next_lsn`, except for statistics-only commits
-    pub catalog_boundary: bool,
-    /// Capture input for a catalog boundary; `Some` iff `catalog_boundary`
+    /// Catalog boundary: commit or command changed catalog data, so pause
+    /// publication of later bytes until shadow replays through `next_lsn`,
+    /// except for statistics-only commits
     pub boundary_info: Option<std::sync::Arc<BoundaryInfo>>,
     /// Abort of a catalog-dirty tree: every member the filter drained.
     /// Pending catalog slots those xids wrote drop here, on the pump, ahead
@@ -195,11 +221,57 @@ pub struct Record<'a> {
     pub xact_db: Option<u32>,
 }
 
-pub trait RecordSink {
+pub trait RecordSink: Send {
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
+
+    /// [`on_record`](Self::on_record) for a dispatcher done with the record,
+    /// so a sink keeping it skips the copy
+    fn on_record_owned(
+        &mut self,
+        record: Record<'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + '_>> {
+        Box::pin(async move { self.on_record(&record).await })
+    }
+
+    /// Pre-filter: `false` lets a dispatcher skip `on_record` entirely,
+    /// sparing its boxed future and poll cycle. Pure in the record, so a
+    /// dispatcher may evaluate it before the sink's own task sees the record
+    /// (the queueing pump never clones a skipped record). Position tracking
+    /// still observes every record, so skipping cannot move the resume floor.
+    fn wants(_record: &Record<'_>) -> bool
+    where
+        Self: Sized,
+    {
+        true
+    }
+
+    /// Whether `on_record` may wait on shadow replaying this record's bytes.
+    /// The pump ships bytes through such a record, and none past it, before
+    /// dispatching it; records answering `false` may dispatch after bytes of
+    /// their successors are already on the wire
+    fn may_park(&self, _record: &Record<'_>) -> bool {
+        true
+    }
+
+    /// One boxed future per batch rather than per record; order preserved.
+    /// `pre` holds tuples a dispatcher decoded ahead, off this sink's task,
+    /// by batch index; empty when nothing was decoded ahead, and sinks
+    /// without a decode step drop it
+    fn on_records<'a>(
+        &'a mut self,
+        batch: &'a [Record<'a>],
+        _pre: &'a mut [Option<Predecoded>],
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            for record in batch {
+                self.on_record(record).await?;
+            }
+            Ok(())
+        })
+    }
 
     fn on_idle<'a>(
         &'a mut self,
@@ -228,6 +300,7 @@ pub trait RecordBytesSink: Send {
         bytes: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 
+    /// WAL below `_new_start_lsn` is in place on disk
     fn on_segment_retired<'a>(
         &'a mut self,
         _new_start_lsn: u64,
@@ -237,6 +310,8 @@ pub trait RecordBytesSink: Send {
 }
 
 pub trait SegmentSink {
+    /// Persist `bytes` as `seg`. May return while `seg` is still writing, but
+    /// only once every earlier segment is in place
     fn on_segment<'a>(
         &'a mut self,
         seg: SegmentName,
@@ -254,21 +329,8 @@ impl RecordSink for CollectingRecordSink {
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.records.push(Record {
-                parsed: record.parsed.clone().into_owned(),
-                source_lsn: record.source_lsn,
-                next_lsn: record.next_lsn,
-                page_magic: record.page_magic,
-                route: record.route,
-                catalog_boundary: record.catalog_boundary,
-                boundary_info: record.boundary_info.clone(),
-                aborted_tree: record.aborted_tree.clone(),
-                defer_catalog_decode: record.defer_catalog_decode,
-                xact_db: record.xact_db,
-            });
-            Ok(())
-        })
+        self.records.push(record.to_static());
+        Box::pin(Done)
     }
 }
 
@@ -311,19 +373,35 @@ impl MetricsRecordSink {
     }
 }
 
+impl MetricsRecordSink {
+    pub fn observe(&mut self, record: &Record<'_>) {
+        *self
+            .by_rm_route
+            .entry((record.parsed.header.resource_manager_id, record.route))
+            .or_default() += 1;
+        self.total += 1;
+    }
+}
+
 impl RecordSink for MetricsRecordSink {
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            *self
-                .by_rm_route
-                .entry((record.parsed.header.resource_manager_id, record.route))
-                .or_default() += 1;
-            self.total += 1;
-            Ok(())
-        })
+        self.observe(record);
+        Box::pin(Done)
+    }
+}
+
+/// Already-complete sink future. Zero-sized, so boxing it never allocates:
+/// a sink finishing synchronously costs its caller no heap traffic
+pub struct Done;
+
+impl Future for Done {
+    type Output = Result<(), SinkError>;
+
+    fn poll(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        std::task::Poll::Ready(Ok(()))
     }
 }
 
@@ -370,24 +448,6 @@ impl SegmentSink for CollectingSegmentSink {
 }
 
 #[derive(Debug, Default)]
-pub struct CollectingBytesSink {
-    pub chunks: Vec<(u64, Vec<u8>)>,
-}
-
-impl RecordBytesSink for CollectingBytesSink {
-    fn on_wire_chunk<'a>(
-        &'a mut self,
-        start_lsn: u64,
-        bytes: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.chunks.push((start_lsn, bytes.to_vec()));
-            Ok(())
-        })
-    }
-}
-
-#[derive(Debug, Default)]
 pub struct NoopBytesSink;
 
 impl RecordBytesSink for NoopBytesSink {
@@ -428,5 +488,14 @@ mod tests {
             .map(|s| s.timeline)
             .collect();
         assert_eq!(tlis, [2, 3]);
+    }
+
+    #[test]
+    fn rmgr_label_names_known_ids_and_falls_back_to_number() {
+        assert_eq!(rmgr_label(RmId::Xlog as u8), "xlog");
+        assert_eq!(rmgr_label(RmId::Heap as u8), "heap");
+        assert_eq!(rmgr_label(RmId::CommitTs as u8), "commit_ts");
+        assert_eq!(rmgr_label(RmId::LogicalMsg as u8), "logical_msg");
+        assert_eq!(rmgr_label(RmId::LogicalMsg as u8 + 1), "rmgr_22");
     }
 }

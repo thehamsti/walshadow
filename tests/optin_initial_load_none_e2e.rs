@@ -43,8 +43,10 @@ fn write_config(path: &Path, ch_port: u16) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn optin_initial_load_none_skips_snapshot_but_streams_cdc() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::tools::pg_available()
+        || !fx::tools::pg_basebackup_available()
+        || !fx::tools::clickhouse_available()
+    {
         return;
     }
 
@@ -143,11 +145,15 @@ async fn optin_initial_load_none_skips_snapshot_but_streams_cdc() {
         // knows it, then assert the snapshot rows never landed.
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            if ch.query("EXISTS TABLE default.t").unwrap_or_default() == "1" {
+            if ch
+                .query("EXISTS TABLE default.public_t")
+                .unwrap_or_default()
+                == "1"
+            {
                 break;
             }
             if Instant::now() >= deadline {
-                anyhow::bail!("CH table default.t never created");
+                anyhow::bail!("CH table default.public_t never created");
             }
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -158,12 +164,12 @@ async fn optin_initial_load_none_skips_snapshot_but_streams_cdc() {
         )?;
         fx::wait_for_ch_value(
             &ch,
-            "SELECT name FROM default.t FINAL WHERE id = 100000",
+            "SELECT name FROM default.public_t FINAL WHERE id = 100000",
             "[1,2]",
             Duration::from_secs(60),
         )?;
         anyhow::ensure!(
-            ch.query("SELECT count() FROM default.t FINAL WHERE id <= 500")? == "0",
+            ch.query("SELECT count() FROM default.public_t FINAL WHERE id <= 500")? == "0",
             "initial_load=none loaded snapshot rows"
         );
 
@@ -176,7 +182,7 @@ async fn optin_initial_load_none_skips_snapshot_but_streams_cdc() {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let n = ch
-                .query("SELECT count() FROM default.t FINAL WHERE id = 100001")
+                .query("SELECT count() FROM default.public_t FINAL WHERE id = 100001")
                 .unwrap_or_default();
             if n == "1" {
                 break;
@@ -189,10 +195,7 @@ async fn optin_initial_load_none_skips_snapshot_but_streams_cdc() {
         Ok(())
     })();
 
-    let _ = guard.into_inner().map(|mut c| {
-        let _ = c.kill();
-        let _ = c.wait();
-    });
+    drop(guard);
     if bootstrap_shadow_data_dir.join("postmaster.pid").exists() {
         let mut shadow_cfg =
             ShadowConfig::new(bootstrap_shadow_data_dir.clone(), shadow_filter_dir.clone());

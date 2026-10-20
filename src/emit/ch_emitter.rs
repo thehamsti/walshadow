@@ -33,13 +33,13 @@ use clickhouse_c::{Allocator, ColumnBuilder, Kind, TypeAst};
 #[cfg(test)]
 use crate::ch::is_retryable;
 use crate::ch::{CompressionChoice, ConnectionConfig, EmitterError, quote_ident, types};
-use crate::column_rules::{ColumnEntry, ColumnRule, ColumnRules};
+use crate::column_rules::{ColumnEntry, ColumnRule, ColumnRules, Substitute};
 #[cfg(test)]
 use crate::decode::decoder_sink::DecoderSinkError;
 use crate::decode::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, NamespaceMapping, SystemColumnNames, SystemColumns,
-    TableMapping, TableTarget,
+    TableMapping, TableTarget, named_instance,
 };
 use crate::ops::bridge::MAX_REQUEST_BYTES;
 use crate::ops::oracle::{
@@ -50,7 +50,7 @@ use crate::schema::{RelAttr, RelDescriptor, RelName};
 use crate::source::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
 };
-use crate::table_rules::{MatchKind, TableRule};
+use crate::table_rules::{MatchKind, PartitionRoute, TableRule};
 use ahash::{HashMap, HashMapExt};
 
 /// Microseconds between PG `TimestampTz` epoch (2000-01-01 UTC) and Unix
@@ -72,9 +72,7 @@ pub(crate) const DEFAULT_ROW_BUDGET: usize = 4_194_304;
 pub(crate) const DEFAULT_BYTE_BUDGET: usize = 256 << 20; // 256 MiB
 
 /// Default commit-drain slice budgets
-/// ([`crate::xact::xact_buffer::CommittedDrain::next_batch`]). Bytes sized at
-/// half the default `xact_buffer_max`: a slice plus the one loading behind
-/// it stay within the ingest budget.
+/// ([`crate::xact::xact_buffer::CommittedDrain::next_batch`])
 pub(crate) const DEFAULT_DRAIN_BATCH_ROWS: usize = 65_536;
 pub(crate) const DEFAULT_DRAIN_BATCH_BYTES: usize = 32 << 20; // 32 MiB
 pub(crate) const DEFAULT_PLAN_DISK_MAX: u64 = 8 << 30; // 8 GiB
@@ -87,6 +85,34 @@ pub(crate) const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 1000;
 /// Rows coalesced per batcher chunk
 pub(crate) const DEFAULT_DECODE_CHUNK_ROWS: usize = 1024;
 
+/// Database of `instance`: `[ch] database` for default, None when unknown
+pub fn instance_database<'a>(
+    instances: &'a BTreeMap<String, InstanceConfig>,
+    default_db: &'a str,
+    instance: Option<&str>,
+) -> Option<&'a str> {
+    match instance {
+        None | Some("default") => Some(default_db),
+        Some(name) => instances.get(name).map(|c| c.database.as_str()),
+    }
+}
+
+/// Database for a table without `target_database`: namespace
+/// `target_database`, else instance's database, else `[ch] database`
+pub fn default_database<'a>(
+    namespaces: &'a HashMap<String, NamespaceMapping>,
+    instances: &'a BTreeMap<String, InstanceConfig>,
+    default_db: &'a str,
+    namespace: &str,
+    instance: Option<&str>,
+) -> &'a str {
+    namespaces
+        .get(namespace)
+        .and_then(|n| n.target_database.as_deref())
+        .or_else(|| instance_database(instances, default_db, instance))
+        .unwrap_or(default_db)
+}
+
 /// Per-replica connection + mapping config. TOML `[ch]` table holds
 /// connection params, `[table.<namespace>.<relname>]` blocks declare
 /// per-relation mapping; parse via [`EmitterConfig::from_toml_str`].
@@ -97,22 +123,14 @@ pub(crate) const DEFAULT_DECODE_CHUNK_ROWS: usize = 1024;
 pub struct EmitterConfig {
     pub snowflake: Option<Arc<crate::destination::snowflake::runtime::SnowflakeRuntime>>,
     pub snowflake_snapshots: Arc<HashMap<RelName, String>>,
-    pub host: String,
-    pub port: u16,
-    pub database: String,
-    pub user: String,
-    pub password: String,
-    /// Wrap native protocol in TLS (rustls, public webpki roots). Set
-    /// for ClickHouse Cloud, whose secure native port (9440) speaks
-    /// native-over-TLS. SNI + cert verification key off `host`.
-    pub secure: bool,
+    pub instances: BTreeMap<String, InstanceConfig>,
+    pub conn: InstanceConfig,
     /// Custom rustls roots/config for `secure` path: private CA, pinned
     /// self-signed cert, or mTLS. `None` uses public webpki roots via
     /// [`clickhouse_c::tls::default_config`]. Not parsed from TOML;
     /// carried through reconnect + DDL applicator so every CH socket
     /// pins the same roots.
     pub tls_config: Option<Arc<clickhouse_c::tls::rustls::ClientConfig>>,
-    pub compression: CompressionChoice,
     pub row_budget: usize,
     pub byte_budget: usize,
     /// Hold INSERTs open across xacts. Deadline arms at the first row of a
@@ -137,9 +155,15 @@ pub struct EmitterConfig {
     /// `[stream] paused`: pump idles (stops consuming source WAL) when true.
     /// Live via reload.
     pub paused: bool,
+    pub skip_attribution: bool,
     /// `[stream] replicate_all` (default true): replicate every user table in
     /// non-system namespaces. Per-table `replicate = false` still opts out.
     pub replicate_all: bool,
+    /// `[stream] auto_create_name_all`: derived-name template for every
+    /// namespace, which a `[namespace.*]` entry overrides. `None` is
+    /// `$schema$_$table$`. The knob `replicate_all` needs: a namespace with no
+    /// entry of its own still auto-creates under it
+    pub auto_create_name_all: Option<crate::mapping::NameTemplate>,
     /// Pending capture cost controls, boot-only
     pub pending_capture: crate::source::catalog_capture::PendingCaptureConfig,
     /// Per-namespace defaults keyed on PG schema name; per-table
@@ -151,6 +175,9 @@ pub struct EmitterConfig {
     /// Global `--drop-table-strategy` default; per-namespace override
     /// via `[namespace.<ns>] drop_table_strategy = ...`
     pub drop_table_strategy: DropTableStrategy,
+    /// `[ch] detach_strategy`: rows a detached partition leaves in its root's
+    /// destination, overridable per namespace
+    pub detach_strategy: DropTableStrategy,
     pub retry: RetryConfig,
     /// Wall-clock limit for one INSERT attempt. If connection stalls
     /// mid-INSERT, return retryable [`EmitterError::Timeout`] so inserter
@@ -230,9 +257,7 @@ pub struct EmitterConfig {
 /// Initialized data dir resumes regardless of mode
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BootstrapMode {
-    /// Never bootstrap. Without `--bootstrap-shadow-data-dir`, manage shadow
-    /// externally. With data dir, manage initialized cluster but reject
-    /// empty dir
+    /// Resume initialized managed shadow; reject empty data dir
     #[default]
     Off,
     /// Source-PG-driven BASE_BACKUP over the replication protocol,
@@ -263,9 +288,8 @@ impl std::str::FromStr for BootstrapMode {
 /// through to the CLI flag, then to the built-in default — a set key that
 /// the CLI also passes loses to the CLI.
 ///
-/// `shadow_data_dir` stays CLI-only: it decides whether the daemon owns a
-/// shadow at all, and pairs with `--start-lsn` / `--ignore-cursor` as a
-/// per-invocation recovery decision.
+/// Keep `shadow_data_dir` CLI-only alongside `--start-lsn` / `--ignore-cursor`
+/// as a per-invocation recovery decision
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct BootstrapSettings {
     /// `mode`: `off` / `direct` / `object_store`. Validated at parse so a typo
@@ -379,11 +403,21 @@ pub(crate) const DEFAULT_IDLE_RECONNECT_SECS: u64 = 30;
 /// Bounded-retry knobs. Retryable error (IO, clickhouse-c protocol,
 /// ServerException) triggers reconnect + retry up to `max_attempts`
 /// with exponential backoff capped at `max_backoff`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
 pub struct RetryConfig {
     /// Retry budget after initial call, including failed reconnects
+    #[serde(rename = "retry_max_attempts")]
     pub max_attempts: u32,
+    #[serde(
+        rename = "retry_initial_backoff_ms",
+        deserialize_with = "crate::toml_de::de_millis"
+    )]
     pub initial_backoff: std::time::Duration,
+    #[serde(
+        rename = "retry_max_backoff_ms",
+        deserialize_with = "crate::toml_de::de_millis"
+    )]
     pub max_backoff: std::time::Duration,
 }
 
@@ -408,54 +442,11 @@ impl Default for RetryConfig {
 
 impl Default for EmitterConfig {
     fn default() -> Self {
-        Self {
-            snowflake: None,
-            snowflake_snapshots: Arc::new(HashMap::default()),
-            host: "localhost".into(),
-            port: 9000,
-            database: "default".into(),
-            user: "default".into(),
-            password: String::new(),
-            secure: false,
-            tls_config: None,
-            compression: CompressionChoice::default(),
-            row_budget: DEFAULT_ROW_BUDGET,
-            byte_budget: DEFAULT_BYTE_BUDGET,
-            flush_timeout: Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS),
-            tables: HashMap::new(),
-            table_initial_loads: HashMap::new(),
-            table_entries: Vec::new(),
-            column_entries: Vec::new(),
-            table_opt_ins: HashMap::new(),
-            paused: false,
-            replicate_all: true,
-            pending_capture: Default::default(),
-            namespaces: HashMap::new(),
-            databases: Vec::new(),
-            drop_table_strategy: DropTableStrategy::default(),
-            retry: RetryConfig::default(),
-            insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
-            idle_reconnect: Duration::from_secs(DEFAULT_IDLE_RECONNECT_SECS),
-            soft_delete: false,
-            system_columns: Arc::default(),
-            decode_chunk_rows: DEFAULT_DECODE_CHUNK_ROWS,
-            drain_batch_rows: DEFAULT_DRAIN_BATCH_ROWS,
-            drain_batch_bytes: DEFAULT_DRAIN_BATCH_BYTES,
-            plan_disk_max: DEFAULT_PLAN_DISK_MAX,
-            runtime_config_schema: None,
-            source: crate::config::SourceConn::default(),
-            resident_payload_max: default_resident_payload_max(),
-            inline_value_max: DEFAULT_INLINE_VALUE_MAX,
-            value_reserve: DEFAULT_VALUE_RESERVE,
-            inline_value_overflow: InlineValueOverflow::default(),
-            decoder_pool_size: DEFAULT_DECODER_POOL,
-            inserter_pool_size: default_inserter_pool(),
-            decoder_batch_size: DEFAULT_QUEUEING_BATCH_SIZE,
-            decoder_queue_capacity: DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
-            backup: None,
-            bootstrap: BootstrapSettings::default(),
-            toast: ToastSettings::default(),
-        }
+        Self::from_sections(
+            ChSection::default(),
+            MemorySection::default(),
+            StreamSection::default(),
+        )
     }
 }
 
@@ -596,27 +587,31 @@ fn parse_backup(bk: &BackupSection) -> Result<walrus::config::Settings, EmitterE
 
 impl ConnectionConfig for EmitterConfig {
     fn host(&self) -> &str {
-        &self.host
+        &self.conn.host
     }
 
     fn port(&self) -> u16 {
-        self.port
+        self.conn.port
     }
 
     fn database(&self) -> &str {
-        &self.database
+        &self.conn.database
     }
 
     fn user(&self) -> &str {
-        &self.user
+        &self.conn.user
     }
 
     fn password(&self) -> &str {
-        &self.password
+        &self.conn.password
     }
 
     fn secure(&self) -> bool {
-        self.secure
+        self.conn.secure
+    }
+
+    fn tls_server_name(&self) -> &str {
+        &self.conn.tls_server_name
     }
 
     fn tls_config(&self) -> Option<Arc<clickhouse_c::tls::rustls::ClientConfig>> {
@@ -624,7 +619,7 @@ impl ConnectionConfig for EmitterConfig {
     }
 
     fn compression(&self) -> CompressionChoice {
-        self.compression
+        self.conn.compression
     }
 
     fn idle_reconnect(&self) -> Duration {
@@ -635,13 +630,13 @@ impl ConnectionConfig for EmitterConfig {
 #[derive(serde::Deserialize)]
 struct ConfigDocument {
     #[serde(default)]
-    ch: ChPatch,
+    ch: ChSection,
     #[serde(default)]
-    memory: MemoryPatch,
+    memory: MemorySection,
     #[serde(default)]
     runtime_config: RuntimeConfigPatch,
     #[serde(default)]
-    stream: StreamPatch,
+    stream: StreamSection,
     #[serde(default)]
     system_columns: SystemColumns,
     #[serde(default)]
@@ -777,64 +772,138 @@ fn reject_backup_loads(db: &str, entries: &DbEntries) -> Result<(), EmitterError
     Ok(())
 }
 
-/// Resolve ClickHouse destination to check for conflicting mappings
-/// Skip patterns and entries with replication disabled
-fn declared_target(
-    ch_database: &str,
-    schema_database: Option<&str>,
-    rel: &str,
-    t: &TablePatch,
-) -> Option<(String, String)> {
-    if t.replicate == Some(false)
-        || matches!(t.match_kind, Some(MatchKind::Glob | MatchKind::Regex))
-    {
-        return None;
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InstanceConfig {
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub user: String,
+    pub password: String,
+    /// Wrap native protocol in TLS (rustls, public webpki roots). Set
+    /// for ClickHouse Cloud, whose secure native port (9440) speaks
+    /// native-over-TLS. SNI + cert verification key off `tls_server_name`,
+    /// else `host`.
+    pub secure: bool,
+    /// Name sent as TLS SNI and matched against the server certificate
+    /// when `secure`. Lets `host` be an IP or another DNS name while the
+    /// handshake still names what the certificate was issued for. Empty
+    /// uses `host`.
+    pub tls_server_name: String,
+    #[serde(deserialize_with = "crate::toml_de::de_parse")]
+    pub compression: CompressionChoice,
+}
+
+impl Default for InstanceConfig {
+    fn default() -> Self {
+        let ch = ChSection::default();
+        Self {
+            host: ch.host,
+            port: ch.port,
+            database: ch.database,
+            user: ch.user,
+            password: ch.password,
+            secure: ch.secure,
+            tls_server_name: ch.tls_server_name,
+            compression: ch.compression,
+        }
     }
-    let database = t
-        .target_database
-        .clone()
-        .or_else(|| schema_database.map(str::to_owned))
-        .unwrap_or_else(|| ch_database.to_owned());
-    Some((
-        database,
-        t.target_table.clone().unwrap_or_else(|| rel.to_owned()),
-    ))
 }
 
-#[derive(Default, serde::Deserialize)]
-struct ChPatch {
-    host: Option<String>,
-    port: Option<u16>,
-    database: Option<String>,
-    user: Option<String>,
-    password: Option<String>,
-    secure: Option<bool>,
-    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
-    compression: Option<CompressionChoice>,
-    row_budget: Option<usize>,
-    byte_budget: Option<usize>,
-    drain_batch_rows: Option<usize>,
-    drain_batch_bytes: Option<usize>,
-    plan_disk_max: Option<u64>,
-    decoder_pool_size: Option<usize>,
-    inserter_pool_size: Option<usize>,
-    decoder_batch_size: Option<usize>,
-    decoder_queue_capacity: Option<usize>,
-    flush_timeout_ms: Option<u64>,
-    retry_max_attempts: Option<u32>,
-    retry_initial_backoff_ms: Option<u64>,
-    retry_max_backoff_ms: Option<u64>,
-    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
-    drop_table_strategy: Option<DropTableStrategy>,
-    soft_delete: Option<bool>,
+impl InstanceConfig {
+    pub fn apply(&self, base: &EmitterConfig) -> EmitterConfig {
+        EmitterConfig {
+            conn: self.clone(),
+            ..base.clone()
+        }
+    }
 }
 
-#[derive(Default, serde::Deserialize)]
-struct MemoryPatch {
-    resident_payload_max: Option<usize>,
-    inline_value_max: Option<usize>,
-    value_reserve: Option<usize>,
-    inline_value_overflow: Option<InlineValueOverflow>,
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct ChSection {
+    instances: BTreeMap<String, InstanceConfig>,
+    host: String,
+    port: u16,
+    database: String,
+    user: String,
+    password: String,
+    secure: bool,
+    tls_server_name: String,
+    #[serde(deserialize_with = "crate::toml_de::de_parse")]
+    compression: CompressionChoice,
+    row_budget: usize,
+    byte_budget: usize,
+    drain_batch_rows: usize,
+    drain_batch_bytes: usize,
+    plan_disk_max: u64,
+    /// Leave zero for bin/stream/args.rs to clamp
+    decoder_pool_size: usize,
+    inserter_pool_size: usize,
+    decoder_batch_size: usize,
+    decoder_queue_capacity: usize,
+    #[serde(
+        rename = "flush_timeout_ms",
+        deserialize_with = "crate::toml_de::de_millis"
+    )]
+    flush_timeout: Duration,
+    #[serde(flatten)]
+    retry: RetryConfig,
+    #[serde(deserialize_with = "crate::toml_de::de_parse")]
+    drop_table_strategy: DropTableStrategy,
+    #[serde(deserialize_with = "crate::toml_de::de_parse")]
+    detach_strategy: DropTableStrategy,
+    soft_delete: bool,
+}
+
+impl Default for ChSection {
+    fn default() -> Self {
+        Self {
+            instances: BTreeMap::new(),
+            host: "localhost".into(),
+            port: 9000,
+            database: "default".into(),
+            user: "default".into(),
+            password: String::new(),
+            secure: false,
+            tls_server_name: String::new(),
+            compression: CompressionChoice::default(),
+            row_budget: DEFAULT_ROW_BUDGET,
+            byte_budget: DEFAULT_BYTE_BUDGET,
+            drain_batch_rows: DEFAULT_DRAIN_BATCH_ROWS,
+            drain_batch_bytes: DEFAULT_DRAIN_BATCH_BYTES,
+            plan_disk_max: DEFAULT_PLAN_DISK_MAX,
+            decoder_pool_size: DEFAULT_DECODER_POOL,
+            inserter_pool_size: default_inserter_pool(),
+            decoder_batch_size: DEFAULT_QUEUEING_BATCH_SIZE,
+            decoder_queue_capacity: DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
+            flush_timeout: Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS),
+            retry: RetryConfig::default(),
+            drop_table_strategy: DropTableStrategy::default(),
+            detach_strategy: DropTableStrategy::default(),
+            soft_delete: false,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct MemorySection {
+    resident_payload_max: usize,
+    inline_value_max: usize,
+    value_reserve: usize,
+    inline_value_overflow: InlineValueOverflow,
+}
+
+impl Default for MemorySection {
+    fn default() -> Self {
+        Self {
+            resident_payload_max: default_resident_payload_max(),
+            inline_value_max: DEFAULT_INLINE_VALUE_MAX,
+            value_reserve: DEFAULT_VALUE_RESERVE,
+            inline_value_overflow: InlineValueOverflow::default(),
+        }
+    }
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -843,12 +912,27 @@ struct RuntimeConfigPatch {
     schema: Option<String>,
 }
 
-#[derive(Default, serde::Deserialize)]
-struct StreamPatch {
-    paused: Option<bool>,
-    replicate_all: Option<bool>,
-    pending_max_boundaries_per_xact: Option<u32>,
-    pending_max_hold_ms: Option<u64>,
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct StreamSection {
+    paused: bool,
+    skip_attribution: bool,
+    replicate_all: bool,
+    auto_create_name_all: Option<String>,
+    #[serde(flatten)]
+    pending_capture: crate::source::catalog_capture::PendingCaptureConfig,
+}
+
+impl Default for StreamSection {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            skip_attribution: false,
+            replicate_all: true,
+            auto_create_name_all: None,
+            pending_capture: Default::default(),
+        }
+    }
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -856,8 +940,11 @@ struct StreamPatch {
 struct NamespacePatch {
     target_database: Option<String>,
     auto_create: Option<bool>,
+    auto_create_name: Option<String>,
     #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
     drop_table_strategy: Option<DropTableStrategy>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    detach_strategy: Option<DropTableStrategy>,
     #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
     initial_load: Option<InitialLoadMode>,
 }
@@ -865,6 +952,7 @@ struct NamespacePatch {
 #[derive(Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TablePatch {
+    target_instance: Option<String>,
     replicate: Option<bool>,
     target_database: Option<String>,
     target_table: Option<String>,
@@ -872,12 +960,19 @@ struct TablePatch {
     initial_load: Option<InitialLoadMode>,
     order_by: Option<Vec<String>>,
     primary_key: Option<Vec<String>>,
-    /// Same four keys as `[system_columns]`, for this entry's relations alone
+    engine: Option<String>,
+    partition_by: Option<String>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    route: Option<PartitionRoute>,
+    tee: Option<Vec<crate::mapping::Tee>>,
+    /// Same keys as `[system_columns]`, for this entry's relations alone
     lsn: Option<String>,
     xid: Option<String>,
     commit_ts: Option<String>,
     #[serde(default, deserialize_with = "crate::mapping::de_marker_override")]
     is_deleted: Option<String>,
+    #[serde(default, deserialize_with = "crate::mapping::de_leaf_override")]
+    leaf: Option<String>,
     #[serde(
         rename = "match",
         default,
@@ -902,9 +997,82 @@ struct ColumnPatch {
         deserialize_with = "crate::toml_de::de_from_str"
     )]
     match_kind: Option<MatchKind>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    nan: Option<Substitute>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    pos_inf: Option<Substitute>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    neg_inf: Option<Substitute>,
 }
 
 impl EmitterConfig {
+    fn from_sections(ch: ChSection, memory: MemorySection, stream: StreamSection) -> Self {
+        Self {
+            snowflake: None,
+            snowflake_snapshots: Arc::new(HashMap::default()),
+            instances: ch.instances,
+            conn: InstanceConfig {
+                host: ch.host,
+                port: ch.port,
+                database: ch.database,
+                user: ch.user,
+                password: ch.password,
+                secure: ch.secure,
+                tls_server_name: ch.tls_server_name,
+                compression: ch.compression,
+            },
+            tls_config: None,
+            row_budget: ch.row_budget,
+            byte_budget: ch.byte_budget,
+            flush_timeout: ch.flush_timeout,
+            tables: HashMap::new(),
+            table_initial_loads: HashMap::new(),
+            table_entries: Vec::new(),
+            column_entries: Vec::new(),
+            table_opt_ins: HashMap::new(),
+            paused: stream.paused,
+            skip_attribution: stream.skip_attribution,
+            replicate_all: stream.replicate_all,
+            auto_create_name_all: None,
+            pending_capture: stream.pending_capture,
+            namespaces: HashMap::new(),
+            databases: Vec::new(),
+            drop_table_strategy: ch.drop_table_strategy,
+            detach_strategy: ch.detach_strategy,
+            retry: ch.retry,
+            insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
+            idle_reconnect: Duration::from_secs(DEFAULT_IDLE_RECONNECT_SECS),
+            soft_delete: ch.soft_delete,
+            system_columns: Arc::default(),
+            decode_chunk_rows: DEFAULT_DECODE_CHUNK_ROWS,
+            drain_batch_rows: ch.drain_batch_rows,
+            drain_batch_bytes: ch.drain_batch_bytes,
+            plan_disk_max: ch.plan_disk_max,
+            runtime_config_schema: None,
+            source: crate::config::SourceConn::default(),
+            resident_payload_max: memory.resident_payload_max,
+            inline_value_max: memory.inline_value_max,
+            value_reserve: memory.value_reserve,
+            inline_value_overflow: memory.inline_value_overflow,
+            decoder_pool_size: ch.decoder_pool_size,
+            inserter_pool_size: ch.inserter_pool_size,
+            decoder_batch_size: ch.decoder_batch_size,
+            decoder_queue_capacity: ch.decoder_queue_capacity,
+            backup: None,
+            bootstrap: BootstrapSettings::default(),
+            toast: ToastSettings::default(),
+        }
+    }
+
+    pub fn instance_database(&self, instance: Option<&str>) -> Result<&str, EmitterError> {
+        instance_database(&self.instances, &self.conn.database, instance).ok_or_else(|| {
+            EmitterError::Config(format!(
+                "unknown ClickHouse instance `{}`",
+                instance.unwrap_or_default()
+            ))
+        })
+    }
+
     /// Boot-only row-shape knobs frozen into every route
     pub fn row_policy(&self) -> crate::emit::route::RowPolicy {
         crate::emit::route::RowPolicy {
@@ -937,6 +1105,8 @@ impl EmitterConfig {
     /// target_table = "foo"         # optional: source relname
     /// order_by = ["id"]            # optional: CH ORDER BY, else replica identity
     /// primary_key = ["id"]         # optional: index prefix of order_by
+    /// engine = "MergeTree"         # optional: CH engine, else ReplacingMergeTree
+    /// tee = [{ table = "foo_audit", engine = "MergeTree" }]  # optional: extra destinations
     /// lsn = "_peerdb_version"      # optional: per-relation system column
     /// is_deleted = false           # renames, same keys as [system_columns]
     /// columns = [
@@ -945,8 +1115,7 @@ impl EmitterConfig {
     /// ]
     /// ```
     pub fn from_toml_str(s: &str) -> Result<Self, EmitterError> {
-        let root: toml::Table = toml::from_str(s)
-            .map_err(|e: toml::de::Error| EmitterError::Config(format!("toml: {e}")))?;
+        let root: toml::Table = toml::from_str(s).map_err(crate::toml_de::config_error)?;
         Self::from_table(&root)
     }
 
@@ -965,63 +1134,31 @@ impl EmitterConfig {
         let doc: ConfigDocument = toml::Value::Table(root.clone())
             .try_into()
             .map_err(crate::toml_de::config_error)?;
-        let mut out = Self::default();
-        let ch = doc.ch;
-        out.host = ch.host.unwrap_or(out.host);
-        out.port = ch.port.unwrap_or(out.port);
-        out.database = ch.database.unwrap_or(out.database);
-        out.user = ch.user.unwrap_or(out.user);
-        out.password = ch.password.unwrap_or(out.password);
-        out.secure = ch.secure.unwrap_or(out.secure);
-        out.compression = ch.compression.unwrap_or(out.compression);
-        out.row_budget = ch.row_budget.unwrap_or(out.row_budget);
-        out.byte_budget = ch.byte_budget.unwrap_or(out.byte_budget);
-        out.drain_batch_rows = ch.drain_batch_rows.unwrap_or(out.drain_batch_rows);
-        out.drain_batch_bytes = ch.drain_batch_bytes.unwrap_or(out.drain_batch_bytes);
-        out.plan_disk_max = ch.plan_disk_max.unwrap_or(out.plan_disk_max);
-        // Leave zero for bin/stream/args.rs to clamp
-        out.decoder_pool_size = ch.decoder_pool_size.unwrap_or(out.decoder_pool_size);
-        out.inserter_pool_size = ch.inserter_pool_size.unwrap_or(out.inserter_pool_size);
-        out.decoder_batch_size = ch.decoder_batch_size.unwrap_or(out.decoder_batch_size);
-        out.decoder_queue_capacity = ch
-            .decoder_queue_capacity
-            .unwrap_or(out.decoder_queue_capacity);
-        out.flush_timeout = ch
-            .flush_timeout_ms
-            .map_or(out.flush_timeout, Duration::from_millis);
-        out.retry.max_attempts = ch.retry_max_attempts.unwrap_or(out.retry.max_attempts);
-        out.retry.initial_backoff = ch
-            .retry_initial_backoff_ms
-            .map_or(out.retry.initial_backoff, Duration::from_millis);
-        out.retry.max_backoff = ch
-            .retry_max_backoff_ms
-            .map_or(out.retry.max_backoff, Duration::from_millis);
-        out.drop_table_strategy = ch.drop_table_strategy.unwrap_or(out.drop_table_strategy);
-        out.soft_delete = ch.soft_delete.unwrap_or(out.soft_delete);
+        let prefix_all = doc.stream.auto_create_name_all.clone();
+        let mut out = Self::from_sections(doc.ch, doc.memory, doc.stream);
+        for (name, instance) in &out.instances {
+            if name.is_empty() || name == "default" {
+                return Err(EmitterError::Config(format!(
+                    "ch.instances.{name}: reserved instance name"
+                )));
+            }
+            if instance.host.is_empty() || instance.port == 0 {
+                return Err(EmitterError::Config(format!(
+                    "ch.instances.{name}: host and port must be nonempty"
+                )));
+            }
+            instance.compression.build_codec()?;
+        }
+        out.auto_create_name_all = prefix_all
+            .as_deref()
+            .map(crate::mapping::NameTemplate::parse)
+            .transpose()
+            .map_err(|e| EmitterError::Config(format!("`stream.auto_create_name_all`: {e}")))?;
         doc.system_columns
             .validate()
             .map_err(EmitterError::Config)?;
         out.system_columns = Arc::new(doc.system_columns);
-        out.resident_payload_max = doc
-            .memory
-            .resident_payload_max
-            .unwrap_or(out.resident_payload_max);
-        out.inline_value_max = doc.memory.inline_value_max.unwrap_or(out.inline_value_max);
-        out.value_reserve = doc.memory.value_reserve.unwrap_or(out.value_reserve);
-        out.inline_value_overflow = doc
-            .memory
-            .inline_value_overflow
-            .unwrap_or(out.inline_value_overflow);
         out.runtime_config_schema = doc.runtime_config.schema;
-        let st = doc.stream;
-        out.paused = st.paused.unwrap_or(out.paused);
-        out.replicate_all = st.replicate_all.unwrap_or(out.replicate_all);
-        out.pending_capture.max_boundaries_per_xact = st
-            .pending_max_boundaries_per_xact
-            .unwrap_or(out.pending_capture.max_boundaries_per_xact);
-        out.pending_capture.max_hold_per_xact = st
-            .pending_max_hold_ms
-            .map_or(out.pending_capture.max_hold_per_xact, Duration::from_millis);
         out.source = doc.source;
         // Unprefixed entries belong to `[source] dbname` whatever database
         // this parse is scoped to, so a prefixed entry for another database
@@ -1052,62 +1189,33 @@ impl EmitterConfig {
             reject_backup_loads(db, entries)?;
         }
         let local = buckets.remove(&scope).unwrap_or_default();
-        // Entries of the scoped database read back as the operator wrote them
-        let local_ctx = |ns: &str, name: &str| {
-            if scope == default_db {
-                format!("table.{ns}.{name}")
-            } else {
-                format!("database.{scope}.table.{ns}.{name}")
-            }
-        };
         for (ns, n) in local.namespace {
+            let auto_create_name = n
+                .auto_create_name
+                .as_deref()
+                .map(crate::mapping::NameTemplate::parse)
+                .transpose()
+                .map_err(|e| {
+                    EmitterError::Config(format!("`namespace.{ns}.auto_create_name`: {e}"))
+                })?;
             out.namespaces.insert(
                 ns,
                 NamespaceMapping {
                     target_database: n.target_database,
                     auto_create: n.auto_create.unwrap_or(false),
+                    auto_create_name,
                     drop_table_strategy: n.drop_table_strategy,
+                    detach_strategy: n.detach_strategy,
                     initial_load: n.initial_load,
                 },
             );
         }
-        // Prevent processes from writing different source tables to one destination
-        let mut owners: HashMap<(String, String), String> = HashMap::new();
         for (ns, rels) in local.table {
             for (name, t) in rels {
-                let schema_db = out
-                    .namespaces
-                    .get(&ns)
-                    .and_then(|n| n.target_database.clone());
-                if let Some(target) =
-                    declared_target(&out.database, schema_db.as_deref(), &name, &t)
-                {
-                    owners.insert(target, local_ctx(&ns, &name));
-                }
                 out.fold_table_entry(&ns, name, t)?;
             }
         }
-        for (db, entries) in buckets {
-            for (ns, rels) in &entries.table {
-                let schema_db = entries
-                    .namespace
-                    .get(ns)
-                    .and_then(|n| n.target_database.as_deref());
-                for (name, t) in rels {
-                    let Some(target) = declared_target(&out.database, schema_db, name, t) else {
-                        continue;
-                    };
-                    let ctx = format!("database.{db}.table.{ns}.{name}");
-                    if let Some(owner) = owners.get(&target) {
-                        return Err(EmitterError::Config(format!(
-                            "`{ctx}` and `{owner}` both write to {}.{}, set a different \
-                             target_database or target_table",
-                            target.0, target.1
-                        )));
-                    }
-                    owners.insert(target, ctx);
-                }
-            }
+        for db in buckets.into_keys() {
             out.databases.push(db);
         }
         out.databases
@@ -1122,20 +1230,35 @@ impl EmitterConfig {
         &mut self,
         ns: &str,
         name: String,
-        t: TablePatch,
+        mut t: TablePatch,
     ) -> Result<(), EmitterError> {
         let rel = RelName::new(ns, &name);
         let ctx = format!("table.{ns}.{name}");
         let kind = t.match_kind.unwrap_or(MatchKind::Exact);
+        self.instance_database(t.target_instance.as_deref())?;
+        for tee in t.tee.iter_mut().flatten() {
+            let database = self.instance_database(tee.instance.as_deref())?;
+            if tee.instance.is_some() && tee.database.is_none() {
+                tee.database = Some(database.to_owned());
+            }
+        }
         let replicate = t.replicate;
         let system = SystemColumnNames {
             lsn: t.lsn,
             xid: t.xid,
             commit_ts: t.commit_ts,
             is_deleted: t.is_deleted,
+            leaf: t.leaf,
         };
         system.validate(&ctx).map_err(EmitterError::Config)?;
+        if t.tee.is_some() && kind != MatchKind::Exact {
+            return Err(EmitterError::Config(format!(
+                "{ctx}.tee: a `match = \"{}\"` entry would merge every matched table into one tee",
+                kind.as_str()
+            )));
+        }
         let rule = TableRule {
+            target_instance: t.target_instance,
             system,
             target_database: t.target_database,
             target_table: t.target_table,
@@ -1143,6 +1266,10 @@ impl EmitterConfig {
             initial_load: t.initial_load.map(|m| m.as_str().to_string()),
             order_by: t.order_by,
             primary_key: t.primary_key,
+            engine: t.engine,
+            partition_by: t.partition_by,
+            route: t.route,
+            tee: t.tee,
         };
         self.table_entries.push((rel.clone(), kind, rule.clone()));
         let mut pinned = Vec::new();
@@ -1186,20 +1313,22 @@ impl EmitterConfig {
                             att_kind.as_str()
                         )));
                     }
-                    if c.target.is_none() && c.target_type.is_none() {
-                        return Err(EmitterError::Config(format!(
-                            "{ctx}: sets neither target nor type"
-                        )));
+                    let rule = ColumnRule {
+                        target_name: c.target,
+                        target_type: c.target_type,
+                        nan: c.nan,
+                        pos_inf: c.pos_inf,
+                        neg_inf: c.neg_inf,
+                    };
+                    if rule.is_empty() {
+                        return Err(EmitterError::Config(format!("{ctx}: sets nothing")));
                     }
                     named.push(ColumnEntry {
                         rel: rel.clone(),
                         rel_kind: kind,
                         attname,
                         att_kind,
-                        rule: ColumnRule {
-                            target_name: c.target,
-                            target_type: c.target_type,
-                        },
+                        rule,
                     });
                 }
             }
@@ -1237,20 +1366,33 @@ impl EmitterConfig {
         if replicate == Some(false) {
             return Ok(());
         }
-        let database = rule
-            .target_database
-            .or_else(|| {
-                self.namespaces
-                    .get(ns)
-                    .and_then(|n| n.target_database.clone())
-            })
-            .unwrap_or_else(|| self.database.clone());
-        let table = rule.target_table.unwrap_or(name);
+        let database = rule.target_database.unwrap_or_else(|| {
+            default_database(
+                &self.namespaces,
+                &self.instances,
+                &self.conn.database,
+                ns,
+                rule.target_instance.as_deref(),
+            )
+            .to_owned()
+        });
+        let table = rule.target_table.unwrap_or_else(|| {
+            self.namespaces
+                .get(ns)
+                .and_then(|n| n.auto_create_name.clone())
+                .unwrap_or_default()
+                .render(&self.source.dbname, ns, &name)
+        });
         self.tables.insert(
             rel.clone(),
             TableMapping {
-                target: TableTarget { database, table },
+                target: TableTarget {
+                    instance: rule.target_instance.and_then(named_instance),
+                    database,
+                    table,
+                },
                 columns: pinned,
+                tees: rule.tee.unwrap_or_default(),
             },
         );
         if let Some(mode) = rule.initial_load {
@@ -1266,11 +1408,21 @@ pub(crate) struct TablePlan {
     pub(crate) synth_lsn: ColumnPlan,
     pub(crate) synth_xid: ColumnPlan,
     pub(crate) synth_commit_ts: ColumnPlan,
-    /// Delete marker `Bool` (1 on delete, else 0), appended last. `None` when
+    /// Delete marker `Bool` (1 on delete, else 0). `None` when
     /// `[system_columns] is_deleted = false` drops it
     pub(crate) synth_is_deleted: Option<ColumnPlan>,
-    /// Pre-formatted so on-tuple paths don't reassemble per row
-    pub(crate) insert_sql: String,
+    /// Source partition `UInt32`, appended last on partitioned-root
+    /// destinations
+    pub(crate) synth_leaf: Option<ColumnPlan>,
+    /// Format once to avoid rebuilding SQL for each row. Main destination
+    /// first, then each tee
+    pub(crate) inserts: Vec<InsertQuery>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertQuery {
+    pub instance: Option<String>,
+    pub sql: String,
 }
 
 pub(crate) struct ColumnPlan {
@@ -1279,7 +1431,90 @@ pub(crate) struct ColumnPlan {
     pub(crate) type_repr: String,
     pub(crate) ast: TypeAst,
     pub(crate) decimal: Option<DecimalWire>,
+    pub(crate) datetime64_scale: i32,
+    pub(crate) non_finite: NonFinite,
     pub(crate) encoding: ColumnEncoding,
+}
+
+/// Values replacing non-finite numerics or temporal infinities, `None` rejects
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct NonFinite {
+    nan: Option<ColumnValue>,
+    pos_inf: Option<ColumnValue>,
+    neg_inf: Option<ColumnValue>,
+}
+
+impl NonFinite {
+    /// Resolve settings against Decimal or temporal destination once per plan
+    fn compile(rule: &ColumnRule, ast: &TypeAst) -> Result<Self, String> {
+        use crate::decode::codecs::NumericKind;
+        let nullable = ast.view().kind() == Some(Kind::Nullable);
+        let inner = types::strip_nullable(ast.view());
+        let decimal = decimal_wire_of(ast);
+        if decimal.is_none() && !matches!(inner.kind(), Some(Kind::Date32 | Kind::DateTime64)) {
+            return Ok(Self::default());
+        }
+        let precision =
+            usize::try_from(inner.decimal_precision()).map_err(|_| "bad Decimal precision")?;
+        let scale = usize::from(decimal.map_or(0, |w| w.scale));
+        let bound = format!("{}.{}", "9".repeat(precision - scale), "9".repeat(scale));
+        let cell = |key: &str, sub: &Option<Substitute>| {
+            let text = match sub {
+                None | Some(Substitute::Reject) => return Ok(None),
+                Some(Substitute::Null) if nullable => return Ok(Some(ColumnValue::Null)),
+                Some(Substitute::Null) => {
+                    return Err(format!("{key} = \"null\" needs a Nullable destination"));
+                }
+                Some(_) if decimal.is_none() => {
+                    return Err(format!(
+                        "{key}: temporal infinity supports only reject or null"
+                    ));
+                }
+                Some(Substitute::Min) => format!("-{bound}"),
+                Some(Substitute::Max) => bound.clone(),
+                Some(Substitute::Literal(lit)) => lit.clone(),
+            };
+            let (int, frac) = crate::column_rules::decimal_parts(&text).unwrap_or_default();
+            if frac.len() > scale && frac[scale..].bytes().any(|b| b != b'0') {
+                return Err(format!(
+                    "{key} = {text:?}: more than {scale} fractional digits"
+                ));
+            }
+            if int.trim_start_matches('0').len() + scale > precision {
+                return Err(format!(
+                    "{key} = {text:?}: exceeds Decimal({precision}, {scale})"
+                ));
+            }
+            Ok(Some(ColumnValue::Numeric(NumericKind::Finite(text))))
+        };
+        Ok(Self {
+            // Temporal values have no NaN
+            nan: if decimal.is_some() {
+                cell("nan", &rule.nan)?
+            } else {
+                None
+            },
+            pos_inf: cell("pos_inf", &rule.pos_inf)?,
+            neg_inf: cell("neg_inf", &rule.neg_inf)?,
+        })
+    }
+
+    fn substitute<'a>(&'a self, v: &'a ColumnValue) -> &'a ColumnValue {
+        use crate::decode::codecs::NumericKind;
+        let sub = match v {
+            ColumnValue::Numeric(NumericKind::NaN) => &self.nan,
+            ColumnValue::Numeric(NumericKind::PInf)
+            | ColumnValue::Date(i32::MAX)
+            | ColumnValue::Timestamp(i64::MAX)
+            | ColumnValue::TimestampTz(i64::MAX) => &self.pos_inf,
+            ColumnValue::Numeric(NumericKind::NInf)
+            | ColumnValue::Date(i32::MIN)
+            | ColumnValue::Timestamp(i64::MIN)
+            | ColumnValue::TimestampTz(i64::MIN) => &self.neg_inf,
+            _ => return v,
+        };
+        sub.as_ref().unwrap_or(v)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1293,6 +1528,13 @@ pub(crate) enum ColumnEncoding {
 }
 
 impl ColumnEncoding {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Oracle { .. } => "oracle",
+        }
+    }
+
     fn choose(att: Option<&RelAttr>, ast: &TypeAst) -> Self {
         let Some(att) = att else {
             // Predeclared post-ALTER column has only default cells
@@ -1331,7 +1573,7 @@ fn canonical_type(ast: &TypeAst, configured: &str) -> String {
 fn composite_target(ast: &TypeAst) -> bool {
     matches!(
         types::strip_nullable(ast.view()).kind(),
-        Some(Kind::Array | Kind::Map | Kind::Object)
+        Some(Kind::Array | Kind::Map | Kind::Object | Kind::QBit)
     )
 }
 
@@ -1347,16 +1589,6 @@ pub(crate) enum DecimalWidth {
 }
 
 impl DecimalWidth {
-    fn from_elem_size(size: usize) -> Option<Self> {
-        Some(match size {
-            4 => Self::D32,
-            8 => Self::D64,
-            16 => Self::D128,
-            32 => Self::D256,
-            _ => return None,
-        })
-    }
-
     fn bytes(self) -> usize {
         self as usize
     }
@@ -1377,6 +1609,45 @@ impl TablePlan {
         column_rules: &ColumnRules,
         system: &SystemColumns,
     ) -> Result<Self, EmitterError> {
+        Self::build_owned(
+            alloc,
+            rel,
+            &rel.rel_name,
+            mapping,
+            column_rules,
+            system,
+            None,
+        )
+    }
+
+    /// Plan for rows routed by `route`: a partition's rows encode under
+    /// its root's column rules and stamp the partition column
+    pub(crate) fn for_route(
+        alloc: Allocator,
+        rel: &RelDescriptor,
+        route: &crate::emit::route::RouteSnapshot,
+    ) -> Result<Self, EmitterError> {
+        let system = route.system_columns();
+        Self::build_owned(
+            alloc,
+            rel,
+            route.owner(&rel.rel_name),
+            &route.mapping,
+            &route.column_rules,
+            system,
+            route.partition.as_ref().and(system.leaf.as_deref()),
+        )
+    }
+
+    fn build_owned(
+        alloc: Allocator,
+        rel: &RelDescriptor,
+        owner: &RelName,
+        mapping: &TableMapping,
+        column_rules: &ColumnRules,
+        system: &SystemColumns,
+        leaf: Option<&str>,
+    ) -> Result<Self, EmitterError> {
         let mut columns = Vec::with_capacity(mapping.columns.len());
         let mut col_sql = Vec::with_capacity(mapping.columns.len() + 4);
         // Mapping attnums absent from the catalog descriptor are not a
@@ -1396,13 +1667,15 @@ impl TablePlan {
                 name: c.target_name.clone(),
                 type_repr: canonical_type(&ast, &c.target_type),
                 encoding: ColumnEncoding::choose(att, &ast),
+                datetime64_scale: types::strip_nullable(ast.view()).datetime64_scale(),
                 ast,
                 decimal,
+                non_finite: NonFinite::default(),
             };
-            if let Some(ty) =
-                att.and_then(|a| column_rules.settings(&rel.rel_name, &a.name).target_type)
-            {
-                let ty = &ty;
+            let settings = att
+                .map(|a| column_rules.settings(owner, &a.name))
+                .unwrap_or_default();
+            if let Some(ty) = &settings.target_type {
                 match TypeAst::parse(ty, alloc) {
                     Ok(oast) => {
                         if let Some(decimal) = override_wire(&plan.ast, &oast) {
@@ -1410,8 +1683,11 @@ impl TablePlan {
                                 name: plan.name,
                                 type_repr: canonical_type(&oast, ty),
                                 encoding: ColumnEncoding::choose(att, &oast),
+                                datetime64_scale: types::strip_nullable(oast.view())
+                                    .datetime64_scale(),
                                 ast: oast,
                                 decimal,
+                                non_finite: NonFinite::default(),
                             };
                         } else {
                             tracing::warn!(
@@ -1434,6 +1710,29 @@ impl TablePlan {
                     ),
                 }
             }
+            let config_err =
+                |e: &str| EmitterError::Config(format!("{}.{}: {e}", rel.rel_name, c.target_name));
+            let source_temporal = att.and_then(|a| match a.type_oid {
+                crate::schema::DATEOID => Some(Kind::Date32),
+                crate::schema::TIMESTAMPOID | crate::schema::TIMESTAMPTZOID => {
+                    Some(Kind::DateTime64)
+                }
+                _ => None,
+            });
+            if plan.encoding == ColumnEncoding::Local
+                && source_temporal.is_some()
+                && types::strip_nullable(plan.ast.view()).kind() != source_temporal
+            {
+                return Err(config_err(
+                    "local temporal encoding needs Date32 or DateTime64 matching source type",
+                ));
+            }
+            plan.non_finite =
+                NonFinite::compile(&settings, &plan.ast).map_err(|e| config_err(&e))?;
+            // Oracle cells never pass through substitution
+            if plan.encoding != ColumnEncoding::Local && plan.non_finite != NonFinite::default() {
+                return Err(config_err("substitution needs local encoding"));
+            }
             columns.push(plan);
             col_sql.push(quote_ident(&c.target_name));
         }
@@ -1444,6 +1743,8 @@ impl TablePlan {
                 ast: TypeAst::parse(ty, alloc)
                     .map_err(|e| EmitterError::Type(format!("{ty}: {e}")))?,
                 decimal: None,
+                datetime64_scale: 0,
+                non_finite: NonFinite::default(),
                 encoding: ColumnEncoding::Local,
             })
         };
@@ -1455,22 +1756,28 @@ impl TablePlan {
             .as_deref()
             .map(|name| mk(name, "Bool"))
             .transpose()?;
+        let synth_leaf = leaf.map(|name| mk(name, "UInt32")).transpose()?;
         col_sql.push(quote_ident(&synth_lsn.name));
         col_sql.push(quote_ident(&synth_xid.name));
         col_sql.push(quote_ident(&synth_commit_ts.name));
         col_sql.extend(synth_is_deleted.iter().map(|c| quote_ident(&c.name)));
-        let insert_sql = format!(
-            "INSERT INTO {} ({}) FORMAT Native",
-            mapping.target.sql(),
-            col_sql.join(", "),
-        );
+        col_sql.extend(synth_leaf.iter().map(|c| quote_ident(&c.name)));
+        let col_sql = col_sql.join(", ");
+        let insert = |t: &TableTarget| format!("INSERT INTO {} ({col_sql}) FORMAT Native", t.sql());
         Ok(Self {
             columns,
             synth_lsn,
             synth_xid,
             synth_commit_ts,
             synth_is_deleted,
-            insert_sql,
+            synth_leaf,
+            inserts: mapping
+                .targets()
+                .map(|t| InsertQuery {
+                    sql: insert(&t),
+                    instance: t.instance,
+                })
+                .collect(),
         })
     }
 
@@ -1600,39 +1907,6 @@ impl ColumnBuf {
         }
     }
 
-    fn append_null(&mut self) -> Result<(), EmitterError> {
-        match self {
-            Self::NullableFixed {
-                width,
-                null_map,
-                inner,
-            } => {
-                null_map.push(1);
-                inner.extend(std::iter::repeat_n(0u8, *width));
-                Ok(())
-            }
-            Self::NullableString {
-                offsets,
-                data,
-                null_map,
-                absent,
-            } => {
-                null_map.push(1);
-                data.extend_from_slice(absent);
-                offsets.push(data.len() as u64);
-                Ok(())
-            }
-            Self::Oracle(o) => {
-                o.push(OracleCell::Default);
-                Ok(())
-            }
-            _ => Err(EmitterError::UnsupportedValue {
-                target_column: String::new(),
-                kind: "NULL for non-Nullable column",
-            }),
-        }
-    }
-
     /// Use CH type defaults for non-nullable columns, NULL otherwise
     fn append_default(&mut self) {
         match self {
@@ -1645,7 +1919,25 @@ impl ColumnBuf {
                 data.extend_from_slice(absent);
                 offsets.push(data.len() as u64);
             }
-            nullable => nullable.append_null().expect("nullable shape takes NULL"),
+            Self::NullableFixed {
+                width,
+                null_map,
+                inner,
+            } => {
+                null_map.push(1);
+                inner.extend(std::iter::repeat_n(0u8, *width));
+            }
+            Self::NullableString {
+                offsets,
+                data,
+                null_map,
+                absent,
+            } => {
+                null_map.push(1);
+                data.extend_from_slice(absent);
+                offsets.push(data.len() as u64);
+            }
+            Self::Oracle(o) => o.push(OracleCell::Default),
         }
     }
 
@@ -1678,10 +1970,7 @@ impl ColumnBuf {
                 inner.extend_from_slice(le);
                 Ok(())
             }
-            _ => Err(EmitterError::UnsupportedValue {
-                target_column: String::new(),
-                kind: "fixed-width value into string-shaped buffer",
-            }),
+            _ => Err(unsupported("fixed-width value into string-shaped buffer")),
         }
     }
 
@@ -1703,10 +1992,7 @@ impl ColumnBuf {
                 offsets.push(data.len() as u64);
                 Ok(())
             }
-            _ => Err(EmitterError::UnsupportedValue {
-                target_column: String::new(),
-                kind: "string value into fixed-shaped buffer",
-            }),
+            _ => Err(unsupported("string value into fixed-shaped buffer")),
         }
     }
 }
@@ -1747,6 +2033,12 @@ pub(crate) fn fresh_buffers(plan: &TablePlan) -> Result<Vec<ColumnBuf>, EmitterE
             bytes: Vec::new(),
         }); // delete marker Bool (1 wire byte, same as UInt8)
     }
+    if plan.synth_leaf.is_some() {
+        buffers.push(ColumnBuf::Fixed {
+            width: 4,
+            bytes: Vec::new(),
+        }); // partition UInt32
+    }
     Ok(buffers)
 }
 
@@ -1783,12 +2075,24 @@ impl TableEncoder {
         Ok((old, rows))
     }
 
-    /// Return [`Append::Full`] without mutation when oracle threshold is hit
+    #[cfg(test)]
     pub fn append_row(
         &mut self,
         committed: &CommittedTuple,
         mapping: &TableMapping,
         op_code: i8,
+    ) -> Result<Append, EmitterError> {
+        self.append_routed(committed, mapping, op_code, None)
+    }
+
+    /// Append one row, stamping `leaf` into the partition column. Return
+    /// [`Append::Full`] without mutation when oracle threshold is hit
+    pub fn append_routed(
+        &mut self,
+        committed: &CommittedTuple,
+        mapping: &TableMapping,
+        op_code: i8,
+        leaf: Option<u32>,
     ) -> Result<Append, EmitterError> {
         let decoded = &committed.decoded;
         let side = match decoded.op {
@@ -1832,22 +2136,19 @@ impl TableEncoder {
         }
         let mut cell_iter = cells.iter_mut();
         for (i, col) in mapping.columns.iter().enumerate() {
-            let decimal = self.plan.columns[i].decimal;
+            let col_plan = &self.plan.columns[i];
             let buf = &mut self.buffers[i];
             if let ColumnBuf::Oracle(o) = buf {
                 let cell = cell_iter.next().expect("one cell per oracle column");
                 o.push(std::mem::replace(cell, OracleCell::Default));
                 continue;
             }
-            match value_of(col) {
-                // Absent / NULL coerces: Nullable target takes NULL,
-                // non-Nullable the type default. Covers key-only delete
-                // tombstones under non-FULL replica identity and NULL
-                // source values mapped onto non-Nullable columns
-                None | Some(ColumnValue::Null) => buf.append_default(),
-                Some(v) => {
-                    encode_value(buf, v, decimal).map_err(|e| name_column(e, &col.target_name))?
-                }
+            match value_of(col).map(|v| col_plan.non_finite.substitute(v)) {
+                // Absent coerces like NULL, covers key-only delete
+                // tombstones under non-FULL replica identity
+                None => buf.append_default(),
+                Some(v) => encode_value(buf, v, col_plan.decimal, col_plan.datetime64_scale)
+                    .map_err(|e| name_column(e, &col.target_name))?,
             }
         }
         cells.clear();
@@ -1859,9 +2160,14 @@ impl TableEncoder {
         push_fixed(&mut self.buffers[off + 1], &decoded.xid.to_le_bytes())?;
         let unix_us = committed.commit_ts.saturating_add(DATETIME64_PG_EPOCH_US);
         push_fixed(&mut self.buffers[off + 2], &unix_us.to_le_bytes())?;
+        let mut next = off + 3;
         if self.plan.synth_is_deleted.is_some() {
             let is_deleted: u8 = (op_code == OP_DELETE).into();
-            push_fixed(&mut self.buffers[off + 3], &is_deleted.to_le_bytes())?;
+            push_fixed(&mut self.buffers[next], &is_deleted.to_le_bytes())?;
+            next += 1;
+        }
+        if self.plan.synth_leaf.is_some() {
+            push_fixed(&mut self.buffers[next], &leaf.unwrap_or(0).to_le_bytes())?;
         }
         self.rows += 1;
         self.approx_bytes = self.buffers.iter().map(ColumnBuf::approx_size).sum();
@@ -1926,28 +2232,25 @@ pub(crate) fn build_leaf(
     })
 }
 
-/// Borrow leaf from storage that outlives returned root
+/// Borrow leaf from storage that outlives returned root, `None` for oracle
+/// columns which carry no local wire shape
 pub(crate) fn build_root<'b>(
     buf: &'b ColumnBuf,
     leaf: Option<&'b ColumnBuilder<'b>>,
     n_rows: usize,
-) -> Result<ColumnBuilder<'b>, EmitterError> {
+) -> Result<Option<ColumnBuilder<'b>>, EmitterError> {
     let wrap = |null_map: &'b [u8]| -> Result<ColumnBuilder<'b>, EmitterError> {
         let leaf = leaf.ok_or_else(|| EmitterError::Type("nullable column without leaf".into()))?;
         Ok(leaf.nullable(null_map)?)
     };
-    Ok(match buf {
+    Ok(Some(match buf {
         ColumnBuf::Fixed { width, bytes } => ColumnBuilder::fixed(bytes, *width, n_rows)?,
         ColumnBuf::String { offsets, data, .. } => ColumnBuilder::string(offsets, data, n_rows)?,
         ColumnBuf::NullableFixed { null_map, .. } | ColumnBuf::NullableString { null_map, .. } => {
             wrap(null_map)?
         }
-        ColumnBuf::Oracle(_) => {
-            return Err(EmitterError::Type(
-                "oracle column has no local wire shape".into(),
-            ));
-        }
-    })
+        ColumnBuf::Oracle(_) => return Ok(None),
+    }))
 }
 
 fn push_fixed(buf: &mut ColumnBuf, le: &[u8]) -> Result<(), EmitterError> {
@@ -1958,15 +2261,16 @@ fn push_fixed(buf: &mut ColumnBuf, le: &[u8]) -> Result<(), EmitterError> {
 /// Peels one `Nullable` layer like [`ColumnBuf::new_for_ast`].
 fn decimal_wire_of(ast: &TypeAst) -> Option<DecimalWire> {
     let inner = types::strip_nullable(ast.view());
-    if !matches!(
-        inner.kind(),
-        Some(Kind::Decimal32 | Kind::Decimal64 | Kind::Decimal128 | Kind::Decimal256)
-    ) {
-        return None;
-    }
+    let width = match inner.kind()? {
+        Kind::Decimal32 => DecimalWidth::D32,
+        Kind::Decimal64 => DecimalWidth::D64,
+        Kind::Decimal128 => DecimalWidth::D128,
+        Kind::Decimal256 => DecimalWidth::D256,
+        _ => return None,
+    };
     Some(DecimalWire {
         scale: u8::try_from(inner.decimal_scale()).ok()?,
-        width: DecimalWidth::from_elem_size(inner.elem_size())?,
+        width,
     })
 }
 
@@ -1986,35 +2290,31 @@ fn wire_shape_of(ast: &TypeAst) -> Option<(WireShape, Kind)> {
     Some((shape, inner.kind()?))
 }
 
-/// Whether a `config_column.target_type` override may replace `default` in
-/// the encode plan, and the `DecimalWire` the plan should carry if so.
-/// `encode_value` performs no arithmetic conversion — it writes the source
-/// value's natural wire bytes — so an override is admissible only when
-/// those bytes are valid wire data for the override type:
-///
-/// - Decimal-encoded source (`numeric`): any Decimal (the text→scaled path
-///   converts), String (lossless text), or a signed Int32/64/128/256 as a
-///   scale-0 decimal (the plan's acceptance drill: `numeric(38,0)` →
-///   `Int128`). Unsigned ints rejected — a negative value would encode as
-///   wrapped garbage
-/// - String-shaped source: string-shaped override only
-/// - Fixed-width source: same-width non-Decimal override (reinterpretation,
-///   e.g. `Int32` → `UInt32`); Decimal rejected because a nonzero scale
-///   would silently rescale the value
+/// Keep temporal kinds compatible; Decimal conversion also permits String
+/// or signed integers. Other scalar overrides require matching wire shape.
 fn override_wire(default: &TypeAst, over: &TypeAst) -> Option<Option<DecimalWire>> {
+    let source_kind = types::strip_nullable(default.view()).kind();
+    let target_kind = types::strip_nullable(over.view()).kind();
+    let temporal = |k| matches!(k, Some(Kind::Date32 | Kind::DateTime64 | Kind::Time64));
+    if temporal(source_kind) || temporal(target_kind) {
+        return (source_kind == target_kind).then_some(None);
+    }
     if decimal_wire_of(default).is_some() {
         if let Some(w) = decimal_wire_of(over) {
             return Some(Some(w));
         }
         return match wire_shape_of(over)? {
             (WireShape::Str, _) => Some(None),
-            (WireShape::Fixed(w), Kind::Int32 | Kind::Int64 | Kind::Int128 | Kind::Int256) => {
-                Some(Some(DecimalWire {
-                    scale: 0,
-                    width: DecimalWidth::from_elem_size(w)?,
-                }))
+            (WireShape::Fixed(_), kind) => {
+                let width = match kind {
+                    Kind::Int32 => DecimalWidth::D32,
+                    Kind::Int64 => DecimalWidth::D64,
+                    Kind::Int128 => DecimalWidth::D128,
+                    Kind::Int256 => DecimalWidth::D256,
+                    _ => return None,
+                };
+                Some(Some(DecimalWire { scale: 0, width }))
             }
-            _ => None,
         };
     }
     match (wire_shape_of(default)?.0, wire_shape_of(over)?.0) {
@@ -2106,10 +2406,7 @@ impl PartialOrd for U256 {
 }
 
 fn decimal_oob() -> EmitterError {
-    EmitterError::UnsupportedValue {
-        target_column: String::new(),
-        kind: "numeric out of range for Decimal column",
-    }
+    unsupported("numeric out of range for Decimal column")
 }
 
 fn decimal_type_error(msg: &str) -> EmitterError {
@@ -2202,13 +2499,46 @@ fn decimal_text_to_scaled_le(
     Ok(out)
 }
 
+fn unsupported(kind: &'static str) -> EmitterError {
+    EmitterError::UnsupportedValue {
+        target_column: String::new(),
+        kind,
+    }
+}
+
+fn timestamp_ticks(pg_us: i64, scale: i32) -> Result<i64, EmitterError> {
+    micros_to_ticks(
+        i128::from(pg_us) + i128::from(DATETIME64_PG_EPOCH_US),
+        scale,
+    )
+}
+
+/// Convert microseconds to `DateTime64(scale)` or `Time64(scale)` ticks
+fn micros_to_ticks(us: i128, scale: i32) -> Result<i64, EmitterError> {
+    if !(0..=9).contains(&scale) {
+        return Err(EmitterError::Type("invalid temporal precision".into()));
+    }
+    let ticks = if scale < 6 {
+        let divisor = 10i128.pow((6 - scale) as u32);
+        us / divisor
+    } else {
+        us * 10i128.pow((scale - 6) as u32)
+    };
+    i64::try_from(ticks).map_err(|_| unsupported("finite temporal value overflows storage"))
+}
+
 fn encode_value(
     buf: &mut ColumnBuf,
     v: &ColumnValue,
     decimal: Option<DecimalWire>,
+    timestamp_scale: i32,
 ) -> Result<(), EmitterError> {
     match v {
-        ColumnValue::Null => buf.append_null(),
+        // Non-Nullable target takes type default
+        ColumnValue::Null => {
+            buf.append_default();
+            Ok(())
+        }
         ColumnValue::Bool(b) => buf.append_fixed_bytes(&[*b as u8]),
         ColumnValue::Char(c) => buf.append_fixed_bytes(&c.to_le_bytes()),
         ColumnValue::Int2(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
@@ -2217,15 +2547,25 @@ fn encode_value(
         ColumnValue::Float4(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
         ColumnValue::Float8(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
         ColumnValue::Oid(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        // saturating so PG ±infinity dates don't overflow
+        ColumnValue::Date(i32::MIN | i32::MAX)
+        | ColumnValue::Timestamp(i64::MIN | i64::MAX)
+        | ColumnValue::TimestampTz(i64::MIN | i64::MAX) => Err(unsupported(
+            "temporal infinity, set pos_inf/neg_inf to null on a Nullable destination",
+        )),
         ColumnValue::Date(n) => {
-            buf.append_fixed_bytes(&n.saturating_add(DATE32_PG_EPOCH_DAYS).to_le_bytes())
+            let days = n
+                .checked_add(DATE32_PG_EPOCH_DAYS)
+                .ok_or_else(|| unsupported("finite date overflows Date32 epoch conversion"))?;
+            buf.append_fixed_bytes(&days.to_le_bytes())
         }
-        // `time` → `Time64(6)`: microseconds since midnight, no epoch offset
-        ColumnValue::Time(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        // PG time counts microseconds since midnight, without an epoch offset
+        ColumnValue::Time(n) => {
+            let ticks = micros_to_ticks(i128::from(*n), timestamp_scale)?;
+            buf.append_fixed_bytes(&ticks.to_le_bytes())
+        }
         ColumnValue::Timestamp(n) | ColumnValue::TimestampTz(n) => {
-            let unix_us = n.saturating_add(DATETIME64_PG_EPOCH_US);
-            buf.append_fixed_bytes(&unix_us.to_le_bytes())
+            let ticks = timestamp_ticks(*n, timestamp_scale)?;
+            buf.append_fixed_bytes(&ticks.to_le_bytes())
         }
         // `timetz` → text: CH has no zone-aware time type, text keeps
         // the offset the old fixed encoding dropped
@@ -2240,20 +2580,17 @@ fn encode_value(
             use crate::decode::codecs::NumericKind;
             match decimal {
                 // Decimal column: non-finite (NaN/±Inf) is unrepresentable,
-                // error rather than silently corrupt (operator maps the
-                // column to String to recover)
+                // error rather than silently corrupt unless column sets a
+                // substitute or maps to String
                 Some(decimal) => match n {
                     NumericKind::Finite(s) => {
                         let scaled =
                             decimal_text_to_scaled_le(s, i32::from(decimal.scale), decimal.width)?;
                         buf.append_fixed_bytes(&scaled[..decimal.width.bytes()])
                     }
-                    NumericKind::NaN | NumericKind::PInf | NumericKind::NInf => {
-                        Err(EmitterError::UnsupportedValue {
-                            target_column: String::new(),
-                            kind: "non-finite numeric (NaN/Inf) into Decimal column",
-                        })
-                    }
+                    NumericKind::NaN | NumericKind::PInf | NumericKind::NInf => Err(unsupported(
+                        "non-finite numeric (NaN/Inf) into Decimal column, set nan/pos_inf/neg_inf or map to String",
+                    )),
                 },
                 // String column: lossless text, including NaN/±Inf
                 None => buf.append_string_bytes(n.as_text().as_bytes()),
@@ -2262,18 +2599,14 @@ fn encode_value(
         ColumnValue::Inet(v) => buf.append_string_bytes(v.to_text().as_bytes()),
         ColumnValue::Interval(v) => buf.append_string_bytes(v.to_text().as_bytes()),
         ColumnValue::Bytea(b) => buf.append_string_bytes(b),
-        ColumnValue::ExternalToast(_) => Err(EmitterError::UnsupportedValue {
-            target_column: String::new(),
-            kind: "unresolved TOAST pointer (xact buffer should have reassembled)",
-        }),
+        ColumnValue::ExternalToast(_) => Err(unsupported(
+            "unresolved TOAST pointer (xact buffer should have reassembled)",
+        )),
         ColumnValue::PgPendingText { text, .. } => buf.append_string_bytes(text.as_bytes()),
         // Never interpret raw Datum bytes as local String data
-        ColumnValue::PgPending { .. } | ColumnValue::Unsupported { .. } => {
-            Err(EmitterError::UnsupportedValue {
-                target_column: String::new(),
-                kind: "unresolved source value routed to a local column",
-            })
-        }
+        ColumnValue::PgPending { .. } | ColumnValue::Unsupported { .. } => Err(unsupported(
+            "unresolved source value routed to a local column",
+        )),
     }
 }
 
@@ -2410,10 +2743,9 @@ crate::atomic_stats! {
         pub plan_failures_partial_update,
         pub plan_failures_view,
         pub plan_failures_drain,
-        /// Plan-time route resolutions, one per relation per transaction
-        /// (memoised)
-        pub route_snapshots_mapped,
-        pub route_snapshots_unmapped,
+        pub unmapped_rows_by_table: crate::emit::pipeline::row_ledger::TableRowCounts,
+        pub rows_inserted_by_table: crate::emit::pipeline::row_ledger::TableRowCounts,
+        pub cells_inserted_by_type: crate::emit::pipeline::row_ledger::CellCounts,
         /// Commit-resolve raw decode: records by verdict kind, per op
         /// (`raw_decode_records_total{kind,op}`)
         pub raw_decode_toast_ops: crate::decode::heap_decoder::OpCounters,
@@ -2442,6 +2774,75 @@ crate::atomic_stats! {
         /// Oracle-routed columns the daemon built itself: rendered cells
         /// against a `String` target, which PG would hand straight back
         pub oracle_local_columns,
+    }
+}
+
+/// Comparable view of a buffer's wire content
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) enum Wire<'a> {
+    Fixed {
+        width: usize,
+        bytes: &'a [u8],
+    },
+    String {
+        offsets: &'a [u64],
+        data: &'a [u8],
+        absent: &'a [u8],
+    },
+    NullableFixed {
+        width: usize,
+        null_map: &'a [u8],
+        inner: &'a [u8],
+    },
+    NullableString {
+        offsets: &'a [u64],
+        data: &'a [u8],
+        null_map: &'a [u8],
+        absent: &'a [u8],
+    },
+    Oracle(&'a [OracleCell]),
+}
+
+#[cfg(test)]
+impl ColumnBuf {
+    pub(crate) fn wire(&self) -> Wire<'_> {
+        match self {
+            Self::Fixed { width, bytes } => Wire::Fixed {
+                width: *width,
+                bytes,
+            },
+            Self::String {
+                offsets,
+                data,
+                absent,
+            } => Wire::String {
+                offsets,
+                data,
+                absent,
+            },
+            Self::NullableFixed {
+                width,
+                null_map,
+                inner,
+            } => Wire::NullableFixed {
+                width: *width,
+                null_map,
+                inner,
+            },
+            Self::NullableString {
+                offsets,
+                data,
+                null_map,
+                absent,
+            } => Wire::NullableString {
+                offsets,
+                data,
+                null_map,
+                absent,
+            },
+            Self::Oracle(o) => Wire::Oracle(o.cells()),
+        }
     }
 }
 
@@ -2504,8 +2905,12 @@ pub async fn load_merged_with(
     over: Option<(&std::path::Path, &toml::Table)>,
 ) -> Result<toml::Table, EmitterError> {
     let mut root: toml::Table = match tokio::fs::read_to_string(ch_config).await {
-        Ok(s) => toml::from_str(&s).map_err(|e: toml::de::Error| {
-            EmitterError::Config(format!("parse {}: {e}", ch_config.display()))
+        Ok(s) => toml::from_str(&s).map_err(|e| {
+            EmitterError::Config(format!(
+                "parse {}: {}",
+                ch_config.display(),
+                crate::toml_de::message(e)
+            ))
         })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
         Err(e) => {
@@ -2539,8 +2944,12 @@ pub async fn load_merged_with(
         let s = tokio::fs::read_to_string(&p)
             .await
             .map_err(|e| EmitterError::Config(format!("read {}: {e}", p.display())))?;
-        let frag: toml::Table = toml::from_str(&s).map_err(|e: toml::de::Error| {
-            EmitterError::Config(format!("parse {}: {e}", p.display()))
+        let frag: toml::Table = toml::from_str(&s).map_err(|e| {
+            EmitterError::Config(format!(
+                "parse {}: {}",
+                p.display(),
+                crate::toml_de::message(e)
+            ))
         })?;
         merge_tables(&mut root, frag);
     }
@@ -2601,6 +3010,53 @@ mod tests {
     }
 
     #[test]
+    fn namespace_auto_create_name_parses() {
+        let parse = |toml: &str| {
+            EmitterConfig::from_toml_str(toml)
+                .expect("parses")
+                .namespaces
+                .get("public")
+                .expect("namespace parsed")
+                .auto_create_name
+                .clone()
+        };
+        let rendered = |toml: &str| {
+            parse(toml)
+                .unwrap_or_default()
+                .render("app", "public", "orders")
+        };
+        assert_eq!(
+            parse("[ch]\n[namespace.public]\nauto_create = true\n"),
+            None,
+            "an absent template derives from the namespace name",
+        );
+        for (template, want) in [
+            ("", "orders"),
+            ("wh_", "wh_orders"),
+            ("$schema$_", "public_orders"),
+            ("$table$_v2", "orders_v2"),
+            ("$database$_$schema$_$table$", "app_public_orders"),
+            ("$$lit$$_$table$", "$lit$_orders"),
+        ] {
+            let toml = format!(
+                "[ch]\n[namespace.public]\nauto_create = true\nauto_create_name = \"{template}\"\n"
+            );
+            assert_eq!(rendered(&toml), want, "template {template:?}");
+        }
+        for bad in ["$nope$_$table$", "$table$_$unclosed"] {
+            let toml = format!(
+                "[ch]\n[namespace.public]\nauto_create = true\nauto_create_name = \"{bad}\"\n"
+            );
+            let err = EmitterConfig::from_toml_str(&toml).expect_err("rejects");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("namespace.public.auto_create_name"),
+                "{bad:?} names the key: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn defaults_match_high_throughput_profile() {
         let c = EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n").expect("parses");
         assert_eq!(c.row_budget, 4_194_304);
@@ -2619,6 +3075,33 @@ mod tests {
     }
 
     #[test]
+    fn stream_auto_create_name_all_parses_and_rejects() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\nhost = \"h\"\n[stream]\nauto_create_name_all = \"$database$_$schema$_\"\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            c.auto_create_name_all
+                .expect("template parsed")
+                .render("app", "audit", "orders"),
+            "app_audit_orders",
+        );
+        assert!(
+            EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n")
+                .expect("parses")
+                .auto_create_name_all
+                .is_none(),
+            "absent leaves the built-in default",
+        );
+        let err = EmitterConfig::from_toml_str(
+            "[ch]\nhost = \"h\"\n[stream]\nauto_create_name_all = \"$nope$\"\n",
+        )
+        .expect_err("rejects")
+        .to_string();
+        assert!(err.contains("stream.auto_create_name_all"), "{err}");
+    }
+
+    #[test]
     fn replicate_all_disabled_via_stream_flag() {
         let c =
             EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n[stream]\nreplicate_all = false\n")
@@ -2628,10 +3111,8 @@ mod tests {
 
     #[test]
     fn decimal_type_error_wraps_message_in_type_variant() {
-        match decimal_type_error("scale out of range") {
-            EmitterError::Type(msg) => assert_eq!(msg, "scale out of range"),
-            other => panic!("expected Type, got {other:?}"),
-        }
+        let e = decimal_type_error("scale out of range");
+        assert_eq!(format!("{e:?}"), r#"Type("scale out of range")"#);
     }
 
     #[test]
@@ -2655,10 +3136,7 @@ mod tests {
     #[test]
     fn emitter_error_converts_into_decoder_observer_error() {
         let d: DecoderSinkError = EmitterError::Type("nope".into()).into();
-        match d {
-            DecoderSinkError::Observer(msg) => assert!(msg.contains("nope"), "{msg}"),
-            other => panic!("expected Observer, got {other:?}"),
-        }
+        assert_eq!(format!("{d:?}"), r#"Observer("type: nope")"#);
     }
 
     fn mk_mapping() -> TableMapping {
@@ -2678,6 +3156,7 @@ mod tests {
                     type_pinned: false,
                 },
             ],
+            tees: Vec::new(),
         }
     }
 
@@ -2713,6 +3192,7 @@ mod tests {
             rel_name: RelName::new("public", "foo"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![
                 RelAttr {
@@ -2858,13 +3338,15 @@ mod tests {
         let mut buf = OracleColumnBuf::string(0, -1);
         buf.push(OracleCell::Literal(b"a".to_vec()));
         buf.push(OracleCell::Default);
-        match literal_column(&buf, 2) {
-            Some(ColumnBuf::String { offsets, data, .. }) => {
-                assert_eq!(data, b"a");
-                assert_eq!(offsets, [1, 1]);
+        let lit = literal_column(&buf, 2).expect("renders");
+        assert_eq!(
+            lit.wire(),
+            Wire::String {
+                offsets: &[1, 1],
+                data: b"a",
+                absent: b"",
             }
-            other => panic!("got {other:?}"),
-        }
+        );
         for reject in ["Array(String)", "LowCardinality(String)", "JSON", "Int32"] {
             let mut buf = OracleColumnBuf::new(
                 0,
@@ -2947,34 +3429,38 @@ mod tests {
         );
         let (buffers, rows) = enc.take_block().unwrap();
         assert_eq!(rows, 2);
-        let ColumnBuf::Oracle(o) = &buffers[1] else {
-            panic!("oracle column")
-        };
-        assert!(literal_column(o, rows).is_some());
+        assert!(matches!(buffers[1].wire(), Wire::Oracle(cells) if cells.len() == 2));
+        let oracle = buffers.iter().find_map(|b| match b {
+            ColumnBuf::Oracle(o) => Some(o),
+            _ => None,
+        });
+        assert!(literal_column(oracle.expect("oracle column"), rows).is_some());
     }
 
     #[test]
     fn new_for_ast_picks_shape_from_chc_type_kind() {
         let alloc = Allocator::global(&mimalloc::MiMalloc);
         let cases = [
-            ("Int32", "Fixed"),
-            ("String", "String"),
-            ("Nullable(Int64)", "NullableFixed"),
-            ("Nullable(String)", "NullableString"),
-            ("FixedString(7)", "Fixed"),
-            ("Nullable(FixedString(7))", "NullableFixed"),
+            ("Int32", "Fixed { width: 4, bytes_len: 0 }"),
+            ("String", "String { rows: 0, data_len: 0 }"),
+            (
+                "Nullable(Int64)",
+                "NullableFixed { width: 8, rows: 0, inner_len: 0 }",
+            ),
+            (
+                "Nullable(String)",
+                "NullableString { rows: 0, offsets_len: 0, data_len: 0 }",
+            ),
+            ("FixedString(7)", "Fixed { width: 7, bytes_len: 0 }"),
+            (
+                "Nullable(FixedString(7))",
+                "NullableFixed { width: 7, rows: 0, inner_len: 0 }",
+            ),
         ];
-        for (name, tag) in cases {
+        for (name, shape) in cases {
             let ast = TypeAst::parse(name, alloc).expect("parses");
             let buf = ColumnBuf::new_for_ast(&ast).expect("shape");
-            let actual = match buf {
-                ColumnBuf::Fixed { .. } => "Fixed",
-                ColumnBuf::String { .. } => "String",
-                ColumnBuf::NullableFixed { .. } => "NullableFixed",
-                ColumnBuf::NullableString { .. } => "NullableString",
-                ColumnBuf::Oracle(_) => "Oracle",
-            };
-            assert_eq!(actual, tag, "{name}");
+            assert_eq!(format!("{buf:?}"), shape, "{name}");
         }
     }
 
@@ -3041,21 +3527,23 @@ mod tests {
             &mut buf,
             &ColumnValue::Numeric(NumericKind::Finite("1.50".into())),
             decimal,
+            6,
         )
         .unwrap();
-        match &buf {
-            ColumnBuf::Fixed { width, bytes } => {
-                assert_eq!(*width, 8);
-                assert_eq!(bytes.as_slice(), &150i64.to_le_bytes());
+        assert_eq!(
+            buf.wire(),
+            Wire::Fixed {
+                width: 8,
+                bytes: &150i64.to_le_bytes(),
             }
-            _ => panic!("expected fixed-shape buffer"),
-        }
+        );
         let mut buf_nan = ColumnBuf::new_for_ast(&ast).unwrap();
         assert!(
             encode_value(
                 &mut buf_nan,
                 &ColumnValue::Numeric(NumericKind::NaN),
                 decimal,
+                6,
             )
             .is_err()
         );
@@ -3070,30 +3558,35 @@ mod tests {
             })
         );
         let mut wide_buf = ColumnBuf::new_for_ast(&wide_ast).unwrap();
+        let wide_text = "123456789012345678901234567890123456789012345678.12";
         encode_value(
             &mut wide_buf,
-            &ColumnValue::Numeric(NumericKind::Finite(
-                "123456789012345678901234567890123456789012345678.12".into(),
-            )),
+            &ColumnValue::Numeric(NumericKind::Finite(wide_text.into())),
             wide_decimal,
+            6,
         )
         .unwrap();
-        match &wide_buf {
-            ColumnBuf::Fixed { width, bytes } => {
-                assert_eq!(*width, 32);
-                assert_eq!(bytes.len(), 32);
-                assert!(bytes[16..32].iter().any(|b| *b != 0));
+        let wide_le = decimal_text_to_scaled_le(wide_text, 2, DecimalWidth::D256).unwrap();
+        assert!(wide_le[16..32].iter().any(|b| *b != 0));
+        assert_eq!(
+            wide_buf.wire(),
+            Wire::Fixed {
+                width: 32,
+                bytes: &wide_le,
             }
-            _ => panic!("expected fixed-shape buffer"),
-        }
+        );
 
         let sast = TypeAst::parse("String", alloc).unwrap();
         let mut sbuf = ColumnBuf::new_for_ast(&sast).unwrap();
-        encode_value(&mut sbuf, &ColumnValue::Numeric(NumericKind::NaN), None).unwrap();
-        match &sbuf {
-            ColumnBuf::String { data, .. } => assert_eq!(data.as_slice(), b"NaN"),
-            _ => panic!("expected string-shape buffer"),
-        }
+        encode_value(&mut sbuf, &ColumnValue::Numeric(NumericKind::NaN), None, 6).unwrap();
+        assert_eq!(
+            sbuf.wire(),
+            Wire::String {
+                offsets: &[3],
+                data: b"NaN",
+                absent: b"",
+            }
+        );
     }
 
     #[test]
@@ -3102,14 +3595,24 @@ mod tests {
         let micros = 45_296_000_000i64; // 12:34:56
         let ast = TypeAst::parse("Time64(6)", alloc).unwrap();
         let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
-        encode_value(&mut buf, &ColumnValue::Time(micros), None).unwrap();
-        match &buf {
-            ColumnBuf::Fixed { width, bytes } => {
-                assert_eq!(*width, 8);
-                assert_eq!(bytes.as_slice(), &micros.to_le_bytes());
+        encode_value(&mut buf, &ColumnValue::Time(micros), None, 6).unwrap();
+        assert_eq!(
+            buf.wire(),
+            Wire::Fixed {
+                width: 8,
+                bytes: &micros.to_le_bytes(),
             }
-            _ => panic!("expected fixed-shape buffer"),
-        }
+        );
+        let ast = TypeAst::parse("Time64(3)", alloc).unwrap();
+        let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
+        encode_value(&mut buf, &ColumnValue::Time(micros + 7_999), None, 3).unwrap();
+        assert_eq!(
+            buf.wire(),
+            Wire::Fixed {
+                width: 8,
+                bytes: &(micros / 1_000 + 7).to_le_bytes(),
+            }
+        );
         let sast = TypeAst::parse("String", alloc).unwrap();
         let mut sbuf = ColumnBuf::new_for_ast(&sast).unwrap();
         encode_value(
@@ -3119,12 +3622,17 @@ mod tests {
                 tz_seconds: -7200,
             },
             None,
+            6,
         )
         .unwrap();
-        match &sbuf {
-            ColumnBuf::String { data, .. } => assert_eq!(data.as_slice(), b"12:34:56+02"),
-            _ => panic!("expected string-shape buffer"),
-        }
+        assert_eq!(
+            sbuf.wire(),
+            Wire::String {
+                offsets: &[11],
+                data: b"12:34:56+02",
+                absent: b"",
+            }
+        );
     }
 
     #[test]
@@ -3146,14 +3654,56 @@ mod tests {
             &SystemColumns::default(),
         )
         .expect("plan builds");
-        assert!(plan.insert_sql.contains("INSERT INTO `default`.`foo`"));
-        assert!(plan.insert_sql.contains("`id`"));
-        assert!(plan.insert_sql.contains("`name`"));
-        assert!(plan.insert_sql.contains("`_lsn`"));
-        assert!(plan.insert_sql.contains("`_xid`"));
-        assert!(plan.insert_sql.contains("`_commit_ts`"));
-        assert!(plan.insert_sql.contains("`_is_deleted`"));
-        assert!(plan.insert_sql.ends_with(") FORMAT Native"));
+        let [insert_sql] = plan.inserts.as_slice() else {
+            panic!("one target: {:?}", plan.inserts)
+        };
+        assert!(insert_sql.sql.contains("INSERT INTO `default`.`foo`"));
+        assert!(insert_sql.sql.contains("`id`"));
+        assert!(insert_sql.sql.contains("`name`"));
+        assert!(insert_sql.sql.contains("`_lsn`"));
+        assert!(insert_sql.sql.contains("`_xid`"));
+        assert!(insert_sql.sql.contains("`_commit_ts`"));
+        assert!(insert_sql.sql.contains("`_is_deleted`"));
+        assert!(insert_sql.sql.ends_with(") FORMAT Native"));
+    }
+
+    #[test]
+    fn table_plan_sends_same_columns_to_each_tee() {
+        use crate::mapping::Tee;
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let mut m = mk_mapping();
+        m.tees = vec![
+            Tee {
+                table: "foo_audit".into(),
+                ..Tee::default()
+            },
+            Tee {
+                database: Some("wh".into()),
+                table: "foo".into(),
+                ..Tee::default()
+            },
+        ];
+        let plan = TablePlan::build(
+            alloc,
+            &mk_rel(),
+            &m,
+            &ColumnRules::default(),
+            &SystemColumns::default(),
+        )
+        .unwrap();
+        let [primary, tees @ ..] = plan.inserts.as_slice() else {
+            panic!("primary first")
+        };
+        let cols = primary.sql.strip_prefix("INSERT INTO `default`.`foo` ");
+        assert_eq!(
+            tees.iter()
+                .map(|query| query.sql.clone())
+                .collect::<Vec<_>>(),
+            [
+                format!("INSERT INTO `default`.`foo_audit` {}", cols.unwrap()),
+                format!("INSERT INTO `wh`.`foo` {}", cols.unwrap()),
+            ]
+        );
     }
 
     #[test]
@@ -3202,10 +3752,328 @@ mod tests {
         assert_eq!(plan.columns[0].type_repr, "Int32");
     }
 
+    fn non_finite(ty: &str, nan: &str, pos_inf: &str, neg_inf: &str) -> Result<NonFinite, String> {
+        let ast = TypeAst::parse(ty, Allocator::global(&mimalloc::MiMalloc)).unwrap();
+        let rule = ColumnRule {
+            nan: Some(nan.parse()?),
+            pos_inf: Some(pos_inf.parse()?),
+            neg_inf: Some(neg_inf.parse()?),
+            ..ColumnRule::default()
+        };
+        NonFinite::compile(&rule, &ast)
+    }
+
+    fn finite(text: &str) -> Option<ColumnValue> {
+        Some(ColumnValue::Numeric(
+            crate::decode::codecs::NumericKind::Finite(text.into()),
+        ))
+    }
+
+    #[test]
+    fn temporal_infinity_policies_validate_destination() {
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        for ty in ["Date32", "DateTime64(3, 'UTC')"] {
+            let ast = TypeAst::parse(ty, alloc).unwrap();
+            for action in ["null", "min", "max", "0"] {
+                let rule = ColumnRule {
+                    pos_inf: Some(action.parse().unwrap()),
+                    ..ColumnRule::default()
+                };
+                assert!(NonFinite::compile(&rule, &ast).is_err());
+            }
+            let nullable = TypeAst::parse(&format!("Nullable({ty})"), alloc).unwrap();
+            let nf = NonFinite::compile(
+                &ColumnRule {
+                    pos_inf: Some(Substitute::Null),
+                    neg_inf: Some(Substitute::Reject),
+                    ..ColumnRule::default()
+                },
+                &nullable,
+            )
+            .unwrap();
+            assert_eq!(nf.pos_inf, Some(ColumnValue::Null));
+            assert_eq!(nf.neg_inf, None);
+            for value in [
+                ColumnValue::Date(i32::MIN + 1),
+                ColumnValue::Date(i32::MAX - 1),
+                ColumnValue::Timestamp(i64::MIN + 1),
+                ColumnValue::TimestampTz(i64::MAX - 1),
+            ] {
+                assert_eq!(nf.substitute(&value), &value);
+            }
+        }
+    }
+
+    #[test]
+    fn temporal_policy_rejects_oracle_encoding() {
+        let mut rel = mk_rel();
+        rel.attributes[0].type_oid = 99999;
+        let mut mapping = mk_mapping();
+        mapping.columns[0].target_type = "Nullable(DateTime64(6, 'UTC'))".into();
+        let mut builder = crate::column_rules::ColumnRulesBuilder::new();
+        builder.add(
+            &rel.rel_name,
+            MatchKind::Exact,
+            "id",
+            MatchKind::Exact,
+            ColumnRule {
+                pos_inf: Some(Substitute::Null),
+                ..ColumnRule::default()
+            },
+        );
+        let result = TablePlan::build(
+            Allocator::global(&mimalloc::MiMalloc),
+            &rel,
+            &mapping,
+            &builder.finish().0,
+            &SystemColumns::default(),
+        );
+        assert!(
+            matches!(result, Err(EmitterError::Config(e)) if e.contains("needs local encoding"))
+        );
+    }
+
+    #[test]
+    fn temporal_infinity_rows_reject_or_write_null() {
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        for (ty, oid, values) in [
+            (
+                "Date32",
+                crate::schema::DATEOID,
+                vec![ColumnValue::Date(i32::MIN), ColumnValue::Date(i32::MAX)],
+            ),
+            (
+                "DateTime64(3, 'UTC')",
+                crate::schema::TIMESTAMPOID,
+                vec![
+                    ColumnValue::Timestamp(i64::MIN),
+                    ColumnValue::Timestamp(i64::MAX),
+                ],
+            ),
+            (
+                "DateTime64(6, 'UTC')",
+                crate::schema::TIMESTAMPTZOID,
+                vec![
+                    ColumnValue::TimestampTz(i64::MIN),
+                    ColumnValue::TimestampTz(i64::MAX),
+                ],
+            ),
+        ] {
+            let mut rel = mk_rel();
+            rel.attributes[0].type_oid = oid;
+            rel.attributes[0].type_len = if oid == crate::schema::DATEOID { 4 } else { 8 };
+            let mut mapping = mk_mapping();
+            mapping.columns[0].target_type = format!("Nullable({ty})");
+            for value in values {
+                let mut row = committed(1, None);
+                row.decoded.new.as_mut().unwrap().columns[0] = Some(value);
+                for substitute in [false, true] {
+                    let mut builder = crate::column_rules::ColumnRulesBuilder::new();
+                    if substitute {
+                        builder.add(
+                            &rel.rel_name,
+                            MatchKind::Exact,
+                            "id",
+                            MatchKind::Exact,
+                            ColumnRule {
+                                pos_inf: Some(Substitute::Null),
+                                neg_inf: Some(Substitute::Null),
+                                ..ColumnRule::default()
+                            },
+                        );
+                    }
+                    let plan = TablePlan::build(
+                        alloc,
+                        &rel,
+                        &mapping,
+                        &builder.finish().0,
+                        &SystemColumns::default(),
+                    )
+                    .unwrap();
+                    let mut encoder = TableEncoder::new(plan).unwrap();
+                    let result = encoder.append_row(&row, &mapping, OP_INSERT);
+                    if substitute {
+                        result.unwrap();
+                        let width = rel.attributes[0].type_len as usize;
+                        assert_eq!(
+                            encoder.buffers[0].wire(),
+                            Wire::NullableFixed {
+                                width,
+                                null_map: &[1],
+                                inner: &vec![0; width],
+                            }
+                        );
+                    } else {
+                        let err = result.unwrap_err().to_string();
+                        assert!(
+                            err.contains("id") && err.contains("temporal infinity"),
+                            "{err}"
+                        );
+                        assert_eq!(encoder.buffers[0].approx_size(), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn timestamp_rows_use_destination_precision() {
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        for scale in [0, 3, 6, 9] {
+            let mut mapping = mk_mapping();
+            mapping.columns[0].target_type = format!("Nullable(DateTime64({scale}, 'UTC'))");
+            let mut rel = mk_rel();
+            rel.attributes[0].type_oid = crate::schema::TIMESTAMPOID;
+            rel.attributes[0].type_len = 8;
+            let plan = TablePlan::build(
+                alloc,
+                &rel,
+                &mapping,
+                &ColumnRules::default(),
+                &SystemColumns::default(),
+            )
+            .unwrap();
+            let mut encoder = TableEncoder::new(plan).unwrap();
+            for seconds in [-1i64, 0, 946_684_800] {
+                let mut row = committed(1, None);
+                row.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Timestamp(
+                    seconds * 1_000_000 - DATETIME64_PG_EPOCH_US,
+                ));
+                encoder.append_row(&row, &mapping, OP_INSERT).unwrap();
+            }
+            let expected: Vec<u8> = [-1i64, 0, 946_684_800]
+                .into_iter()
+                .flat_map(|s| (s * 10i64.pow(scale)).to_le_bytes())
+                .collect();
+            assert_eq!(
+                encoder.buffers[0].wire(),
+                Wire::NullableFixed {
+                    width: 8,
+                    null_map: &[0, 0, 0],
+                    inner: &expected,
+                }
+            );
+        }
+        for us in [-1999, -1001, -1000, -1, 0, 1, 1000, 1001, 1999] {
+            assert_eq!(
+                timestamp_ticks(us - DATETIME64_PG_EPOCH_US, 3).unwrap(),
+                us / 1000
+            );
+        }
+        let err = timestamp_ticks(i64::MAX - 1, 6).unwrap_err();
+        assert!(err.to_string().contains("overflows storage"));
+        assert!(timestamp_ticks(i64::MAX / 1_000_000 * 1_000_000, 0).is_ok());
+        assert!(timestamp_ticks(i64::MIN + 1, 9).is_err());
+    }
+
+    #[test]
+    fn non_finite_substitutes_resolve_against_destination() {
+        let nf = non_finite("Decimal(10, 2)", "0", "1.230", "reject").unwrap();
+        assert_eq!(nf.nan, finite("0"));
+        assert_eq!(nf.pos_inf, finite("1.230"));
+        assert_eq!(nf.neg_inf, None);
+
+        let nf = non_finite("Nullable(Decimal(10, 2))", "null", "reject", "reject").unwrap();
+        assert_eq!(nf.nan, Some(ColumnValue::Null));
+
+        for (ty, nan) in [
+            ("Decimal(10, 2)", "null"),
+            ("Decimal(10, 2)", "1.234"),
+            ("Decimal(10, 2)", "123456789.00"),
+            ("Decimal(10, 2)", "NaN"),
+        ] {
+            assert!(
+                non_finite(ty, nan, "reject", "reject").is_err(),
+                "{ty} nan = {nan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounds_apply_independently_of_non_finite_reason() {
+        let wide = format!("{}.9999", "9".repeat(34));
+        for (ty, bound) in [
+            ("Decimal(10, 2)", "99999999.99"),
+            ("Decimal(38, 4)", &wide),
+            ("Decimal(2, 2)", ".99"),
+            ("Nullable(Decimal(2, 0))", "99."),
+        ] {
+            for (action, literal) in [("min", format!("-{bound}")), ("max", bound.into())] {
+                let nf = non_finite(ty, action, action, action).unwrap();
+                let expected = finite(&literal);
+                assert_eq!(nf.nan, expected);
+                assert_eq!(nf.pos_inf, expected);
+                assert_eq!(nf.neg_inf, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn nan_row_lands_as_configured_substitute() {
+        use crate::decode::codecs::NumericKind;
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let rel = mk_rel();
+        let mut m = mk_mapping();
+        m.columns[0].target_type = "Decimal(10, 2)".into();
+        let mut row = committed(1, None);
+        row.decoded.new.as_mut().expect("insert tuple").columns[0] =
+            Some(ColumnValue::Numeric(NumericKind::NaN));
+
+        let plan = TablePlan::build(
+            alloc,
+            &rel,
+            &m,
+            &ColumnRules::default(),
+            &SystemColumns::default(),
+        )
+        .unwrap();
+        let err = TableEncoder::new(plan)
+            .unwrap()
+            .append_row(&row, &m, OP_INSERT)
+            .unwrap_err();
+        assert!(err.to_string().contains("id"), "{err}");
+
+        let mut b = crate::column_rules::ColumnRulesBuilder::new();
+        b.add(
+            &RelName::new("public", "*"),
+            MatchKind::Glob,
+            "*",
+            MatchKind::Glob,
+            ColumnRule {
+                nan: Some(Substitute::Literal("0".into())),
+                ..ColumnRule::default()
+            },
+        );
+        let rules = b.finish().0;
+        let plan = TablePlan::build(alloc, &rel, &m, &rules, &SystemColumns::default()).unwrap();
+        assert_eq!(
+            plan.columns[1].non_finite,
+            NonFinite::default(),
+            "String column keeps text"
+        );
+        let mut enc = TableEncoder::new(plan).unwrap();
+        enc.append_row(&row, &m, OP_INSERT).unwrap();
+        assert_eq!(
+            enc.buffers[0].wire(),
+            Wire::Fixed {
+                width: 8,
+                bytes: &0i64.to_le_bytes(),
+            }
+        );
+    }
+
     #[test]
     fn override_wire_admissibility() {
         let alloc = Allocator::global(&mimalloc::MiMalloc);
         let p = |s: &str| TypeAst::parse(s, alloc).unwrap();
+        assert!(override_wire(&p("Date32"), &p("Int32")).is_none());
+        assert!(override_wire(&p("Int64"), &p("DateTime64(6)")).is_none());
+        assert!(override_wire(&p("DateTime64(6)"), &p("Nullable(DateTime64(3))")).is_some());
+        assert!(override_wire(&p("Time64(6)"), &p("Time64(3)")).is_some());
+        assert!(override_wire(&p("Time64(6)"), &p("Int64")).is_none());
+        let vector = p("Array(Float32)");
+        assert!(override_wire(&vector, &p("QBit(Float32, 3)")).is_some());
+        assert!(override_wire(&vector, &p("Array(BFloat16)")).is_some());
         // Decimal-encoded source: Decimal / String / signed ints convert
         let dec = p("Decimal(38, 0)");
         assert!(override_wire(&dec, &p("Decimal(38, 2)")).is_some());
@@ -3245,7 +4113,7 @@ mod tests {
             &SystemColumns::default(),
         )
         .expect("plan builds");
-        assert!(plan.insert_sql.contains("`_is_deleted`"));
+        assert!(plan.inserts[0].sql.contains("`_is_deleted`"));
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed(1, Some("a")), &m, OP_INSERT)
             .unwrap();
@@ -3253,13 +4121,13 @@ mod tests {
             .unwrap();
         // _is_deleted is the trailing buffer: 0 for insert, 1 for delete
         let last = enc.buffers.len() - 1;
-        match &enc.buffers[last] {
-            ColumnBuf::Fixed { bytes, width } => {
-                assert_eq!(*width, 1);
-                assert_eq!(bytes, &[0u8, 1]);
+        assert_eq!(
+            enc.buffers[last].wire(),
+            Wire::Fixed {
+                width: 1,
+                bytes: &[0, 1],
             }
-            other => panic!("_is_deleted expected Fixed(1), got {other:?}"),
-        }
+        );
     }
 
     #[test]
@@ -3286,24 +4154,22 @@ mod tests {
                 Some(ColumnValue::Json(r#"{"a": 1}"#.into()));
             enc.append_row(&doc, &m, OP_INSERT).unwrap();
             enc.append_row(&committed(2, None), &m, OP_INSERT).unwrap();
-            match &enc.buffers[1] {
-                ColumnBuf::String {
+            let (offsets, data, absent) = (&[8, 10][..], &br#"{"a": 1}{}"#[..], &b"{}"[..]);
+            let expected = if target == "JSON" {
+                Wire::String {
                     offsets,
                     data,
                     absent,
                 }
-                | ColumnBuf::NullableString {
+            } else {
+                Wire::NullableString {
                     offsets,
                     data,
+                    null_map: &[0, 1],
                     absent,
-                    ..
-                } => {
-                    assert_eq!(*absent, b"{}", "{target}");
-                    assert_eq!(data.as_slice(), br#"{"a": 1}{}"#, "{target}");
-                    assert_eq!(offsets, &[8, 10], "{target}");
                 }
-                other => panic!("{target} took no local shape: {other:?}"),
-            }
+            };
+            assert_eq!(enc.buffers[1].wire(), expected, "{target}");
         }
     }
 
@@ -3395,13 +4261,14 @@ mod tests {
         enc.append_row(&committed_delete(3), &m, OP_DELETE).unwrap();
         // Insert: genuine NULL mapped onto the non-Nullable column
         enc.append_row(&committed(4, None), &m, OP_INSERT).unwrap();
-        match &enc.buffers[1] {
-            ColumnBuf::String { offsets, data, .. } => {
-                assert_eq!(offsets, &[0u64, 0]);
-                assert!(data.is_empty());
+        assert_eq!(
+            enc.buffers[1].wire(),
+            Wire::String {
+                offsets: &[0, 0],
+                data: b"",
+                absent: b"",
             }
-            other => panic!("name expected String, got {other:?}"),
-        }
+        );
     }
 
     #[test]
@@ -3419,10 +4286,15 @@ mod tests {
         .expect("plan builds");
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed_delete(3), &m, OP_DELETE).unwrap();
-        match &enc.buffers[1] {
-            ColumnBuf::NullableString { null_map, .. } => assert_eq!(null_map, &[1u8]),
-            other => panic!("name expected NullableString, got {other:?}"),
-        }
+        assert_eq!(
+            enc.buffers[1].wire(),
+            Wire::NullableString {
+                offsets: &[0],
+                data: b"",
+                null_map: &[1],
+                absent: b"",
+            }
+        );
     }
 
     #[test]
@@ -3445,44 +4317,39 @@ mod tests {
         enc.append_row(&committed(9, Some("nine")), &m, OP_INSERT)
             .unwrap();
         assert_eq!(enc.rows, 3);
-        match &enc.buffers[0] {
-            ColumnBuf::Fixed { bytes, width } => {
-                assert_eq!(*width, 4);
-                assert_eq!(bytes.len(), 12);
-                assert_eq!(&bytes[0..4], &7i32.to_le_bytes());
-                assert_eq!(&bytes[4..8], &8i32.to_le_bytes());
-                assert_eq!(&bytes[8..12], &9i32.to_le_bytes());
+        let ids: Vec<u8> = [7i32, 8, 9].iter().flat_map(|n| n.to_le_bytes()).collect();
+        assert_eq!(
+            enc.buffers[0].wire(),
+            Wire::Fixed {
+                width: 4,
+                bytes: &ids,
             }
-            other => panic!("col 0 expected Fixed, got {other:?} variant tag"),
-        }
-        match &enc.buffers[1] {
-            ColumnBuf::NullableString {
-                offsets,
-                data,
-                null_map,
-                ..
-            } => {
-                assert_eq!(null_map, &[0u8, 1, 0]);
-                assert_eq!(offsets, &[5u64, 5, 9]);
-                assert_eq!(&data[..], b"sevennine");
+        );
+        assert_eq!(
+            enc.buffers[1].wire(),
+            Wire::NullableString {
+                offsets: &[5, 5, 9],
+                data: b"sevennine",
+                null_map: &[0, 1, 0],
+                absent: b"",
             }
-            other => panic!("col 1 expected NullableString, got {other:?} variant tag"),
-        }
+        );
         let off = m.columns.len();
-        match &enc.buffers[off] {
-            ColumnBuf::Fixed { bytes, .. } => {
-                assert_eq!(bytes.len(), 24);
-                assert_eq!(&bytes[0..8], &0xCAFEu64.to_le_bytes());
+        let lsns = 0xCAFEu64.to_le_bytes().repeat(3);
+        assert_eq!(
+            enc.buffers[off].wire(),
+            Wire::Fixed {
+                width: 8,
+                bytes: &lsns,
             }
-            other => panic!("_lsn expected Fixed, got {other:?} variant tag"),
-        }
-        match &enc.buffers[off + 3] {
-            ColumnBuf::Fixed { bytes, width } => {
-                assert_eq!(*width, 1);
-                assert_eq!(bytes, &[0u8, 0, 0]);
+        );
+        assert_eq!(
+            enc.buffers[off + 3].wire(),
+            Wire::Fixed {
+                width: 1,
+                bytes: &[0, 0, 0],
             }
-            _ => panic!("_is_deleted expected Fixed"),
-        }
+        );
     }
 
     #[test]
@@ -3495,6 +4362,7 @@ mod tests {
             user = "ingest"
             password = "secret"
             secure = true
+            tls_server_name = "svc.clickhouse.cloud"
             compression = "lz4"
             row_budget = 1024
             byte_budget = 4096
@@ -3518,6 +4386,7 @@ mod tests {
 
             [stream]
             paused = true
+            skip_attribution = true
             replicate_all = false
             pending_max_boundaries_per_xact = 22
             pending_max_hold_ms = 23
@@ -3530,18 +4399,27 @@ mod tests {
             ]
         "#;
         let c = EmitterConfig::from_toml_str(src).expect("parses");
-        assert_eq!(c.host, "ch.example.com");
-        assert_eq!(c.port, 9000);
-        assert_eq!(c.database, "default");
-        assert_eq!(c.user, "ingest");
-        assert_eq!(c.password, "secret");
-        assert!(c.secure);
-        assert_eq!(c.compression, CompressionChoice::Lz4);
-        // Omitting `secure` defaults to plaintext
-        assert!(
-            !EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n")
-                .unwrap()
-                .secure
+        assert_eq!(c.conn.host, "ch.example.com");
+        assert_eq!(c.conn.port, 9000);
+        assert_eq!(c.conn.database, "default");
+        assert_eq!(c.conn.user, "ingest");
+        assert_eq!(c.conn.password, "secret");
+        assert!(c.conn.secure);
+        assert_eq!(c.conn.tls_server_name, "svc.clickhouse.cloud");
+        assert_eq!(c.conn.compression, CompressionChoice::Lz4);
+        // Omitting `secure` defaults to plaintext, and SNI falls back to `host`
+        let plain = EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n").unwrap();
+        assert!(!plain.conn.secure);
+        assert_eq!(plain.conn.tls_server_name, "");
+        // Named instances take the same key
+        let named = EmitterConfig::from_toml_str(
+            "[ch]\nhost = \"h\"\n[ch.instances.cloud]\nhost = \"10.0.0.5\"\nsecure = true\n\
+             tls_server_name = \"svc.clickhouse.cloud\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            named.instances["cloud"].tls_server_name,
+            "svc.clickhouse.cloud"
         );
         assert_eq!(c.row_budget, 1024);
         assert_eq!(c.byte_budget, 4096);
@@ -3555,6 +4433,8 @@ mod tests {
         assert_eq!(c.retry.max_backoff, Duration::from_millis(19));
         assert_eq!(c.runtime_config_schema.as_deref(), Some("ws"));
         assert!(c.paused);
+        assert!(c.skip_attribution);
+        assert!(!plain.skip_attribution);
         assert!(!c.replicate_all);
         assert_eq!(c.pending_capture.max_boundaries_per_xact, 22);
         assert_eq!(
@@ -3563,8 +4443,8 @@ mod tests {
         );
         let rel = RelName::new("public", "foo");
         let t = c.tables.get(&rel).expect("mapping present");
-        // target_database/target_table omitted: [ch] database + source relname
-        assert_eq!(t.target, TableTarget::new("default", "foo"));
+        // target_database/target_table omitted: [ch] database + derived name
+        assert_eq!(t.target, TableTarget::new("default", "public_foo"));
         assert_eq!(t.columns.len(), 2);
         assert_eq!(t.columns[0].src_attnum, 1);
         assert_eq!(t.columns[1].target_type, "Nullable(String)");
@@ -3799,11 +4679,13 @@ mod tests {
             "[ch]\n\
              [table.public.events]\n\
              order_by = [\"tenant\", \"id\"]\n\
-             primary_key = [\"tenant\"]\n",
+             primary_key = [\"tenant\"]\n\
+             engine = \"Null\"\n",
         )
         .unwrap();
         let rel = RelName::new("public", "events");
         let (_, _, rule) = &c.table_entries[0];
+        assert_eq!(rule.engine.as_deref(), Some("Null"));
         assert_eq!(
             rule.order_by.as_deref(),
             Some(["tenant".to_string(), "id".to_string()].as_slice())
@@ -3828,6 +4710,87 @@ mod tests {
     }
 
     #[test]
+    fn named_instances_resolve_and_validate() {
+        let cfg = EmitterConfig::from_toml_str(
+            r#"
+            [ch]
+            database = "main"
+            [ch.instances.archive]
+            host = "archive.internal"
+            database = "history"
+            [table.public.events]
+            target_instance = "archive"
+            tee = [
+                { table = "local_copy" },
+                { instance = "default", table = "default_copy" },
+                { instance = "archive", database = "audit", table = "log" },
+            ]
+            columns = [{ attnum = 1, target = "id", type = "Int32" }]
+        "#,
+        )
+        .unwrap();
+        let m = &cfg.tables[&RelName::new("public", "events")];
+        let targets: Vec<_> = m.targets().collect();
+        assert_eq!(
+            targets
+                .iter()
+                .map(|t| t.instance.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("archive"), Some("archive"), None, Some("archive")]
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .map(|t| t.database.as_str())
+                .collect::<Vec<_>>(),
+            ["history", "history", "main", "audit"]
+        );
+        for config in [
+            "[table.public.t]\ntarget_instance = 'missing'",
+            "[table.public.t]\ntee = [{ instance = 'missing', table = 't' }]",
+            "[ch.instances.default]\nhost = 'localhost'",
+            "[ch.instances.a]\nport = 0",
+            "[ch.instances.a]\nhots = 'typo'",
+        ] {
+            assert!(EmitterConfig::from_toml_str(config).is_err(), "{config}");
+        }
+    }
+
+    #[test]
+    fn tee_parses_on_exact_entries_only() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.public.events]\n\
+             columns = [{ attnum = 1, target = \"id\", type = \"Int32\" }]\n\
+             [[table.public.events.tee]]\n\
+             table = \"events_audit\"\n\
+             engine = \"MergeTree\"\n\
+             order_by = [\"id\", \"_lsn\"]\n",
+        )
+        .unwrap();
+        let m = &c.tables[&RelName::new("public", "events")];
+        assert_eq!(m.tees.len(), 1);
+        assert_eq!(m.tees[0].engine.as_deref(), Some("MergeTree"));
+        assert_eq!(
+            m.tee_targets().collect::<Vec<_>>(),
+            [TableTarget::new("default", "events_audit")]
+        );
+        let err = EmitterConfig::from_toml_str(
+            "[ch]\n[table.public.\"ev_*\"]\nmatch = \"glob\"\ntee = [{ table = \"audit\" }]\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("merge every matched table"),
+            "{err}"
+        );
+        assert!(
+            EmitterConfig::from_toml_str("[ch]\n[table.public.t]\ntee = [{ engine = \"Log\" }]\n")
+                .is_err(),
+            "tee needs a table"
+        );
+    }
+
+    #[test]
     fn plan_renames_synthetic_columns_and_can_drop_the_marker() {
         let alloc = Allocator::global(&mimalloc::MiMalloc);
         let rel = mk_rel();
@@ -3837,19 +4800,80 @@ mod tests {
             xid: "_x".into(),
             commit_ts: "_at".into(),
             is_deleted: None,
+            leaf: None,
         };
         let plan =
             TablePlan::build(alloc, &rel, &m, &ColumnRules::default(), &sys).expect("plan builds");
         assert!(
-            plan.insert_sql
+            plan.inserts[0]
+                .sql
                 .ends_with("`_v`, `_x`, `_at`) FORMAT Native"),
-            "{}",
-            plan.insert_sql
+            "{:?}",
+            plan.inserts
         );
         assert!(plan.synth_is_deleted.is_none());
         let enc = TableEncoder::new(plan).expect("encoder");
         // Mapped columns plus three synthetic, no marker buffer
         assert_eq!(enc.buffers.len(), m.columns.len() + 3);
+    }
+
+    /// A partition's rows encode under its root's column rules and stamp
+    /// the partition column after the system columns
+    #[test]
+    fn partition_route_plans_and_stamps_the_partition_column() {
+        use crate::emit::route::{PartitionOf, RouteSnapshot, RowPolicy};
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let leaf = RelDescriptor {
+            rel_name: RelName::new("public", "foo_1"),
+            ..mk_rel()
+        };
+        let root = RelName::new("public", "foo");
+        let mut rules = crate::column_rules::ColumnRulesBuilder::new();
+        rules.add(
+            &root,
+            MatchKind::Exact,
+            "name",
+            MatchKind::Exact,
+            ColumnRule {
+                target_type: Some("LowCardinality(Nullable(String))".into()),
+                ..ColumnRule::default()
+            },
+        );
+        let route = RouteSnapshot::freeze(
+            Arc::new(mk_mapping()),
+            Arc::new(rules.finish().0),
+            RowPolicy::default(),
+        )
+        .with_partition(PartitionOf {
+            root,
+            leaf: 16999,
+            shared: true,
+        });
+        let plan = TablePlan::for_route(alloc, &leaf, &route).expect("plan builds");
+        assert!(
+            plan.inserts[0]
+                .sql
+                .ends_with("`_is_deleted`, `_leaf_oid`) FORMAT Native"),
+            "{:?}",
+            plan.inserts
+        );
+        assert_eq!(
+            plan.columns[1].type_repr, "LowCardinality(Nullable(String))",
+            "root's column rule applies"
+        );
+        let mut enc = TableEncoder::new(plan).expect("encoder");
+        enc.append_routed(
+            &committed(1, Some("a")),
+            &route.mapping,
+            OP_INSERT,
+            Some(16999),
+        )
+        .unwrap();
+        assert!(
+            matches!(enc.buffers.last(), Some(ColumnBuf::Fixed { width: 4, bytes })
+                if bytes[..] == 16999u32.to_le_bytes()),
+            "partition column is UInt32"
+        );
     }
 
     #[test]
@@ -3896,10 +4920,10 @@ mod tests {
         .unwrap();
         let dotted_ns = c.tables.get(&RelName::new("a.b", "c")).expect("a.b / c");
         let dotted_rel = c.tables.get(&RelName::new("a", "b.c")).expect("a / b.c");
-        assert_eq!(dotted_ns.target, TableTarget::new("default", "c"));
-        assert_eq!(dotted_rel.target, TableTarget::new("default", "b.c"));
+        assert_eq!(dotted_ns.target, TableTarget::new("default", "a.b_c"));
+        assert_eq!(dotted_rel.target, TableTarget::new("default", "a_b.c"));
         // Interpolation quotes the dot inside the identifier
-        assert_eq!(dotted_rel.target.sql(), "`default`.`b.c`");
+        assert_eq!(dotted_rel.target.sql(), "`default`.`a_b.c`");
     }
 
     /// Database prefixes preserve table identity within source database
@@ -4034,27 +5058,24 @@ mod tests {
         assert_eq!(c.databases, vec!["app".to_string(), "billing".to_string()]);
     }
 
-    /// Reject mappings that mix source databases in one ClickHouse table
+    /// Two source databases may share one ClickHouse table: rows merge there
     #[test]
-    fn cross_database_destination_collision_is_rejected() {
-        let msg = EmitterConfig::from_toml_str(
-            "[ch]\n\
+    fn cross_database_destination_collision_is_allowed() {
+        let shared = "[ch]\n\
              database = \"cdc\"\n\
              [source]\n\
              dbname = \"app\"\n\
              [table.public.orders]\n\
              replicate = true\n\
              [database.billing.table.public.orders]\n\
-             replicate = true\n",
-        )
-        .expect_err("collides")
-        .to_string();
-        assert!(
-            msg.contains("`database.billing.table.public.orders`"),
-            "{msg}"
+             replicate = true\n";
+        let c = EmitterConfig::from_toml_str(shared).expect("merging destinations is allowed");
+        assert_eq!(c.databases, vec!["app".to_string(), "billing".to_string()]);
+        assert_eq!(
+            c.table_entries.iter().map(|(r, ..)| r).collect::<Vec<_>>(),
+            vec![&RelName::new("public", "orders")],
+            "this process still scopes to its own database",
         );
-        assert!(msg.contains("`table.public.orders`"), "{msg}");
-        assert!(msg.contains("cdc.orders"), "{msg}");
         for distinct in [
             "target_database = \"billing_cdc\"",
             "target_table = \"billing_orders\"",
@@ -4214,8 +5235,8 @@ mod tests {
         assert_eq!(ch["port"].as_integer(), Some(9000));
         assert_eq!(ch["database"].as_str(), Some("demo"));
         let cfg = EmitterConfig::from_table(&merged).unwrap();
-        assert_eq!(cfg.host, "fifty");
-        assert_eq!(cfg.database, "demo");
+        assert_eq!(cfg.conn.host, "fifty");
+        assert_eq!(cfg.conn.database, "demo");
     }
 
     #[tokio::test]
@@ -4234,8 +5255,8 @@ mod tests {
 
     #[test]
     fn config_backup_s3_static_creds() {
-        use walrus::config::StorageSettings;
-        use walrus::storage::s3::CredentialSource;
+        use walrus::config::StorageSettings::S3;
+        use walrus::storage::s3::CredentialSource::Static;
         let c = EmitterConfig::from_toml_str(
             "[backup]\n\
              archive = \"s3://my-bucket/walshadow/prefix\"\n\
@@ -4246,33 +5267,25 @@ mod tests {
              secret_key = \"SK\"\n",
         )
         .unwrap();
-        let s3 = match c.backup.expect("backup set").storage {
-            StorageSettings::S3(s3) => s3,
-            other => panic!("expected S3, got {other:?}"),
-        };
+        let storage = c.backup.expect("backup set").storage;
+        let S3(s3) = storage else { panic!() };
         assert_eq!(s3.bucket, "my-bucket");
         assert_eq!(s3.prefix, "walshadow/prefix");
         assert_eq!(s3.region, "eu-west-1");
         assert_eq!(s3.endpoint.as_deref(), Some("https://minio.internal"));
         assert!(s3.force_path_style);
-        match s3.creds {
-            CredentialSource::Static(cr) => {
-                assert_eq!(cr.access_key, "AK");
-                assert_eq!(cr.secret_key, "SK");
-            }
-            other => panic!("expected static creds, got {other:?}"),
-        }
+        let Static(cr) = s3.creds else { panic!() };
+        assert_eq!(cr.access_key, "AK");
+        assert_eq!(cr.secret_key, "SK");
     }
 
     #[test]
     fn config_backup_s3_defaults_region_and_imds() {
-        use walrus::config::StorageSettings;
+        use walrus::config::StorageSettings::S3;
         use walrus::storage::s3::CredentialSource;
         let c = EmitterConfig::from_toml_str("[backup]\narchive = \"s3://b\"\n").unwrap();
-        let s3 = match c.backup.unwrap().storage {
-            StorageSettings::S3(s3) => s3,
-            other => panic!("expected S3, got {other:?}"),
-        };
+        let storage = c.backup.unwrap().storage;
+        let S3(s3) = storage else { panic!() };
         assert_eq!(s3.bucket, "b");
         assert_eq!(s3.prefix, "");
         assert_eq!(s3.region, "us-east-1");
@@ -4281,21 +5294,17 @@ mod tests {
 
     #[test]
     fn config_backup_gcs_and_file() {
-        use walrus::config::StorageSettings;
+        use walrus::config::StorageSettings::{self, Gcs};
         let gcs = EmitterConfig::from_toml_str(
             "[backup]\narchive = \"gs://gb/pre\"\ncredentials_path = \"/sa.json\"\n",
         )
         .unwrap()
         .backup
         .unwrap();
-        match gcs.storage {
-            StorageSettings::Gcs(g) => {
-                assert_eq!(g.bucket, "gb");
-                assert_eq!(g.prefix, "pre");
-                assert_eq!(g.credentials_path.as_deref(), Some("/sa.json"));
-            }
-            other => panic!("expected GCS, got {other:?}"),
-        }
+        let Gcs(g) = gcs.storage else { panic!() };
+        assert_eq!(g.bucket, "gb");
+        assert_eq!(g.prefix, "pre");
+        assert_eq!(g.credentials_path.as_deref(), Some("/sa.json"));
         let fs = EmitterConfig::from_toml_str("[backup]\narchive = \"file:///var/wal\"\n")
             .unwrap()
             .backup
@@ -4412,5 +5421,34 @@ mod tests {
             ),
             (DropTableStrategy::Drop, Some(DropTableStrategy::Warn))
         );
+    }
+
+    #[test]
+    fn config_parses_partition_settings() {
+        EmitterConfig::from_toml_str("[table.public.m]\nleaf = 7\n").expect_err("leaf = 7");
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\ndetach_strategy = \"drop\"\n\
+             [namespace.sales]\ndetach_strategy = \"warn\"\n\
+             [system_columns]\nleaf = \"_part\"\n\
+             [table.public.m]\npartition_by = \"toYYYYMM(ts)\"\nleaf = false\n\
+             [table.public.\"m_*\"]\nmatch = \"glob\"\nroute = \"self\"\n",
+        )
+        .expect("parses");
+        assert_eq!(c.detach_strategy, DropTableStrategy::Drop);
+        assert_eq!(
+            c.namespaces["sales"].detach_strategy,
+            Some(DropTableStrategy::Warn)
+        );
+        assert_eq!(c.system_columns.leaf.as_deref(), Some("_part"));
+        let rule = |name: &str| {
+            c.table_entries
+                .iter()
+                .find(|(rel, ..)| &*rel.name == name)
+                .map(|(_, _, rule)| rule.clone())
+                .unwrap()
+        };
+        assert_eq!(rule("m").partition_by.as_deref(), Some("toYYYYMM(ts)"));
+        assert_eq!(rule("m").system.leaf.as_deref(), Some(""));
+        assert_eq!(rule("m_*").route, Some(PartitionRoute::Self_));
     }
 }

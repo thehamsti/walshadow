@@ -10,6 +10,7 @@ use walshadow::boundary_hold::BoundaryHoldStats;
 use walshadow::ch_emitter::EmitterStats;
 use walshadow::config::ConfigResolver;
 use walshadow::metrics::{DbSeries, MetricsRegistry, MetricsSnapshot};
+use walshadow::pipeline::row_ledger::TableRowCounts;
 use walshadow::pos::{
     Drain, EmitterAck, FilterDispatched, Floor, Pos, ShadowReplay, SourceReceived,
 };
@@ -284,7 +285,7 @@ pub(crate) async fn populate_metrics(
         pause_consumed_lsn: timeline_view.pause_frontier.map_or(0, |(c, _)| c),
         pause_received_lsn: timeline_view.pause_frontier.map_or(0, |(_, r)| r),
         pause_refrozen: timeline_view.pause_refrozen,
-        promotion_ready: timeline_view.promotion.ready,
+        promotion_ready: timeline_view.promotion.ready(),
         promotion_blocked_on: timeline_view.promotion.blocked_on,
         promotion_target_in_recovery: timeline_view.promotion.in_recovery,
         promotion_target_replay_lsn: timeline_view.promotion.replay_lsn,
@@ -377,10 +378,27 @@ pub(crate) async fn populate_pipeline_metrics(
         xacts_committed_total: xact_stats.committed_xacts_total,
         xacts_aborted_total: xact_stats.aborted_xacts_total,
         decoder_decoded_total: decoder_stats.decoded.load(Ordering::Relaxed),
+        decoder_records_by_op: [
+            &decoder_stats.inserts,
+            &decoder_stats.updates,
+            &decoder_stats.hot_updates,
+            &decoder_stats.deletes,
+            &decoder_stats.truncates,
+        ]
+        .map(|n| n.load(Ordering::Relaxed)),
+        decoder_buffer_lock_waits_total: decoder_stats.buffer_lock_waits.load(Ordering::Relaxed),
+        decoder_buffer_lock_wait_seconds_total: decoder_stats
+            .buffer_lock_wait_nanos
+            .load(Ordering::Relaxed) as f64
+            / 1e9,
         decoder_partial_total: decoder_stats.partial.load(Ordering::Relaxed),
         decoder_toast_chunks_total: decoder_stats.toast_chunks_buffered.load(Ordering::Relaxed),
         decoder_toast_malformed_total: decoder_stats.toast_chunks_malformed.load(Ordering::Relaxed),
         decoder_toast_deletes_total: decoder_stats.toast_chunk_deletes.load(Ordering::Relaxed),
+        decoder_catalog_not_found_total: decoder_stats.catalog_not_found.load(Ordering::Relaxed),
+        decoder_skipped_op_total: decoder_stats.skipped_op.load(Ordering::Relaxed),
+        decoder_skipped_no_block_total: decoder_stats.skipped_no_block.load(Ordering::Relaxed),
+        skipped_records_by_rel: skipped_by_rel(decoder_stats, counters.db_name),
         toast_stash_buffered_total: decoder_stats.toast_stash_buffered.load(Ordering::Relaxed),
         raw_stash_deferred_total: decoder_stats.raw_stash_deferred.load(Ordering::Relaxed),
         raw_stash_records_by_kind_op: [
@@ -417,6 +435,8 @@ pub(crate) async fn populate_pipeline_metrics(
 /// counters sum into one series
 pub(crate) struct StageCounters<'a> {
     pub(crate) emitter: Option<&'a walshadow::ch_emitter::EmitterStats>,
+    /// `database=` label for a source database oid
+    pub(crate) db_name: &'a (dyn Fn(u32) -> String + Sync),
     /// Live first, bootstrap's second. Only one of the pair is ever serving
     pub(crate) oracle: [Option<&'a walshadow::oracle::OracleStats>; 2],
     pub(crate) bootstrap: Option<&'a BootstrapProgress>,
@@ -433,12 +453,50 @@ pub(crate) fn emitter_counts<const N: usize>(
     picks.map(|pick| stats.map_or(0, |s| pick(s).load(Ordering::Relaxed)))
 }
 
+/// Stop conditions beyond the crossing and shadow views
 pub(crate) fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
     stage_gauges_on(v, MetricsSnapshot::default())
 }
 
+const UNMAPPED_STATUS_ROWS: usize = 20;
+
+fn skipped_by_rel(
+    stats: &walshadow::decoder_sink::DecoderStats,
+    db_name: &(dyn Fn(u32) -> String + Sync),
+) -> Vec<walshadow::metrics::SkippedRel> {
+    let mut per_reason = ahash::HashMap::<_, usize>::default();
+    stats
+        .skipped_by_rel
+        .snapshot()
+        .into_iter()
+        .filter(|(key, _)| {
+            let seen = per_reason.entry(key.reason).or_default();
+            *seen += 1;
+            *seen <= UNMAPPED_STATUS_ROWS
+        })
+        .map(|(key, records)| walshadow::metrics::SkippedRel {
+            database: db_name(key.db_oid),
+            rel_node: key.rel_node.to_string(),
+            op: key.op,
+            reason: key.reason.label(),
+            records,
+        })
+        .collect()
+}
+
 pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> MetricsSnapshot {
     let (proc_cpu, proc_rss, proc_threads) = read_process_stats();
+    let by_table = |pick: fn(&EmitterStats) -> &TableRowCounts| {
+        v.emitter.map_or_else(Vec::new, |s| {
+            pick(s)
+                .snapshot()
+                .into_iter()
+                .map(|(key, rows)| ((v.db_name)(key.db_oid), key.rel.to_string(), rows))
+                .collect::<Vec<_>>()
+        })
+    };
+    let mut unmapped_rows_by_table = by_table(|s| &s.unmapped_rows_by_table);
+    unmapped_rows_by_table.truncate(UNMAPPED_STATUS_ROWS);
     let emitter = |pick: fn(&EmitterStats) -> &AtomicU64| -> u64 {
         v.emitter.map_or(0, |s| pick(s).load(Ordering::Relaxed))
     };
@@ -506,13 +564,6 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
                 |s| &s.plan_failures_drain,
             ],
         ),
-        route_snapshots_by_result: emitter_counts(
-            v.emitter,
-            [
-                |s| &s.route_snapshots_mapped,
-                |s| &s.route_snapshots_unmapped,
-            ],
-        ),
         raw_decode_records_by_kind_op: [
             emitter_ops(|s| &s.raw_decode_toast_ops),
             emitter_ops(|s| &s.raw_decode_ordinary_ops),
@@ -539,6 +590,17 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
         emitter_xacts_total: emitter(|s| &s.xacts_committed),
         emitter_unsupported_relations: emitter(|s| &s.unsupported_relations),
         emitter_deletes_discarded: emitter(|s| &s.deletes_discarded),
+        unmapped_rows_by_table,
+        rows_inserted_by_table: by_table(|s| &s.rows_inserted_by_table),
+        cells_inserted_by_type: v.emitter.map_or_else(Vec::new, |s| {
+            s.cells_inserted_by_type
+                .snapshot()
+                .into_iter()
+                .map(|((ty, enc), n)| (ty, enc, n))
+                .collect()
+        }),
+        emitter_retries_attempted_total: emitter(|s| &s.retries_attempted),
+        emitter_reconnects_total: emitter(|s| &s.reconnects),
         oracle_local_columns_total: emitter(|s| &s.oracle_local_columns),
         oracle_blocks_total: oracle(|s| &s.blocks),
         oracle_rows_total: oracle(|s| &s.rows),
@@ -580,6 +642,10 @@ pub(crate) fn bootstrap_gauges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn db_label(oid: u32) -> String {
+        format!("db{oid}")
+    }
 
     /// A partial publish from inside the leg must not blank the fields the
     /// status loop owns, or the leg would look like a dead pipeline
@@ -644,6 +710,7 @@ mod tests {
                     boundary_hold: &boundary,
                     by_database: Vec::new(),
                     counters: StageCounters {
+                        db_name: &db_label,
                         emitter: Some(&emitter),
                         oracle: [None, None],
                         bootstrap: None,
@@ -668,11 +735,50 @@ mod tests {
         }
     }
 
+    /// The publisher names each counted table by resolving its `db_oid`, so a
+    /// ledger with rows has to reach the snapshot under the database's name
+    #[test]
+    fn per_table_counters_resolve_their_database_name() {
+        use walshadow::schema::{RelName, TableKey};
+        let emitter = EmitterStats::default();
+        let orders = TableKey::new(5, RelName::new("public", "orders"));
+        let noise = TableKey::new(9, RelName::new("public", "noise"));
+        emitter
+            .rows_inserted_by_table
+            .counter(&orders)
+            .fetch_add(7, Ordering::Relaxed);
+        emitter
+            .unmapped_rows_by_table
+            .counter(&noise)
+            .fetch_add(3, Ordering::Relaxed);
+        let snap = stage_gauges(&StageCounters {
+            db_name: &|oid| match oid {
+                5 => "app".to_owned(),
+                _ => db_label(oid),
+            },
+            emitter: Some(&emitter),
+            oracle: [None, None],
+            bootstrap: None,
+            bootstrap_attempt: 0,
+            uptime_secs: 0,
+        });
+        assert_eq!(
+            snap.rows_inserted_by_table,
+            vec![("app".to_owned(), "public.orders".to_owned(), 7)],
+        );
+        assert_eq!(
+            snap.unmapped_rows_by_table,
+            vec![("db9".to_owned(), "public.noise".to_owned(), 3)],
+            "an oid the config does not name still has to be reportable",
+        );
+    }
+
     #[test]
     fn archive_stage_metrics_refresh_without_resetting_recovery_state() {
         use walshadow::record::WAL_SEG_SIZE;
         let emitter = EmitterStats::default();
         let counters = StageCounters {
+            db_name: &db_label,
             emitter: Some(&emitter),
             oracle: [None, None],
             bootstrap: None,
@@ -727,6 +833,7 @@ mod tests {
         boot_oracle.rows.fetch_add(7, Ordering::Relaxed);
 
         let snap = stage_gauges(&StageCounters {
+            db_name: &db_label,
             emitter: None,
             oracle: [Some(&live_oracle), Some(&boot_oracle)],
             bootstrap: None,
@@ -738,6 +845,7 @@ mod tests {
         assert_eq!(snap.bootstrap_attempt, 2);
 
         let boot_only = stage_gauges(&StageCounters {
+            db_name: &db_label,
             emitter: None,
             oracle: [None, Some(&boot_oracle)],
             bootstrap: None,

@@ -54,7 +54,8 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::task::JoinHandle;
 use walrus::pg::walparser::RelFileNode;
 
 use crate::catalog::desc_log::{decode_descriptor_bytes, encode_descriptor_bytes};
@@ -244,6 +245,7 @@ impl RawRecord {
 /// `(toast_relid, value_id)`, concatenates by `chunk_seq` at drain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToastChunk {
+    pub db_oid: u32,
     pub toast_relid: u32,
     pub value_id: u32,
     /// 0-based, PG writes sequentially
@@ -260,6 +262,7 @@ pub struct ToastChunk {
 /// Deleted TOAST tuple TID, one tombstone per chunk
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToastDelete {
+    pub db_oid: u32,
     pub toast_relid: u32,
     pub blkno: u32,
     pub offnum: u16,
@@ -281,10 +284,11 @@ pub const SPILL_MAGIC: [u8; 2] = *b"WS";
 /// v2 added `HeapOp::Truncate` body encoding. v3 added chunk TIDs and
 /// `ToastDelete` entries. v4 added `TAG_RAW` stashed records. v5 added
 /// the `TAG_DESCRIPTOR` dictionary (Heap bodies reference descriptors by dict
-/// id). v6 added writer xid to heap + raw bodies. `DrainEntry` events
+/// id). v6 added writer xid to heap + raw bodies. v7 added database OID to
+/// chunk and `ToastDelete` bodies. `DrainEntry` events
 /// (Catalog, ToastBarrier, Config/Signal) are drain-time, never spilled,
 /// so they don't touch this format
-pub const SPILL_VERSION: u16 = 6;
+pub const SPILL_VERSION: u16 = 7;
 
 /// Wire tags, one block per tag space so encode and decode read off the same
 /// table. Renumbering is a body-encoding change: bump [`SPILL_VERSION`]
@@ -357,20 +361,18 @@ impl SpillStore {
     /// after a slot rotation don't collide on disk
     pub async fn writer(&self, xid: u32, first_lsn: u64) -> Result<SpillWriter> {
         let path = self.dir.join(format!("xid-{xid:010}-{first_lsn:016X}.bin"));
-        let mut header = [0u8; 4];
-        header[..2].copy_from_slice(&SPILL_MAGIC);
-        header[2..].copy_from_slice(&SPILL_VERSION.to_le_bytes());
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .read(true)
             .open(&path)
             .await?;
-        file.write_all(&header).await?;
+        let mut out = ChunkWriter::new(file.into_std().await, 0);
+        out.buf.extend_from_slice(&SPILL_MAGIC);
+        push_u16(&mut out.buf, SPILL_VERSION);
         Ok(SpillWriter {
-            file,
+            out,
             path,
-            byte_count: header.len() as u64,
             dict: HashMap::new(),
         })
     }
@@ -444,10 +446,6 @@ impl Drop for BodySpoolFile {
     }
 }
 
-/// Write coalescing threshold; refs into the buffered tail become readable
-/// at the next [`BodySpoolWriter::flush`]
-const BODY_SPOOL_BUF: usize = 256 << 10;
-
 /// Drain-owned append side of the xact body spool. Raw concatenated
 /// bodies, no framing: [`BodyRef`]s are process-local and files never
 /// survive restart ([`SpillStore::clear`])
@@ -496,7 +494,8 @@ impl BodySpoolWriter {
         };
         self.buf.extend_from_slice(body);
         self.len += u64::from(len);
-        if self.buf.len() >= BODY_SPOOL_BUF {
+        // Refs into buffered tail become readable at next flush
+        if self.buf.len() >= IO_CHUNK {
             self.flush()?;
         }
         Ok(r)
@@ -509,15 +508,6 @@ impl BodySpoolWriter {
             self.buf.clear();
         }
         Ok(())
-    }
-
-    /// Total appended bytes
-    pub fn len(&self) -> u64 {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     /// Reader handle for batch views; outlives writer and unlink
@@ -536,9 +526,8 @@ impl BodySpoolWriter {
 }
 
 pub struct SpillWriter {
-    file: File,
+    out: ChunkWriter,
     path: PathBuf,
-    byte_count: u64,
     /// Descriptor dictionary ids by log identity, assigned in first-use order
     dict: HashMap<(RelFileNode, u64), u32>,
 }
@@ -549,58 +538,135 @@ impl SpillWriter {
     }
 
     pub fn byte_count(&self) -> u64 {
-        self.byte_count
+        self.out.len()
     }
 
-    pub async fn write(&mut self, entry: &SpillEntry) -> Result<()> {
-        let mut body = Vec::with_capacity(128);
+    pub async fn write_batch(&mut self, entries: Vec<SpillEntry>) -> Result<()> {
+        for entry in entries {
+            self.encode(&entry);
+            self.out.maybe_flush().await?;
+        }
+        self.out.flush().await
+    }
+
+    fn encode(&mut self, entry: &SpillEntry) {
+        let body = &mut self.out.buf;
         match entry {
             SpillEntry::Heap(h) => {
                 let key = (h.descriptor.rfn, h.descriptor_valid_from);
                 let next_id = self.dict.len() as u32;
                 let id = *self.dict.entry(key).or_insert(next_id);
                 if id == next_id {
-                    frame_into(&mut body, TAG_DESCRIPTOR, |out| {
+                    frame_into(body, TAG_DESCRIPTOR, |out| {
                         push_u64(out, h.descriptor_valid_from);
                         encode_descriptor_bytes(out, &h.descriptor);
                     });
                 }
-                frame_into(&mut body, TAG_HEAP, |out| {
+                frame_into(body, TAG_HEAP, |out| {
                     push_u32(out, id);
                     encode_heap_into(out, &h.decoded);
                 });
             }
-            SpillEntry::Chunk(c) => {
-                frame_into(&mut body, TAG_CHUNK, |out| encode_chunk_into(out, c))
-            }
-            SpillEntry::ToastDelete(d) => frame_into(&mut body, TAG_TOAST_DELETE, |out| {
+            SpillEntry::Chunk(c) => frame_into(body, TAG_CHUNK, |out| encode_chunk_into(out, c)),
+            SpillEntry::ToastDelete(d) => frame_into(body, TAG_TOAST_DELETE, |out| {
                 encode_toast_delete_into(out, d)
             }),
-            SpillEntry::Raw(r) => frame_into(&mut body, TAG_RAW, |out| encode_raw_into(out, r)),
+            SpillEntry::Raw(r) => frame_into(body, TAG_RAW, |out| encode_raw_into(out, r)),
         }
-        self.file.write_all(&body).await?;
-        self.byte_count += body.len() as u64;
-        Ok(())
     }
 
-    /// Flush + close, return a reader at the start. Caller drives `next()` to
+    /// Close, return a reader at the start. Caller drives `next()` to
     /// `Ok(None)` then `unlink()`. No fsync: restart wipes spill unread
     pub async fn finish(mut self) -> Result<SpillReader> {
-        self.file.flush().await?;
-        drop(self.file);
-        let file = OpenOptions::new().read(true).open(&self.path).await?;
-        Ok(SpillReader {
-            file,
-            path: self.path,
-            header_checked: false,
-            dict: Vec::new(),
-        })
+        self.out.flush().await?;
+        let chunk_size = self.out.len().min(IO_CHUNK as u64) as usize;
+        drop(self.out);
+        SpillReader::open(self.path, chunk_size).await
     }
 
     /// Abort path: drop the file unread
     pub async fn unlink(self) -> Result<()> {
-        unlink_file(self.file, &self.path).await
+        unlink_file(self.out, &self.path).await
     }
+}
+
+/// Coalesced file I/O size for spill, spool, and body spool files
+pub(crate) const IO_CHUNK: usize = 256 << 10;
+
+/// Append-only file writer: caller encodes into `buf`, a full buffer writes
+/// on blocking pool while caller encodes next one
+pub(crate) struct ChunkWriter {
+    file: Arc<std::fs::File>,
+    pub(crate) buf: Vec<u8>,
+    pending: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    /// Bytes handed to `file`, starting from its length at open
+    written: u64,
+}
+
+impl ChunkWriter {
+    /// `file` positioned at its end, `len` bytes long
+    pub(crate) fn new(file: std::fs::File, len: u64) -> Self {
+        Self {
+            file: Arc::new(file),
+            buf: Vec::with_capacity(IO_CHUNK),
+            pending: None,
+            written: len,
+        }
+    }
+
+    /// File length once buffered bytes land
+    pub(crate) fn len(&self) -> u64 {
+        self.written + self.buf.len() as u64
+    }
+
+    pub(crate) async fn maybe_flush(&mut self) -> Result<()> {
+        if self.buf.len() >= IO_CHUNK {
+            self.spawn_write().await?;
+        }
+        Ok(())
+    }
+
+    /// Write everything buffered and wait
+    pub(crate) async fn flush(&mut self) -> Result<()> {
+        if !self.buf.is_empty() {
+            self.spawn_write().await?;
+        }
+        if let Some(write) = self.pending.take() {
+            self.buf = wait_write(write).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn sync_data(&mut self) -> Result<()> {
+        self.flush().await?;
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || file.sync_data())
+            .await
+            .map_err(io::Error::other)??;
+        Ok(())
+    }
+
+    async fn spawn_write(&mut self) -> Result<()> {
+        let spare = match self.pending.take() {
+            Some(write) => wait_write(write).await?,
+            None => Vec::with_capacity(IO_CHUNK),
+        };
+        let body = std::mem::replace(&mut self.buf, spare);
+        self.written += body.len() as u64;
+        let file = self.file.clone();
+        self.pending = Some(tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            (&*file).write_all(&body)?;
+            Ok(body)
+        }));
+        Ok(())
+    }
+}
+
+async fn wait_write(write: JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    let mut body = write.await.map_err(io::Error::other)??;
+    body.clear();
+    Ok(body)
 }
 
 /// `[tag][u32 len LE][body]`, length back-patched after `f` appends in place
@@ -616,7 +682,7 @@ fn frame_into(out: &mut Vec<u8>, tag: u8, f: impl FnOnce(&mut Vec<u8>)) {
 
 /// Drop `file`, remove `path`, tolerating already-gone (abort races,
 /// crash-cleanup re-runs)
-async fn unlink_file(file: File, path: &Path) -> Result<()> {
+async fn unlink_file<T>(file: T, path: &Path) -> Result<()> {
     drop(file);
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
@@ -626,69 +692,49 @@ async fn unlink_file(file: File, path: &Path) -> Result<()> {
 }
 
 pub struct SpillReader {
-    file: File,
     path: PathBuf,
-    /// Lazy header check: first `next()` verifies [`SPILL_MAGIC`] + version,
-    /// so a stale on-disk spill fails cleanly with [`SpillError::Format`]
-    header_checked: bool,
+    chunks: ChunkReader,
     /// Descriptor dictionary rebuilt from tag-4 records in write order;
     /// heap bodies reference by index
     dict: Vec<(Arc<RelDescriptor>, u64)>,
 }
 
 impl SpillReader {
-    pub fn path(&self) -> &Path {
-        &self.path
+    async fn open(path: PathBuf, chunk_size: usize) -> Result<Self> {
+        Ok(Self {
+            chunks: ChunkReader::open(&path, SPILL_MAGIC, SPILL_VERSION, 0, chunk_size).await?,
+            path,
+            dict: Vec::new(),
+        })
     }
 
-    async fn check_header(&mut self) -> Result<()> {
-        let mut buf = [0u8; 4];
-        if let Err(e) = self.file.read_exact(&mut buf).await {
-            return Err(match e.kind() {
-                io::ErrorKind::UnexpectedEof => SpillError::Format {
-                    offset: 0,
-                    detail: "spill file shorter than 4-byte header".into(),
-                },
-                _ => e.into(),
-            });
-        }
-        if buf[..2] != SPILL_MAGIC {
-            return Err(SpillError::Format {
-                offset: 0,
-                detail: format!("bad magic {:02x?}, expected WS", &buf[..2]),
-            });
-        }
-        let version = u16::from_le_bytes([buf[2], buf[3]]);
-        if version != SPILL_VERSION {
-            return Err(SpillError::Format {
-                offset: 2,
-                detail: format!("unsupported spill version {version}, expected {SPILL_VERSION}"),
-            });
-        }
-        self.header_checked = true;
-        Ok(())
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.chunks.buffered_bytes()
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// One entry per call; `Ok(None)` at clean EOF. `TAG_DESCRIPTOR`
     /// records fold into `dict` and never surface
     pub async fn next(&mut self) -> Result<Option<SpillEntry>> {
-        if !self.header_checked {
-            self.check_header().await?;
-        }
         loop {
-            let mut tag_buf = [0u8; 1];
-            match self.file.read_exact(&mut tag_buf).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-                Err(e) => return Err(e.into()),
+            if !self.chunks.fill(5).await? {
+                if self.chunks.unread().is_empty() {
+                    return Ok(None);
+                }
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
             }
-            let mut len_buf = [0u8; 4];
-            self.file.read_exact(&mut len_buf).await?;
-            let len = u32::from_le_bytes(len_buf) as usize;
-            let mut body = vec![0u8; len];
-            self.file.read_exact(&mut body).await?;
-            let mut cur = Cursor::new(&body);
-            let entry = match tag_buf[0] {
+            let head = self.chunks.unread();
+            let tag = head[0];
+            let len = u32::from_le_bytes(head[1..5].try_into().unwrap()) as usize;
+            if !self.chunks.fill(5 + len).await? {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+            }
+            let body = &self.chunks.consume(5 + len)[5..];
+            let mut cur = Cursor::new(body);
+            let entry = match tag {
                 TAG_HEAP => {
                     let dict_id = cur.u32()? as usize;
                     let h = decode_heap(&mut cur)?;
@@ -740,8 +786,103 @@ impl SpillReader {
     }
 
     pub async fn unlink(self) -> Result<()> {
-        unlink_file(self.file, &self.path).await
+        unlink_file(self.chunks, &self.path).await
     }
+}
+
+/// Sequential file reader: next chunk reads on blocking pool while
+/// caller decodes current one
+pub(crate) struct ChunkReader {
+    buf: Vec<u8>,
+    pos: usize,
+    chunk_size: usize,
+    next_chunk: Option<ChunkRead>,
+}
+
+impl ChunkReader {
+    /// Open past a checked `[magic][u16 LE version]` header plus `offset`
+    /// bytes; stale formats fail with [`SpillError::Format`]
+    pub(crate) async fn open(
+        path: &Path,
+        magic: [u8; 2],
+        version: u16,
+        offset: u64,
+        chunk_size: usize,
+    ) -> Result<Self> {
+        let mut file = File::open(path).await?;
+        let mut header = [0u8; 4];
+        file.read_exact(&mut header).await?;
+        if header[..2] != magic {
+            return Err(SpillError::Format {
+                offset: 0,
+                detail: format!("bad magic {:02x?}, expected {magic:02x?}", &header[..2]),
+            });
+        }
+        let found = u16::from_le_bytes([header[2], header[3]]);
+        if found != version {
+            return Err(SpillError::Format {
+                offset: 2,
+                detail: format!("unsupported version {found}, expected {version}"),
+            });
+        }
+        file.seek(io::SeekFrom::Start(4 + offset)).await?;
+        let file = file.into_std().await;
+        Ok(Self {
+            buf: Vec::new(),
+            pos: 0,
+            chunk_size,
+            next_chunk: Some(read_chunk(file, Vec::new(), chunk_size)),
+        })
+    }
+
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        2 * self.chunk_size
+    }
+
+    /// Buffer at least `n` unread bytes, false on EOF first
+    pub(crate) async fn fill(&mut self, n: usize) -> Result<bool> {
+        while self.buf.len() - self.pos < n {
+            let Some(pending) = self.next_chunk.take() else {
+                return Ok(false);
+            };
+            let (file, mut chunk) = pending.await.map_err(io::Error::other)??;
+            if chunk.is_empty() {
+                return Ok(false);
+            }
+            if self.pos == self.buf.len() {
+                std::mem::swap(&mut self.buf, &mut chunk);
+            } else {
+                self.buf.drain(..self.pos);
+                self.buf.extend_from_slice(&chunk);
+            }
+            self.pos = 0;
+            self.next_chunk = Some(read_chunk(file, chunk, self.chunk_size));
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn unread(&self) -> &[u8] {
+        &self.buf[self.pos..]
+    }
+
+    /// Advance past `n` buffered bytes, returning them
+    pub(crate) fn consume(&mut self, n: usize) -> &[u8] {
+        let start = self.pos;
+        self.pos += n;
+        &self.buf[start..self.pos]
+    }
+}
+
+type ChunkRead = JoinHandle<io::Result<(std::fs::File, Vec<u8>)>>;
+
+fn read_chunk(mut file: std::fs::File, mut chunk: Vec<u8>, size: usize) -> ChunkRead {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        chunk.resize(size, 0);
+        let n = file.read(&mut chunk)?;
+        chunk.truncate(n);
+        Ok((file, chunk))
+    })
 }
 
 // ── encoding ────────────────────────────────────────────────────────
@@ -939,7 +1080,8 @@ pub(crate) fn encode_value(out: &mut Vec<u8>, v: &ColumnValue) {
 }
 
 fn encode_chunk_into(out: &mut Vec<u8>, c: &ToastChunk) {
-    out.reserve(40 + c.chunk_data.len());
+    out.reserve(44 + c.chunk_data.len());
+    push_u32(out, c.db_oid);
     push_u32(out, c.toast_relid);
     push_u32(out, c.value_id);
     push_u32(out, c.chunk_seq);
@@ -950,6 +1092,7 @@ fn encode_chunk_into(out: &mut Vec<u8>, c: &ToastChunk) {
 }
 
 fn encode_toast_delete_into(out: &mut Vec<u8>, d: &ToastDelete) {
+    push_u32(out, d.db_oid);
     push_u32(out, d.toast_relid);
     push_u32(out, d.blkno);
     push_u16(out, d.offnum);
@@ -1201,6 +1344,7 @@ pub(crate) fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
 }
 
 fn decode_chunk(c: &mut Cursor) -> Result<ToastChunk> {
+    let db_oid = c.u32()?;
     let toast_relid = c.u32()?;
     let value_id = c.u32()?;
     let chunk_seq = c.u32()?;
@@ -1209,6 +1353,7 @@ fn decode_chunk(c: &mut Cursor) -> Result<ToastChunk> {
     let offnum = c.u16()?;
     let chunk_data = bytes::Bytes::from(c.bytes()?);
     Ok(ToastChunk {
+        db_oid,
         toast_relid,
         value_id,
         chunk_seq,
@@ -1221,6 +1366,7 @@ fn decode_chunk(c: &mut Cursor) -> Result<ToastChunk> {
 
 fn decode_toast_delete(c: &mut Cursor) -> Result<ToastDelete> {
     Ok(ToastDelete {
+        db_oid: c.u32()?,
         toast_relid: c.u32()?,
         blkno: c.u32()?,
         offnum: c.u16()?,
@@ -1283,6 +1429,7 @@ mod tests {
             rel_name: crate::schema::RelName::new("public", "spill_t"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: crate::schema::ReplIdent::Full {
                 pk_attnums: Some(vec![1]),
             },
@@ -1338,6 +1485,7 @@ mod tests {
 
     fn sample_chunk(value_id: u32, seq: u32, lsn: u64, body: &[u8]) -> ToastChunk {
         ToastChunk {
+            db_oid: 0,
             toast_relid: 16400,
             value_id,
             chunk_seq: seq,
@@ -1349,47 +1497,91 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn batch_round_trip_across_buffers_and_descriptor_reuse() {
+        let tmp = tempdir().unwrap();
+        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        let mut writer = store.writer(42, 0x1000).await.unwrap();
+        let mut expected = Vec::new();
+        for i in 0..600 {
+            let mut heap = sample_heap(42, 0x2000 + i);
+            heap.decoded.new.as_mut().unwrap().columns = vec![Some(ColumnValue::Bytea(vec![
+                i as u8;
+                if i == 300 {
+                    IO_CHUNK + 17
+                } else {
+                    1021
+                }
+            ]))];
+            heap.descriptor_valid_from += i % 2;
+            expected.push(SpillEntry::Heap(Box::new(heap)));
+        }
+        writer.write_batch(Vec::new()).await.unwrap();
+        for batch in expected.chunks(137) {
+            writer.write_batch(batch.to_vec()).await.unwrap();
+        }
+        let bytes = writer.byte_count();
+        assert_eq!(writer.dict.len(), 2);
+        let mut reader = writer.finish().await.unwrap();
+        assert_eq!(std::fs::metadata(reader.path()).unwrap().len(), bytes);
+        for entry in expected {
+            assert_eq!(reader.next().await.unwrap(), Some(entry));
+        }
+        assert!(reader.next().await.unwrap().is_none());
+        assert!(reader.next().await.unwrap().is_none(), "EOF stays EOF");
+        reader.unlink().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_reader_rejects_truncated_frame() {
+        let tmp = tempdir().unwrap();
+        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        for remaining in [1, 3, 5, 31] {
+            let mut writer = store.writer(42, remaining).await.unwrap();
+            writer
+                .write_batch(vec![SpillEntry::Chunk(sample_chunk(
+                    99,
+                    0,
+                    0x2000,
+                    &vec![7; IO_CHUNK + 1],
+                ))])
+                .await
+                .unwrap();
+            let mut reader = writer.finish().await.unwrap();
+            let file = OpenOptions::new()
+                .write(true)
+                .open(reader.path())
+                .await
+                .unwrap();
+            file.set_len(4 + remaining).await.unwrap();
+            assert!(matches!(
+                reader.next().await,
+                Err(SpillError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof
+            ));
+            reader.unlink().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn round_trip_heap_and_chunk() {
         let tmp = tempdir().unwrap();
         let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
         let mut w = store.writer(42, 0x1000).await.unwrap();
         let h = sample_heap(42, 0x2000);
         let c = sample_chunk(99, 0, 0x2100, &[0xDE, 0xAD, 0xBE, 0xEF]);
-        w.write(&SpillEntry::Heap(Box::new(h.clone())))
+        w.write_batch(vec![SpillEntry::Heap(Box::new(h.clone()))])
             .await
             .unwrap();
-        w.write(&SpillEntry::Chunk(c.clone())).await.unwrap();
+        w.write_batch(vec![SpillEntry::Chunk(c.clone())])
+            .await
+            .unwrap();
         let bc = w.byte_count();
         assert!(bc > 0);
         let mut r = w.finish().await.unwrap();
-        match r.next().await.unwrap().unwrap() {
-            SpillEntry::Heap(b) => {
-                assert_eq!(b.decoded.xid, 42);
-                assert_eq!(b.decoded.source_lsn, 0x2000);
-                assert_eq!(b.descriptor_valid_from, 0x1000);
-                assert_eq!(b.descriptor, sample_descriptor(16385));
-                assert_eq!(b.decoded.new.as_ref().unwrap().columns.len(), 5);
-                let cols = &b.decoded.new.as_ref().unwrap().columns;
-                assert!(matches!(cols[0], Some(ColumnValue::Int4(7))));
-                assert!(matches!(cols[1], Some(ColumnValue::Text(ref t)) if t == "hello"));
-                assert!(cols[2].is_none());
-                assert!(matches!(cols[3], Some(ColumnValue::Null)));
-                match &cols[4] {
-                    Some(ColumnValue::ExternalToast(p)) => {
-                        assert_eq!(p.va_valueid, 99);
-                        assert_eq!(p.va_rawsize, 1024);
-                    }
-                    other => panic!("expected ExternalToast, got {other:?}"),
-                }
-            }
-            other => panic!("expected Heap, got {other:?}"),
-        }
-        match r.next().await.unwrap().unwrap() {
-            SpillEntry::Chunk(c2) => {
-                assert_eq!(c2, c);
-            }
-            other => panic!("expected Chunk, got {other:?}"),
-        }
+        assert_eq!(
+            r.next().await.unwrap().unwrap(),
+            SpillEntry::Heap(Box::new(h))
+        );
+        assert_eq!(r.next().await.unwrap().unwrap(), SpillEntry::Chunk(c));
         assert!(r.next().await.unwrap().is_none(), "EOF expected");
         r.unlink().await.unwrap();
     }
@@ -1400,17 +1592,17 @@ mod tests {
         let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
         let mut w = store.writer(7, 0x100).await.unwrap();
         let d = ToastDelete {
+            db_oid: 0,
             toast_relid: 16400,
             blkno: 3,
             offnum: 9,
             source_lsn: 0x2200,
         };
-        w.write(&SpillEntry::ToastDelete(d)).await.unwrap();
+        w.write_batch(vec![SpillEntry::ToastDelete(d)])
+            .await
+            .unwrap();
         let mut r = w.finish().await.unwrap();
-        match r.next().await.unwrap().unwrap() {
-            SpillEntry::ToastDelete(d2) => assert_eq!(d2, d),
-            other => panic!("expected ToastDelete, got {other:?}"),
-        }
+        assert_eq!(r.next().await.unwrap().unwrap(), SpillEntry::ToastDelete(d));
         assert!(r.next().await.unwrap().is_none());
         r.unlink().await.unwrap();
     }
@@ -1443,32 +1635,30 @@ mod tests {
                 data: vec![1, 2, 3, 4],
             }],
         };
-        w.write(&SpillEntry::Raw(Box::new(raw.clone())))
+        w.write_batch(vec![SpillEntry::Raw(Box::new(raw.clone()))])
             .await
             .unwrap();
         let mut r = w.finish().await.unwrap();
-        match r.next().await.unwrap().unwrap() {
-            SpillEntry::Raw(got) => {
-                assert_eq!(*got, raw);
-                let rec = got.to_xlog_record();
-                assert_eq!(rec.header.xact_id, 77, "writer xid restored for _xid");
-                assert_eq!(rec.header.resource_manager_id, 10);
-                assert_eq!(rec.header.info, 0x80);
-                assert_eq!(rec.blocks.len(), 1);
-                assert_eq!(rec.blocks[0].header.location.block_no, 3);
-                assert_eq!(rec.blocks[0].header.image_header.hole_length, 7000);
-                assert_eq!(&*rec.main_data, &[1, 0, 8]);
-                assert_eq!(
-                    got.rfn(),
-                    Some(RelFileNode {
-                        spc_node: 1663,
-                        db_node: 5,
-                        rel_node: 24680,
-                    })
-                );
-            }
-            other => panic!("expected Raw, got {other:?}"),
-        }
+        assert_eq!(
+            r.next().await.unwrap().unwrap(),
+            SpillEntry::Raw(Box::new(raw.clone()))
+        );
+        let rec = raw.to_xlog_record();
+        assert_eq!(rec.header.xact_id, 77, "writer xid restored for _xid");
+        assert_eq!(rec.header.resource_manager_id, 10);
+        assert_eq!(rec.header.info, 0x80);
+        assert_eq!(rec.blocks.len(), 1);
+        assert_eq!(rec.blocks[0].header.location.block_no, 3);
+        assert_eq!(rec.blocks[0].header.image_header.hole_length, 7000);
+        assert_eq!(&*rec.main_data, &[1, 0, 8]);
+        assert_eq!(
+            raw.rfn(),
+            Some(RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 24680,
+            })
+        );
         assert!(r.next().await.unwrap().is_none());
         r.unlink().await.unwrap();
     }
@@ -1524,7 +1714,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let store = SpillStore::new(crate::fs::scratch_dir(tmp.path())).unwrap();
         let mut w1 = store.writer(1, 0).await.unwrap();
-        w1.write(&SpillEntry::Heap(Box::new(sample_heap(1, 0))))
+        w1.write_batch(vec![SpillEntry::Heap(Box::new(sample_heap(1, 0)))])
             .await
             .unwrap();
         // Drop without finish() so file stays on disk
@@ -1541,7 +1731,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
         let mut w = store.writer(7, 0).await.unwrap();
-        w.write(&SpillEntry::Heap(Box::new(sample_heap(7, 0))))
+        w.write_batch(vec![SpillEntry::Heap(Box::new(sample_heap(7, 0)))])
             .await
             .unwrap();
         let path = w.path().to_path_buf();
@@ -1558,7 +1748,6 @@ mod tests {
         let b = w.append(b"world!").unwrap();
         assert_eq!((a.offset, a.len), (0, 5));
         assert_eq!((b.offset, b.len), (5, 6));
-        assert_eq!(w.len(), 11);
         w.flush().unwrap();
         let shared = w.shared().clone();
         assert_eq!(shared.read(a).unwrap(), b"hello");
@@ -1623,62 +1812,12 @@ mod tests {
         bytes.extend_from_slice(&SPILL_VERSION.to_le_bytes());
         bytes.extend_from_slice(&[255u8, 0u8, 0u8, 0u8, 0u8]);
         tokio::fs::write(&path, &bytes).await.unwrap();
-        let mut r = SpillReader {
-            file: OpenOptions::new().read(true).open(&path).await.unwrap(),
-            path,
-            header_checked: false,
-            dict: Vec::new(),
-        };
+        let mut r = SpillReader::open(path, IO_CHUNK).await.unwrap();
         let err = r.next().await.expect_err("must error on bad tag");
         match err {
             SpillError::Format { detail, .. } => {
                 assert!(detail.contains("unknown entry tag"), "{detail}");
             }
-            other => panic!("expected Format, got {other:?}"),
-        }
-    }
-
-    /// Pre-xid spill format (v5) fails closed at open; startup wipes the
-    /// spill dir, so rejection is self-check honesty, never migration
-    #[tokio::test(flavor = "current_thread")]
-    async fn old_version_surfaces_format_error() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("xid-0000000000-0000000000000000.bin");
-        let mut bytes = Vec::with_capacity(4);
-        bytes.extend_from_slice(&SPILL_MAGIC);
-        bytes.extend_from_slice(&5u16.to_le_bytes());
-        tokio::fs::write(&path, &bytes).await.unwrap();
-        let mut r = SpillReader {
-            file: OpenOptions::new().read(true).open(&path).await.unwrap(),
-            path,
-            header_checked: false,
-            dict: Vec::new(),
-        };
-        let err = r.next().await.expect_err("must error on old version");
-        match err {
-            SpillError::Format { detail, .. } => {
-                assert!(detail.contains("unsupported spill version 5"), "{detail}");
-            }
-            other => panic!("expected Format, got {other:?}"),
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn missing_magic_surfaces_format_error() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("xid-0000000000-0000000000000000.bin");
-        tokio::fs::write(&path, &[0u8, 0u8, 0u8, 0u8])
-            .await
-            .unwrap();
-        let mut r = SpillReader {
-            file: OpenOptions::new().read(true).open(&path).await.unwrap(),
-            path,
-            header_checked: false,
-            dict: Vec::new(),
-        };
-        let err = r.next().await.expect_err("must error on missing magic");
-        match err {
-            SpillError::Format { detail, .. } => assert!(detail.contains("bad magic"), "{detail}"),
             other => panic!("expected Format, got {other:?}"),
         }
     }
@@ -1798,9 +1937,9 @@ mod tests {
             "sampled tags are not gapless from {VAL_NULL}"
         );
         let probe = decode_value(&mut Cursor::new(&[next]));
-        let Err(SpillError::Format { detail, .. }) = probe else {
-            panic!("tag {next} decodes, so it needs a round-trip sample here")
-        };
+        let detail = probe
+            .expect_err("decodable tag needs a round-trip sample here")
+            .to_string();
         assert!(
             detail.contains("unknown ColumnValue tag"),
             "tag {next} is live, so it needs a round-trip sample here: {detail}"
@@ -1833,7 +1972,9 @@ mod tests {
                     partial: false,
                 });
             }
-            w.write(&SpillEntry::Heap(Box::new(h))).await.unwrap();
+            w.write_batch(vec![SpillEntry::Heap(Box::new(h))])
+                .await
+                .unwrap();
         }
         let mut r = w.finish().await.unwrap();
         assert!(r.path().to_str().unwrap().contains("xid-"));
@@ -1876,12 +2017,10 @@ mod tests {
     fn decode_value_rejects_unknown_tag() {
         let mut cur = Cursor::new(&[99u8]);
         let err = decode_value(&mut cur).unwrap_err();
-        match err {
-            SpillError::Format { detail, .. } => {
-                assert!(detail.contains("unknown ColumnValue tag"), "{detail}");
-            }
-            other => panic!("expected Format, got {other:?}"),
-        }
+        assert_eq!(
+            err.to_string(),
+            "spill format at offset 1: unknown ColumnValue tag 99"
+        );
     }
 
     #[test]
@@ -1890,12 +2029,10 @@ mod tests {
         let buf = [20u8, 99u8];
         let mut cur = Cursor::new(&buf);
         let err = decode_value(&mut cur).unwrap_err();
-        match err {
-            SpillError::Format { detail, .. } => {
-                assert!(detail.contains("unknown NumericKind tag"), "{detail}");
-            }
-            other => panic!("expected Format, got {other:?}"),
-        }
+        assert_eq!(
+            err.to_string(),
+            "spill format at offset 2: unknown NumericKind tag 99"
+        );
     }
 
     #[test]
@@ -1905,12 +2042,10 @@ mod tests {
         buf.push(99u8);
         let mut cur = Cursor::new(&buf);
         let err = decode_heap(&mut cur).unwrap_err();
-        match err {
-            SpillError::Format { detail, .. } => {
-                assert!(detail.contains("unknown HeapOp tag"), "{detail}");
-            }
-            other => panic!("expected Format, got {other:?}"),
-        }
+        assert_eq!(
+            err.to_string(),
+            "spill format at offset 25: unknown HeapOp tag 99"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1929,7 +2064,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
         let mut w = store.writer(14, 0).await.unwrap();
-        w.write(&SpillEntry::Heap(Box::new(sample_heap(14, 0))))
+        w.write_batch(vec![SpillEntry::Heap(Box::new(sample_heap(14, 0)))])
             .await
             .unwrap();
         let r = w.finish().await.unwrap();

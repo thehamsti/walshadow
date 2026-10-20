@@ -9,10 +9,9 @@
 //! the source sidecar) while CDC streams another, mixing two databases into one
 //! ClickHouse table with no diagnostic.
 //!
-//! Both entries use `table.<database>.<schema>.<relname>` keys, so one
-//! process replicates both databases into destinations of their own. Existing
-//! rows load from the backup for `[source] dbname` only, so `postgres`'s
-//! pre-boot row stays out while its post-boot CDC row lands
+//! `postgres` holds a same-named table whose rows, pre-boot and live, must
+//! never reach the destination: only `[source] dbname` is followed. Further
+//! databases replicate as tenants (`multi_tenant_e2e`)
 //!
 //! Here the table lives in source database `duptest`, named only by the TOML.
 //! `--dbname postgres` disagrees and `--shadow-dbname postgres` is passed as
@@ -85,20 +84,18 @@ fn write_config(path: &Path, ch_port: u16) -> Result<()> {
          database = \"default\"\n\
          compression = \"lz4\"\n\
          \n\
-         [database.duptest.table.\"public\".\"dup\"]\n\
-         replicate = true\n\
-         \n\
-         [database.postgres.table.\"public\".\"dup\"]\n\
-         replicate = true\n\
-         target_table = \"dup_from_postgres\"\n"
+         [table.\"public\".\"dup\"]\n\
+         replicate = true\n"
     );
     fs::write(path, body).context("write ch-config")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shadow_catalog_follows_applied_source_dbname() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::tools::pg_available()
+        || !fx::tools::pg_basebackup_available()
+        || !fx::tools::clickhouse_available()
+    {
         return;
     }
 
@@ -202,9 +199,12 @@ async fn shadow_catalog_follows_applied_source_dbname() {
 
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            if ch.query("EXISTS TABLE default.dup").unwrap_or_default() == "1"
+            if ch
+                .query("EXISTS TABLE default.public_dup")
+                .unwrap_or_default()
+                == "1"
                 && ch
-                    .query("SELECT b FROM default.dup FINAL WHERE a = 1")
+                    .query("SELECT b FROM default.public_dup FINAL WHERE a = 1")
                     .unwrap_or_default()
                     == "from-duptest"
             {
@@ -214,7 +214,8 @@ async fn shadow_catalog_follows_applied_source_dbname() {
                 Instant::now() < deadline,
                 "bootstrap did not load duptest's row (saw {:?}); the shadow \
                  catalog is resolved against the wrong database",
-                ch.query("SELECT b FROM default.dup FINAL WHERE a = 1").ok(),
+                ch.query("SELECT b FROM default.public_dup FINAL WHERE a = 1")
+                    .ok(),
             );
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -232,45 +233,27 @@ async fn shadow_catalog_follows_applied_source_dbname() {
             .with_context(|| format!("post-boot insert into {db}"))?;
         }
         psql_db(&source, "postgres", "SELECT pg_switch_wal();").context("seal post-boot WAL")?;
-        // Each database commits on its own, so wait for both destinations
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             let mine = ch
-                .query("SELECT b FROM default.dup FINAL WHERE a = 2")
+                .query("SELECT b FROM default.public_dup FINAL WHERE a = 2")
                 .unwrap_or_default();
             anyhow::ensure!(
                 mine != "cdc-postgres",
                 "CDC replicated the wrong database: --dbname/--shadow-dbname \
                  named postgres, [source] dbname named duptest"
             );
-            let other = match ch
-                .query("EXISTS TABLE default.dup_from_postgres")
-                .as_deref()
-            {
-                Ok("1") => ch
-                    .query("SELECT b FROM default.dup_from_postgres FINAL WHERE a = 2")
-                    .unwrap_or_default(),
-                _ => String::new(),
-            };
-            if mine == "cdc-duptest" && other == "cdc-postgres" {
+            if mine == "cdc-duptest" {
                 break;
             }
             anyhow::ensure!(
                 Instant::now() < deadline,
-                "post-boot CDC rows never landed (dup {mine:?}, \
-                 dup_from_postgres {other:?})"
+                "post-boot CDC row never landed (dup {mine:?})"
             );
             std::thread::sleep(Duration::from_millis(200));
         }
         anyhow::ensure!(
-            ch.query("SELECT count() FROM default.dup_from_postgres FINAL WHERE a = 1")
-                .unwrap_or_default()
-                == "0",
-            "a backup load covers `[source] dbname` only, so the second \
-             database's pre-boot row must not appear"
-        );
-        anyhow::ensure!(
-            ch.query("SELECT count() FROM default.dup FINAL")
+            ch.query("SELECT count() FROM default.public_dup FINAL")
                 .unwrap_or_default()
                 == "2",
             "duptest's destination holds its own two rows and no others"

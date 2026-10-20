@@ -1,6 +1,6 @@
 //! Catalog-boundary publication hold.
 //!
-//! At the commit of a catalog-mutating xact ([`Record::catalog_boundary`],
+//! At the commit of a catalog-mutating xact ([`Record::boundary_info`],
 //! stamped by the pump classifier) the pump must not publish successor
 //! bytes until shadow replays through the commit's `next_lsn`
 //! (PG `EndRecPtr`). [`BoundaryHoldSink`] enforces this by blocking inside
@@ -25,6 +25,7 @@
 //! queued barrier work — only shadow replay of already-shipped bytes.
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,8 +33,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
+use crate::catalog::shadow_catalog::ParkedAt;
 use crate::pos::{Pos, ShadowReplay};
-use crate::record::{BoundaryKind, Record, RecordSink, SinkError};
+use crate::record::{BoundaryKind, Record, RecordSink, Route, SinkError};
 use crate::source::catalog_capture::CaptureSet;
 use crate::source::queueing_record_sink::QueueingRecordSink;
 use crate::source::shadow_stream::ShadowStreamState;
@@ -105,7 +107,7 @@ impl CatalogBoundaryGate {
         commit_lsn: u64,
         next_lsn: Pos<ShadowReplay>,
         worker_alive: impl Fn() -> bool,
-    ) -> Result<(), SinkError> {
+    ) -> Result<ParkedAt, SinkError> {
         let applied = self.state.lock().await.applied();
         let start = Instant::now();
         let held = loop {
@@ -145,12 +147,75 @@ impl CatalogBoundaryGate {
             held = ?held,
             "catalog boundary released",
         );
-        Ok(())
+        Ok(ParkedAt::new(next_lsn.get()))
     }
 
-    fn fail(&self, msg: String) -> Result<(), SinkError> {
+    fn fail<T>(&self, msg: String) -> Result<T, SinkError> {
         self.stats.failures.fetch_add(1, Ordering::Relaxed);
         Err(SinkError::Other(msg))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingDatabase {
+    pub oid: u32,
+    pub name: String,
+    pub visible_at: u64,
+    pub bridge_socket: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseAttach {
+    pub oid: u32,
+    pub name: String,
+    pub lsn: u64,
+}
+
+pub type AttachSlot = Arc<std::sync::Mutex<Option<DatabaseAttach>>>;
+
+#[derive(Debug, Clone, Default)]
+pub struct PendingDatabases {
+    waiting: Vec<PendingDatabase>,
+    attach_timeout: Duration,
+    attached: AttachSlot,
+}
+
+impl PendingDatabases {
+    pub fn new(
+        waiting: Vec<PendingDatabase>,
+        attach_timeout: Duration,
+        attached: AttachSlot,
+    ) -> Self {
+        Self {
+            waiting,
+            attach_timeout,
+            attached,
+        }
+    }
+
+    fn hit(&self, record: &Record<'_>) -> Option<&PendingDatabase> {
+        self.waiting.iter().find(|p| {
+            record.source_lsn >= p.visible_at
+                || (!matches!(record.route, Route::ToShadow)
+                    && record
+                        .parsed
+                        .blocks
+                        .iter()
+                        .any(|b| b.header.location.rel.db_node == p.oid))
+        })
+    }
+}
+
+async fn bridge_listening(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if tokio::net::UnixStream::connect(path).await.is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -177,6 +242,7 @@ pub struct BoundaryHoldSink {
     pub gate: CatalogBoundaryGate,
     /// Empty = hold-only (tests / capture-less harnesses)
     pub capture: CaptureSet,
+    pub pending: PendingDatabases,
 }
 
 impl BoundaryHoldSink {
@@ -185,12 +251,63 @@ impl BoundaryHoldSink {
             inner,
             gate,
             capture: CaptureSet::default(),
+            pending: PendingDatabases::default(),
         }
     }
 
     pub fn with_capture(mut self, capture: CaptureSet) -> Self {
         self.capture = capture;
         self
+    }
+
+    pub fn with_pending(mut self, pending: PendingDatabases) -> Self {
+        self.pending = pending;
+        self
+    }
+
+    async fn attach_pending(
+        &mut self,
+        db: PendingDatabase,
+        record: &Record<'_>,
+    ) -> Result<(), SinkError> {
+        self.inner.flush().await?;
+        let inner = &self.inner;
+        let held = self
+            .gate
+            .hold(record.source_lsn, Pos::new(record.next_lsn), || {
+                inner.worker_alive()
+            })
+            .await;
+        if let Err(hold_err) = held {
+            self.inner.flush().await?;
+            return Err(hold_err);
+        }
+        if !bridge_listening(&db.bridge_socket, self.pending.attach_timeout).await {
+            return Err(SinkError::Other(format!(
+                "database {} (oid {}) is on the source, but the shadow replayed through \
+                 {:#X} and its bridge at {} never came up: the shadow lacks the database \
+                 (dropped and recreated after the backup?) or its bridge worker fails, \
+                 see the shadow's startup.log",
+                db.name,
+                db.oid,
+                record.next_lsn,
+                db.bridge_socket.display(),
+            )));
+        }
+        tracing::info!(
+            target: "walshadow",
+            database = %db.name,
+            oid = db.oid,
+            lsn = format_args!("{:#X}", record.source_lsn),
+            "shadow replayed a pending database's creation; restarting the session to follow it",
+        );
+        let msg = format!("attaching database {} at {:#X}", db.name, record.source_lsn);
+        *self.pending.attached.lock().expect("attach slot poisoned") = Some(DatabaseAttach {
+            oid: db.oid,
+            name: db.name,
+            lsn: record.source_lsn,
+        });
+        Err(SinkError::Other(msg))
     }
 
     pub fn in_flight(&self) -> u64 {
@@ -211,34 +328,43 @@ impl BoundaryHoldSink {
 }
 
 impl RecordSink for BoundaryHoldSink {
+    fn may_park(&self, record: &Record<'_>) -> bool {
+        record.boundary_info.is_some()
+            || record.aborted_tree.is_some()
+            || self.pending.hit(record).is_some()
+    }
+
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        // Common record: nothing to attach, forget or hold, so pass the inner
+        // future through instead of boxing a hold-sized one around it
+        if !self.may_park(record) {
+            return self.inner.on_record(record);
+        }
         Box::pin(async move {
+            if let Some(db) = self.pending.hit(record).cloned() {
+                return self.attach_pending(db, record).await;
+            }
             if let Some(members) = &record.aborted_tree {
                 self.capture.forget_aborted(members);
             }
-            if !record.catalog_boundary {
+            let Some(info) = &record.boundary_info else {
                 return self.inner.on_record(record).await;
-            }
-            let boundary = record.boundary_info.clone();
-            let park = match &boundary {
-                Some(info) if !self.capture.is_empty() => {
-                    self.capture.admits(info, record.next_lsn)
-                }
+            };
+            let park = if self.capture.is_empty() {
                 // Without capture, wait only for commits that change more than statistics
-                Some(info) => matches!(info.kind, BoundaryKind::Commit) && !info.stats_only,
-                None => true,
+                matches!(info.kind, BoundaryKind::Commit) && !info.stats_only
+            } else {
+                self.capture.admits(info, record.next_lsn)
             };
             if !park {
                 // Save an empty batch so restart can replay this commit
                 // without reading catalog state from shadow
-                if let Some(info) = &boundary
-                    && matches!(info.kind, BoundaryKind::Commit)
-                {
+                if matches!(info.kind, BoundaryKind::Commit) {
                     self.capture
-                        .capture_boundary(info, record.source_lsn, record.next_lsn)
+                        .cover_unparked(info, record.source_lsn, record.next_lsn)
                         .await?;
                 }
                 return self.inner.on_record(record).await;
@@ -249,24 +375,25 @@ impl RecordSink for BoundaryHoldSink {
             self.inner.flush().await?;
             let inner = &self.inner;
             let parked = Instant::now();
-            if let Err(hold_err) = self
+            let held = self
                 .gate
                 .hold(record.source_lsn, Pos::new(record.next_lsn), || {
                     inner.worker_alive()
                 })
-                .await
-            {
-                // Prefer the worker's parked root cause over the generic
-                // hold error (empty-buffer flush only drains the err slot)
-                self.inner.flush().await?;
-                return Err(hold_err);
-            }
-            if let Some(info) = &boundary {
-                self.capture.charge_hold(info, parked.elapsed());
-                self.capture
-                    .capture_boundary(info, record.source_lsn, record.next_lsn)
-                    .await?;
-            }
+                .await;
+            let held = match held {
+                Ok(held) => held,
+                Err(hold_err) => {
+                    // Dead worker fails flush with its own error, so hold error
+                    // only surfaces on timeout
+                    self.inner.flush().await?;
+                    return Err(hold_err);
+                }
+            };
+            self.capture.charge_hold(info, parked.elapsed());
+            self.capture
+                .capture_boundary(info, record.source_lsn, &held)
+                .await?;
             self.inner.on_record(record).await?;
             // Ship the commit immediately: the drain (and its CH effects)
             // must not wait out the accumulator
@@ -274,23 +401,15 @@ impl RecordSink for BoundaryHoldSink {
         })
     }
 
-    fn on_idle<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        self.inner.on_idle()
-    }
-
-    fn on_close<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        self.inner.on_close()
-    }
-
-    fn on_idle_advance<'a>(
-        &'a mut self,
-        lsn: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        self.inner.on_idle_advance(lsn)
+    fn on_record_owned(
+        &mut self,
+        record: Record<'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + '_>> {
+        if !self.may_park(&record) {
+            return self.inner.on_record_owned(record);
+        }
+        // Rare, so parking keeps its one by-reference path
+        Box::pin(async move { self.on_record(&record).await })
     }
 }
 
@@ -396,25 +515,20 @@ mod tests {
             .register_connection(0x1000, 1, None)
             .expect("current timeline");
         let gate = gate_with(s.clone(), Duration::from_secs(5));
+        let queued = s.lock().await.queued();
         let prodded = tokio::spawn({
             let s = s.clone();
             async move {
-                loop {
-                    let drained = s.lock().await.drain_send_queue(id);
-                    if let Some(bytes) = drained {
-                        // 'd' + u32 len + 'k' + wal_end(8) + time(8) + reply(1)
-                        assert_eq!(bytes[5], b'k');
-                        assert_eq!(*bytes.last().unwrap(), 1, "reply requested");
-                        s.lock().await.observe_status(
-                            id,
-                            0x3000,
-                            Pos::new(0x3000),
-                            Pos::new(0x3000),
-                        );
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
+                // Wait on listener wake, not runtime task order
+                queued.advance(Pos::ZERO).await.expect("state alive");
+                let bytes = s.lock().await.drain_send_queue(id);
+                let bytes = bytes.expect("keepalive queued before hold parks");
+                // 'd' + u32 len + 'k' + wal_end(8) + time(8) + reply(1)
+                assert_eq!(bytes[5], b'k');
+                assert_eq!(*bytes.last().unwrap(), 1, "reply requested");
+                s.lock()
+                    .await
+                    .observe_status(id, 0x3000, Pos::new(0x3000), Pos::new(0x3000));
             }
         });
         gate.hold(0x2F00, Pos::new(0x3000), || true)
@@ -489,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn sink_parks_only_at_catalog_boundary() {
-        // DML-only records (catalog_boundary = false) pass straight
+        // DML-only records (no boundary_info) pass straight
         // through with no shadow connection and no timeout
         let s = state();
         let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 4, 16, None);
@@ -517,7 +631,6 @@ mod tests {
         let rec = Record {
             source_lsn: 0x1F00,
             next_lsn: 0x2000,
-            catalog_boundary: true,
             boundary_info: Some(Arc::new(crate::record::BoundaryInfo {
                 kind: BoundaryKind::Command { writer_xid: 7 },
                 ..Default::default()
@@ -543,7 +656,6 @@ mod tests {
         let rec = Record {
             source_lsn: 0x1F00,
             next_lsn: 0x2000,
-            catalog_boundary: true,
             boundary_info: Some(Arc::new(stub)),
             ..Default::default()
         };
@@ -592,17 +704,17 @@ mod tests {
         let rec = Record {
             source_lsn: 0x1F00,
             next_lsn: 0x2000,
-            catalog_boundary: true,
+            boundary_info: Some(Arc::new(crate::record::BoundaryInfo::default())),
             ..Default::default()
         };
         sink.on_record(&rec).await.expect("boundary releases");
         releaser.await.unwrap();
         // Forced flush shipped the sub-batch-size buffer to the worker
-        for _ in 0..100 {
+        for _ in 0..1000 {
             if *counter.lock().unwrap() == 1 {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         assert_eq!(*counter.lock().unwrap(), 1, "commit reached the worker");
         sink.close().await.expect("close");
@@ -636,10 +748,85 @@ mod tests {
         let rec = Record {
             source_lsn: 0x1F00,
             next_lsn: 0x2000,
-            catalog_boundary: true,
+            boundary_info: Some(Arc::new(crate::record::BoundaryInfo::default())),
             ..Default::default()
         };
         let err = sink.on_record(&rec).await.expect_err("must fail");
         assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    fn boundary() -> Record<'static> {
+        Record {
+            source_lsn: 0x1F00,
+            next_lsn: 0x2000,
+            boundary_info: Some(Arc::new(crate::record::BoundaryInfo::default())),
+            ..Default::default()
+        }
+    }
+
+    /// Database visible from LSN 0 whose bridge never listens
+    fn pending_sink(gate: CatalogBoundaryGate) -> BoundaryHoldSink {
+        let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 4, 16, None);
+        let db = PendingDatabase {
+            oid: 5,
+            name: "late".into(),
+            visible_at: 0,
+            bridge_socket: PathBuf::new(),
+        };
+        BoundaryHoldSink::new(q, gate).with_pending(PendingDatabases::new(
+            vec![db],
+            Duration::ZERO,
+            AttachSlot::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn sink_boundary_timeout_surfaces_hold_error() {
+        // No walreceiver, worker alive: hold's own error is the cause
+        let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 4, 16, None);
+        let mut sink = BoundaryHoldSink::new(q, gate_with(state(), Duration::from_millis(10)));
+        let err = sink.on_record(&boundary()).await.expect_err("timeout");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        sink.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn pending_attach_timeout_surfaces_hold_error() {
+        let mut sink = pending_sink(gate_with(state(), Duration::from_millis(10)));
+        let err = sink.on_record(&boundary()).await.expect_err("timeout");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        sink.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn pending_attach_fails_when_bridge_never_listens() {
+        let s = state();
+        let id = s
+            .lock()
+            .await
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
+        s.lock()
+            .await
+            .observe_status(id, 0x2000, Pos::new(0x2000), Pos::new(0x2000));
+        let mut sink = pending_sink(gate_with(s, Duration::from_secs(5)));
+        let err = sink.on_record(&boundary()).await.expect_err("no bridge");
+        assert!(err.to_string().contains("never came up"), "{err}");
+        assert!(sink.pending.attached.lock().unwrap().is_none());
+        sink.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn aborted_tree_without_boundary_forwards() {
+        let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 1, 4, None);
+        let mut sink = BoundaryHoldSink::new(q, gate_with(state(), Duration::from_millis(10)));
+        let rec = Record {
+            aborted_tree: Some(Arc::new(vec![7])),
+            ..Default::default()
+        };
+        assert!(sink.may_park(&rec));
+        sink.on_record(&rec).await.expect("forwarded");
+        assert_eq!(sink.gate.stats.failures.load(Ordering::Relaxed), 0);
+        sink.close().await.expect("close");
     }
 }

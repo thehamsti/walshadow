@@ -145,6 +145,37 @@ fn statement_timeout() -> u64 {
     6 * 3600
 }
 
+/// Snowflake writes one source-shaped table per relation over one
+/// connection. ClickHouse-only routing (explicit column mappings, named
+/// instances, tees, partition `route`) has no Snowflake meaning, so refuse it
+/// rather than ignore it. Partitions replicate each to its own table
+pub fn check_snowflake_routing(cfg: &crate::ch_emitter::EmitterConfig) -> Result<()> {
+    ensure!(
+        cfg.column_entries.is_empty() && cfg.tables.is_empty(),
+        "Snowflake explicit column mappings are not supported; use source-shaped tables"
+    );
+    ensure!(
+        cfg.instances.is_empty(),
+        "`[ch.instances]` needs a ClickHouse destination"
+    );
+    for (rel, _, rule) in &cfg.table_entries {
+        ensure!(
+            rule.target_instance.is_none(),
+            "{rel}: `target_instance` needs a ClickHouse destination"
+        );
+        ensure!(
+            rule.tee.is_none(),
+            "{rel}: `tee` needs a ClickHouse destination"
+        );
+        ensure!(
+            rule.route.is_none(),
+            "{rel}: Snowflake replicates every partition to its own table; `route` is not \
+             supported"
+        );
+    }
+    Ok(())
+}
+
 impl DestinationConfig {
     pub fn parse(text: &str) -> Result<Self> {
         Self::from_table(&toml::from_str(text)?)

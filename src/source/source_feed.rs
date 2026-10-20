@@ -5,12 +5,13 @@
 //! `CopyData('w')` WAL bytes while handling `CopyData('k')` keepalives
 //! and periodic standby-status replies.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use postgres_protocol::message::backend::Message;
 use tokio::net::{TcpStream, UnixStream};
+use tokio::time::Instant;
 use tokio_postgres::config::SslMode as TpSslMode;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
@@ -27,6 +28,8 @@ use crate::source::manifest::ShadowFloor;
 /// Matches wal-rus / wal-g defaults; servers tolerate up to
 /// `wal_sender_timeout` of silence (default 60s).
 pub const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(10);
+
+const RECEIVE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// SQLSTATE for a WAL segment the source has already recycled
 /// (`undefined_file`). Locale-independent, unlike the message text.
@@ -113,7 +116,7 @@ pub enum SourceEvent<'a> {
     Wal(WalChunk<'a>),
     /// Backend `CopyDone`: the requested timeline is historic and reached its
     /// switchpoint. Only this ending sends one. The connection stays in COPY
-    /// until [`end_historic_stream`](SourceFeed::end_historic_stream) answers.
+    /// until [`end_stream`](SourceFeed::end_stream) answers.
     TimelineEnd,
     /// `WalSndDone` sends a bare `CommandComplete` from inside COPY, then
     /// exits — no `CopyDone` before it and no `ReadyForQuery` after. A parser
@@ -185,17 +188,30 @@ struct StatusFloors {
     apply: Pos<ResumeSafe>,
 }
 
-/// PG assigns a physical slot's restart_lsn from flush unconditionally
-/// (`PhysicalConfirmReceivedLocation`), so a stale lower value walks the
-/// slot backwards, below recycled WAL it can read as invalidatable under
-/// max_slot_wal_keep_size. Hold each field at its own high-water.
-fn clamp_status(status: StandbyStatus, floors: &mut StatusFloors) -> StandbyStatus {
+/// PostgreSQL sets a physical slot's restart_lsn to any valid flush position
+/// (`PhysicalConfirmReceivedLocation`). Sending a lower value can move slot
+/// behind recycled WAL and make it eligible for invalidation under
+/// max_slot_wal_keep_size. Keep each field at its highest reported value.
+/// Report flush position only when it advances; otherwise send `InvalidXLogRecPtr`.
+/// PostgreSQL leaves slot's `restart_lsn` unchanged for an invalid flush position
+/// (`ProcessStandbyReplyMessage`).
+///
+/// During shutdown, `WalSndDone` waits for acknowledgement of all sent WAL.
+/// An invalid flush position makes it use `write`, as with pg_receivewal.
+/// Repeating a flush position at a segment boundary cannot acknowledge a shutdown
+/// checkpoint ending inside a segment, so source shutdown waits for sender timeout.
+fn prepare_status(status: StandbyStatus, floors: &mut StatusFloors) -> StandbyStatus {
+    let previous_flush = floors.flush;
     floors.write = status.write_lsn.max(floors.write);
     floors.flush = status.flush_lsn.max(floors.flush);
     floors.apply = status.apply_lsn.max(floors.apply);
     StandbyStatus {
         write_lsn: floors.write,
-        flush_lsn: floors.flush,
+        flush_lsn: if floors.flush > previous_flush {
+            floors.flush
+        } else {
+            Pos::ZERO
+        },
         apply_lsn: floors.apply,
     }
 }
@@ -232,6 +248,7 @@ pub struct SourceFeed {
     sql_client: Option<Client>,
     status_interval: Duration,
     last_status: Instant,
+    receive_deadline: Option<Instant>,
     floors: StatusFloors,
     /// Most recent `server_wal_end` from a WAL frame or keepalive;
     /// surfaces "source ahead by N" without re-issuing IDENTIFY_SYSTEM.
@@ -247,6 +264,7 @@ impl SourceFeed {
             sql_client: None,
             status_interval: DEFAULT_STATUS_INTERVAL,
             last_status: Instant::now(),
+            receive_deadline: None,
             floors: StatusFloors::default(),
             last_server_wal_end: 0,
         })
@@ -337,6 +355,7 @@ impl SourceFeed {
         // start_lsn would lift flush to the live resume position on reconnect,
         // advancing source's slot past the caller's persisted floor.
         self.last_status = Instant::now();
+        self.receive_deadline = None;
         Ok(())
     }
 
@@ -352,17 +371,27 @@ impl SourceFeed {
     ) -> Result<SourceEvent<'b>> {
         buf.clear();
         loop {
-            if self.last_status.elapsed() >= self.status_interval {
+            // tokio::select! drops losing futures.
+            let deadline = *self
+                .receive_deadline
+                .get_or_insert_with(|| Instant::now() + RECEIVE_TIMEOUT);
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "source replication receive timeout"
+            );
+            let status_interval = self.status_interval.min(RECEIVE_TIMEOUT / 2);
+            if self.last_status.elapsed() >= status_interval {
                 self.send_status(status).await?;
             }
-            let timeout = self
-                .status_interval
-                .saturating_sub(self.last_status.elapsed())
-                .max(Duration::from_millis(50));
-            let Ok(msg) = tokio::time::timeout(timeout, self.conn.recv_message()).await else {
+            let status_due = self.last_status + status_interval;
+            let wake = status_due.max(Instant::now() + Duration::from_millis(50));
+            let Ok(msg) =
+                tokio::time::timeout_at(deadline.min(wake), self.conn.recv_message()).await
+            else {
                 continue;
             };
             let msg = msg?;
+            self.receive_deadline = None;
             match msg {
                 Message::CopyData(d) => {
                     let payload: Bytes = d.into_bytes();
@@ -420,8 +449,8 @@ impl SourceFeed {
     /// `TIMELINE_HISTORY` instead, which the crossing has to parse anyway to
     /// prove lineage and to hand the shadow a history file — a row that only
     /// restates it saves nothing.
-    pub async fn end_historic_stream(&mut self) -> Result<()> {
-        self.conn.end_copy().await.context("end historic COPY")
+    pub async fn end_stream(&mut self) -> Result<()> {
+        self.conn.end_copy().await.context("end replication COPY")
     }
 
     /// `TIMELINE_HISTORY <tli>` → the file's exact bytes. `Ok(None)` when the
@@ -436,12 +465,14 @@ impl SourceFeed {
     }
 
     async fn send_status(&mut self, status: StandbyStatus) -> Result<()> {
-        let held = clamp_status(status, &mut self.floors);
-        let payload = build_status_update(
+        let held = prepare_status(status, &mut self.floors);
+        let mut payload = build_status_update(
             held.write_lsn.get(),
             held.flush_lsn.get(),
             held.apply_lsn.get(),
         );
+        // PostgreSQL replies even when wal_sender_timeout is disabled.
+        *payload.last_mut().expect("standby status reply flag") = 1;
         self.conn.send_copy_data(&payload).await?;
         self.last_status = Instant::now();
         Ok(())
@@ -646,15 +677,79 @@ pub async fn open_sql_client(cfg: &PgConfig) -> Result<Client> {
 mod tests {
     use super::*;
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn backend(socket: &mut TcpStream, tag: u8, body: &[u8]) {
+        let mut frame = vec![tag];
+        frame.extend_from_slice(&(body.len() as u32 + 4).to_be_bytes());
+        frame.extend_from_slice(body);
+        socket.write_all(&frame).await.unwrap();
+    }
+
+    async fn mock_feed() -> (SourceFeed, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = PgConfig {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            user: "test".into(),
+            password: None,
+            database: "test".into(),
+            application_name: "source-timeout-test".into(),
+            sslmode: SslMode::Disable,
+            tls: Default::default(),
+        };
+        let client = async {
+            let mut feed = SourceFeed::connect(&cfg).await.unwrap();
+            feed.start_physical_replication(None, 0, 1).await.unwrap();
+            feed
+        };
+        let server = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            let len = socket.read_u32().await.unwrap() as usize;
+            socket.read_exact(&mut vec![0; len - 4]).await.unwrap();
+            backend(&mut socket, b'R', &0u32.to_be_bytes()).await;
+            backend(&mut socket, b'S', b"server_version\x0016.3\0").await;
+            backend(&mut socket, b'Z', b"I").await;
+            assert_eq!(socket.read_u8().await.unwrap(), b'Q');
+            let len = socket.read_u32().await.unwrap() as usize;
+            socket.read_exact(&mut vec![0; len - 4]).await.unwrap();
+            backend(&mut socket, b'W', &[0, 0, 0]).await;
+            socket
+        };
+        tokio::join!(client, server)
+    }
+
+    #[tokio::test]
+    async fn silent_source_times_out_despite_cancelled_polls() {
+        let (mut feed, _server) = mock_feed().await;
+        tokio::time::pause();
+        let started = Instant::now();
+        let mut buf = Vec::new();
+        loop {
+            match tokio::time::timeout(
+                Duration::from_millis(250),
+                feed.next_event(StandbyStatus::default(), &mut buf),
+            )
+            .await
+            {
+                Err(_) => assert!(started.elapsed() < RECEIVE_TIMEOUT),
+                Ok(Err(_)) => break,
+                Ok(Ok(event)) => panic!("unexpected event: {event:?}"),
+            }
+        }
+    }
+
     fn triple(s: StandbyStatus) -> (u64, u64, u64) {
         (s.write_lsn.get(), s.flush_lsn.get(), s.apply_lsn.get())
     }
 
     #[test]
-    fn clamp_keeps_each_field_independent() {
+    fn status_keeps_each_field_independent() {
         let mut floors = StatusFloors::default();
         // leading write must not lift flush/apply
-        let held = clamp_status(
+        let held = prepare_status(
             StandbyStatus {
                 write_lsn: 3000.into(),
                 flush_lsn: 1000.into(),
@@ -664,7 +759,7 @@ mod tests {
         );
         assert_eq!(triple(held), (3000, 1000, 800));
         // higher flush/apply, same write: each rises from its own floor
-        let held = clamp_status(
+        let held = prepare_status(
             StandbyStatus {
                 write_lsn: 3000.into(),
                 flush_lsn: 1500.into(),
@@ -676,9 +771,9 @@ mod tests {
     }
 
     #[test]
-    fn clamp_never_regresses_a_field() {
+    fn status_retains_floors_when_inputs_regress() {
         let mut floors = StatusFloors::default();
-        clamp_status(
+        prepare_status(
             StandbyStatus {
                 write_lsn: 5000.into(),
                 flush_lsn: 4000.into(),
@@ -687,7 +782,7 @@ mod tests {
             &mut floors,
         );
         // stale lower values hold at prior floor
-        let held = clamp_status(
+        let held = prepare_status(
             StandbyStatus {
                 write_lsn: 4500.into(),
                 flush_lsn: 3000.into(),
@@ -695,7 +790,27 @@ mod tests {
             },
             &mut floors,
         );
-        assert_eq!(triple(held), (5000, 4000, 4000));
+        assert_eq!(triple(held), (5000, 0, 4000));
+        assert_eq!(floors.flush.get(), 4000);
+    }
+
+    /// Send an invalid flush position when unchanged, allowing shutdown to use
+    /// `write` for acknowledgement without moving slot's `restart_lsn`.
+    #[test]
+    fn status_reports_flush_only_when_it_advances() {
+        let mut floors = StatusFloors::default();
+        for (flush, expected) in [(0, 0), (2000, 2000), (2000, 0), (1000, 0), (3000, 3000)] {
+            let status = prepare_status(
+                StandbyStatus {
+                    write_lsn: 4000.into(),
+                    flush_lsn: flush.into(),
+                    apply_lsn: 0.into(),
+                },
+                &mut floors,
+            );
+            assert_eq!(status.flush_lsn.get(), expected);
+        }
+        assert_eq!(floors.flush.get(), 3000);
     }
 
     #[test]

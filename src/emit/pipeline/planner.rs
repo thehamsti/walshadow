@@ -37,17 +37,17 @@
 //! - planned schema transition reproducible → control entries carry
 //!   `SchemaEvent` values (old + new descriptors) into replay verbatim
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::decode::heap_decoder::DescribedHeap;
 use crate::emit::pipeline::plan_spool::{
-    DEFAULT_PLAN_MEM_MAX, PlanSpoolError, PlanWriter, SealedPlan,
+    DEFAULT_PLAN_MEM_MAX, PlanPath, PlanSpoolError, PlanWriter, SealedPlan,
 };
 use crate::emit::route::RouteSnapshot;
 use crate::toast::{ChunkRefMap, ToastResolver};
 use crate::xact::xact_buffer::{
     DrainEntry, DrainWalk, DrainedBatch, FailClosedReason, WalkStep, XactBufferError, detoast_heap,
+    heap_reads_toast,
 };
 
 /// Planner's window onto route state. Implementations resolve from frozen
@@ -123,7 +123,7 @@ pub struct Planner<'a, V> {
 
 impl<'a, V: PlanRouteView> Planner<'a, V> {
     pub fn create(
-        path: PathBuf,
+        path: impl Into<PlanPath>,
         disk_cap: u64,
         view: &'a mut V,
         resolver: &'a ToastResolver,
@@ -154,13 +154,16 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
             match step {
                 WalkStep::Rows { upto } => cursor = cursor.max(upto),
                 WalkStep::Event(e) => {
-                    self.view.apply(&e).await.map_err(PlanError::View)?;
+                    // Boxed: rare, and deep enough to bloat every plan future
+                    Box::pin(self.view.apply(&e))
+                        .await
+                        .map_err(PlanError::View)?;
                     self.writer.push_control(e, self.rows_base + cursor);
                 }
-                WalkStep::Truncate(heap) => {
-                    self.writer.note_truncate_cursor(self.rows_base + cursor);
+                WalkStep::Truncate { heap, upto } => {
                     let route = self.view.route_for(&heap);
-                    self.writer.push_heap(&heap, route.as_ref())?;
+                    self.writer
+                        .push_truncate(heap, route, self.rows_base + upto)?;
                 }
                 WalkStep::Heap(mut heap) => {
                     // Route before validation and detoast: unmapped rows
@@ -174,9 +177,12 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                                 lsn: heap.decoded.source_lsn,
                             });
                         }
-                        detoast_heap(&mut heap, spool, &ref_maps, self.resolver).await?;
+                        if heap_reads_toast(&heap) {
+                            Box::pin(detoast_heap(&mut heap, spool, &ref_maps, self.resolver))
+                                .await?;
+                        }
                     }
-                    self.writer.push_heap(&heap, route.as_ref())?;
+                    self.writer.push_heap(heap, route)?;
                 }
             }
         }
@@ -203,7 +209,7 @@ mod tests {
     use crate::xact::xact_buffer::raw_fixtures::{
         inject_ordinary, int4_descriptor, multi_insert_raw,
     };
-    use crate::xact::xact_buffer::{FailClosedReason, XactBuffer, XactBufferConfig};
+    use crate::xact::xact_buffer::{FailClosedReason, StashResolved, XactBuffer, XactBufferConfig};
     use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
     use walrus::pg::walparser::RelFileNode;
 
@@ -284,6 +290,7 @@ mod tests {
             rel_name: RelName::new("public", &format!("t{rel_node}")),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: crate::schema::ReplIdent::Full { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
@@ -325,6 +332,7 @@ mod tests {
             Arc::new(TableMapping {
                 target: TableTarget::new("db", "t"),
                 columns: Vec::new(),
+                tees: Vec::new(),
             }),
             Arc::default(),
             Default::default(),
@@ -383,6 +391,7 @@ mod tests {
             SchemaEvent::Dropped {
                 oid: 16600,
                 rel_name: rel.rel_name.clone(),
+                partition: None,
             },
         );
         b.on_heap(heap(&rel, 200, ColumnValue::Int4(3)))
@@ -397,7 +406,10 @@ mod tests {
         let resolver = ToastResolver::disabled();
         let mut planner =
             Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver).unwrap();
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         // 1-row slices force the multi-batch path
         while let Some(batch) = drain.next_batch(1, usize::MAX, None).await.unwrap() {
             let is_final = batch.is_final;
@@ -416,7 +428,7 @@ mod tests {
         while let Some(item) = rd.next_item().unwrap() {
             order.push(match item {
                 PlanItem::Control(_) => "e".to_string(),
-                PlanItem::Heap(h) => format!(
+                PlanItem::Heap(h) | PlanItem::Truncate { heap: h, .. } => format!(
                     "h{}{}",
                     h.described.decoded.source_lsn,
                     if h.route.is_some() { "r" } else { "-" }
@@ -437,7 +449,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn detoast_failure_in_last_row_abandons_plan() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let mut b = XactBuffer::new(XactBufferConfig {
+            drain_batch_rows: 1,
+            ..cfg(tmp.path().to_path_buf())
+        })
+        .unwrap();
         let rel = descriptor(16601, TEXTOID);
         b.on_heap(heap(&rel, 90, ColumnValue::Text("ok".into())))
             .await
@@ -466,7 +482,10 @@ mod tests {
         );
         let path = tmp.path().join("1.plan");
         let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver).unwrap();
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         // 1-row slices: the valid row plans before the toast row fails
         let first = drain
             .next_batch(1, usize::MAX, None)
@@ -479,9 +498,7 @@ mod tests {
             .await
             .unwrap()
             .expect("toast row slice");
-        let Err(err) = planner.plan_batch(second).await else {
-            panic!("expected detoast failure");
-        };
+        let err = planner.plan_batch(second).await.unwrap_err();
         assert!(matches!(err, PlanError::Detoast(_)), "{err}");
         drain.finish().await.unwrap();
         drop(planner);
@@ -503,7 +520,7 @@ mod tests {
         let mut bad = multi_insert_raw(1, 120, 16610, &[3]);
         bad.main_data[0] = 0; // strip CONTAINS_NEW_TUPLE: ImageOnly on fold
         b.stash_raw(1, bad).await.unwrap();
-        inject_ordinary(&mut b, rfn, rel.clone());
+        let stash = inject_ordinary(rfn, rel.clone());
 
         let mut view = MapView {
             routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
@@ -513,29 +530,25 @@ mod tests {
         let resolver = ToastResolver::disabled();
         let path = tmp.path().join("1.plan");
         let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver).unwrap();
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let mut planned = 0usize;
         // 1-row slices: valid fanout rows plan before the bad record folds
         let err = loop {
-            match drain.next_batch(1, usize::MAX, None).await {
-                Ok(Some(batch)) => {
-                    planned += batch.heaps.len();
-                    planner.plan_batch(batch).await.unwrap();
-                }
-                Ok(None) => panic!("expected fold failure before EOF"),
+            let batch = match drain.next_batch(1, usize::MAX, None).await {
+                Ok(batch) => batch.expect("fold failure before EOF"),
                 Err(e) => break e,
-            }
+            };
+            planned += batch.heaps.len();
+            planner.plan_batch(batch).await.unwrap();
         };
         assert!(planned >= 1, "earlier valid rows planned before failure");
+        let msg = err.to_string();
         assert!(
-            matches!(
-                &err,
-                XactBufferError::OrdinaryFailClosed {
-                    reason: FailClosedReason::ImageOnly,
-                    ..
-                }
-            ),
-            "{err}"
+            msg.ends_with("failed closed: image-only operation"),
+            "{msg}"
         );
         drop(planner);
         assert!(!path.exists(), "abandoned plan unlinks, nothing to execute");
@@ -565,7 +578,10 @@ mod tests {
         let resolver = ToastResolver::disabled();
         let mut planner =
             Planner::create(tmp.path().join("1.plan"), 1 << 30, &mut view, &resolver).unwrap();
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         while let Some(batch) = drain.next_batch(1024, usize::MAX, None).await.unwrap() {
             let is_final = batch.is_final;
             planner.plan_batch(batch).await.unwrap();
@@ -583,10 +599,8 @@ mod tests {
         let mut rd = plan.replay().unwrap();
         let mut rows = 0usize;
         while let Some(item) = rd.next_item().unwrap() {
-            let PlanItem::Heap(h) = item else {
-                panic!("no controls planned");
-            };
-            assert!(h.route.is_some());
+            // No controls planned, every heap routed
+            assert!(matches!(item, PlanItem::Heap(h) if h.route.is_some()));
             rows += 1;
         }
         drop(rd);
@@ -605,6 +619,7 @@ mod tests {
         for (seq, lsn) in [(0u32, 100u64), (1, 102)] {
             b.on_toast_chunk(
                 ToastChunk {
+                    db_oid: 0,
                     toast_relid: 16606,
                     value_id: 50,
                     chunk_seq: seq,
@@ -627,6 +642,7 @@ mod tests {
             SchemaEvent::Dropped {
                 oid: 16699,
                 rel_name: RelName::new("public", "other"),
+                partition: None,
             },
         );
         let mut truncate = heap(&rel, 105, ColumnValue::Int4(0));
@@ -642,7 +658,10 @@ mod tests {
         let resolver = ToastResolver::disabled();
         let mut planner =
             Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver).unwrap();
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], true).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], true)
+            .await
+            .unwrap();
         while let Some(batch) = drain.next_batch(1, usize::MAX, None).await.unwrap() {
             let is_final = batch.is_final;
             planner.plan_batch(batch).await.unwrap();
@@ -693,7 +712,10 @@ mod tests {
             let resolver = ToastResolver::disabled();
             let path = tmp.path().join("1.plan");
             let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver).unwrap();
-            let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+            let mut drain = b
+                .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
+                .await
+                .unwrap();
             let batch = drain
                 .next_batch(8, usize::MAX, None)
                 .await
@@ -744,21 +766,19 @@ mod tests {
         let resolver = ToastResolver::disabled();
         let mut planner =
             Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver).unwrap();
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         while let Some(batch) = drain.next_batch(8, usize::MAX, None).await.unwrap() {
-            let is_final = batch.is_final;
             planner.plan_batch(batch).await.unwrap();
-            if is_final {
-                break;
-            }
         }
         drain.finish().await.unwrap();
         let plan = planner.seal(0x2000, 42).unwrap();
         assert_eq!(plan.heap_count, 1);
         let mut rd = plan.replay().unwrap();
-        let Some(PlanItem::Heap(h)) = rd.next_item().unwrap() else {
-            panic!("expected heap");
-        };
-        assert!(h.route.is_none(), "unmapped discard planned as such");
+        // Unmapped discard planned as such
+        let item = rd.next_item().unwrap();
+        assert!(matches!(item, Some(PlanItem::Heap(h)) if h.route.is_none()));
     }
 }

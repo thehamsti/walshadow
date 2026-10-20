@@ -64,6 +64,7 @@
 //! can key on it.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
@@ -79,6 +80,32 @@ use crate::schema::{
 /// SmallVec sized at 1: single-row INSERT/UPDATE/DELETE stays stack-allocated,
 /// only MULTI_INSERT with ntuples > 1 spills.
 pub type DecodedHeaps = SmallVec<[DecodedHeap; 1]>;
+
+/// Tuples of one record decoded ahead of the serial worker against the
+/// descriptor resolved then. Decoding is pure in (record, descriptor), so
+/// they stand in for the worker's own decode when its lookup lands on the
+/// same descriptor version
+#[derive(Debug)]
+pub struct Predecoded {
+    rel: Arc<RelDescriptor>,
+    valid_from: u64,
+    set: DecodedHeaps,
+}
+
+impl Predecoded {
+    pub fn new(rel: Arc<RelDescriptor>, valid_from: u64, set: DecodedHeaps) -> Self {
+        Self {
+            rel,
+            valid_from,
+            set,
+        }
+    }
+
+    /// Tuples, if decoded against `rel` valid from `valid_from`
+    pub fn take_if(self, rel: &Arc<RelDescriptor>, valid_from: u64) -> Option<DecodedHeaps> {
+        (Arc::ptr_eq(&self.rel, rel) && self.valid_from == valid_from).then_some(self.set)
+    }
+}
 
 /// PG `SizeOfHeapHeader`.
 pub const SIZE_OF_HEAP_HEADER: usize = 5;
@@ -416,9 +443,6 @@ pub fn decode_heap_record(
     rel: &RelDescriptor,
 ) -> Result<DecodedHeaps, DecodeError> {
     let rm = record.header.resource_manager_id;
-    if rm != RmId::Heap as u8 && rm != RmId::Heap2 as u8 {
-        return Ok(SmallVec::new());
-    }
     let info_op = record.header.info & XLOG_HEAP_OPMASK;
     let rfn = record
         .blocks
@@ -427,25 +451,24 @@ pub fn decode_heap_record(
         .unwrap_or_default();
     let xid = record.header.xact_id;
 
-    if rm == RmId::Heap as u8 {
-        match info_op {
-            XLOG_HEAP_INSERT => Ok(smallvec![decode_insert(record, source_lsn, rfn, xid, rel)?]),
-            XLOG_HEAP_UPDATE => Ok(smallvec![decode_update(
-                record, source_lsn, rfn, xid, rel, false,
-            )?]),
-            XLOG_HEAP_HOT_UPDATE => Ok(smallvec![decode_update(
-                record, source_lsn, rfn, xid, rel, true,
-            )?]),
-            XLOG_HEAP_DELETE => Ok(smallvec![
-                decode_delete(record, source_lsn, rfn, xid, rel,)?
-            ]),
-            _ => Ok(SmallVec::new()),
-        }
-    } else {
-        match info_op {
-            XLOG_HEAP2_MULTI_INSERT => decode_multi_insert(record, source_lsn, rfn, xid, rel),
-            _ => Ok(SmallVec::new()),
-        }
+    if rm == RmId::Heap2 as u8 && info_op == XLOG_HEAP2_MULTI_INSERT {
+        return decode_multi_insert(record, source_lsn, rfn, xid, rel);
+    }
+    if rm != RmId::Heap as u8 {
+        return Ok(SmallVec::new());
+    }
+    match info_op {
+        XLOG_HEAP_INSERT => Ok(smallvec![decode_insert(record, source_lsn, rfn, xid, rel)?]),
+        XLOG_HEAP_UPDATE => Ok(smallvec![decode_update(
+            record, source_lsn, rfn, xid, rel, false,
+        )?]),
+        XLOG_HEAP_HOT_UPDATE => Ok(smallvec![decode_update(
+            record, source_lsn, rfn, xid, rel, true,
+        )?]),
+        XLOG_HEAP_DELETE => Ok(smallvec![
+            decode_delete(record, source_lsn, rfn, xid, rel,)?
+        ]),
+        _ => Ok(SmallVec::new()),
     }
 }
 
@@ -990,10 +1013,10 @@ fn decoded_size_or_skip(att: &RelAttr) -> Option<usize> {
 /// we can't peek to detect a short varlena header (`att_align_pointer`).
 fn align_for(cur: usize, attalign: char) -> usize {
     match attalign {
-        'c' => cur,
         's' => align_up(cur, 2),
         'i' => align_up(cur, 4),
         'd' => align_up(cur, 8),
+        // TYPALIGN_CHAR, unknown: no-align rather than panic
         _ => cur,
     }
 }
@@ -1022,11 +1045,10 @@ fn att_align_nominal(
         return cur_offset;
     }
     match attalign {
-        'c' => cur_offset,              // TYPALIGN_CHAR
         's' => align_up(cur_offset, 2), // TYPALIGN_SHORT
         'i' => align_up(cur_offset, 4), // TYPALIGN_INT
         'd' => align_up(cur_offset, 8), // TYPALIGN_DOUBLE
-        _ => cur_offset,                // unknown: no-align rather than panic
+        _ => cur_offset,                // TYPALIGN_CHAR, unknown: no-align
     }
 }
 
@@ -1425,11 +1447,8 @@ pub(crate) fn take_toast_chunk_columns(
     let &ColumnValue::Int4(chunk_seq) = cols[1].as_ref()? else {
         return None;
     };
-    let chunk_data = match cols[2].take()? {
-        ColumnValue::Bytea(b) => b,
-        // Text-typed toast chunk: re-encode to bytes (not a normal flow)
-        ColumnValue::Text(s) => s.into_bytes(),
-        _ => return None,
+    let ColumnValue::Bytea(chunk_data) = cols[2].take()? else {
+        return None;
     };
     Some((chunk_id, chunk_seq as u32, chunk_data))
 }
@@ -1446,6 +1465,39 @@ pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {
             .unwrap_or(false),
         ReplIdent::UsingIndex { key_attnums, .. } => key_attnums.contains(&attnum),
     }
+}
+
+/// Build a delete marker when UPDATE changes primary/index key, or any column
+/// under `REPLICA IDENTITY FULL` without a primary key. Use `lsn - 1` so new
+/// row wins if both share a destination key. PostgreSQL default/index identity
+/// logs old values only when key changes or contains TOASTed values
+pub fn take_key_change_tombstone(
+    heap: &mut DecodedHeap,
+    rel: &RelDescriptor,
+) -> Option<DecodedHeap> {
+    let hot = match heap.op {
+        HeapOp::Update => false,
+        HeapOp::HotUpdate => true,
+        _ => return None,
+    };
+    let (old, new) = (heap.old.as_ref()?, heap.new.as_ref()?);
+    let differs = |a: usize| matches!((old.columns.get(a), new.columns.get(a)), (Some(Some(o)), Some(Some(n))) if o != n);
+    let keys = crate::schema::replident_key_attnums(rel);
+    let moved = if keys.is_empty() {
+        matches!(rel.replident, ReplIdent::Full { pk_attnums: None })
+            && (0..new.columns.len()).any(differs)
+    } else {
+        // PostgreSQL HOT updates leave indexed columns unchanged
+        !hot && keys.iter().any(|&a| differs(a as usize - 1))
+    };
+    moved.then(|| DecodedHeap {
+        rfn: heap.rfn,
+        xid: heap.xid,
+        source_lsn: heap.source_lsn - 1,
+        op: HeapOp::Delete,
+        new: None,
+        old: heap.old.take(),
+    })
 }
 
 /// PG `attmissingval`: one-element, no-null `ArrayType`, payload at `MAXALIGN(24)`
@@ -1520,6 +1572,7 @@ mod tests {
             rel_name: RelName::new("public", "t"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: attrs,
         }
@@ -1626,12 +1679,11 @@ mod tests {
         assert_eq!(v, ColumnValue::Text("cd".into()));
         assert_eq!(n, 3);
         // no terminator before buffer end
-        match decode_cstring(b"hello", 0) {
-            Err(DecodeError::Truncated { offset, need, have }) => {
-                assert_eq!((offset, need, have), (0, 1, 0));
-            }
-            other => panic!("expected Truncated, got {other:?}"),
-        }
+        let err = decode_cstring(b"hello", 0).unwrap_err();
+        assert_eq!(
+            format!("{err:?}"),
+            "Truncated { offset: 0, need: 1, have: 0 }"
+        );
     }
 
     #[test]
@@ -1944,15 +1996,15 @@ mod tests {
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
-        match &new.columns[0] {
-            Some(ColumnValue::ExternalToast(p)) => {
-                assert_eq!(p.va_rawsize, 12345);
-                assert_eq!(p.va_extinfo, 678);
-                assert_eq!(p.va_valueid, 12);
-                assert_eq!(p.va_toastrelid, 99);
-            }
-            other => panic!("expected ExternalToast, got {other:?}"),
-        }
+        assert_eq!(
+            new.columns[0],
+            Some(ColumnValue::ExternalToast(ToastPointer {
+                va_rawsize: 12345,
+                va_extinfo: 678,
+                va_valueid: 12,
+                va_toastrelid: 99,
+            }))
+        );
     }
 
     #[test]
@@ -1971,13 +2023,13 @@ mod tests {
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
-        match &new.columns[0] {
-            Some(ColumnValue::PgPending { type_oid, raw }) => {
-                assert_eq!(*type_oid, TSVECTOROID);
-                assert_eq!(raw.as_slice(), body);
-            }
-            other => panic!("expected PgPending, got {other:?}"),
-        }
+        assert_eq!(
+            new.columns[0],
+            Some(ColumnValue::PgPending {
+                type_oid: TSVECTOROID,
+                raw: body.to_vec(),
+            })
+        );
     }
 
     #[test]
@@ -2180,13 +2232,14 @@ mod tests {
             TSVECTOROID,
             &short_varlena(&body),
         )));
-        match missing_value_for(&a) {
-            ColumnValue::PgPending { type_oid, raw } => {
-                assert_eq!(type_oid, TSVECTOROID);
-                assert_eq!(raw, body);
+        // Tier-3 fast default stays pending
+        assert_eq!(
+            missing_value_for(&a),
+            ColumnValue::PgPending {
+                type_oid: TSVECTOROID,
+                raw: body.to_vec(),
             }
-            other => panic!("tier-3 fast default must stay pending, got {other:?}"),
-        }
+        );
     }
 
     #[test]
@@ -2337,5 +2390,111 @@ mod tests {
         assert!(!is_replica_identity_attr(&default_no_pk, 1));
         assert!(is_replica_identity_attr(&idx, 3));
         assert!(!is_replica_identity_attr(&idx, 1));
+    }
+
+    #[test]
+    fn key_change_tombstone_matrix() {
+        let tuple = |id: i32, v: &str| DecodedTuple {
+            columns: vec![
+                Some(ColumnValue::Int4(id)),
+                Some(ColumnValue::Text(v.into())),
+            ],
+            partial: false,
+        };
+        let heap = |op, old: Option<DecodedTuple>| DecodedHeap {
+            rfn: RelFileNode::default(),
+            xid: 7,
+            source_lsn: 0x100,
+            op,
+            new: Some(tuple(2, "b")),
+            old,
+        };
+        let mut rel = descriptor(1, vec![]);
+        let pk = Some(vec![1]);
+        let cases = [
+            (
+                ReplIdent::Default {
+                    pk_attnums: pk.clone(),
+                },
+                HeapOp::Update,
+                Some(tuple(1, "")),
+                true,
+            ),
+            (
+                ReplIdent::Default {
+                    pk_attnums: pk.clone(),
+                },
+                HeapOp::Update,
+                None,
+                false,
+            ),
+            // PostgreSQL logs TOASTed keys even when unchanged
+            (
+                ReplIdent::Default {
+                    pk_attnums: pk.clone(),
+                },
+                HeapOp::Update,
+                Some(tuple(2, "")),
+                false,
+            ),
+            (
+                ReplIdent::Full {
+                    pk_attnums: pk.clone(),
+                },
+                HeapOp::Update,
+                Some(tuple(2, "a")),
+                false,
+            ),
+            (
+                ReplIdent::Full {
+                    pk_attnums: pk.clone(),
+                },
+                HeapOp::HotUpdate,
+                Some(tuple(1, "a")),
+                false,
+            ),
+            (
+                ReplIdent::Full { pk_attnums: None },
+                HeapOp::HotUpdate,
+                Some(tuple(2, "a")),
+                true,
+            ),
+            (
+                ReplIdent::Full { pk_attnums: None },
+                HeapOp::Update,
+                Some(tuple(2, "b")),
+                false,
+            ),
+            (
+                ReplIdent::Full { pk_attnums: None },
+                HeapOp::Delete,
+                Some(tuple(2, "a")),
+                false,
+            ),
+            (
+                ReplIdent::UsingIndex {
+                    index_oid: 9,
+                    key_attnums: vec![2],
+                },
+                HeapOp::Update,
+                Some(tuple(2, "a")),
+                true,
+            ),
+        ];
+        for (replident, op, old, split) in cases {
+            rel.replident = replident;
+            let mut h = heap(op, old.clone());
+            let tomb = take_key_change_tombstone(&mut h, &rel);
+            assert_eq!(tomb.is_some(), split, "{:?} {op:?} {old:?}", rel.replident);
+            let Some(tomb) = tomb else {
+                assert_eq!(h.old, old);
+                continue;
+            };
+            assert_eq!(
+                (tomb.op, tomb.source_lsn, tomb.xid),
+                (HeapOp::Delete, 0xff, 7)
+            );
+            assert_eq!((tomb.old, tomb.new, h.old), (old, None, None));
+        }
     }
 }

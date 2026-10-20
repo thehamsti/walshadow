@@ -6,12 +6,12 @@
 
 #[path = "common/inproc_harness.rs"]
 mod h;
+use h::tools::pg_available;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::pin::Pin;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use walrus::pg::replication::conn::PgConfig;
@@ -24,15 +24,7 @@ use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_stream::ShadowStreamSink;
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
-use walshadow::wal_stream::WalStream;
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+use walshadow::wal_stream::{WalStream, WalStreamBuilder};
 
 fn make_source(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("source-data"), tmp.path().join("filtered"));
@@ -368,7 +360,7 @@ async fn phase(
 }
 
 /// Attach replication feed and filter to source
-async fn attach(source: &Shadow, app_name: &str) -> (SourceFeed, WalStream) {
+async fn attach(source: &Shadow, app_name: &str) -> (SourceFeed, WalStreamBuilder) {
     let cfg = source.config();
     let pgcfg = PgConfig {
         host: cfg.socket_dir.to_string_lossy().into_owned(),
@@ -386,7 +378,7 @@ async fn attach(source: &Shadow, app_name: &str) -> (SourceFeed, WalStream) {
         .with_status_interval(Duration::from_millis(500));
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
+    let mut stream = WalStream::builder(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
     stream.filter_mut().set_target_db(current_db_oid(source));
     {
         let sql_client = feed.sql_client().await.expect("sql client");
@@ -412,7 +404,6 @@ async fn attach(source: &Shadow, app_name: &str) -> (SourceFeed, WalStream) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maintenance_traffic_costs_no_catalog_boundary() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -433,7 +424,8 @@ async fn maintenance_traffic_costs_no_catalog_boundary() {
         .expect("seed schema");
 
     let names = Names::load(&source);
-    let (mut feed, mut stream) = attach(&source, "vacuum-census").await;
+    let (mut feed, stream) = attach(&source, "vacuum-census").await;
+    let mut stream = stream.start();
     let mut segs = DirSegmentSink::new(tmp.path().join("out")).expect("out dir");
     let mut buf = Vec::with_capacity(64 * 1024);
 
@@ -514,12 +506,10 @@ async fn maintenance_traffic_costs_no_catalog_boundary() {
 /// Verify maintenance workloads do not park a live pump
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn maintenance_traffic_parks_the_pump_for_nothing() {
-    if !h::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !h::tools::pg_available() {
         return;
     }
-    if !h::pg_basebackup_available() {
-        eprintln!("skip: no pg_basebackup on PATH");
+    if !h::tools::pg_basebackup_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -547,6 +537,7 @@ async fn maintenance_traffic_parks_the_pump_for_nothing() {
 
     let (mut feed, mut stream) = attach(source, "vacuum-hold").await;
     stream.set_bytes_sink(Box::new(ShadowStreamSink::new(shadow_state.clone())));
+    let mut stream = stream.start();
     let mut segs = DirSegmentSink::new(clusters.shadow_filter_dir.clone()).expect("filter dir");
     let mut buf = Vec::with_capacity(64 * 1024);
     let mut sink = HoldingCensus {

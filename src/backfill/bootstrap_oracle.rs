@@ -323,12 +323,16 @@ pub fn needs_oracle(
 ) -> bool {
     let alloc = Allocator::global(&mimalloc::MiMalloc);
     let system = SystemColumns::default();
-    catalog.descriptors().any(|desc| {
-        tables.get(&desc.rel_name).is_some_and(|mapping| {
-            TablePlan::build(alloc, desc, mapping, column_rules, &system)
-                .map_or(true, |plan| plan.needs_oracle())
+    // Partitions encode under their root's mapping and column types
+    catalog
+        .partitioned()
+        .chain(catalog.descriptors())
+        .any(|desc| {
+            tables.get(&desc.rel_name).is_some_and(|mapping| {
+                TablePlan::build(alloc, desc, mapping, column_rules, &system)
+                    .map_or(true, |plan| plan.needs_oracle())
+            })
         })
-    })
 }
 
 #[cfg(test)]
@@ -373,6 +377,7 @@ mod tests {
             rel_name: RelName::new("public", "foo"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: attrs,
         }
@@ -382,12 +387,13 @@ mod tests {
         let mapping = TableMapping {
             target: TableTarget::new("default", "foo"),
             columns: derive_columns_for_mapping(&desc, rules),
+            tees: Vec::new(),
         };
         let mut tables = HashMap::default();
         tables.insert(desc.rel_name.clone(), mapping);
         let mut catalog = CatalogMap::new();
         catalog.insert(Arc::new(desc));
-        (catalog, Arc::new(tables))
+        (catalog, Arc::new(crate::mapping::shared(tables)))
     }
 
     fn override_rule(attname: &str, target_type: &str) -> ColumnRules {
@@ -458,7 +464,7 @@ mod tests {
             ]),
             &ColumnRules::default(),
         );
-        let mapping = Arc::make_mut(&mut tables).values_mut().next().unwrap();
+        let mapping = Arc::make_mut(Arc::make_mut(&mut tables).values_mut().next().unwrap());
         for (column, sql_type) in
             mapping
                 .columns
@@ -519,8 +525,9 @@ mod tests {
         let rules = ColumnRules::default();
         let desc = rel(vec![attr(1, "id", INT4OID, "int4", 4)]);
         let (catalog, mut tables) = bridged(desc.clone(), &rules);
-        let mapping = Arc::make_mut(&mut tables).get_mut(&desc.rel_name).unwrap();
-        mapping.columns[0].target_type = "NotAType".into();
+        let entry = Arc::make_mut(&mut tables).get_mut(&desc.rel_name).unwrap();
+        Arc::make_mut(entry).columns[0].target_type = "NotAType".into();
+        let mapping = entry.as_ref();
         assert!(
             TablePlan::build(
                 Allocator::global(&mimalloc::MiMalloc),

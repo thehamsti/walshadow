@@ -15,8 +15,10 @@ move DNS
 - required WAL remains available
 - when using slots, target already has physical slot covering resume position
 
-Physical slots are not synchronized to standbys. Create target slot before
-switchover with storage and WAL coverage appropriate for deployment
+Physical slots are not necessary when using object storage, since archive
+covers WAL retention. Physical slots are not synchronized to standbys. Create
+target slot before switchover with storage and WAL coverage appropriate for
+deployment
 
 ## Procedure
 
@@ -28,6 +30,12 @@ switchover with storage and WAL coverage appropriate for deployment
    ```
 
    Record `pause_consumed_lsn` and `pause_received_lsn`
+
+   Pause leaves the replication stream, so the old primary's walsender exits
+   on its own and step 2's fast shutdown does not wait out
+   `wal_sender_timeout`. Resume redials from the same position. Without a
+   replication slot the source may recycle WAL across a long pause; resume
+   then reads the gap from the archive, or stops if neither holds it
 
 2. Stop writes on old primary, using application fencing or PostgreSQL fast shutdown
 
@@ -88,8 +96,8 @@ ClickHouse acknowledgement state
 ## Unsupported failover
 
 Unplanned promotion while walshadow is consuming old primary can leave
-transactions or rows beyond fork point. Current release fails closed instead
+transactions or rows beyond fork point. walshadow fails closed instead
 of compensating ClickHouse
 
 Rebuild from known baseline or restore old planned path after unplanned
-promotion. See [Current limits](limitations.md)
+promotion. See [Limits](limitations.md)

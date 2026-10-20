@@ -32,7 +32,7 @@ use crate::destination::snowflake::types::SnowflakeRow;
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
-use crate::emit::route::RouteSnapshot;
+use crate::emit::route::{FrozenRoutes, PartitionOf, RouteSnapshot, partition_mapping, routing};
 use crate::mapping::{ColumnMapping, MappingSnapshot, TableMapping, TableTarget};
 use crate::ops::oracle::Oracle;
 use crate::pos::{Pos, Snapshot};
@@ -62,27 +62,49 @@ const PENDING_SLAB_ROWS: usize = 256;
 #[derive(Debug, Clone)]
 pub struct PendingRel {
     pub rel: RelName,
-    pub database: String,
-    pub table: String,
+    pub target: TableTarget,
+    /// Also copy rows here when releasing them from pending tables
+    pub tees: Vec<TableTarget>,
+    /// Partition OID used to stage rows separately from siblings sharing `target`
+    pub leaf: Option<u32>,
 }
 
 impl PendingRel {
     pub fn pending_table(&self) -> String {
-        format!("{}{PENDING_SUFFIX}", self.table)
+        match self.leaf {
+            Some(leaf) => format!("{}{PENDING_SUFFIX}_{leaf}", self.target.table),
+            None => format!("{}{PENDING_SUFFIX}", self.target.table),
+        }
     }
 
     pub fn target_sql(&self) -> String {
-        format!(
-            "{}.{}",
-            quote_ident(&self.database),
-            quote_ident(&self.table)
-        )
+        self.target.sql()
+    }
+
+    fn targets(&self) -> impl Iterator<Item = TableTarget> + '_ {
+        std::iter::once(self.target.clone()).chain(self.tees.iter().cloned())
+    }
+
+    fn remote_copies(&self) -> impl Iterator<Item = PendingRel> + '_ {
+        self.tees
+            .iter()
+            .filter(|t| t.instance != self.target.instance)
+            .map(|t| self.for_target(t))
+    }
+
+    fn for_target(&self, target: &TableTarget) -> Self {
+        Self {
+            rel: self.rel.clone(),
+            target: target.clone(),
+            tees: Vec::new(),
+            leaf: self.leaf,
+        }
     }
 
     pub fn pending_sql(&self) -> String {
         format!(
             "{}.{}",
-            quote_ident(&self.database),
+            quote_ident(&self.target.database),
             quote_ident(&self.pending_table())
         )
     }
@@ -119,8 +141,21 @@ fn pending_table_mapping(
             }),
     );
     TableMapping {
-        target: TableTarget::new(&pending.database, &pending.pending_table()),
+        target: TableTarget {
+            instance: pending.target.instance.clone(),
+            ..TableTarget::new(&pending.target.database, &pending.pending_table())
+        },
         columns,
+        // Store pending rows on each destination instance so INSERT SELECT can read them
+        tees: pending
+            .remote_copies()
+            .map(|rel| crate::mapping::Tee {
+                table: rel.pending_table(),
+                instance: Some(rel.target.instance.unwrap_or_else(|| "default".into())),
+                database: Some(rel.target.database),
+                ..Default::default()
+            })
+            .collect(),
     }
 }
 
@@ -246,16 +281,27 @@ pub async fn ship(
         return Ok(Vec::new());
     }
 
-    let mut routes: HashMap<RelName, TableMapping> = HashMap::with_capacity(tally.len());
+    let rules = config.as_ref().map(|rc| rc.rules.clone());
+    let row_policy = dest.current().row_policy();
+    let column_rules = config
+        .as_ref()
+        .map_or_else(Arc::default, |rc| rc.column_rules.clone());
+    let mut routes: ahash::HashMap<RelName, Arc<RouteSnapshot>> =
+        ahash::HashMap::with_capacity(tally.len());
     let mut manifests = Vec::with_capacity(tally.len());
     let mut sess = StagingSession::connect(dest.clone())
         .await
         .map_err(|e| format!("pending visibility: connect: {e}"))?;
     for desc in catalog.descriptors() {
-        let Some(counted) = tally.get(&desc.rel_name) else {
+        // Excluded partitions have no owner and no tapped rows
+        let (Some(counted), Some(owner)) = (
+            tally.get(&desc.rel_name),
+            routing(desc, rules.as_deref()).owner(desc),
+        ) else {
             continue;
         };
-        let Some(m) = live.get(&desc.rel_name) else {
+        let leaf = (owner.oid != desc.oid).then_some(desc.oid);
+        let Some(m) = live.get(&owner.rel_name) else {
             // Unmapped at resolution: rows had nowhere to publish either
             tracing::warn!(
                 target: "walshadow::visibility_pending",
@@ -264,13 +310,36 @@ pub async fn ship(
             );
             continue;
         };
+        let m = if leaf.is_some() {
+            &partition_mapping(m, owner, desc)
+        } else {
+            m
+        };
         let rel = PendingRel {
             rel: desc.rel_name.clone(),
-            database: m.target.database.clone(),
-            table: m.target.table.clone(),
+            target: m.target.clone(),
+            tees: m.tee_targets().collect(),
+            leaf,
         };
         rebuild_pending(&mut sess, &rel).await?;
-        routes.insert(desc.rel_name.clone(), pending_table_mapping(m, desc, &rel));
+        for remote in rel.remote_copies() {
+            rebuild_pending(&mut sess, &remote).await?;
+        }
+        let route = RouteSnapshot::freeze(
+            Arc::new(pending_table_mapping(m, desc, &rel)),
+            column_rules.clone(),
+            row_policy.for_rel(config.as_deref(), &owner.rel_name),
+        );
+        let route = if let Some(leaf) = leaf {
+            route.with_partition(PartitionOf {
+                root: owner.rel_name.clone(),
+                leaf,
+                shared: false,
+            })
+        } else {
+            route
+        };
+        routes.insert(desc.rel_name.clone(), route);
         manifests.push(PendingManifest {
             rel,
             relation_oid: desc.oid,
@@ -301,14 +370,12 @@ pub async fn ship(
     let drain = tokio::spawn(bootstrap::drain(
         rx,
         catalog,
-        Arc::new(routes),
+        FrozenRoutes::pinned(routes),
         tail.msg_tx.clone(),
         tail.ack.clone(),
         stats.clone(),
         resolver,
         bootstrap::Deferral::Local(DeferredSpool::new(deferred, DEFERRED_SPOOL_MEM_MAX)),
-        emitter.row_policy(),
-        config,
         HashSet::new(),
         emitter.snowflake.is_some(),
         None,
@@ -368,8 +435,7 @@ async fn ship_snowflake(
                 desc.rel_name
             ));
         };
-        let route =
-            RouteSnapshot::freeze(Arc::new(mapping.clone()), Arc::default(), policy.clone());
+        let route = RouteSnapshot::freeze(mapping.clone(), Arc::default(), policy.clone());
         let schema = runtime
             .schema_for(desc, &route)
             .await
@@ -378,8 +444,9 @@ async fn ship_snowflake(
         manifests.push(PendingManifest {
             rel: PendingRel {
                 rel: desc.rel_name.clone(),
-                database: mapping.target.database.clone(),
-                table: mapping.target.table.clone(),
+                target: mapping.target.clone(),
+                tees: Vec::new(),
+                leaf: None,
             },
             relation_oid: desc.oid,
             start_lsn: counted.start_lsn,
@@ -522,6 +589,8 @@ fn pending_create_sql(rel: &PendingRel) -> String {
 }
 
 async fn rebuild_pending(sess: &mut StagingSession, rel: &PendingRel) -> Result<(), String> {
+    sess.select(rel.target.instance.as_deref())
+        .map_err(|e| e.to_string())?;
     let pending = rel.pending_sql();
     sess.exec_retry(&format!("DROP TABLE IF EXISTS {pending}"))
         .await
@@ -570,17 +639,25 @@ pub struct PendingEntry {
     pub relation_oid: u32,
     pub namespace: String,
     pub relname: String,
-    pub database: String,
-    pub table: String,
+    #[serde(flatten)]
+    pub target: TableTarget,
+    #[serde(default)]
+    pub tees: Vec<TableTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaf: Option<u32>,
     /// Preserve load version through promotion
     pub start_lsn: Pos<Snapshot>,
-    /// Deciding xids whose outcome is still unknown
+    /// Sorted deciding xids whose outcome is still unknown
     #[serde(default)]
     pub outstanding: Vec<u32>,
     #[serde(default)]
     pub committed: Vec<u32>,
     #[serde(default)]
     pub aborted: Vec<u32>,
+    /// Awaiting EXCHANGE: outcomes accumulate, promotion waits since the
+    /// swap would discard promoted rows
+    #[serde(default)]
+    pub held: bool,
     /// Limit promotion to newly resolved rows; relearn after crash for retry
     #[serde(skip)]
     fresh_committed: Vec<u32>,
@@ -592,16 +669,21 @@ impl PendingEntry {
     fn rel(&self) -> PendingRel {
         PendingRel {
             rel: RelName::new(&self.namespace, &self.relname),
-            database: self.database.clone(),
-            table: self.table.clone(),
+            target: self.target.clone(),
+            tees: self.tees.clone(),
+            leaf: self.leaf,
         }
     }
 
+    fn is(&self, rel: &RelName) -> bool {
+        *self.namespace == *rel.namespace && *self.relname == *rel.name
+    }
+
     fn note(&mut self, xid: u32, committed: bool) -> bool {
-        let Some(i) = self.outstanding.iter().position(|x| *x == xid) else {
+        let Ok(i) = self.outstanding.binary_search(&xid) else {
             return false;
         };
-        self.outstanding.swap_remove(i);
+        self.outstanding.remove(i);
         self.decided(xid, committed);
         true
     }
@@ -618,6 +700,16 @@ impl PendingEntry {
 
     fn has_fresh(&self) -> bool {
         !self.fresh_committed.is_empty() || !self.fresh_aborted.is_empty()
+    }
+}
+
+/// Bootstrap's pending tables are durable, so its marker may clear
+pub struct PendingRecorded(());
+
+impl PendingRecorded {
+    /// No visibility gate ran, so no pending table exists
+    pub fn nothing_pending() -> Self {
+        Self(())
     }
 }
 
@@ -652,8 +744,8 @@ impl PendingLedger {
             {
                 if entry.namespace != manifest.source_namespace
                     || entry.relname != manifest.source_relname
-                    || entry.database != manifest.database
-                    || entry.table != manifest.table
+                    || entry.target.database != manifest.database
+                    || entry.target.table != manifest.table
                 {
                     return Err("Snowflake pending relation metadata conflicts with ledger".into());
                 }
@@ -671,12 +763,14 @@ impl PendingLedger {
                     relation_oid: manifest.relation_oid,
                     namespace: manifest.source_namespace,
                     relname: manifest.source_relname,
-                    database: manifest.database,
-                    table: manifest.table,
+                    target: TableTarget::new(&manifest.database, &manifest.table),
+                    tees: Vec::new(),
+                    leaf: None,
                     start_lsn: Pos::new(manifest.start_lsn),
                     outstanding: manifest.xids,
                     committed: Vec::new(),
                     aborted: Vec::new(),
+                    held: false,
                     fresh_committed: Vec::new(),
                     fresh_aborted: Vec::new(),
                 });
@@ -698,11 +792,15 @@ impl PendingLedger {
         let path = ledger_path(spill_dir);
         match tokio::fs::read_to_string(&path).await {
             Ok(text) => {
-                let file: PendingFile = toml::from_str(&text)?;
+                let mut file: PendingFile = toml::from_str(&text)?;
                 if file.version != PENDING_LEDGER_VERSION {
                     return Err(PendingLedgerError::Version(file.version));
                 }
                 let unstamped = crate::fs::check_source(&path, file.system_id, system_id)?;
+                // v0.1 ledger files may hold outstanding unsorted
+                for e in &mut file.entries {
+                    e.outstanding.sort_unstable();
+                }
                 ledger.entries = file.entries;
                 if unstamped {
                     ledger.persist().await?;
@@ -762,20 +860,68 @@ impl PendingLedger {
         self.persist().await
     }
 
+    /// [`Self::push`] each manifest under one persist
+    pub async fn record(&mut self, manifests: &[PendingManifest]) -> io::Result<PendingRecorded> {
+        if !manifests.is_empty() {
+            manifests.iter().for_each(|m| self.stage(m));
+            self.persist().await?;
+        }
+        Ok(PendingRecorded(()))
+    }
+
     /// [`Self::push`] without persisting
     pub fn stage(&mut self, manifest: &PendingManifest) {
+        self.stage_entry(manifest, false);
+    }
+
+    /// [`Self::stage`] withholding promotion until [`Self::activate`]
+    pub fn hold(&mut self, manifest: &PendingManifest) {
+        self.stage_entry(manifest, true);
+    }
+
+    /// Release a held entry once its EXCHANGE applied. Nothing promoted
+    /// while held, so every decided xid is fresh
+    pub fn activate(&mut self, rel: &RelName) -> bool {
+        let Some(e) = self.entries.iter_mut().find(|e| e.held && e.is(rel)) else {
+            return false;
+        };
+        e.held = false;
+        e.fresh_committed.clone_from(&e.committed);
+        e.fresh_aborted.clone_from(&e.aborted);
+        true
+    }
+
+    /// Forget a held entry whose load never published; a retry rebuilds it
+    pub fn discard_held(&mut self, rel: &RelName) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| !e.held || !e.is(rel));
+        self.entries.len() != before
+    }
+
+    /// Forget held entries `swapped` rejects. Boot cleanup: a crash between
+    /// hold and swap mark leaves entries no swap resume will activate
+    pub fn discard_held_unless(&mut self, swapped: impl Fn(&RelName) -> bool) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| !e.held || swapped(&RelName::new(&e.namespace, &e.relname)));
+        self.entries.len() != before
+    }
+
+    fn stage_entry(&mut self, manifest: &PendingManifest, held: bool) {
         let mut xids = manifest.xids.clone();
         xids.sort_unstable();
         let entry = PendingEntry {
             relation_oid: manifest.relation_oid,
             namespace: manifest.rel.rel.namespace.to_string(),
             relname: manifest.rel.rel.name.to_string(),
-            database: manifest.rel.database.clone(),
-            table: manifest.rel.table.clone(),
+            target: manifest.rel.target.clone(),
+            tees: manifest.rel.tees.clone(),
+            leaf: manifest.rel.leaf,
             start_lsn: Pos::new(manifest.start_lsn),
             outstanding: xids,
             committed: Vec::new(),
             aborted: Vec::new(),
+            held,
             fresh_committed: Vec::new(),
             fresh_aborted: Vec::new(),
         };
@@ -879,10 +1025,15 @@ pub async fn settle(
     }
     let mut done = Vec::new();
     for (i, e) in ledger.entries.iter_mut().enumerate() {
+        if e.held {
+            continue;
+        }
         let rel = e.rel();
+        sess.select(rel.target.instance.as_deref())
+            .map_err(|err| err.to_string())?;
         // Crash may follow DROP but precede ledger persist
         if sess
-            .table_uuid(&e.database, &rel.pending_table())
+            .table_uuid(&e.target.database, &rel.pending_table())
             .await
             .map_err(|err| format!("pending visibility: {}: {err}", rel.pending_sql()))?
             .is_none()
@@ -898,9 +1049,13 @@ pub async fn settle(
         if !e.outstanding.is_empty() {
             continue;
         }
-        sess.exec_retry(&format!("DROP TABLE IF EXISTS {}", rel.pending_sql()))
-            .await
-            .map_err(|err| err.to_string())?;
+        for copy in rel.remote_copies().chain(std::iter::once(rel.clone())) {
+            sess.select(copy.target.instance.as_deref())
+                .map_err(|err| err.to_string())?;
+            sess.exec_retry(&format!("DROP TABLE IF EXISTS {}", copy.pending_sql()))
+                .await
+                .map_err(|err| err.to_string())?;
+        }
         stats.pending_tables_dropped.fetch_add(1, Ordering::Relaxed);
         done.push(i);
     }
@@ -922,15 +1077,32 @@ async fn promote(
     rel: &PendingRel,
     entry: &PendingEntry,
 ) -> Result<(), String> {
-    let list = shared_columns(sess, rel).await?;
-    let sql = promote_sql(rel, entry, &list);
-    sess.exec_retry(&sql).await.map_err(|e| e.to_string())
+    for target in rel.targets() {
+        let copy = if target.instance == rel.target.instance {
+            rel.clone()
+        } else {
+            rel.for_target(&target)
+        };
+        sess.select(copy.target.instance.as_deref())
+            .map_err(|e| e.to_string())?;
+        if sess
+            .table_uuid(&copy.target.database, &copy.pending_table())
+            .await
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            continue;
+        }
+        let list = shared_columns(sess, &copy).await?;
+        let sql = promote_sql(&target.sql(), &copy, entry, &list);
+        sess.exec_retry(&sql).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
-fn promote_sql(rel: &PendingRel, entry: &PendingEntry, list: &str) -> String {
+fn promote_sql(target: &str, rel: &PendingRel, entry: &PendingEntry, list: &str) -> String {
     format!(
-        "INSERT INTO {} ({list}) SELECT {list} FROM {} WHERE {} AND {} AND {}",
-        rel.target_sql(),
+        "INSERT INTO {target} ({list}) SELECT {list} FROM {} WHERE {} AND {} AND {}",
         rel.pending_sql(),
         settled_side(XMIN_COLUMN, &entry.committed),
         settled_side(XMAX_COLUMN, &entry.aborted),
@@ -943,8 +1115,8 @@ async fn shared_columns(sess: &mut StagingSession, rel: &PendingRel) -> Result<S
         .query_strings(&format!(
             "SELECT name FROM system.columns WHERE database = {} AND table = {} \
              ORDER BY position",
-            sql_str(&rel.database),
-            sql_str(&rel.table)
+            sql_str(&rel.target.database),
+            sql_str(&rel.target.table)
         ))
         .await
         .map_err(|e| e.to_string())?;
@@ -952,7 +1124,7 @@ async fn shared_columns(sess: &mut StagingSession, rel: &PendingRel) -> Result<S
         .query_strings(&format!(
             "SELECT name FROM system.columns WHERE database = {} AND table = {} \
              ORDER BY position",
-            sql_str(&rel.database),
+            sql_str(&rel.target.database),
             sql_str(&rel.pending_table())
         ))
         .await
@@ -1014,8 +1186,9 @@ mod tests {
         PendingManifest {
             rel: PendingRel {
                 rel: RelName::new("public", rel),
-                database: "db".into(),
-                table: rel.into(),
+                target: TableTarget::new("db", rel),
+                tees: Vec::new(),
+                leaf: None,
             },
             relation_oid: 42,
             start_lsn: 0x5000,
@@ -1052,6 +1225,7 @@ mod tests {
                 target_type: "Int32".into(),
                 type_pinned: false,
             }],
+            tees: Vec::new(),
         };
         let rel = manifest("t", Vec::new()).rel;
         let pending = pending_table_mapping(&m, &desc, &rel);
@@ -1114,6 +1288,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ledger_keeps_tees_for_promotion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
+        let mut m = manifest("orders", vec![101]);
+        m.rel.target.instance = Some("warehouse".into());
+        m.rel.tees = vec![TableTarget {
+            instance: Some("archive".into()),
+            ..TableTarget::new("audit", "orders_log")
+        }];
+        ledger.push(&m).await.unwrap();
+        let reloaded = PendingLedger::load(tmp.path(), 7).await.unwrap();
+        let rel = reloaded.entries()[0].rel();
+        assert_eq!(rel.target.instance.as_deref(), Some("warehouse"));
+        let copies: Vec<_> = rel.remote_copies().collect();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].target.instance.as_deref(), Some("archive"));
+        assert_eq!(copies[0].pending_sql(), "`audit`.`orders_log__wspending`");
+        assert_eq!(
+            reloaded.entries()[0]
+                .rel()
+                .targets()
+                .map(|t| t.sql())
+                .collect::<Vec<_>>(),
+            ["`db`.`orders`", "`audit`.`orders_log`"]
+        );
+    }
+
+    #[tokio::test]
     async fn promote_selects_only_settled_rows() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
@@ -1125,7 +1327,7 @@ mod tests {
         ledger.note(102, &[], false);
         let entry = &ledger.entries()[0];
         assert_eq!(
-            promote_sql(&entry.rel(), entry, "`id`, `_lsn`"),
+            promote_sql("`db`.`orders`", &entry.rel(), entry, "`id`, `_lsn`"),
             "INSERT INTO `db`.`orders` (`id`, `_lsn`) \
              SELECT `id`, `_lsn` FROM `db`.`orders__wspending` \
              WHERE (`_ws_xmin` = 0 OR `_ws_xmin` IN (101)) \
@@ -1146,7 +1348,7 @@ mod tests {
         ledger.note(101, &[], true);
         let first = {
             let e = &ledger.entries()[0];
-            promote_sql(&e.rel(), e, "`id`")
+            promote_sql("`db`.`orders`", &e.rel(), e, "`id`")
         };
         assert!(first.ends_with("AND (`_ws_xmin` IN (101))"), "{first}");
 
@@ -1154,13 +1356,38 @@ mod tests {
         ledger.note(102, &[], false);
         let second = {
             let e = &ledger.entries()[0];
-            promote_sql(&e.rel(), e, "`id`")
+            promote_sql("`db`.`orders`", &e.rel(), e, "`id`")
         };
         assert!(
             second.contains("(`_ws_xmin` = 0 OR `_ws_xmin` IN (101))"),
             "{second}"
         );
         assert!(second.ends_with("AND (`_ws_xmax` IN (102))"), "{second}");
+    }
+
+    #[tokio::test]
+    async fn held_entry_promotes_every_outcome_once_activated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
+        ledger.hold(&manifest("orders", vec![101, 102]));
+        ledger.hold(&manifest("items", vec![103]));
+        // Outcome lands while EXCHANGE is outstanding, then restart drops fresh
+        ledger.note(101, &[], true);
+        ledger.persist().await.unwrap();
+        let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
+        assert!(ledger.entries().iter().all(|e| e.held));
+
+        let orders = RelName::new("public", "orders");
+        assert!(!ledger.discard_held_unless(|_| true));
+        assert!(ledger.discard_held_unless(|r| *r == orders));
+        assert!(!ledger.discard_held(&RelName::new("public", "items")));
+        assert!(ledger.activate(&orders));
+        assert!(!ledger.activate(&orders), "already active");
+        assert!(!ledger.discard_held(&orders), "active entries stay");
+        let e = &ledger.entries()[0];
+        assert!(!e.held);
+        let sql = promote_sql("`db`.`orders`", &e.rel(), e, "`id`");
+        assert!(sql.ends_with("AND (`_ws_xmin` IN (101))"), "{sql}");
     }
 
     #[test]
@@ -1183,7 +1410,7 @@ mod tests {
         ledger.note(101, &[], false);
         ledger.note(102, &[], true);
         let entry = &ledger.entries()[0];
-        let sql = promote_sql(&entry.rel(), entry, "`id`");
+        let sql = promote_sql("`db`.`orders`", &entry.rel(), entry, "`id`");
         // Rows waiting on 101's commit or 102's abort match neither side
         assert!(
             sql.contains("(`_ws_xmin` = 0 OR `_ws_xmin` IN (102))"),
@@ -1203,7 +1430,7 @@ mod tests {
         let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
         ledger.push(&manifest("orders", vec![101])).await.unwrap();
         let accum = PgXactAccum::new();
-        let patch = PgXactPatch::new();
+        let patch = PgXactPatch::new().seal();
         let fold = ledger.note_view(&PgXactView::new(&accum, &patch));
         assert_eq!(fold.settled, 0);
         assert_eq!(fold.undecidable, 1, "an aged-out xid is visible as such");

@@ -5,6 +5,7 @@
 //! `50-api.toml` unless `--control-fragment` names another, keeping
 //! operator-owned config read-only. PeerDB shim consumes this protocol
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use toml::{Table, Value};
 use walrus::pg::backup::format_pg_lsn;
 
 use crate::config::SourceConn;
+use crate::emit::ch_emitter::{InstanceConfig, instance_database};
 use crate::introspect;
 use crate::metrics::MetricsRegistry;
 use crate::schema::RelName;
@@ -497,15 +499,37 @@ fn namespace_str(root: &Table, db: &str, namespace: &str, key: &str) -> Option<S
         .map(str::to_owned)
 }
 
-fn status_tables(root: &Table, db: &str, ch_database: &str) -> Vec<Value> {
+fn status_tables(
+    root: &Table,
+    db: &str,
+    ch_database: &str,
+    instances: &BTreeMap<String, InstanceConfig>,
+) -> Vec<Value> {
     replicated_entries(root, db)
         .into_iter()
         .map(|(ns, rel, block)| {
             let block_str = |key: &str| block.get(key).and_then(Value::as_str).map(str::to_owned);
+            let instance = block_str("target_instance").unwrap_or_else(|| "default".into());
             let database = block_str("target_database")
                 .or_else(|| namespace_str(root, db, ns, "target_database"))
-                .unwrap_or_else(|| ch_database.to_owned());
-            let table = block_str("target_table").unwrap_or_else(|| rel.to_owned());
+                .unwrap_or_else(|| {
+                    instance_database(instances, ch_database, Some(&instance))
+                        .unwrap_or(ch_database)
+                        .to_owned()
+                });
+            let table = block_str("target_table").unwrap_or_else(|| {
+                namespace_str(root, db, ns, "auto_create_name")
+                    .or_else(|| {
+                        root.get("stream")
+                            .and_then(Value::as_table)
+                            .and_then(|t| t.get("auto_create_name_all"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .and_then(|raw| crate::mapping::NameTemplate::parse(&raw).ok())
+                    .unwrap_or_default()
+                    .render(db, ns, rel)
+            });
             let initial_load = block_str("initial_load")
                 .or_else(|| namespace_str(root, db, ns, "initial_load"))
                 .unwrap_or_else(|| "none".into());
@@ -515,6 +539,7 @@ fn status_tables(root: &Table, db: &str, ch_database: &str) -> Vec<Value> {
                 "destination_table".into(),
                 format!("{database}.{table}").into(),
             );
+            entry.insert("destination_instance".into(), instance.into());
             entry.insert("initial_load".into(), initial_load.into());
             entry.insert("cdc".into(), true.into());
             Value::Table(entry)
@@ -544,6 +569,12 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
         .and_then(Value::as_str)
         .unwrap_or("default")
         .to_string();
+    let instances: BTreeMap<String, InstanceConfig> = root
+        .get("ch")
+        .and_then(|ch| ch.get("instances"))
+        .cloned()
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or_default();
     // One entry per database, each holding that database's selected tables
     let per_db: Vec<Value> = databases(&root)
         .iter()
@@ -552,14 +583,14 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
             row.insert("dbname".into(), db.clone().into());
             row.insert(
                 "tables".into(),
-                Value::Array(status_tables(&root, db, &ch_database)),
+                Value::Array(status_tables(&root, db, &ch_database, &instances)),
             );
             Value::Table(row)
         })
         .collect();
     // Flat list stays the primary database's, which is what a single-database
     // deployment reports
-    let tables = status_tables(&root, dbname(&root), &ch_database);
+    let tables = status_tables(&root, dbname(&root), &ch_database, &instances);
     let snap = ctx.metrics.snapshot().await;
     let mut out = Table::new();
     out.insert("paused".into(), paused.into());
@@ -576,6 +607,32 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
         "backfills_pending".into(),
         (snap.config_backfills_pending as i64).into(),
     );
+    let unmapped: Vec<Value> = snap
+        .unmapped_rows_by_table
+        .iter()
+        .map(|(database, table, rows)| {
+            let mut row = Table::new();
+            row.insert("database".into(), database.clone().into());
+            row.insert("table".into(), table.clone().into());
+            row.insert("rows".into(), (*rows as i64).into());
+            Value::Table(row)
+        })
+        .collect();
+    out.insert("unmapped_tables".into(), Value::Array(unmapped));
+    let skipped: Vec<Value> = snap
+        .skipped_records_by_rel
+        .iter()
+        .map(|skip| {
+            let mut row = Table::new();
+            row.insert("database".into(), skip.database.clone().into());
+            row.insert("rel_node".into(), skip.rel_node.clone().into());
+            row.insert("op".into(), skip.op.into());
+            row.insert("reason".into(), skip.reason.into());
+            row.insert("records".into(), (skip.records as i64).into());
+            Value::Table(row)
+        })
+        .collect();
+    out.insert("skipped_relations".into(), Value::Array(skipped));
     out.insert(
         "lag_bytes".into(),
         (snap.shadow_apply_lag_bytes as i64).into(),
@@ -718,18 +775,6 @@ fn set_mode_600(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Scalar at `[section] key`, for asserting fragment edits
-    fn str_at(root: &Table, section: &str, key: &str) -> String {
-        root.get(section)
-            .and_then(Value::as_table)
-            .and_then(|t| t.get(key))
-            .map(|v| match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-            .unwrap_or_default()
-    }
-
     fn cfg(toml: &str) -> Table {
         if toml.is_empty() {
             Table::new()
@@ -804,7 +849,7 @@ mod tests {
             "[source]\nhost = \"h\"\npassword = \"p\"\n[table.demo.a]\nreplicate = true\n[table.demo.b]\nreplicate = true\n",
         );
         apply_mask(&mut root, &cfg("[source]\npassword = \"\""));
-        assert_eq!(str_at(&root, "source", "host"), "h");
+        assert_eq!(root["source"]["host"].as_str(), Some("h"));
         assert!(root["source"].as_table().unwrap().get("password").is_none());
         apply_mask(&mut root, &cfg("[table.demo]\na = \"\"\nmissing = \"\""));
         let demo = root["table"].as_table().unwrap()["demo"]
@@ -853,6 +898,7 @@ mod tests {
             Some(path),
             Table::new(),
             crate::mapping::mapping_handle(Default::default()),
+            crate::config::ResolverBoot::default(),
         );
         let reloader = Reloader::default();
         reloader.set_resolvers(vec![resolver]).await;
@@ -919,10 +965,14 @@ mod tests {
                 "apply",
                 "[source]\ndbname = \"app\"\n\
                  [ch]\ndatabase = \"cdc\"\n\
+                 [stream]\nauto_create_name_all = \"$database$_$schema$_\"\n\
                  [namespace.shop]\ntarget_database = \"warehouse\"\n\
+                 [namespace.audit]\nauto_create_name = \"$table$\"\n\
                  [table.public.orders]\nreplicate = true\ninitial_load = \"copy\"\n\
                  [table.public.audit]\nreplicate = false\n\
-                 [table.shop.items]\nreplicate = true\ntarget_table = \"line_items\"\n"
+                 [table.shop.items]\nreplicate = true\ntarget_table = \"line_items\"\n\
+                 [table.shop.prices]\nreplicate = true\n\
+                 [table.audit.events]\nreplicate = true\n"
             )
             .await
             .starts_with("OK")
@@ -943,12 +993,27 @@ mod tests {
                 .cloned()
                 .unwrap_or_else(|| panic!("{source} missing from {status}"))
         };
-        assert_eq!(tables.len(), 2, "{status}");
+        assert_eq!(tables.len(), 4, "{status}");
 
         let orders = entry("app.public.orders");
         assert_eq!(
             orders.get("destination_table").and_then(Value::as_str),
-            Some("cdc.orders")
+            Some("cdc.app_public_orders"),
+            "a derived name takes the cluster-wide template",
+        );
+        assert_eq!(
+            entry("app.shop.prices")
+                .get("destination_table")
+                .and_then(Value::as_str),
+            Some("warehouse.app_shop_prices"),
+            "the cluster-wide template reaches every namespace",
+        );
+        assert_eq!(
+            entry("app.audit.events")
+                .get("destination_table")
+                .and_then(Value::as_str),
+            Some("cdc.events"),
+            "a `$table$` auto_create_name derives a bare name",
         );
         assert_eq!(
             orders.get("initial_load").and_then(Value::as_str),

@@ -14,6 +14,9 @@
 
 #![allow(dead_code)]
 
+#[path = "tools.rs"]
+pub mod tools;
+
 #[path = "ports.rs"]
 mod ports;
 #[allow(unused_imports)]
@@ -341,52 +344,6 @@ impl DaemonRun {
     }
 }
 
-/// Skip-gate probe — same shape as `pipeline_e2e.rs::clickhouse_available`.
-pub fn clickhouse_available() -> bool {
-    Command::new("clickhouse")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-pub fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-pub fn pg_basebackup_available() -> bool {
-    Command::new("pg_basebackup")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Skip gate every daemon bootstrap drill shares. Names the missing tool.
-pub fn requirements_available() -> bool {
-    for (tool, found) in [
-        ("initdb", pg_available()),
-        ("pg_basebackup", pg_basebackup_available()),
-        ("clickhouse", clickhouse_available()),
-    ] {
-        if !found {
-            eprintln!("skip: no {tool} on PATH");
-            return false;
-        }
-    }
-    true
-}
-
 /// Source cluster under `tmp`, initialised with the bootstrap overrides,
 /// not yet running.
 fn prepared_source(tmp: &tempfile::TempDir) -> Shadow {
@@ -458,14 +415,11 @@ pub fn wait_for_ch_value(ch: &ChServer, sql: &str, want: &str, timeout: Duration
     }
 }
 
-/// Kill the daemon before the shadow, so its supervisor cannot restart the
-/// postmaster, then stop whatever SIGKILL left behind and report `result`
-/// with the daemon's log attached.
+/// Stop the daemon before the shadow, so its supervisor cannot restart the
+/// postmaster, then stop whatever it left behind and report `result` with
+/// the daemon's log attached.
 pub fn finish_daemon(guard: ChildGuard, daemon: &DaemonRun, result: Result<()>) {
-    if let Some(mut child) = guard.into_inner() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+    drop(guard);
     daemon.stop_shadow();
     if let Err(e) = result {
         panic!("{e:#}\n--- daemon stderr ---\n{}", daemon.stderr());
@@ -566,6 +520,9 @@ pub fn append_source_conf(sh: &Shadow) -> Result<()> {
     writeln!(f, "\n# walshadow bootstrap-CH source overrides")?;
     writeln!(f, "wal_level = logical")?;
     writeln!(f, "max_wal_senders = 8")?;
+    // Slotless source: BASE_BACKUP's checkpoint would otherwise recycle the
+    // segment the live window leg starts reading from
+    writeln!(f, "wal_keep_size = '256MB'")?;
     Ok(())
 }
 
@@ -663,9 +620,8 @@ pub fn wait_with_timeout(
     bail!("walshadow-stream did not exit within {deadline:?}");
 }
 
-/// RAII wrapper that SIGKILLs the walshadow-stream subprocess on drop
-/// (test failure path). Tests that own a clean exit consume the child
-/// via `wait_with_timeout` first.
+/// RAII wrapper that stops the walshadow-stream subprocess on drop. Tests
+/// that own a clean exit consume the child via `wait_with_timeout` first.
 pub struct ChildGuard {
     pub child: Option<Child>,
 }
@@ -683,8 +639,7 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
+            tools::stop_gracefully(&mut c);
         }
     }
 }

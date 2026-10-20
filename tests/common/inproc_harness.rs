@@ -17,6 +17,9 @@
 
 #![allow(dead_code)]
 
+#[path = "tools.rs"]
+pub mod tools;
+
 #[path = "ports.rs"]
 mod ports;
 #[allow(unused_imports)]
@@ -36,7 +39,7 @@ use tokio::sync::Mutex;
 
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::mapping::{
     ColumnMapping, DropTableStrategy, NamespaceMapping, TableMapping, TableTarget,
 };
@@ -50,58 +53,10 @@ use walshadow::record::{
 use walshadow::schema::RelName;
 use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
+use walshadow::shadow_catalog::{ParkedAt, ShadowCatalog, ShadowCatalogConfig};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::wal_stream::WalStream;
 use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
-
-// ---------------------------------------------------------------------------
-// Skip-gate probes
-// ---------------------------------------------------------------------------
-
-pub fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-pub fn pg_basebackup_available() -> bool {
-    Command::new("pg_basebackup")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-pub fn clickhouse_available() -> bool {
-    Command::new("clickhouse")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-pub fn requirements_available() -> bool {
-    for (tool, found) in [
-        ("initdb", pg_available()),
-        ("pg_basebackup", pg_basebackup_available()),
-        ("clickhouse", clickhouse_available()),
-    ] {
-        if !found {
-            eprintln!("skip: no {tool} on PATH");
-            return false;
-        }
-    }
-    true
-}
 
 // ---------------------------------------------------------------------------
 // PG fixture helpers
@@ -625,13 +580,15 @@ impl RecordSink for PipelineSinks {
                         .await
                         .map_err(|e| SinkError::Other(format!("harness boundary wait: {e}")))?;
                     self.capture.charge_hold(info, std::time::Duration::ZERO);
+                    // Harness pump withholds successors while this runs
+                    let parked = ParkedAt::assume_for_test(record.next_lsn);
                     self.capture
-                        .capture_boundary(info, record.source_lsn, record.next_lsn)
+                        .capture_boundary(info, record.source_lsn, &parked)
                         .await?;
                 } else if matches!(info.kind, BoundaryKind::Commit) {
                     // Save an empty batch without waiting, as daemon does
                     self.capture
-                        .capture_boundary(info, record.source_lsn, record.next_lsn)
+                        .cover_unparked(info, record.source_lsn, record.next_lsn)
                         .await?;
                 }
             }
@@ -677,8 +634,17 @@ impl Pipeline {
     }
 }
 
+/// Resource caps tests shrink to reach spill and admission-wait paths
+/// without a large workload
+#[derive(Default)]
+pub struct PipelineKnobs {
+    pub xact_buffer_max: Option<usize>,
+    /// Replaces the pool `build_budget` sizes from the emitter config
+    pub budget: Option<walshadow::budget::MemoryBudget>,
+}
+
 pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
-    build_pipeline_inner(args, |_| {}, None).await
+    build_pipeline_inner(args, |_| {}, None, PipelineKnobs::default()).await
 }
 
 /// `build_pipeline` with final say over the emitter config (eg `[toast]`
@@ -688,7 +654,16 @@ pub async fn build_pipeline_with(
     args: BuildPipelineArgs<'_>,
     tune: impl FnOnce(&mut EmitterConfig),
 ) -> Pipeline {
-    build_pipeline_inner(args, tune, None).await
+    build_pipeline_inner(args, tune, None, PipelineKnobs::default()).await
+}
+
+/// `build_pipeline_with` under shrunken resource caps
+pub async fn build_pipeline_knobs(
+    args: BuildPipelineArgs<'_>,
+    tune: impl FnOnce(&mut EmitterConfig),
+    knobs: PipelineKnobs,
+) -> Pipeline {
+    build_pipeline_inner(args, tune, None, knobs).await
 }
 
 /// `build_pipeline` with the oracle wired in, so oracle-routed columns convert
@@ -700,13 +675,14 @@ pub async fn build_pipeline_tuned(
     tune: impl FnOnce(&mut EmitterConfig),
     oracle: Option<Arc<walshadow::oracle::Oracle>>,
 ) -> Pipeline {
-    build_pipeline_inner(args, tune, oracle).await
+    build_pipeline_inner(args, tune, oracle, PipelineKnobs::default()).await
 }
 
 async fn build_pipeline_inner(
     args: BuildPipelineArgs<'_>,
     tune: impl FnOnce(&mut EmitterConfig),
     oracle: Option<Arc<walshadow::oracle::Oracle>>,
+    knobs: PipelineKnobs,
 ) -> Pipeline {
     let BuildPipelineArgs {
         tmp,
@@ -727,7 +703,7 @@ async fn build_pipeline_inner(
         .with_status_interval(Duration::from_millis(500));
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
+    let mut stream = WalStream::builder(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
     stream.set_bytes_sink(Box::new(walshadow::shadow_stream::ShadowStreamSink::new(
         shadow_stream_state,
     )));
@@ -775,15 +751,21 @@ async fn build_pipeline_inner(
 
     let spill_dir = tmp.path().join("spill");
     fs::create_dir_all(&spill_dir).unwrap();
-    let xact_buf_cfg = XactBufferConfig::new(spill_dir.clone());
+    let mut xact_buf_cfg = XactBufferConfig::new(spill_dir.clone());
+    if let Some(max) = knobs.xact_buffer_max {
+        xact_buf_cfg.xact_buffer_max = max;
+    }
     let xact_buffer = XactBuffer::new(xact_buf_cfg).expect("xact buffer");
     let xact_buffer = Arc::new(Mutex::new(xact_buffer));
 
     let mut emitter_cfg = EmitterConfig {
-        host: "127.0.0.1".into(),
-        port: ch_tcp_port,
-        database: ch_database.into(),
-        compression: CompressionChoice::Lz4,
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port: ch_tcp_port,
+            database: ch_database.into(),
+            compression: CompressionChoice::Lz4,
+            ..Default::default()
+        },
         ..Default::default()
     };
     for spec in mappings {
@@ -792,6 +774,7 @@ async fn build_pipeline_inner(
             TableMapping {
                 target: spec.target_table,
                 columns: spec.columns,
+                tees: Vec::new(),
             },
         );
     }
@@ -816,7 +799,7 @@ async fn build_pipeline_inner(
         .await
         .expect("shadow db oid");
     stream.filter_mut().set_target_db(shadow_db_oid);
-    let smgr_markers = stream.filter_mut().smgr_markers();
+    let smgr_markers = stream.filter().smgr_markers();
     let desc_log = Arc::new(
         walshadow::desc_log::DescriptorLog::open(
             &spill_dir,
@@ -897,18 +880,15 @@ async fn build_pipeline_inner(
         None,
         toml::Table::new(),
         mapping.clone(),
+        walshadow::config::ResolverBoot {
+            shadow_toast: stream.filter().shadow_rels().map(|rels| rels.held()),
+            ..Default::default()
+        },
     );
-    // Apply daemon's TOAST admission check to opt-ins
-    if let Some(rels) = stream.filter().shadow_rels() {
-        config_resolver.bind_shadow_toast(rels.held());
-    }
+    let stream = stream.start();
     let ddl_cfg = DdlConfig::from_resolved(
         &config_rx.borrow(),
-        emitter_cfg.database.clone(),
-        emitter_cfg.soft_delete,
-        emitter_cfg.system_columns.clone(),
-        emitter_cfg.replicate_all,
-        emitter_cfg.runtime_config_schema.clone(),
+        walshadow::ch_ddl::DdlBoot::from_emitter(&emitter_cfg),
     );
     let dest =
         walshadow::config::DestEmitter::new(Arc::new(emitter_cfg.clone()), Some(config_rx.clone()));
@@ -929,7 +909,7 @@ async fn build_pipeline_inner(
         WAL_SEG_SIZE,
     ))));
     let system_id: u64 = ident.sysid.parse().expect("sysid");
-    let retires = walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id)
+    let retires = walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id, None)
         .await
         .expect("load toast retire ledger");
     let pending_rows = walshadow::visibility_pending::PendingLedger::load(&spill_dir, system_id)
@@ -996,22 +976,20 @@ async fn build_pipeline_inner(
         retires,
         pending_rows,
         resume_floor: resume_floor.clone(),
-        budget: None,
+        budget: knobs.budget,
     };
-    let (mut reorder, handle) = pcfg
+    let (booting, handle) = pcfg
         .spawn(emitter_ack.clone())
         .await
         .expect("spawn decode+insert pipeline");
-    // Prior run's drop segment is below the boot head; retire its queued
-    // mirrors now — no commit will replay the drop (mirrors bin/stream/session.rs)
-    reorder
-        .flush_due_retires()
+    let reorder = booting
+        .boot(
+            None,
+            desc_log.active_present_at(ident.xlogpos),
+            ident.xlogpos,
+        )
         .await
-        .expect("boot flush of due toast-mirror retires");
-    reorder
-        .apply_boot_events(desc_log.active_present_at(ident.xlogpos), ident.xlogpos)
-        .await
-        .expect("boot Added pass over descriptor log");
+        .expect("boot reorder sink");
 
     let mut decoder = BufferingDecoderSink::new(
         walshadow::desc_log::DescriptorLogs::single(desc_log.clone()),

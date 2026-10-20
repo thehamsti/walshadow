@@ -14,20 +14,6 @@ use walshadow::segment_sink::SegFsync;
 /// Max unsynced segments queued before the pump blocks on `on_segment`;
 pub(crate) const SEGMENT_FSYNC_QUEUE: usize = 64;
 
-#[cfg(target_os = "linux")]
-pub(crate) fn sync_filesystem(fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    if unsafe { libc::syncfs(fd) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn sync_filesystem(_fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    unreachable!("walshadow-stream is Linux-only")
-}
-
 /// Background segment durability: drain the fsync queue, then `syncfs` the
 /// filesystem holding `out_dir` once per batch — this flushes every written
 /// segment + manifest + the directory entries in one syscall, avoiding the
@@ -46,24 +32,24 @@ pub(crate) fn spawn_segment_fsync(
     durable_lsn: Arc<Monotone<FilterDurable>>,
     fatal: walshadow::pipeline::Fatal,
 ) -> tokio::task::JoinHandle<()> {
-    use std::os::unix::io::AsRawFd;
     tokio::spawn(async move {
         let dir = match std::fs::File::open(&out_dir) {
-            Ok(f) => f,
+            Ok(f) => Arc::new(f),
             Err(e) => {
                 fatal.set(format!("open {} for syncfs: {e}", out_dir.display()));
                 return;
             }
         };
-        let dirfd = dir.as_raw_fd();
-        while let Some(item) = rx.recv().await {
-            let mut max_lsn = item.end_lsn;
+        while let Some(mut last) = rx.recv().await {
             while let Ok(next) = rx.try_recv() {
-                max_lsn = max_lsn.max(next.end_lsn);
+                if next.end_lsn() > last.end_lsn() {
+                    last = next;
+                }
             }
-            let synced = tokio::task::spawn_blocking(move || sync_filesystem(dirfd)).await;
+            let dir = Arc::clone(&dir);
+            let synced = tokio::task::spawn_blocking(move || last.syncfs(&dir)).await;
             match synced {
-                Ok(Ok(())) => {}
+                Ok(Ok(durable)) => durable_lsn.publish(durable),
                 Ok(Err(e)) => {
                     fatal.set(format!("syncfs {}: {e}", out_dir.display()));
                     return;
@@ -72,8 +58,7 @@ pub(crate) fn spawn_segment_fsync(
                     fatal.set(format!("syncfs join {}: {e}", out_dir.display()));
                     return;
                 }
-            }
-            durable_lsn.join(Pos::new(max_lsn));
+            };
         }
     })
 }
@@ -88,8 +73,9 @@ pub(crate) fn spawn_desc_log_gc(
     desc_log: Arc<walshadow::desc_log::DescriptorLog>,
     floor: Gate<Floor>,
     fatal: walshadow::pipeline::Fatal,
+    io: &tokio_util::task::TaskTracker,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    io.spawn(async move {
         let mut cut = floor.current();
         loop {
             if let Err(e) = desc_log.maybe_gc(cut).await {
@@ -150,20 +136,24 @@ pub(crate) async fn trim_retention(
         if lsn.is_zero() {
             continue;
         }
-        if client.is_none() {
-            match open_retention_client(&shadow_conninfo).await {
-                Ok(c) => client = Some(c),
-                Err(e) => {
+        let conn = if let Some(c) = &mut client {
+            c
+        } else {
+            let Ok(c) = open_retention_client(&shadow_conninfo)
+                .await
+                .inspect_err(|e| {
                     tracing::warn!(
                         target: "walshadow::retention",
                         error = %e,
                         "shadow connect failed; retrying next cycle",
                     );
-                    continue;
-                }
-            }
-        }
-        let redo = match query_redo_lsn(client.as_ref().expect("just set")).await {
+                })
+            else {
+                continue;
+            };
+            client.insert(c)
+        };
+        let redo = match query_redo_lsn(conn).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(target: "walshadow::retention", error = %e, "redo lsn query");
@@ -204,4 +194,60 @@ pub(crate) async fn query_redo_lsn(client: &tokio_postgres::Client) -> Result<Op
         .await?;
     let redo: Option<PgLsn> = row.get(0);
     Ok(redo.map(u64::from))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use walshadow::record::{SegmentSink, WAL_SEG_SIZE, segments_covering};
+    use walshadow::segment_sink::DirSegmentSink;
+
+    /// Drain every queued segment, publishing highest end as durable
+    #[tokio::test]
+    async fn queued_segments_publish_highest_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(SEGMENT_FSYNC_QUEUE);
+        let io = tokio_util::task::TaskTracker::new();
+        let mut sink =
+            DirSegmentSink::with_durability(tmp.path().to_path_buf(), WAL_SEG_SIZE, tx, io)
+                .unwrap();
+        let segs = segments_covering(1, 0..3 * WAL_SEG_SIZE);
+        for seg in &segs {
+            sink.on_segment(*seg, &[0u8; 64]).await.unwrap();
+        }
+        sink.close().await.unwrap();
+        let durable = Arc::new(Monotone::new(Pos::new(0)));
+        let fatal = walshadow::pipeline::Fatal::new();
+        spawn_segment_fsync(tmp.path().to_path_buf(), rx, durable.clone(), fatal.clone())
+            .await
+            .unwrap();
+        assert_eq!(fatal.message(), None);
+        assert_eq!(durable.get().get(), segs[2].start_lsn(WAL_SEG_SIZE) + 64);
+    }
+
+    /// Session wrapper's wait covers gc until its floor cell drops
+    #[tokio::test]
+    async fn desc_log_gc_tracked_until_floor_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = walshadow::desc_log::DescLogIdentity {
+            pg_major: 17,
+            system_id: "7300000000000000001".into(),
+            timeline: 1,
+            db_oid: 5,
+            wal_seg_size: WAL_SEG_SIZE as u32,
+        };
+        let log = walshadow::desc_log::DescriptorLog::open(tmp.path(), identity)
+            .await
+            .unwrap();
+        let floor = Monotone::<Floor>::default();
+        let fatal = walshadow::pipeline::Fatal::new();
+        let io = tokio_util::task::TaskTracker::new();
+        let gc = spawn_desc_log_gc(Arc::new(log), floor.watch(), fatal.clone(), &io);
+        io.close();
+        assert_eq!(io.len(), 1);
+        drop(floor);
+        io.wait().await;
+        assert!(gc.is_finished());
+        assert_eq!(fatal.message(), None);
+    }
 }

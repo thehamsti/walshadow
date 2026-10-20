@@ -103,6 +103,66 @@ pub struct TenantsConfig {
     pub capacity: usize,
 }
 
+/// ClickHouse `(host:port, database)` pairs, each owned by one tenant
+pub type ChScopes = std::collections::BTreeSet<(String, String)>;
+
+/// One ClickHouse scope: the endpoint `conn` names and `database` on it
+pub fn ch_scope(conn: &crate::ch_emitter::InstanceConfig, database: &str) -> (String, String) {
+    (
+        format!("{}:{}", conn.host.to_ascii_lowercase(), conn.port),
+        database.to_owned(),
+    )
+}
+
+/// Every ClickHouse database a config can route to: each connection's
+/// default, namespace and table overrides, and tees. Over-reserves where an
+/// override could land on several connections, so two tenants never share
+/// a table through any route (runtime `config_*` rows included, which the
+/// DDL applicator holds to these scopes)
+pub fn clickhouse_scopes(cfg: &crate::ch_emitter::EmitterConfig) -> ChScopes {
+    let conn_of = |instance: Option<&str>| {
+        instance
+            .and_then(|name| cfg.instances.get(name))
+            .unwrap_or(&cfg.conn)
+    };
+    let conns: Vec<_> = std::iter::once(&cfg.conn)
+        .chain(cfg.instances.values())
+        .collect();
+    let mut scopes: ChScopes = conns.iter().map(|c| ch_scope(c, &c.database)).collect();
+    for db in cfg
+        .namespaces
+        .values()
+        .filter_map(|ns| ns.target_database.as_deref())
+    {
+        scopes.extend(conns.iter().map(|c| ch_scope(c, db)));
+    }
+    for (_, _, rule) in &cfg.table_entries {
+        let conn = conn_of(rule.target_instance.as_deref());
+        if let Some(db) = &rule.target_database {
+            scopes.insert(ch_scope(conn, db));
+        }
+        for tee in rule.tee.iter().flatten() {
+            let tee_conn = tee.instance.as_deref().map_or(conn, |n| conn_of(Some(n)));
+            if let Some(db) = &tee.database {
+                scopes.insert(ch_scope(tee_conn, db));
+            }
+        }
+    }
+    scopes
+}
+
+/// Every further database is a tenant: `[database.<dbname>]` sections, which
+/// followed several databases through one shared pipeline, destination and
+/// ack, are rejected wherever a config is read (boot, reload, `ctl apply`)
+pub fn reject_database_sections(root: &toml::Table) -> Result<()> {
+    ensure!(
+        !root.contains_key("database"),
+        "`[database.<dbname>]` sections are not supported: declare a `[tenant.<id>]` \
+         with its own `dbname` for each further database (docs/tenants.md)"
+    );
+    Ok(())
+}
+
 impl TenantsConfig {
     /// `None`: no `[tenants]` and no `[tenant.*]`, the single-database layout
     pub fn from_table(root: &toml::Table) -> Result<Option<Self>> {

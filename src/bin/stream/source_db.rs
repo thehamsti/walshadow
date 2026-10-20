@@ -9,15 +9,15 @@ use anyhow::Context;
 use tokio::sync::Mutex;
 use walrus::pg::backup::format_pg_lsn;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
-use walshadow::config::{CliOverrides, ConfigResolver, SourceConn};
-use walshadow::pos::{Floor, Pos};
+use walshadow::config::{CliOverrides, ConfigResolver, ResolverBoot, SourceConn};
+use walshadow::pos::{Floor, Pos, RawStart};
 use walshadow::runtime_config::InitialLoadMode;
-use walshadow::schema::{RelName, SchemaEvent};
+use walshadow::schema::RelName;
 use walshadow::shadow_catalog::ShadowCatalog;
 use walshadow::source_db::{DbLink, SourceDb};
 
 use crate::args::{Args, cli_base};
-use crate::runtime_cfg::{apply_toml_initial_loads, refresh_mapping, seed_runtime_config};
+use crate::runtime_cfg::{apply_toml_initial_loads, load_runtime_config, refresh_mapping};
 use crate::session::SessionTasks;
 
 pub(crate) struct SourceDbInputs<'a> {
@@ -25,8 +25,6 @@ pub(crate) struct SourceDbInputs<'a> {
     pub(crate) conn: &'a DbLink,
     /// `[source] dbname`: the one database a cluster backup can load
     pub(crate) primary: bool,
-    /// Destinations every followed database has claimed
-    pub(crate) targets: &'a Arc<walshadow::mapping::TargetOwners>,
     pub(crate) desc_log: &'a Arc<walshadow::desc_log::DescriptorLog>,
     /// Backfill ledger lives here, beside this database's descriptor log
     pub(crate) spill_dir: PathBuf,
@@ -37,7 +35,7 @@ pub(crate) struct SourceDbInputs<'a> {
     pub(crate) budget: &'a walshadow::budget::MemoryBudget,
     pub(crate) stats: &'a Arc<EmitterStats>,
     pub(crate) source_major: u32,
-    pub(crate) raw_start: Pos<Floor>,
+    pub(crate) raw_start: Pos<RawStart>,
     /// Relations shadow can serve TOAST for, absent unless `[toast] mode = shadow`
     pub(crate) shadow_toast_held: Option<&'a walshadow::filter::shadow_relations::ShadowHeld>,
     pub(crate) system_id: u64,
@@ -71,6 +69,10 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
             backfiller: None,
         });
     };
+    // A tenant's ClickHouse scopes come from its whole file config, before
+    // priming narrows the table rules
+    let reserved = (input.tenant.is_some() && cfg.snowflake.is_none())
+        .then(|| Arc::new(walshadow::tenants::clickhouse_scopes(&cfg)));
     let priming = input.activation.priming;
     if priming {
         // Nothing in scope until every transaction the tenant saw only
@@ -98,19 +100,41 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
             .map(std::time::Duration::from_millis),
         source_slot: args.slot.clone(),
     };
+    // Runtime-config overlay (§7): seed the resolver from this database's
+    // config_* tables over a sidecar libpq connection. Post-seed writes
+    // arrive live off the WAL stream. Refuse to start if the named schema is
+    // not installed — explicit opt-in means the operator expects the overlay
+    // present.
+    let mut overlay = walshadow::runtime_config::ConfigOverlay::default();
+    let mut seeded_table_rows: Vec<(RelName, walshadow::runtime_config::TableRow)> = Vec::new();
+    if let Some(schema) = cfg.runtime_config_schema.clone() {
+        let client = open_source_sql_client(input.source, &conn.name)
+            .await
+            .context("sidecar sql for runtime-config seed")?;
+        (overlay, seeded_table_rows) = load_runtime_config(&client, &schema)
+            .await
+            .context("seed runtime config overlay")?;
+        if priming {
+            // A priming tenant publishes its scope on activation
+            seeded_table_rows.clear();
+        }
+    }
     let (resolver, config_rx) = ConfigResolver::new(
         &cfg,
         cli_overrides,
         args.ch_config.clone(),
         cli_base(args),
         mapping.clone(),
+        ResolverBoot {
+            overlay,
+            shadow_toast: input.shadow_toast_held.cloned(),
+        },
     );
     if let Some(id) = input.tenant {
         resolver.bind_tenant(id);
     }
     resolver.set_activation(input.activation);
     if let Some(held) = input.shadow_toast_held {
-        resolver.bind_shadow_toast(held.clone());
         // Check configured tables here because they bypass opt-in
         // Preserve exclusions across SIGHUP reloads
         let descs = conn
@@ -131,29 +155,12 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         // Ends once the tenant drops its resolver
         None => drop(tokio::spawn(refresher)),
     }
-    // Runtime-config overlay (§7): before the pump consumes WAL, seed the
-    // resolver from this database's config_* tables over a sidecar libpq
-    // connection. Post-seed writes arrive live off the WAL stream. Refuse
-    // to start if the named schema is not installed — explicit opt-in
-    // means the operator expects the overlay present.
-    let mut seeded_table_rows: Vec<(RelName, walshadow::runtime_config::TableRow)> = Vec::new();
-    if let Some(schema) = cfg.runtime_config_schema.clone() {
-        let client = open_source_sql_client(input.source, &conn.name)
-            .await
-            .context("sidecar sql for runtime-config seed")?;
-        seeded_table_rows = seed_runtime_config(&client, &schema, &resolver)
-            .await
-            .context("seed runtime config overlay")?;
-        if priming {
-            seeded_table_rows.clear();
-        }
-    }
     {
         let rc = config_rx.borrow();
         cfg.row_budget = rc.row_budget;
         cfg.byte_budget = rc.byte_budget;
         cfg.flush_timeout = rc.flush_timeout;
-        cfg.compression = rc.compression;
+        cfg.conn.compression = rc.conn.compression;
         cfg.retry.max_attempts = rc.retry_max_attempts;
     }
     // DDL applicator owned by the reorder coordinator so ALTER /
@@ -162,11 +169,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     // snapshot; refreshes per apply as the resolver republishes.
     let ddl_cfg = walshadow::ch_ddl::DdlConfig::from_resolved(
         &config_rx.borrow(),
-        cfg.database.clone(),
-        cfg.soft_delete,
-        cfg.system_columns.clone(),
-        cfg.replicate_all,
-        cfg.runtime_config_schema.clone(),
+        walshadow::ch_ddl::DdlBoot::from_emitter(&cfg),
     );
     let dest = walshadow::config::DestEmitter::new(Arc::new(cfg.clone()), Some(config_rx.clone()));
     let mut applicator = walshadow::ch_ddl::DdlApplicator::new(
@@ -178,8 +181,10 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     .await
     .context("init DDL applicator")?
     .with_resolver(resolver.clone())
-    .with_oracle(input.oracle.clone())
-    .with_target_owners(conn.oid, input.targets.clone());
+    .with_oracle(input.oracle.clone());
+    if let Some(scopes) = reserved {
+        applicator.reserve_destinations(scopes);
+    }
     // Backfiller for `initial_load` opt-ins (COPY / backup-sourced):
     // own source session + CH tail per backfill or pass, spill-dir
     // ledger dedups restarts. Wired whenever the emitter runs, since an
@@ -326,13 +331,10 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         .await
         .context("resolve descriptors for pinned mappings")?;
     for desc in descs {
-        let rel = desc.rel_name.clone();
         applicator
-            .apply(&SchemaEvent::Added {
-                desc: Arc::new(desc),
-            })
+            .add(&desc)
             .await
-            .with_context(|| format!("ensure CH dest for pinned mapping {rel}"))?;
+            .with_context(|| format!("ensure CH dest for pinned mapping {}", desc.rel_name))?;
     }
     Ok(BuiltSourceDb {
         db: Arc::new(SourceDb::new(
@@ -434,8 +436,8 @@ pub(crate) struct DescLogInputs<'a> {
     pub(crate) identity: walshadow::desc_log::DescLogIdentity,
     pub(crate) lineage: &'a [u32],
     pub(crate) manifest_present: bool,
-    pub(crate) start_lsn_override: Option<Pos<Floor>>,
-    pub(crate) raw_start: Pos<Floor>,
+    pub(crate) start_lsn_override: Option<Pos<RawStart>>,
+    pub(crate) raw_start: Pos<RawStart>,
     pub(crate) aligned: Pos<Floor>,
 }
 
@@ -450,8 +452,9 @@ pub(crate) async fn open_db_desc_log(
     // read uncovered intervals. `--ignore-cursor` discards both.
     let log_files_present = dir.join(walshadow::desc_log::TAIL_FILE).exists()
         || dir.join(walshadow::desc_log::CKPT_FILE).exists();
+    let attaching = dir.join(ATTACH_MARKER).exists();
     anyhow::ensure!(
-        !input.manifest_present || log_files_present || args.ignore_cursor,
+        !input.manifest_present || log_files_present || attaching || args.ignore_cursor,
         "manifest present but descriptor log missing in {}; \
          re-bootstrap or pass --ignore-cursor",
         dir.display(),
@@ -464,6 +467,18 @@ pub(crate) async fn open_db_desc_log(
             let _ = tokio::fs::remove_file(dir.join(f)).await;
         }
     }
+    if walshadow::desc_log::DescriptorLog::predates_partitions(dir).await?
+        && let Some(d) = (input.catalog.lock().await.fetch_all_descriptors().await?.1)
+            .into_iter()
+            .find(|d| d.is_partition())
+    {
+        anyhow::bail!(
+            "descriptor log for database {} predates partition routing and {} is a \
+             partition; re-bootstrap",
+            input.dbname,
+            d.rel_name,
+        );
+    }
     let desc_log = Arc::new(
         walshadow::desc_log::DescriptorLog::open_on_branch(dir, input.identity, input.lineage)
             .await
@@ -471,7 +486,7 @@ pub(crate) async fn open_db_desc_log(
     );
     if let Some(lsn) = input.start_lsn_override {
         anyhow::ensure!(
-            lsn >= desc_log.floor_at_write(),
+            lsn.get() >= desc_log.floor_at_write().get(),
             "--start-lsn {} below descriptor log floor {}; no shape history \
              survives there — --ignore-cursor or re-bootstrap",
             lsn,
@@ -530,7 +545,26 @@ pub(crate) async fn open_db_desc_log(
             "descriptor log seeded",
         );
     }
+    if attaching {
+        tokio::fs::remove_file(dir.join(ATTACH_MARKER))
+            .await
+            .with_context(|| format!("clear attach marker in {}", dir.display()))?;
+    }
     Ok(desc_log)
+}
+
+pub(crate) const ATTACH_MARKER: &str = "attach-pending";
+
+pub(crate) async fn list_databases(
+    client: &tokio_postgres::Client,
+) -> anyhow::Result<ahash::HashMap<String, u32>> {
+    let rows = client
+        .query("SELECT datname::text, oid::int8 FROM pg_database", &[])
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1) as u32))
+        .collect())
 }
 
 /// Source sidecar connection to one database, for config seeding and COPY

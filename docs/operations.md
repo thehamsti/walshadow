@@ -31,6 +31,7 @@ Each replicated relation is one `[[tables]]` entry:
 | Field | Meaning |
 |---|---|
 | `source_table` | `<dbname>.<schema>.<table>` on the source |
+| `destination_instance` | ClickHouse connection name; `default` selects `[ch]` |
 | `destination_table` | `<database>.<table>` in ClickHouse, after `target_database` / `target_table` overrides |
 | `initial_load` | configured mode: `none`, `copy`, `base_backup`, `object_store` |
 | `cdc` | relation is in CDC scope |
@@ -58,6 +59,10 @@ Watch:
 - resident memory and spill usage
 - pending backfills
 - timeline crossing and endpoint swap failures
+
+If decoder queue stays deep, check `walshadow_queue_records_out_total` for
+progress. Use rate of `walshadow_decoder_buffer_lock_wait_seconds_total` to
+measure time spent waiting for transaction buffer lock
 
 Metrics for work a source database owns carry a `database=` label: bridge
 requests, descriptor log and capture counters, and config overlay counters.
@@ -124,7 +129,9 @@ position. Reserve them for recovery drills or operator-directed rebuilds
 
 ## Retain source WAL
 
-Configure a physical replication slot for routine deployments:
+Configure a physical replication slot when not using object storage. With
+object storage, archive already covers WAL retention and slots are not
+necessary:
 
 ```sql
 SELECT pg_create_physical_replication_slot('walshadow');
@@ -143,9 +150,9 @@ immediately. `init` reports SQL above so slot can exist before daemon starts
 Live source moves never create target slot because a new slot cannot protect
 earlier resume position. Pre-create target slot before planned switchover
 
-Without slot, ensure `wal_keep_size` or continuous archive covers worst-case
-outage and backlog. Missing source WAL stops replication rather than skipping
-data
+Without slot, ensure object-storage archive or `wal_keep_size` covers
+worst-case outage and backlog. Missing source WAL stops replication rather
+than skipping data
 
 ## ClickHouse interruptions
 
@@ -178,7 +185,7 @@ boundary capture; archive files provide recovery fallback, not an equivalent
 startup mode. Keep connection timeout enabled and investigate attachment failure
 instead of bypassing it
 
-Walshadow's shadow-facing sender currently trusts its client and lacks TLS/SCRAM
+Walshadow's shadow-facing sender trusts its client and lacks TLS/SCRAM
 Keep that listener on loopback or an otherwise isolated local deployment
 Source PostgreSQL and ClickHouse connection security are separate settings
 

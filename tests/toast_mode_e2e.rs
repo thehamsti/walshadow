@@ -80,13 +80,16 @@ fn dest_table(ch: &fx::ChServer) -> Vec<fx::TableMappingSpec> {
 fn assert_no_mirror(ch: &fx::ChServer, source: &walshadow::shadow::Shadow, stats: &EmitterStats) {
     assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), 0);
     assert_eq!(stats.toast_chunks_stored.load(Ordering::Relaxed), 0);
-    let toast_relid = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
-        .expect("source toast relid");
+    let mirror = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc'::regclass AND d.datname = current_database()",
+        )
+        .expect("source toast mirror");
     assert_eq!(
         ch.query(&format!(
             "SELECT count() FROM system.tables \
-             WHERE database = 'walshadow_test' AND name = 'pg_toast_{toast_relid}'"
+             WHERE database = 'walshadow_test' AND name = '{mirror}'"
         ))
         .expect("mirror presence"),
         "0",
@@ -96,7 +99,7 @@ fn assert_no_mirror(ch: &fx::ChServer, source: &walshadow::shadow::Shadow, stats
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unchanged_toast_pointer_resolves_out_of_shadow() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -171,7 +174,7 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
     assert!(
         pipeline
             .stream
-            .filter_mut()
+            .filter()
             .shadow_rels()
             .is_some_and(|rels| rels.contains(&(db_oid, toast_filenode))),
         "shadow mode must route the TOAST relation's records to shadow",
@@ -249,7 +252,7 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unchanged_toast_pointer_fills_null_without_store() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -288,7 +291,7 @@ async fn unchanged_toast_pointer_fills_null_without_store() {
     .await;
 
     assert!(
-        pipeline.stream.filter_mut().shadow_rels().is_none(),
+        pipeline.stream.filter().shadow_rels().is_none(),
         "disabled mode must not replay user heaps on shadow",
     );
 

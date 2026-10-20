@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use toml::{Table, Value};
 
 use crate::control::{SharedCtx, ok, ok_toml};
@@ -48,33 +48,37 @@ fn tenants_of(root: &Table) -> Result<TenantsConfig> {
 /// Every tenant parses and every tenant's effective config parses: what
 /// the daemon checks at boot, so an accepted change stays restart-safe
 pub fn validate(root: &Table) -> Result<()> {
+    crate::tenants::reject_database_sections(root)?;
     let Some(tenants) = TenantsConfig::from_table(root)? else {
-        return Ok(());
+        return check_destination(root);
     };
-    // `[database.*]` follows extra databases through the one pipeline of the
-    // single-tenant layout; a tenant follows exactly one
     for decl in &tenants.decls {
-        let eff = decl.effective_table(root);
-        crate::destination::config::DestinationConfig::from_table(&eff)
-            .with_context(|| format!("tenant {}: destination", decl.id))?;
-        let cfg = crate::ch_emitter::EmitterConfig::from_table(&eff)
-            .map_err(|e| anyhow::anyhow!("tenant {}: {e}", decl.id))?;
-        if cfg.databases.len() > 1 {
-            bail!(
-                "tenant {}: `[database.*]` entries belong to the single-tenant layout; \
-                 declare a tenant per database instead",
-                decl.id
-            );
-        }
+        check_destination(&decl.effective_table(root))
+            .with_context(|| format!("tenant {}", decl.id))?;
     }
     ensure_distinct_destinations(root, &tenants)
 }
 
-/// Two tenants writing one Snowflake schema or one state directory would
-/// collide on channels, receipts and state locks
+/// The destination section and table rules parse, and a Snowflake
+/// destination uses no ClickHouse-only routing
+fn check_destination(root: &Table) -> Result<()> {
+    let dest =
+        crate::destination::config::DestinationConfig::from_table(root).context("destination")?;
+    let cfg = crate::ch_emitter::EmitterConfig::from_table(root).map_err(|e| anyhow!("{e}"))?;
+    if dest.snowflake.is_some() {
+        crate::destination::config::check_snowflake_routing(&cfg)?;
+    }
+    Ok(())
+}
+
+/// Tenants own disjoint destinations: two tenants writing one Snowflake
+/// database (whatever their internal schemas), one ClickHouse database or
+/// one state directory would collide on tables, channels, receipts and
+/// state locks
 fn ensure_distinct_destinations(root: &Table, tenants: &TenantsConfig) -> Result<()> {
-    let mut seen_dest = std::collections::BTreeMap::new();
+    let mut seen_snowflake = std::collections::BTreeMap::new();
     let mut seen_state = std::collections::BTreeMap::new();
+    let mut seen_ch = std::collections::BTreeMap::new();
     for decl in &tenants.decls {
         let eff = decl.effective_table(root);
         let dest = crate::destination::config::DestinationConfig::from_table(&eff)?;
@@ -82,15 +86,13 @@ fn ensure_distinct_destinations(root: &Table, tenants: &TenantsConfig) -> Result
             let key = (
                 sf.account_url.to_ascii_lowercase(),
                 sf.database.to_ascii_uppercase(),
-                sf.internal_schema.to_ascii_uppercase(),
             );
-            if let Some(other) = seen_dest.insert(key, decl.id.clone()) {
+            if let Some(other) = seen_snowflake.insert(key, decl.id.clone()) {
                 bail!(
-                    "tenants {other} and {} share Snowflake database {} schema {}; give each \
-                     tenant its own database or internal_schema",
+                    "tenants {other} and {} share Snowflake database {}; give each tenant \
+                     its own database",
                     decl.id,
                     sf.database,
-                    sf.internal_schema
                 );
             }
             if let Some(other) = seen_state.insert(sf.state.directory.clone(), decl.id.clone()) {
@@ -99,6 +101,20 @@ fn ensure_distinct_destinations(root: &Table, tenants: &TenantsConfig) -> Result
                     decl.id,
                     sf.state.directory.display()
                 );
+            }
+        } else if eff.contains_key("ch") {
+            let cfg = crate::ch_emitter::EmitterConfig::from_table(&eff)
+                .map_err(|e| anyhow!("tenant {}: {e}", decl.id))?;
+            for (endpoint, database) in crate::tenants::clickhouse_scopes(&cfg) {
+                let key = (endpoint.clone(), database.clone());
+                if let Some(other) = seen_ch.insert(key, decl.id.clone()) {
+                    bail!(
+                        "tenants {other} and {} both reach ClickHouse database {database} on \
+                         {endpoint}; give each tenant its own databases, including \
+                         `[ch] database`, namespace and table overrides, instances and tees",
+                        decl.id,
+                    );
+                }
             }
         }
     }
@@ -370,4 +386,130 @@ fn single_tenant(body: &Table) -> Result<(String, Table)> {
         .as_table()
         .with_context(|| format!("[tenant.{id}] must be a table"))?;
     Ok((id.clone(), t.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root(text: &str) -> Table {
+        toml::from_str(text).unwrap()
+    }
+
+    fn snowflake_tenant(id: &str, database: &str, internal_schema: &str, extra: &str) -> String {
+        format!(
+            r#"
+[tenant.{id}]
+dbname = "{id}_db"
+[tenant.{id}.destination]
+kind = "snowflake"
+[tenant.{id}.snowflake]
+account_url = "https://acme-test.snowflakecomputing.com"
+user = "REPLICATOR"
+role = "REPLICATION"
+warehouse = "INGEST"
+database = "{database}"
+internal_schema = "{internal_schema}"
+[tenant.{id}.snowflake.auth]
+method = "oauth"
+token_file = "/run/secrets/snowflake"
+[tenant.{id}.snowflake.state]
+directory = "/var/lib/walshadow/snowflake/{id}"
+max_bytes = 10737418240
+[tenant.{id}.snowflake.stage]
+bucket = "replication"
+prefix = "{id}/"
+region = "us-east-1"
+name = "{database}.INTERNAL.LOAD_STAGE"
+{extra}
+"#
+        )
+    }
+
+    const CLUSTER: &str = "[source]\nhost = 'pg'\ndbname = 'postgres'\n[tenants]\n";
+
+    #[test]
+    fn database_sections_are_refused_in_either_layout() {
+        let single = "[source]\ndbname = 'app'\n[ch]\nhost = 'h'\n\
+                      [database.billing.table.public.ledger]\nreplicate = true\n";
+        let err = validate(&root(single)).unwrap_err().to_string();
+        assert!(err.contains("[tenant.<id>]"), "{err}");
+        assert!(validate(&root(&format!("{CLUSTER}[database.b.table.public.t]\n"))).is_err());
+    }
+
+    #[test]
+    fn snowflake_tenants_own_whole_databases() {
+        let distinct = format!(
+            "{CLUSTER}{}{}",
+            snowflake_tenant("a", "A_DB", "WALSHADOW_INTERNAL", ""),
+            snowflake_tenant("b", "B_DB", "WALSHADOW_INTERNAL", "")
+        );
+        validate(&root(&distinct)).unwrap();
+        // A separate internal schema leaves public views colliding
+        let shared = format!(
+            "{CLUSTER}{}{}",
+            snowflake_tenant("a", "SHARED", "A_INTERNAL", ""),
+            snowflake_tenant("b", "SHARED", "B_INTERNAL", "")
+        );
+        let err = validate(&root(&shared)).unwrap_err().to_string();
+        assert!(err.contains("share Snowflake database SHARED"), "{err}");
+    }
+
+    #[test]
+    fn snowflake_tenants_refuse_clickhouse_only_routing() {
+        for extra in [
+            "[tenant.a.table.public.orders]\nreplicate = true\n\
+             tee = [{ table = 'orders_audit' }]\n",
+            "[tenant.a.table.public.events_2026]\nroute = 'self'\n",
+        ] {
+            let cfg = format!(
+                "{CLUSTER}{}",
+                snowflake_tenant("a", "A_DB", "WALSHADOW_INTERNAL", extra)
+            );
+            assert!(validate(&root(&cfg)).is_err(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn clickhouse_tenants_reaching_one_database_are_refused() {
+        let ch = |id: &str, body: &str| {
+            format!("[tenant.{id}]\ndbname = '{id}_db'\n[tenant.{id}.ch]\nhost = 'ch'\n{body}")
+        };
+        validate(&root(&format!(
+            "{CLUSTER}{}{}",
+            ch("a", "database = 'a'\n"),
+            ch("b", "database = 'b'\n")
+        )))
+        .unwrap();
+        // Different hosts may reuse a database name
+        validate(&root(&format!(
+            "{CLUSTER}{}[tenant.b]\ndbname = 'b_db'\n[tenant.b.ch]\nhost = 'other'\ndatabase = 'a'\n",
+            ch("a", "database = 'a'\n"),
+        )))
+        .unwrap();
+        for converging in [
+            // Both left at the default database
+            String::new(),
+            "database = 'b'\n[tenant.b.namespace.public]\ntarget_database = 'a'\n".into(),
+            "database = 'b'\n[tenant.b.table.public.orders]\nreplicate = true\n\
+             target_database = 'a'\n"
+                .into(),
+            "database = 'b'\n[tenant.b.table.public.orders]\nreplicate = true\n\
+             tee = [{ database = 'a', table = 'orders_audit' }]\n"
+                .into(),
+            "database = 'b'\n[tenant.b.ch.instances.mirror]\nhost = 'ch'\ndatabase = 'a'\n".into(),
+        ] {
+            let a = if converging.is_empty() {
+                ch("a", "")
+            } else {
+                ch("a", "database = 'a'\n")
+            };
+            let cfg = format!("{CLUSTER}{a}{}", ch("b", &converging));
+            let err = validate(&root(&cfg)).unwrap_err().to_string();
+            assert!(
+                err.contains("both reach ClickHouse database"),
+                "{converging}: {err}"
+            );
+        }
+    }
 }

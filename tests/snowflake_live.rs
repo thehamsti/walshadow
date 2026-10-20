@@ -433,6 +433,7 @@ fn runtime_descriptor() -> RelDescriptor {
         missing_default: None,
     };
     let mut desc = RelDescriptor {
+        ancestors: Vec::new(),
         rfn: Default::default(),
         oid: 987_654,
         toast_oid: 0,

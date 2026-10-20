@@ -15,10 +15,13 @@
 //!
 //! Clusters are socket-only, so tests are parallel-safe.
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::pg_available;
+
 #[path = "common/ports.rs"]
 mod ports;
 
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,16 +39,8 @@ use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
 use walshadow::spill::ToastChunk;
 use walshadow::toast::{ChunkRefMap, MemChunkStore, ToastResolver};
 use walshadow::xact_buffer::{
-    WalkStep, XactBuffer, XactBufferConfig, XactBufferError, detoast_heap,
+    StashResolved, WalkStep, XactBuffer, XactBufferConfig, XactBufferError, detoast_heap,
 };
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_shadow(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
@@ -234,14 +229,14 @@ async fn log_from_catalog(cat: &Arc<Mutex<ShadowCatalog>>, dir: &std::path::Path
 async fn drain_all(
     b: &mut XactBuffer,
     resolver: &ToastResolver,
-    xid: u32,
+    stash: StashResolved,
     commit_ts: i64,
     commit_lsn: u64,
     subxids: &[u32],
 ) -> Result<Vec<CommittedTuple>, XactBufferError> {
     let mut drain = b
         .drain_committed(
-            xid,
+            stash,
             commit_ts,
             commit_lsn,
             subxids,
@@ -273,7 +268,6 @@ async fn fixture_shadow_with_things(
     port: u16,
 ) -> Option<(tempfile::TempDir, Shadow, ShadowCatalog, RelFileNode)> {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return None;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -329,9 +323,16 @@ async fn commit_drains_in_arrival_order_and_clears_state() {
     ))
     .await
     .unwrap();
-    let seen = drain_all(&mut b, &ToastResolver::disabled(), 7, 12345, 300, &[])
-        .await
-        .unwrap();
+    let seen = drain_all(
+        &mut b,
+        &ToastResolver::disabled(),
+        StashResolved::nothing_stashed(7),
+        12345,
+        300,
+        &[],
+    )
+    .await
+    .unwrap();
     assert_eq!(seen.len(), 2);
     assert_eq!(seen[0].decoded.source_lsn, 100);
     assert_eq!(seen[1].decoded.source_lsn, 200);
@@ -395,7 +396,6 @@ async fn defer_catalog_decode_stashes_raw_and_commit_fences() {
         next_lsn: 160,
         page_magic: 0xD116,
         route: Route::ToDecoder,
-        catalog_boundary: false,
         boundary_info: None,
         aborted_tree: None,
         defer_catalog_decode: true,
@@ -416,7 +416,7 @@ async fn defer_catalog_decode_stashes_raw_and_commit_fences() {
         "defer path, not marker path"
     );
     let stats = Arc::new(EmitterStats::default());
-    resolve_stash(
+    let stash = resolve_stash(
         &buffer,
         &log,
         &Default::default(),
@@ -428,7 +428,7 @@ async fn defer_catalog_decode_stashes_raw_and_commit_fences() {
     .await
     .unwrap();
     let mut b = buffer.lock().await;
-    let err = drain_all(&mut b, &ToastResolver::disabled(), 77, 0, 1000, &[])
+    let err = drain_all(&mut b, &ToastResolver::disabled(), stash, 0, 1000, &[])
         .await
         .expect_err("payload-less raw record must fail closed, not skip");
     assert!(
@@ -452,8 +452,11 @@ async fn commit_unknown_xid_no_ops() {
     // Even with no buffered records the commit's source LSN advances
     // `drain_lsn`, and the caller still registers a seq (had_states=false)
     // so the contiguous watermark passes read-only / filter-dropped xacts.
-    let mut drain = b.drain_committed(99, 0, 0x9000, &[], false).await.unwrap();
-    assert!(!drain.had_states);
+    let mut drain = b
+        .drain_committed(StashResolved::nothing_stashed(99), 0, 0x9000, &[], false)
+        .await
+        .unwrap();
+    assert!(!drain.had_states());
     assert!(
         drain
             .next_batch(usize::MAX, usize::MAX, None)
@@ -503,9 +506,16 @@ async fn commit_drains_spilled_then_in_memory_entries() {
         .await
         .unwrap();
     }
-    let seen = drain_all(&mut b, &ToastResolver::disabled(), 5, 0, 250, &[])
-        .await
-        .unwrap();
+    let seen = drain_all(
+        &mut b,
+        &ToastResolver::disabled(),
+        StashResolved::nothing_stashed(5),
+        0,
+        250,
+        &[],
+    )
+    .await
+    .unwrap();
     assert_eq!(seen.len(), 5);
     for (i, c) in seen.iter().enumerate() {
         let lsn = c.decoded.source_lsn;
@@ -551,9 +561,16 @@ async fn commit_merges_top_and_subxact_in_source_lsn_order() {
     b.on_heap(described(&log, heap(rfn, 7, 200, HeapOp::Insert, col(3))))
         .await
         .unwrap();
-    let seen = drain_all(&mut b, &ToastResolver::disabled(), 7, 12345, 300, &[8])
-        .await
-        .unwrap();
+    let seen = drain_all(
+        &mut b,
+        &ToastResolver::disabled(),
+        StashResolved::nothing_stashed(7),
+        12345,
+        300,
+        &[8],
+    )
+    .await
+    .unwrap();
     let lsns: Vec<u64> = seen.iter().map(|c| c.decoded.source_lsn).collect();
     assert_eq!(lsns, [100, 150, 200]);
     // Per-top accounting: one bump, regardless of subxact count.
@@ -586,6 +603,7 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
     for (seq, body) in [(0u32, &b"Hell"[..]), (1, b"o, "), (2, b"wor")] {
         b.on_toast_chunk(
             ToastChunk {
+                db_oid: 0,
                 toast_relid: toast_oid,
                 value_id: 55,
                 chunk_seq: seq,
@@ -611,9 +629,16 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
     ))
     .await
     .unwrap();
-    let seen = drain_all(&mut b, &ToastResolver::disabled(), 33, 12345, 300, &[])
-        .await
-        .unwrap();
+    let seen = drain_all(
+        &mut b,
+        &ToastResolver::disabled(),
+        StashResolved::nothing_stashed(33),
+        12345,
+        300,
+        &[],
+    )
+    .await
+    .unwrap();
     assert_eq!(seen.len(), 1);
     let body_col = &seen[0].decoded.new.as_ref().unwrap().columns[1];
     match body_col {
@@ -645,6 +670,7 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
     for (seq, body) in [(0u32, &b"AAA"[..]), (2, b"CCC")] {
         b.on_toast_chunk(
             ToastChunk {
+                db_oid: 0,
                 toast_relid: toast_oid,
                 value_id: 1,
                 chunk_seq: seq,
@@ -674,9 +700,16 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
         Arc::new(MemChunkStore::new()),
         Arc::new(EmitterStats::default()),
     );
-    let err = drain_all(&mut b, &resolver, 42, 0, 200, &[])
-        .await
-        .expect_err("missing chunk surfaces");
+    let err = drain_all(
+        &mut b,
+        &resolver,
+        StashResolved::nothing_stashed(42),
+        0,
+        200,
+        &[],
+    )
+    .await
+    .expect_err("missing chunk surfaces");
     match err {
         XactBufferError::MissingToastChunk {
             value_id, missing, ..

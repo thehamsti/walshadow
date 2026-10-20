@@ -9,6 +9,28 @@ Correctness tests should assert outcomes without comparing wall-clock speed
 Keep performance runs on dedicated hardware, separate from shared CI runners
 Publish repeatable baselines and their variance before choosing regression bands
 
+## Establish sustained WAL baseline
+
+Resolve source/destination mapping from status and destination DDL; use matching
+identities for setup, queries, and cleanup. Prove a sentinel transaction arrives
+before starting load. Keep failed recovery drills and table recreation separate
+from performance runs
+
+Extend existing `sustained` workload toward 200 MB/s of source WAL, recording
+achieved rate and byte units explicitly. Measure source LSN deltas over elapsed
+time, not row count times nominal payload size. Record batch/commit cadence and
+compression; distinguish sustained generation with bounded backlog from draining
+a finite backlog after generator stops
+
+Track receive, shadow replay, contiguous destination acknowledgement, retained
+WAL, queues, RSS, spill, and process restarts throughout run. Record final committed
+marker's boundary and wait for destination acknowledgement to cover it, then reconcile
+keys and payloads against source using `FINAL WHERE _is_deleted = 0`.
+Do not use raw `count()` or newest `_commit_ts` alone to prove completion
+
+Report failures and recovery separately from rate; require healthy baseline and
+exact reconciliation before attributing bottlenecks or changing concurrency
+
 ## Initial load
 
 Initial-load and greenfield-bootstrap workloads already exist, including fresh
@@ -60,18 +82,17 @@ or insert latency
 
 Try these in order:
 
-1. Parallelize backup-backfill inserts within existing byte budget
-   [Backup backfill](../src/backfill/backup_backfill.rs) currently starts one
-   inserter even when configured pool size is 16. Compare one versus four workers
-   sharing unchanged encoded-buffer allowance. Measure backfill rows/s separately
-   from WAL progress, plus insert latency, part count, RSS, and durable completion
-   counts. Verify overlapping inserts improve throughput before raising concurrency
-2. Profile serial WAL dispatch, then batch measured hot operations
-   [Queue worker](../src/source/queueing_record_sink.rs) receives batches but awaits
-   each record individually. Attribute decode, transaction-buffer, commit-drain,
-   shadow-replay waits, and downstream waits before changing execution. Amortize
-   hot operations across records where possible while preserving commit/DDL order,
-   byte-before-record reachability, and contiguous durable acknowledgements
+1. Measure backup-backfill insert scaling
+   [Backup backfill](../src/backfill/backup_backfill.rs) already uses configured
+   inserter count capped at three. Compare pool sizes within unchanged byte
+   budget before raising cap. Measure rows/s separately from WAL progress, plus
+   insert latency, part count, RSS, and durable completion counts
+2. Profile serial WAL dispatch before splitting it further
+   [Queue worker](../src/source/queueing_record_sink.rs) now dispatches batches
+   with heap decode started ahead of dispatch. Measure transaction buffer lock
+   waits, commit draining, shadow replay, and downstream waits before changing
+   execution. Preserve commit/DDL order, byte-before-record reachability, and
+   contiguous durable acknowledgements
 
 ## Bootstrap worker shape
 

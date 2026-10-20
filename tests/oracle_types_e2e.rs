@@ -8,8 +8,6 @@
 mod fx;
 
 use fx::spawn_txn;
-use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,23 +17,10 @@ use walshadow::oracle::Oracle;
 use walshadow::schema::RelName;
 
 fn skip_gate() -> bool {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return true;
     }
     false
-}
-
-fn extension_available(name: &str) -> bool {
-    let out = Command::new("pg_config").arg("--sharedir").output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            Path::new(&dir)
-                .join(format!("extension/{name}.control"))
-                .exists()
-        }
-        _ => false,
-    }
 }
 
 fn col(attnum: i16, name: &str, ty: &str) -> ColumnMapping {
@@ -109,7 +94,7 @@ async fn run_oracle_stats(
         .await
         .expect("bridge connect");
     assert!(
-        bridge.info().expect("hello").in_recovery,
+        bridge.info().in_recovery,
         "shadow must serve decode while in recovery",
     );
     let oracle = Arc::new(Oracle::new(Arc::new(bridge)));
@@ -300,8 +285,7 @@ async fn jsonb_fast_default_renders_on_add_column() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hstore_maps_through_the_extension_expander() {
-    if skip_gate() || !extension_available("hstore") {
-        eprintln!("skip: hstore extension not installed");
+    if skip_gate() || !fx::tools::extension("hstore") {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
@@ -546,8 +530,7 @@ async fn geometric_types_resolve_via_oracle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgvector_resolves_via_oracle() {
-    if skip_gate() || !extension_available("vector") {
-        eprintln!("skip: vector extension not installed");
+    if skip_gate() || !fx::tools::extension("vector") {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
@@ -580,6 +563,47 @@ async fn pgvector_resolves_via_oracle() {
         ch.query("SELECT v, hv, sv FROM walshadow_test.vec FINAL WHERE id = 1 AND _is_deleted = 0")
             .unwrap(),
         "[1,2,3]\t[4,5,6]\t{1:1,3:2}/5",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pgvector_fills_float_arrays_and_qbit() {
+    if skip_gate() || !fx::tools::extension("vector") {
+        return;
+    }
+    let (source, ch, _tmp) = run_oracle(
+        fx::Ports::alloc(),
+        "walshadow-oracle-qbit",
+        "CREATE EXTENSION vector;\n\
+         CREATE TABLE public.vec (id int PRIMARY KEY, v vector(3));\n",
+        "CREATE OR REPLACE TABLE walshadow_test.vec (\
+            id Int32, q QBit(Float32, 3), d Array(Float64), b Array(BFloat16),\
+            _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+        vec![fx::TableMappingSpec {
+            source_table: RelName::new("public", "vec"),
+            target_table: TableTarget::new("walshadow_test", "vec"),
+            columns: vec![
+                col(1, "id", "Int32"),
+                col(2, "q", "QBit(Float32, 3)"),
+                col(2, "d", "Array(Float64)"),
+                col(2, "b", "Array(BFloat16)"),
+            ],
+        }],
+        "INSERT INTO public.vec VALUES (1, '[1,2.5,-3]'), (2, '[1.1,0,0]');\n\
+         SELECT pg_switch_wal();\n",
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+
+    assert_eq!(
+        ch.query(
+            "SELECT id, q, d, b FROM walshadow_test.vec FINAL \
+             WHERE _is_deleted = 0 ORDER BY id"
+        )
+        .unwrap(),
+        "1\t[1,2.5,-3]\t[1,2.5,-3]\t[1,2.5,-3]\n\
+         2\t[1.1,0,0]\t[1.100000023841858,0,0]\t[1.09375,0,0]",
     );
 }
 

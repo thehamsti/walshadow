@@ -3,7 +3,7 @@ members = ["bench"]
 
 [package]
 name = "walshadow"
-version = "0.1.1"
+version = "0.1.5"
 edition = "2024"
 description = "Schema-only Postgres + WAL replay catalog mirror for CDC to ClickHouse"
 license = "AGPL-3.0-only"
@@ -37,6 +37,11 @@ path = "src/lib.rs"
 default = ["lz4", "zstd"]
 lz4 = ["clickhouse-c-rs/lz4"]
 zstd = ["clickhouse-c-rs/zstd"]
+test-support = []
+
+[lints.rust]
+# cargo-llvm-cov passes --cfg=coverage
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 
 [dependencies]
 wal-rus = "0.3.5"
@@ -68,6 +73,7 @@ smallvec = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "fs", "sync", "signal", "io-util"] }
 tokio-postgres = "0.7"
+tokio-rustls = { version = "0.26", default-features = false }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 toml = { version = "1", default-features = false, features = ["parse", "display", "serde"] }
 tracing = "0.1"
@@ -103,7 +109,18 @@ harness = false
 name = "oracle_batch"
 harness = false
 
+[[bench]]
+name = "xact_spill"
+harness = false
+
+[[bench]]
+name = "spool_read"
+harness = false
+
 [dev-dependencies]
+walshadow = { path = ".", features = ["test-support"] }
+# Pre-main tracing subscriber for tests
+ctor = "1.0.13"
 tempfile = "3"
 # Enable paused time for batch deadline tests
 tokio = { version = "1", features = ["test-util"] }

@@ -185,8 +185,12 @@ impl Leg {
             .await
             .with_context(|| format!("create {}", spill.display()))?;
         let buffer = Arc::new(Mutex::new(
-            XactBuffer::new(XactBufferConfig::new(spill))
-                .map_err(|e| anyhow::anyhow!("bootstrap window leg: xact buffer: {e}"))?,
+            XactBuffer::new(XactBufferConfig {
+                drain_batch_rows: cfg.dest.current().drain_batch_rows,
+                drain_batch_bytes: cfg.dest.current().drain_batch_bytes,
+                ..XactBufferConfig::new(spill)
+            })
+            .map_err(|e| anyhow::anyhow!("bootstrap window leg: xact buffer: {e}"))?,
         ));
         buffer.lock().await.clear_spill_dir().await.ok();
 
@@ -322,9 +326,10 @@ async fn run_live(
     feed.start_physical_replication(None, begin, timeline)
         .await
         .context("bootstrap window leg: START_REPLICATION")?;
-    let mut stream = WalStream::new(timeline, WAL_SEG_SIZE, Pos::new(begin))
+    let mut stream = WalStream::builder(timeline, WAL_SEG_SIZE, Pos::new(begin))
         .map_err(|e| anyhow::anyhow!("bootstrap window leg: WalStream: {e}"))?;
     stream.filter_mut().set_target_db(leg.db_oid);
+    let mut stream = stream.start();
     let mut seg_sink = DropSegments;
     let mut buf = Vec::new();
 
@@ -444,11 +449,9 @@ mod tests {
             log.descriptor_at(d.rfn, from),
             LookupResult::Present(got) if got.rel_name == d.rel_name
         ));
+        let prefix = log.descriptor_at(d.rfn, read_start(from));
         assert!(
-            matches!(
-                log.descriptor_at(d.rfn, read_start(from)),
-                LookupResult::Present(_)
-            ),
+            matches!(prefix, LookupResult::Present(_)),
             "records in the alignment prefix decode too; their commits drop on `from_lsn`",
         );
         assert!(matches!(

@@ -16,7 +16,7 @@ use async_trait::async_trait;
 
 use crate::ops::bridge::{Bridge, BridgeError, FetchedChunks, MAX_FETCH_VALUES};
 use crate::toast::xid_ceiling::{XidCeiling, follows};
-use crate::toast::{ChunkStore, ChunkStoreError, FetchedValue, ToastRow};
+use crate::toast::{ChunkStore, ChunkStoreError, FetchedValue};
 
 /// Round-trip payload target. Always allow one value even when it exceeds limit
 const FETCH_REQUEST_BYTES: usize = 64 << 20;
@@ -122,7 +122,7 @@ impl ShadowToastStore {
     /// stalled replay and restart timeout whenever replay position changes
     async fn await_replay(&self, bridge: &Bridge, through: u64) -> Result<u64, ChunkStoreError> {
         // Primary files are complete before service and have no replay position
-        if through == 0 || !bridge.info().is_some_and(|i| i.in_recovery) {
+        if through == 0 || !bridge.info().in_recovery {
             return Ok(0);
         }
         let mut since = Instant::now();
@@ -184,18 +184,11 @@ impl ShadowToastStore {
 
 #[async_trait]
 impl ChunkStore for ShadowToastStore {
-    fn accepts_writes(&self) -> bool {
-        false
-    }
-
-    async fn put(&self, _rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
-        Err(ChunkStoreError::ReadOnly("put"))
-    }
-
     /// Treat `max_lsn` as minimum replay position. Chunks precede referring
     /// record, so reaching this position makes value available
     async fn fetch_many(
         &self,
+        _db_oid: u32,
         toast_relid: u32,
         values: &[(u32, usize)],
         max_lsn: u64,
@@ -219,19 +212,6 @@ impl ChunkStore for ShadowToastStore {
             out.extend(got.into_iter().map(|c| judge(c, ceiling)));
         }
         Ok(out)
-    }
-
-    async fn truncate_mirror(&self, _toast_relid: u32) -> Result<(), ChunkStoreError> {
-        Err(ChunkStoreError::ReadOnly("truncate_mirror"))
-    }
-
-    async fn rewrite_barrier(
-        &self,
-        _toast_relid: u32,
-        _marker_lsn: u64,
-        _commit_lsn: u64,
-    ) -> Result<(), ChunkStoreError> {
-        Err(ChunkStoreError::ReadOnly("rewrite_barrier"))
     }
 }
 

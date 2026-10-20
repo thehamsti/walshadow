@@ -3,17 +3,15 @@
 //! Planning already detoasted and routed every heap, so reorder places
 //! each dispatched seq inline: narrow local extensions render here,
 //! deletes drop for destinations without a delete marker, and rows chunk
-//! onto the shared batcher channel in dispatch order. Oracle resolution
-//! happens later, in the inserter.
+//! into the caller's staging list, shipped onto the shared batcher channel
+//! in dispatch order. Oracle resolution happens later, in the inserter.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use tokio::sync::mpsc;
-
-use crate::decode::heap_decoder::{CommittedTuple, HeapOp};
+use crate::decode::heap_decoder::{CommittedTuple, HeapOp, take_key_change_tombstone};
 use crate::emit::ch_emitter::EmitterStats;
-use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk};
+use crate::emit::pipeline::batcher::{RoutedRow, RowChunk};
 use crate::emit::route::RoutedHeap;
 
 /// Byte half of dual trigger with configured row cap. Bounds channel item for
@@ -22,27 +20,15 @@ use crate::emit::route::RoutedHeap;
 /// unchanged.
 pub const DECODE_CHUNK_BYTES: usize = 4 << 20;
 
-/// `Err` means the batcher channel closed (tail tripped fatal).
-async fn route_chunk(
-    msg_tx: &mpsc::Sender<BatcherMsg>,
-    rows: Vec<RoutedRow>,
-    permit: Option<Arc<crate::budget::MemoryPermit>>,
-) -> Result<(), String> {
-    msg_tx
-        .send(BatcherMsg::Rows(RowChunk { rows, permit }))
-        .await
-        .map_err(|_| "batcher channel closed".to_string())
-}
-
-/// Chunk every routed heap of one seq onto the batcher channel. Returns
-/// rows routed (the `R` the collector compares against).
+/// Chunk every routed heap of one seq onto `staged`. Returns rows routed
+/// (the `R` the collector compares against).
 ///
-/// Every routed row is on the channel by return, so the caller's `Placed`
-/// and any later `FlushAll` order after them. `route = None`
-/// (deterministically unmapped, counted at planning) discards here.
+/// Caller ships `staged` before the seq's `Placed` and any later
+/// `FlushAll`. `route = None` (deterministically unmapped, counted at
+/// planning) discards here.
 #[allow(clippy::too_many_arguments)]
-pub async fn place_rows(
-    msg_tx: &mpsc::Sender<BatcherMsg>,
+pub fn place_rows(
+    staged: &mut Vec<RowChunk>,
     stats: &EmitterStats,
     chunk_rows: usize,
     // Snowflake keeps deletes and renders extension types itself
@@ -52,7 +38,7 @@ pub async fn place_rows(
     commit_lsn: u64,
     heaps: Vec<RoutedHeap>,
     permit: Option<Arc<crate::budget::MemoryPermit>>,
-) -> Result<u64, String> {
+) -> u64 {
     stats.decode_jobs_in.fetch_add(1, Ordering::Relaxed);
     let mut routed = 0u64;
     let mut heaps = heaps.into_iter();
@@ -72,6 +58,8 @@ pub async fn place_rows(
             continue;
         }
         let heap = envelope.described;
+        // Ext render and tombstone split leave payload roughly unchanged
+        buf_bytes += envelope.bytes;
         let rel = heap.descriptor;
         let mut committed = CommittedTuple {
             decoded: heap.decoded,
@@ -87,7 +75,24 @@ pub async fn place_rows(
                 crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
             }
         }
-        buf_bytes += committed.decoded.approx_bytes();
+        // Snowflake splits key changes itself when it encodes the batch
+        if !snowflake
+            && !route.drops_deletes()
+            && let Some(tomb) = take_key_change_tombstone(&mut committed.decoded, &rel)
+        {
+            let tomb = CommittedTuple {
+                decoded: tomb,
+                ..committed
+            };
+            buf.push(RoutedRow {
+                seq,
+                rel: rel.clone(),
+                route: route.clone(),
+                committed: tomb,
+                value_permit: None,
+            });
+            routed += 1;
+        }
         buf.push(RoutedRow {
             seq,
             rel,
@@ -97,16 +102,19 @@ pub async fn place_rows(
         });
         routed += 1;
         if buf.len() >= chunk_rows || buf_bytes >= DECODE_CHUNK_BYTES {
-            route_chunk(msg_tx, std::mem::take(&mut buf), permit.clone()).await?;
+            staged.push(RowChunk {
+                rows: std::mem::take(&mut buf),
+                permit: permit.clone(),
+            });
             buf.reserve(chunk_rows.min(heaps.len()));
             buf_bytes = 0;
         }
     }
     if !buf.is_empty() {
-        route_chunk(msg_tx, buf, permit).await?;
+        staged.push(RowChunk { rows: buf, permit });
     }
     stats.decode_rows_out.fetch_add(routed, Ordering::Relaxed);
-    Ok(routed)
+    routed
 }
 
 #[cfg(test)]
@@ -133,6 +141,7 @@ mod tests {
             rel_name: RelName::new("public", "t"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
@@ -160,8 +169,8 @@ mod tests {
             HeapOp::Delete => (None, tuple),
             _ => (tuple, None),
         };
-        RoutedHeap {
-            described: DescribedHeap {
+        RoutedHeap::new(
+            DescribedHeap {
                 decoded: DecodedHeap {
                     rfn: RFN,
                     xid: 7,
@@ -173,8 +182,8 @@ mod tests {
                 descriptor: rel(),
                 descriptor_valid_from: 0x40,
             },
-            route: Some(route),
-        }
+            Some(route),
+        )
     }
 
     fn route(system: SystemColumns) -> Arc<RouteSnapshot> {
@@ -187,6 +196,7 @@ mod tests {
                     target_type: "Int32".into(),
                     type_pinned: false,
                 }],
+                tees: Vec::new(),
             }),
             Arc::default(),
             RowPolicy {
@@ -200,14 +210,14 @@ mod tests {
     /// drop here, before the placed count the ack collector reconciles
     #[tokio::test]
     async fn deletes_drop_when_marker_disabled() {
-        let (msg_tx, mut msg_rx) = mpsc::channel(8);
+        let mut staged = Vec::new();
         let stats = EmitterStats::default();
         let no_marker = route(SystemColumns {
             is_deleted: None,
             ..SystemColumns::default()
         });
         let routed = place_rows(
-            &msg_tx,
+            &mut staged,
             &stats,
             8,
             false,
@@ -219,20 +229,15 @@ mod tests {
                 heap(HeapOp::Delete, no_marker),
             ],
             None,
-        )
-        .await
-        .expect("place");
+        );
         assert_eq!(routed, 1, "insert routed, delete dropped");
         assert_eq!(stats.deletes_discarded.load(Ordering::Relaxed), 1);
-        match msg_rx.recv().await {
-            Some(BatcherMsg::Rows(chunk)) => assert_eq!(chunk.rows.len(), 1),
-            other => panic!("expected one row chunk, got {}", other.is_some()),
-        }
+        assert!(matches!(&staged[..], [c] if c.rows.len() == 1));
 
         // Default policy keeps the marker, so the DELETE rides through
         let marked = route(SystemColumns::default());
         let routed = place_rows(
-            &msg_tx,
+            &mut staged,
             &stats,
             8,
             false,
@@ -241,16 +246,15 @@ mod tests {
             0x3000,
             vec![heap(HeapOp::Delete, marked)],
             None,
-        )
-        .await
-        .expect("place");
+        );
         assert_eq!(routed, 1);
         assert_eq!(stats.deletes_discarded.load(Ordering::Relaxed), 1);
     }
 
-    #[tokio::test]
-    async fn snowflake_preserves_delete_and_pending_geometry() {
-        let (msg_tx, mut msg_rx) = mpsc::channel(8);
+    /// Snowflake keeps a delete the CH routing policy would drop, and leaves
+    /// extension values for its own renderer
+    #[test]
+    fn snowflake_preserves_delete_and_pending_geometry() {
         let stats = EmitterStats::default();
         let no_marker = route(SystemColumns {
             is_deleted: None,
@@ -262,15 +266,15 @@ mod tests {
             type_oid: 23,
             raw: vec![0; 24],
         });
+        let mut staged = Vec::new();
         assert_eq!(
-            place_rows(&msg_tx, &stats, 8, true, 0, 0, 0x2000, vec![row], None)
-                .await
-                .unwrap(),
+            place_rows(&mut staged, &stats, 8, true, 0, 0, 0x2000, vec![row], None),
             1
         );
-        let Some(BatcherMsg::Rows(chunk)) = msg_rx.recv().await else {
+        let [chunk] = &staged[..] else {
             panic!("missing Snowflake row")
         };
+        assert_eq!(stats.deletes_discarded.load(Ordering::Relaxed), 0);
         assert!(matches!(
             chunk.rows[0]
                 .committed
@@ -281,5 +285,86 @@ mod tests {
                 .columns[0],
             Some(ColumnValue::PgPending { .. })
         ));
+    }
+
+    fn key_change(route: Arc<RouteSnapshot>) -> RoutedHeap {
+        let mut h = heap(HeapOp::Update, route);
+        h.described.descriptor = Arc::new(RelDescriptor {
+            replident: ReplIdent::Default {
+                pk_attnums: Some(vec![1]),
+            },
+            ..(*rel()).clone()
+        });
+        h.described.decoded.old = Some(DecodedTuple {
+            columns: vec![Some(ColumnValue::Int4(0))],
+            partial: false,
+        });
+        h
+    }
+
+    /// Snowflake splits a key change itself when it encodes the update, so
+    /// placement passes it whole: one row, no tombstone ahead of it
+    #[test]
+    fn snowflake_key_change_places_one_update() {
+        let stats = EmitterStats::default();
+        let mut staged = Vec::new();
+        let routed = place_rows(
+            &mut staged,
+            &stats,
+            8,
+            true,
+            0,
+            0,
+            0x2000,
+            vec![key_change(route(SystemColumns::default()))],
+            None,
+        );
+        assert_eq!(routed, 1);
+        let ops: Vec<_> = staged[0]
+            .rows
+            .iter()
+            .map(|r| r.committed.decoded.op)
+            .collect();
+        assert_eq!(ops, [HeapOp::Update]);
+    }
+
+    /// Emit and count old-key delete marker before new row unless deletes are disabled
+    #[tokio::test]
+    async fn key_change_places_tombstone_first() {
+        let stats = EmitterStats::default();
+        for (system, placed) in [
+            (SystemColumns::default(), 2),
+            (
+                SystemColumns {
+                    is_deleted: None,
+                    ..SystemColumns::default()
+                },
+                1,
+            ),
+        ] {
+            let mut staged = Vec::new();
+            let routed = place_rows(
+                &mut staged,
+                &stats,
+                8,
+                false,
+                0,
+                0,
+                0x2000,
+                vec![key_change(route(system))],
+                None,
+            );
+            assert_eq!(routed, placed);
+            let [c] = &staged[..] else {
+                panic!("one rows chunk");
+            };
+            let ops: Vec<_> = c.rows.iter().map(|r| r.committed.decoded.op).collect();
+            let want: &[HeapOp] = if placed == 2 {
+                &[HeapOp::Delete, HeapOp::Update]
+            } else {
+                &[HeapOp::Update]
+            };
+            assert_eq!(ops, want);
+        }
     }
 }
