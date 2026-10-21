@@ -396,7 +396,12 @@ fn the_document_lists_every_route_and_nothing_else() {
             assert!(ids.insert(r.doc.operation_id), "{what}: operationId twice");
             assert_eq!(op["operationId"], r.doc.operation_id, "{what}");
             assert!(tags.contains(&r.doc.tag), "{what}: tag {}", r.doc.tag);
+            // A summary is plain text: the page shows it as is
             assert!(!r.doc.summary.is_empty(), "{what}");
+            assert!(
+                !r.doc.summary.contains(['`', '<', '*']),
+                "{what}: markup in the summary"
+            );
             assert_eq!(op["x-walshadow-scope"], r.scope.as_str(), "{what}");
             assert_eq!(
                 op["x-walshadow-rate-class"],

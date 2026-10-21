@@ -263,8 +263,8 @@ pub const HEALTH: RouteDoc = RouteDoc {
 pub const STATUS: RouteDoc = RouteDoc {
     operation_id: "status",
     tag: "status",
-    summary: "`ctl status` as JSON",
-    description: "Plus the epoch and generations of the reload pipeline",
+    summary: "The stream's status",
+    description: "`ctl status` as JSON, plus the epoch and generations of the reload pipeline",
     params: &[],
     body: None,
     replies: &[ok("The status", component::<schema::StatusBody>)],
