@@ -1816,6 +1816,39 @@ pub(crate) async fn detach(
     true
 }
 
+/// C4: a runtime opened for a binding the published revision has since
+/// replaced never routes. It is torn down off the loop, holding its claim
+/// until every writer joined, and the tenant attaches afresh once it has:
+/// nothing of the old binding writes after the new one starts
+pub(crate) async fn discard_superseded(
+    supervisor: &mut Supervisor,
+    reloader: &walshadow::control::Reloader,
+    t: Tenant,
+    sink: BoundaryHoldSink,
+    decl: &walshadow::tenants::TenantDecl,
+    spill_dir: &Path,
+) {
+    let id = t.id.clone();
+    tracing::info!(
+        target: "walshadow::tenant",
+        tenant = %id,
+        "discarding a runtime opened for a binding a later revision replaced; it attaches afresh",
+    );
+    reloader.set_tenant_resolver(&id, None).await;
+    reloader.reservations().tearing_down(&id);
+    supervisor.forget(&id);
+    supervisor.spawn_teardown(
+        t,
+        Some(sink),
+        false,
+        Duration::ZERO,
+        spill_dir.to_path_buf(),
+        decl.clone(),
+        "superseded while opening".into(),
+    );
+    supervisor.queue_attach(&id);
+}
+
 /// Abort and join `producers`, then `consumer`, each bounded by `wait`:
 /// backfill passes write through the Snowflake runtime, so its writers join
 /// only once no pass is left to start another. `true` when all joined
@@ -1832,6 +1865,22 @@ pub(crate) async fn join_writers(
         joined &= set.abort_and_join(wait).await;
     }
     joined
+}
+
+/// What a session shutdown leaves of `id`'s claim. Joined: released, so a
+/// session restarted in this process may claim it. Not joined: kept and
+/// marked tearing down, so not even `id` itself claims it again before a
+/// daemon restart ends the writer that outlived the shutdown
+pub(crate) fn settle_shutdown(
+    reservations: &walshadow::tenants::Reservations,
+    id: &str,
+    joined: bool,
+) {
+    if joined {
+        reservations.release(id);
+    } else {
+        reservations.tearing_down(id);
+    }
 }
 
 /// Claim what a tenant resumed at boot writes, before it opens. A claim
@@ -2418,6 +2467,26 @@ mod tests {
         assert!(err.to_string().contains("restart the daemon"), "{err}");
         assert!(err.to_string().contains("old"), "{err}");
         reservations.release("old");
+        claim_resumed(&reservations, decl, &root, spill).unwrap();
+    }
+
+    /// C2: a shutdown that left a writer running keeps its claim, marked
+    /// tearing down, so the same id cannot reopen beside that writer; a
+    /// joined one gives it back
+    #[test]
+    fn a_failed_shutdown_claim_refuses_a_same_id_reopen() {
+        let root = config();
+        let tenants = TenantsConfig::from_table(&root).unwrap().unwrap();
+        let decl = tenants.get("a").unwrap();
+        let reservations = Reservations::default();
+        let spill = Path::new("/spill");
+        claim_resumed(&reservations, decl, &root, spill).unwrap();
+        settle_shutdown(&reservations, "a", false);
+        let err = claim_resumed(&reservations, decl, &root, spill).unwrap_err();
+        assert!(err.to_string().contains("restart the daemon"), "{err}");
+        assert!(reservations.is_tearing_down("a"));
+        // Joined: released, and the same id claims it again
+        settle_shutdown(&reservations, "a", true);
         claim_resumed(&reservations, decl, &root, spill).unwrap();
     }
 

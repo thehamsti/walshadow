@@ -1226,3 +1226,114 @@ async fn sql_registry_api_updates_compare_authoritative_rows_and_delete_safely()
         .unwrap();
     assert_eq!(h.pid(), pid, "mutations never restart the daemon");
 }
+
+/// C4: a re-bind accepted while the daemon resumes the tenant, its
+/// destination still opening, never lets the runtime opened for the old
+/// binding route WAL: the rows written while the daemon was down land only
+/// in the new database, after a fresh attach, never in the old one
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rebind_during_resume_never_routes_the_old_runtime() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let ports = fx::Ports::alloc();
+    let proxy = Proxy::spawn(ports.ch_tcp).await;
+    let tenants = [
+        Tenant {
+            id: "a",
+            db: "app_a",
+            ch_port: ports.ch_tcp,
+        },
+        Tenant {
+            id: "r",
+            db: "app_r",
+            ch_port: proxy.port,
+        },
+    ];
+    let mut h = Harness::up(&ports, &["app_a", "app_r"], &tenants, 20, &[])
+        .await
+        .expect("harness");
+    let t = Duration::from_secs(180);
+    h.wait_phase("r", "active", t).await.unwrap();
+    h.wait_rows("tenant_r", "app_orders", "app_r", 50, t)
+        .await
+        .unwrap();
+
+    // Rows while the daemon is down, then a restart whose resume of r
+    // blocks on its frozen destination
+    h.stop().unwrap();
+    connect(&h.source, "app_r")
+        .await
+        .unwrap()
+        .batch_execute(
+            "INSERT INTO app.orders SELECT g, 'app_r-while-down-' || g FROM generate_series(1001, 1010) g",
+        )
+        .await
+        .unwrap();
+    proxy.frozen.store(true, Ordering::Relaxed);
+    let before_restart = h.stderr().len();
+    h.start().unwrap();
+    let deadline = Instant::now() + t;
+    while !h.stderr().contains("tenant resumed") {
+        assert!(
+            Instant::now() < deadline,
+            "a never resumed\n{}",
+            tail(&h.stderr())
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Re-bind r to another database while its old runtime is still opening
+    let etag = h.etag("r").await;
+    let (s, out) = h
+        .admin(
+            "PATCH",
+            "/v1/tenants/r?acknowledge_resync=true",
+            Some(&etag),
+            Some(json!({
+                "ch": {"database": "tenant_r2"},
+                "namespace": {"app": {"target_database": "tenant_r2"}},
+            })),
+        )
+        .await;
+    assert_eq!(s, 202, "{out}");
+    assert_eq!(out["classification"], "rebind", "{out}");
+    proxy.frozen.store(false, Ordering::Relaxed);
+
+    // r attaches afresh on the new database, with every row
+    h.wait_rows("tenant_r2", "app_orders", "app_r", 60, t)
+        .await
+        .unwrap();
+    // The runtime opened for the old binding was discarded unrouted:
+    // nothing was attached to the router that a re-bind then had to detach
+    let since_restart = h.stderr()[before_restart..].to_string();
+    assert!(
+        since_restart
+            .lines()
+            .any(|l| l.contains("discarding a runtime opened for a binding")
+                && l.contains("tenant=r")),
+        "{}",
+        tail(&since_restart)
+    );
+    assert!(
+        !since_restart
+            .lines()
+            .any(|l| l.contains("tenant detached") && l.contains("tenant=r")),
+        "the runtime opened for the old binding was routed, then detached\n{}",
+        tail(&since_restart)
+    );
+    // and the old database never got the rows written while it was down
+    let leaked = h
+        .ch
+        .query(
+            "SELECT count() FROM tenant_r.app_orders FINAL WHERE startsWith(note, 'app_r-while-down-')",
+        )
+        .unwrap_or_default();
+    assert_eq!(
+        leaked.trim(),
+        "0",
+        "the runtime opened for the old binding routed WAL into it\n{}",
+        tail(&h.stderr())
+    );
+}

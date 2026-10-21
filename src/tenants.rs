@@ -633,7 +633,7 @@ impl TenantDecl {
         let mut out = std::collections::BTreeSet::new();
         out.insert(Resource::TenantDir(canonical(&tenant_dir(
             spill_dir, &self.id,
-        ))));
+        ))?));
         let eff = self.effective_table(root);
         let dest = crate::destination::config::DestinationConfig::from_table(&eff)
             .with_context(|| format!("tenant {}: destination", self.id))?;
@@ -642,7 +642,7 @@ impl TenantDecl {
                 sf.account_url.to_ascii_lowercase(),
                 sf.database.to_ascii_uppercase(),
             ));
-            out.insert(Resource::StateDir(canonical(&sf.state.directory)));
+            out.insert(Resource::StateDir(canonical(&sf.state.directory)?));
         } else if eff.contains_key("ch") {
             let cfg = crate::ch_emitter::EmitterConfig::from_table(&eff)
                 .map_err(|e| anyhow::anyhow!("tenant {}: {e}", self.id))?;
@@ -656,23 +656,28 @@ impl TenantDecl {
     }
 }
 
-/// `path` with every symlink in the part that exists resolved, and the
-/// rest in lexical normal form: two spellings of one directory, symlinks
-/// included, compare equal, so neither nesting nor aliasing hides overlap
-pub fn canonical(path: &Path) -> PathBuf {
-    let mut existing = path.to_path_buf();
+/// `path` made absolute, with every symlink in the part that exists
+/// resolved and the rest in lexical normal form: two spellings of one
+/// directory, relative or absolute, symlinks included, compare equal, so
+/// neither nesting nor aliasing hides overlap. Fails only when the path
+/// cannot be made absolute
+pub fn canonical(path: &Path) -> Result<PathBuf> {
+    let path = std::path::absolute(path)
+        .with_context(|| format!("{}: cannot make it absolute", path.display()))?;
+    let mut existing = path.clone();
     let mut rest = Vec::new();
     loop {
         if let Ok(mut real) = std::fs::canonicalize(&existing) {
             real.extend(rest.iter().rev());
-            return normalize(&real);
+            return Ok(normalize(&real));
         }
         match (existing.file_name(), existing.parent()) {
             (Some(name), Some(parent)) => {
                 rest.push(name.to_os_string());
                 existing = parent.to_path_buf();
             }
-            _ => return normalize(path),
+            // `..` past what exists: nothing to resolve, so lexical
+            _ => return Ok(normalize(&path)),
         }
     }
 }
@@ -693,11 +698,13 @@ pub fn check_state_dirs(
         let dest = crate::destination::config::DestinationConfig::from_table(&eff)
             .with_context(|| format!("tenant {}: destination", decl.id))?;
         if let Some(sf) = dest.snowflake {
-            let real = canonical(&sf.state.directory);
+            let real = canonical(&sf.state.directory)?;
             dirs.push((decl.id.clone(), sf.state.directory, real));
         }
     }
-    let spill = spill_dir.map(|s| canonical(&s.join("tenants")));
+    let spill = spill_dir
+        .map(|s| canonical(&s.join("tenants")))
+        .transpose()?;
     for (i, (id, dir, real)) in dirs.iter().enumerate() {
         for (other, _, theirs) in &dirs[i + 1..] {
             ensure!(
@@ -1749,9 +1756,97 @@ name = 'DB.INTERNAL.LOAD_STAGE'
         let real = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir(real.join("state")).unwrap();
         std::os::unix::fs::symlink(real.join("state"), real.join("link")).unwrap();
-        assert_eq!(canonical(&real.join("link/./sub")), real.join("state/sub"));
-        assert_eq!(canonical(&real.join("link/../state")), real.join("state"));
-        assert_eq!(canonical(Path::new("./missing/..")), PathBuf::new());
+        assert_eq!(
+            canonical(&real.join("link/./sub")).unwrap(),
+            real.join("state/sub")
+        );
+        assert_eq!(
+            canonical(&real.join("link/../state")).unwrap(),
+            real.join("state")
+        );
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(canonical(Path::new("./missing/..")).unwrap(), cwd);
+    }
+
+    /// Two Snowflake tenants whose state directories are `a` and `b`
+    fn snowflake_pair(a: &str, b: &str) -> toml::Table {
+        let tenant = |id: &str, dir: &str| {
+            format!(
+                "[tenant.{id}]\ndbname = 'app_{id}'\n[tenant.{id}.destination]\nkind = 'snowflake'\n\
+                 [tenant.{id}.snowflake]\naccount_url = 'https://acme-test.snowflakecomputing.com'\n\
+                 user = 'R'\nrole = 'R'\nwarehouse = 'W'\ndatabase = 'DB_{id}'\n\
+                 [tenant.{id}.snowflake.auth]\nmethod = 'oauth'\ntoken_file = '/run/secrets/token'\n\
+                 [tenant.{id}.snowflake.state]\ndirectory = '{dir}'\nmax_bytes = 1048576\n\
+                 [tenant.{id}.snowflake.stage]\nbucket = 'b'\nprefix = '{id}/'\nregion = 'us-east-1'\n\
+                 name = 'DB_{id}.INTERNAL.LOAD_STAGE'\n"
+            )
+        };
+        format!(
+            "[source]\ndbname = 'postgres'\n[tenants]\n{}{}",
+            tenant("a", a),
+            tenant("b", b)
+        )
+        .parse()
+        .unwrap()
+    }
+
+    /// C3: a relative state directory is made absolute when the config
+    /// loads, before any comparison, so its relative and absolute spellings
+    /// are one directory to validation and to reservations alike; a path
+    /// that cannot be made absolute is refused
+    #[test]
+    fn relative_and_absolute_state_directories_are_one_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let absolute = cwd.join("c3-shared-state");
+        assert_eq!(
+            canonical(Path::new("c3-shared-state")).unwrap(),
+            canonical(&absolute).unwrap()
+        );
+        // Loaded absolute
+        let root = snowflake_pair("c3-a-state", "/elsewhere/b");
+        let tenants = TenantsConfig::from_table(&root).unwrap().unwrap();
+        let eff = tenants.get("a").unwrap().effective_table(&root);
+        let sf = crate::destination::config::DestinationConfig::from_table(&eff)
+            .unwrap()
+            .snowflake
+            .unwrap();
+        assert_eq!(sf.state.directory, cwd.join("c3-a-state"));
+        // One relative, one absolute spelling of the same directory
+        let root = snowflake_pair("c3-shared-state", absolute.to_str().unwrap());
+        let tenants = TenantsConfig::from_table(&root).unwrap().unwrap();
+        let err = check_state_dirs(&root, &tenants, None).unwrap_err();
+        assert!(
+            err.to_string().contains("share Snowflake state directory"),
+            "{err}"
+        );
+        // Nested across spellings, through reservations
+        let root = snowflake_pair("c3-shared-state/inner", absolute.to_str().unwrap());
+        let tenants = TenantsConfig::from_table(&root).unwrap().unwrap();
+        let spill = Path::new("/spill");
+        let r = Reservations::default();
+        r.claim(
+            "b",
+            tenants.get("b").unwrap().resources(&root, spill).unwrap(),
+        )
+        .unwrap();
+        let conflict = r
+            .claim(
+                "a",
+                tenants.get("a").unwrap().resources(&root, spill).unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(conflict.holder, "b");
+        // A directory that cannot be made absolute is refused: the config
+        // never loads, and no comparison takes it
+        let root = snowflake_pair("", "/elsewhere/b");
+        let tenants = TenantsConfig::from_table(&root).unwrap().unwrap();
+        let eff = tenants.get("a").unwrap().effective_table(&root);
+        assert!(crate::destination::config::DestinationConfig::from_table(&eff).is_err());
+        let err = canonical(Path::new("")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cannot make it absolute"),
+            "{err:#}"
+        );
     }
 
     #[test]

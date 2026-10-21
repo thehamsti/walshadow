@@ -968,6 +968,17 @@ async fn session_body(
                     reloader.reservations().release(&decl.id);
                 }
                 match booted {
+                    Ok(Some((t, sink, _))) if reloader.is_rebinding(&decl.id) => {
+                        tenant::discard_superseded(
+                            &mut supervisor,
+                            reloader,
+                            t,
+                            sink,
+                            decl,
+                            &args.spill_dir,
+                        )
+                        .await;
+                    }
                     Ok(Some((t, sink, from_lsn))) => {
                         for db in &t.db_oids {
                             stream.filter_mut().add_target_db(*db);
@@ -1541,6 +1552,17 @@ async fn session_body(
                     Some(Ok(None)) => {
                         reloader.reservations().release(&id);
                         supervisor.retry_attach(&id, Duration::from_secs(1));
+                    }
+                    Some(Ok(Some((t, sink, _)))) if reloader.is_rebinding(&id) => {
+                        tenant::discard_superseded(
+                            &mut supervisor,
+                            reloader,
+                            t,
+                            sink,
+                            decl,
+                            &args.spill_dir,
+                        )
+                        .await;
                     }
                     Some(Ok(Some((t, sink, p0)))) => {
                         for db in &t.db_oids {
@@ -2411,13 +2433,12 @@ async fn session_body(
         let id = t.id.clone();
         let sink = router.detach(&t.id).map(|r| r.sink);
         let tenant_drain = t.xact_buffer.lock().await.stats().drain_lsn;
-        match t.shutdown(sink).await {
+        let shut = t.shutdown(sink).await;
+        tenant::settle_shutdown(reloader.reservations(), &id, shut.is_ok());
+        match shut {
             Ok(safe) => {
                 drain = drain.min(tenant_drain);
                 resume_safe = resume_safe.min(safe);
-                // Joined: a session restarted in this process may claim
-                // what it held. A failed shutdown keeps its claims
-                reloader.reservations().release(&id);
             }
             Err(e) => {
                 first_err.get_or_insert(e);
