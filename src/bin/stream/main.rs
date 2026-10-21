@@ -49,6 +49,7 @@ mod shadow_proc;
 mod sinks;
 mod source_db;
 mod source_recovery;
+mod tenant;
 mod tracing_setup;
 
 use std::num::NonZeroUsize;

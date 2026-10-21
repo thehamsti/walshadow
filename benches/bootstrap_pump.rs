@@ -395,6 +395,7 @@ async fn bench_drain(shape: Shape) -> Report {
         ToastResolver::disabled(),
         bootstrap::Deferral::Rejected,
         ahash::HashSet::default(),
+        false,
         None,
     )
     .await

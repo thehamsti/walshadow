@@ -702,8 +702,10 @@ mod tests {
         }
     }
 
+    // Generous bound: under RUST_BACKTRACE=1 a panicking worker first
+    // symbolizes its backtrace, which takes ~1s in a large instrumented binary
     async fn wait_worker_dead(q: &QueueingRecordSink) {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             while q.worker_alive() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }

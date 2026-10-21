@@ -203,7 +203,7 @@ pub(crate) async fn commit_fork_resume(
     resume: walshadow::transition::ForkResume,
     lsn: manifest::LsnSet,
     resume_floor: &Monotone<Floor>,
-    gc_floor: &Monotone<Floor>,
+    gc_floors: &[&Monotone<Floor>],
 ) -> Result<()> {
     let floor = manifest::FloorInputs {
         resume_safe: lsn.emitter_ack,
@@ -233,7 +233,9 @@ pub(crate) async fn commit_fork_resume(
         .context("write resume manifest at the fork")?;
     // Descendant floor starts new position space
     resume_floor.rebase(persisted);
-    gc_floor.rebase(persisted);
+    for gc_floor in gc_floors {
+        gc_floor.rebase(persisted);
+    }
     tracing::info!(
         target: "walshadow",
         timeline = resume.timeline(),

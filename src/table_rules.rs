@@ -247,12 +247,16 @@ pub struct TableRules {
     /// Ranked broadest to narrowest
     rules: Vec<(RelMatcher, TableRule)>,
     has_patterns: bool,
+    /// Destination replicates each declarative partition as a plain table of
+    /// its own (Snowflake), so nothing routes to a root
+    own_partitions: bool,
 }
 
 impl TableRules {
     /// Merged rule plus whether a pattern entry contributed. Patterns reach a
     /// partition only by setting `route = "self"`
     fn merge(&self, rel: &RelName, partition: bool) -> (TableRule, bool) {
+        let partition = partition && !self.own_partitions;
         let mut merged = TableRule::default();
         let mut from_pattern = false;
         let mut barred = false;
@@ -340,6 +344,16 @@ impl TableRules {
     pub fn has_patterns(&self) -> bool {
         self.has_patterns
     }
+
+    /// Treat every declarative partition as a plain table of its own
+    pub fn with_own_partitions(mut self, own: bool) -> Self {
+        self.own_partitions = own;
+        self
+    }
+
+    pub fn own_partitions(&self) -> bool {
+        self.own_partitions
+    }
 }
 
 #[derive(Debug, Default)]
@@ -406,6 +420,7 @@ impl TableRulesBuilder {
             TableRules {
                 has_patterns: rules.iter().any(|(m, _)| m.is_pattern()),
                 rules,
+                own_partitions: false,
             },
             self.rejections,
         )

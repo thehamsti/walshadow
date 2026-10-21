@@ -238,11 +238,9 @@ pub(crate) struct Args {
     /// In-memory xact buffer budget in bytes, shared across open transactions
     #[arg(long, default_value_t = walshadow::xact_buffer::DEFAULT_XACT_BUFFER_MAX)]
     pub(crate) xact_buffer_max: usize,
-    /// CH-Native emitter config (TOML). Set → drained tuples ship to
-    /// ClickHouse via `clickhouse-c-rs`; unset → metrics-only. Shape: see
-    /// [`walshadow::ch_emitter::EmitterConfig::from_toml_str`]. Reloaded on
-    /// SIGHUP (atomic mapping swap; connection params stay boot-only).
-    #[arg(long)]
+    /// Destination TOML configuration for ClickHouse or Snowflake.
+    /// Reload table selection on SIGHUP; Snowflake connection changes require restart.
+    #[arg(long = "config", visible_alias = "ch-config", value_name = "CONFIG")]
     pub(crate) ch_config: Option<PathBuf>,
     /// CLI override for the TOML's `[ch] flush_timeout_ms`. On the live
     /// pipeline `0` (default) selects a 100ms partial-batch deadline so
@@ -452,6 +450,53 @@ pub(crate) fn finish_ch_config(mut cfg: EmitterConfig, args: &Args) -> EmitterCo
         cfg.inserter_pool_size,
     );
     cfg
+}
+
+/// Tenant bridge pool size and reservation, fixed before any owned shadow
+/// is built: `max_worker_processes` is postmaster-scoped
+pub(crate) static TENANT_BRIDGES: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+
+/// Parse one database's scope of a single-database-shaped config (the whole
+/// file, or one tenant's effective view) and open its destination. `None`
+/// without `[ch]` or a Snowflake destination: the metrics-only null tail.
+/// `pools` supplies tenant defaults for pool sizes the config leaves unset
+pub(crate) async fn build_emitter_config(
+    args: &Args,
+    merged: &toml::Table,
+    sysid: u64,
+    dbname: &str,
+    pools: Option<(usize, usize)>,
+) -> Result<Option<EmitterConfig>> {
+    use anyhow::Context;
+    let destination = walshadow::destination::config::DestinationConfig::from_table(merged)
+        .context("parse destination config")?;
+    if !merged.contains_key("ch") && destination.snowflake.is_none() {
+        return Ok(None);
+    }
+    let mut cfg = EmitterConfig::for_database(merged, dbname)
+        .with_context(|| format!("parse ch config for database {dbname}"))?;
+    if let Some((decoders, inserters)) = pools {
+        let set = |key: &str| merged.get("ch").and_then(|c| c.get(key)).is_some();
+        if !set("decoder_pool_size") {
+            cfg.decoder_pool_size = decoders;
+        }
+        if !set("inserter_pool_size") {
+            cfg.inserter_pool_size = inserters;
+        }
+    }
+    if let Some(snowflake) = destination.snowflake {
+        walshadow::destination::config::check_snowflake_routing(&cfg)?;
+        cfg.row_budget = snowflake.batch_rows;
+        cfg.byte_budget = snowflake.batch_bytes;
+        cfg.flush_timeout = std::time::Duration::from_millis(snowflake.flush_interval_ms);
+        cfg.snowflake = Some(
+            walshadow::destination::snowflake::runtime::SnowflakeRuntime::open(
+                snowflake, sysid, dbname,
+            )
+            .await?,
+        );
+    }
+    Ok(Some(finish_ch_config(cfg, args)))
 }
 
 #[cfg(test)]

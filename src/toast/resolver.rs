@@ -427,6 +427,25 @@ pub trait ChunkStore: Send + Sync {
     ) -> Result<(), ChunkStoreError> {
         Err(ChunkStoreError::ReadOnly("truncate_mirror"))
     }
+    /// Truncate stamped with the TRUNCATE record's LSN; stores that version
+    /// mirrors by position (Snowflake) override it
+    async fn truncate_at(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+        _record_lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
+        self.truncate_mirror(db_oid, toast_relid).await
+    }
+    /// Retire stamped with the dropping commit's LSN
+    async fn retire_at(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+        _commit_lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
+        self.truncate_mirror(db_oid, toast_relid).await
+    }
     /// Rewrite-generation residual deaths `O - B`: tombstone at `commit_lsn`
     /// every TID live as of `marker_lsn` (generation's `XLOG_SMGR_CREATE`)
     /// with no row past it. Caller puts the generation's births first.
@@ -1131,12 +1150,13 @@ impl ToastResolver {
 
     /// Build resolver without a bridge
     ///
-    /// Disabled mode keeps no store, other modes use ClickHouse mirror
+    /// Disabled mode keeps no store, other modes use the destination's mirror
     pub fn from_config(dest: Arc<crate::config::DestEmitter>, stats: Arc<EmitterStats>) -> Self {
         let emitter = dest.current();
-        let store: Option<Arc<dyn ChunkStore>> = match emitter.toast.mode {
-            ToastMode::Disabled => None,
-            _ => Some(Arc::new(ClickHouseChunkStore::new(dest))),
+        let store: Option<Arc<dyn ChunkStore>> = match (emitter.toast.mode, &emitter.snowflake) {
+            (ToastMode::Disabled, _) => None,
+            (_, Some(snowflake)) => Some(Arc::new(snowflake.state.toast_store())),
+            (_, None) => Some(Arc::new(ClickHouseChunkStore::new(dest))),
         };
         Self::with_limits(store, &emitter, stats)
     }
@@ -1434,6 +1454,23 @@ impl ToastResolver {
             .await
     }
 
+    /// [`Self::truncate_mirror`] stamped with the TRUNCATE record's LSN
+    pub async fn truncate_mirror_at(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+        record_lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
+        let Some(store) = &self.store.as_ref().filter(|s| s.accepts_writes()) else {
+            return Ok(());
+        };
+        store.truncate_at(db_oid, toast_relid, record_lsn).await?;
+        self.stats
+            .toast_mirror_truncates
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Empty retired mirror without dropping it, no-op without store
     pub async fn retire_mirror(
         &self,
@@ -1442,6 +1479,23 @@ impl ToastResolver {
     ) -> Result<(), ChunkStoreError> {
         self.clear_mirror(db_oid, toast_relid, &self.stats.toast_mirror_retires)
             .await
+    }
+
+    /// [`Self::retire_mirror`] stamped with the dropping commit's LSN
+    pub async fn retire_mirror_at(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+        commit_lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
+        let Some(store) = &self.store.as_ref().filter(|s| s.accepts_writes()) else {
+            return Ok(());
+        };
+        store.retire_at(db_oid, toast_relid, commit_lsn).await?;
+        self.stats
+            .toast_mirror_retires
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Residual `O - B` tombstones after a rewrite generation's births are

@@ -57,6 +57,16 @@ pub struct SourceConn {
     pub sslmode: SslMode,
     #[serde(deserialize_with = "crate::toml_de::de_nonempty")]
     pub slot: Option<String>,
+    /// Standby endpoint for the bulk reads (BASE_BACKUP data files, COPY
+    /// initial loads), so they load a replica's disk instead of the
+    /// primary's. Unset falls back to `host` / `user`; the WAL stream, slot
+    /// and control queries always stay on the primary
+    #[serde(deserialize_with = "crate::toml_de::de_nonempty")]
+    pub replica_host: Option<String>,
+    /// Replica routing user, e.g. PlanetScale's `<user>|replica`; shares
+    /// `password`
+    #[serde(deserialize_with = "crate::toml_de::de_nonempty")]
+    pub replica_user: Option<String>,
 }
 
 impl Default for SourceConn {
@@ -70,6 +80,8 @@ impl Default for SourceConn {
             // libpq default, matching `PgConfig::resolve`
             sslmode: SslMode::Prefer,
             slot: None,
+            replica_host: None,
+            replica_user: None,
         }
     }
 }
@@ -85,6 +97,8 @@ impl std::fmt::Debug for SourceConn {
             .field("dbname", &self.dbname)
             .field("sslmode", &self.sslmode)
             .field("slot", &self.slot)
+            .field("replica_host", &self.replica_host)
+            .field("replica_user", &self.replica_user)
             .finish()
     }
 }
@@ -128,6 +142,21 @@ impl SourceConn {
         }
     }
 
+    /// Standby endpoint for bulk reads, `None` when `[source]` names none
+    pub fn replica_pg_config(&self) -> Option<PgConfig> {
+        if self.replica_host.is_none() && self.replica_user.is_none() {
+            return None;
+        }
+        let mut cfg = self.to_pg_config();
+        if let Some(host) = &self.replica_host {
+            cfg.host = host.clone();
+        }
+        if let Some(user) = &self.replica_user {
+            cfg.user = user.clone();
+        }
+        Some(cfg)
+    }
+
     /// Credential-free endpoint for logs, metrics labels, and `ctl status`
     pub fn endpoint(&self) -> String {
         format!("{}:{}/{}", self.host, self.port, self.dbname)
@@ -168,6 +197,9 @@ pub struct ResolvedConfig {
     pub table_opt_ins: HashMap<RelName, TableRow>,
     /// `[stream] paused` (live: pump idles when true).
     pub paused: bool,
+    /// `[stream] replicate_all`. Live so a tenant attached mid-stream starts
+    /// with nothing in scope and widens once primed
+    pub replicate_all: bool,
     pub skip_attribution: bool,
     /// Mapped relations that are declarative partitions, so rules resolve
     /// by name the way their DDL did
@@ -380,6 +412,12 @@ pub struct ConfigResolver {
     opt_in_total: AtomicU64,
     opt_out_total: AtomicU64,
     shadow_toast: Option<ShadowHeld>,
+    /// Tenant this resolver serves: a reload reads the merged file through
+    /// that tenant's `[tenant.<id>]` view. Unset for the single-database layout
+    tenant: std::sync::OnceLock<String>,
+    /// Scope a tenant attached mid-stream holds over what the file says
+    activation: std::sync::Mutex<Activation>,
+    reserved: std::sync::OnceLock<Arc<crate::tenants::ChScopes>>,
 }
 
 /// State fixed before the pump consumes WAL
@@ -391,6 +429,39 @@ pub struct ResolverBoot {
     /// TOAST heaps shadow can replay. `None` outside shadow mode, which reads
     /// values from destination mirror
     pub shadow_toast: Option<ShadowHeld>,
+}
+
+/// While priming, nothing is in scope whatever the config says; once primed,
+/// the tables in scope at the tenant's start carry their initial load as
+/// opt-ins, persisted by the tenant so a restart resumes unfinished loads
+#[derive(Debug, Default, Clone)]
+pub struct Activation {
+    pub priming: bool,
+    pub opt_ins: HashMap<RelName, TableRow>,
+}
+
+impl Activation {
+    fn apply(&self, base: &mut EmitterConfig) {
+        if self.priming {
+            // Table rules scope relations too (`[table.*] replicate = true`),
+            // not only opt-ins: clear them all until the start scope publishes
+            base.replicate_all = false;
+            base.table_opt_ins.clear();
+            base.table_initial_loads.clear();
+            base.table_entries.clear();
+        }
+        for (rel, row) in &self.opt_ins {
+            let entry = base
+                .table_opt_ins
+                .entry(rel.clone())
+                .or_insert_with(|| row.clone());
+            // A table rule naming no initial load takes the start scope's,
+            // so `[tenant.<id>] initial_load` covers explicit tables too
+            if entry.initial_load.is_none() {
+                entry.initial_load.clone_from(&row.initial_load);
+            }
+        }
+    }
 }
 
 impl ConfigResolver {
@@ -429,8 +500,82 @@ impl ConfigResolver {
             opt_in_total: AtomicU64::new(0),
             opt_out_total: AtomicU64::new(0),
             shadow_toast,
+            tenant: std::sync::OnceLock::new(),
+            activation: std::sync::Mutex::new(Activation::default()),
+            reserved: std::sync::OnceLock::new(),
         });
         (this, rx)
+    }
+
+    /// Replace the activation layer; the next [`reload`](Self::reload)
+    /// publishes it
+    pub fn set_activation(&self, activation: Activation) {
+        *self.activation.lock().unwrap() = activation;
+    }
+
+    /// What `base` would resolve to under this resolver's overlay and CLI
+    /// layers, without publishing: lets a tenant decide its start scope from
+    /// the full config before any of it takes effect
+    pub async fn preview(&self, base: &EmitterConfig) -> ResolvedConfig {
+        let inner = self.inner.lock().await;
+        let prev = self.tx.borrow().column_rules.clone();
+        Self::resolve(base, &inner.overlay, &self.cli, &inner.opt_in, &prev).0
+    }
+
+    /// Serve tenant `id`: reloads see only its effective config
+    pub fn bind_tenant(&self, id: &str) {
+        let _ = self.tenant.set(id.to_string());
+    }
+
+    /// Bind before any mapping is published; seeded runtime rows obey the
+    /// same destination reservations as later WAL updates
+    pub fn reserve_destinations(
+        &self,
+        scopes: Arc<crate::tenants::ChScopes>,
+    ) -> Result<(), EmitterError> {
+        let _ = self.reserved.set(scopes);
+        self.check_destinations(&self.tx.borrow())
+    }
+
+    fn check_destinations(&self, resolved: &ResolvedConfig) -> Result<(), EmitterError> {
+        let Some(scopes) = self.reserved.get() else {
+            return Ok(());
+        };
+        // TOAST mirrors use each connection's default database even before
+        // any user relation is mapped
+        for conn in std::iter::once(&resolved.conn).chain(resolved.instances.values()) {
+            if !scopes.contains(&crate::tenants::ch_scope(conn, &conn.database)) {
+                return Err(EmitterError::Config(format!(
+                    "{}:{} database {} is outside this tenant's reserved destinations; \
+                     detach and re-attach after reserving it in the tenant config",
+                    conn.host, conn.port, conn.database,
+                )));
+            }
+        }
+        for mapping in resolved.tables.values() {
+            for target in mapping.targets() {
+                let conn = match target.instance.as_deref() {
+                    Some(name) => resolved.instances.get(name).ok_or_else(|| {
+                        EmitterError::Config(format!("unknown ClickHouse instance `{name}`"))
+                    })?,
+                    None => &resolved.conn,
+                };
+                if !scopes.contains(&crate::tenants::ch_scope(conn, &target.database)) {
+                    return Err(EmitterError::Config(format!(
+                        "{} on {}:{} is outside this tenant's reserved destinations; \
+                         detach and re-attach after reserving it in the tenant config",
+                        target.sql(),
+                        conn.host,
+                        conn.port,
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn tenant(&self) -> Option<&str> {
+        self.tenant.get().map(String::as_str)
     }
 
     /// `None` unless `[toast] mode = "shadow"`
@@ -536,6 +681,22 @@ impl ConfigResolver {
         self.republish(&inner).await;
     }
 
+    /// Install a destination-validated opt-in mapping. Snowflake callers
+    /// prepare this from source identity and neutral types before remote DDL,
+    /// then publish it through the same resolver layer as CH opt-ins.
+    pub async fn materialize_prepared_opt_in(&self, desc: &RelDescriptor, mapping: TableMapping) {
+        let mut inner = self.inner.lock().await;
+        let rel = desc.rel_name.clone();
+        inner.opt_in.mappings.insert(rel.clone(), mapping);
+        inner.opt_in.derived.remove(&rel);
+        inner.opt_in.excluded.remove(&rel);
+        inner.opt_in.pending_decl.remove(&rel);
+        self.pending_decl
+            .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
+        self.opt_in_total.fetch_add(1, Ordering::Relaxed);
+        self.republish(&inner).await;
+    }
+
     /// Take a rel out of scope (`replicate=false` / `TableRemoved`): drop its
     /// mapping + any pending decl, record the exclusion so republish keeps it
     /// out even when TOML-mapped, republish. In-flight
@@ -591,6 +752,25 @@ impl ConfigResolver {
         let mut inner = self.inner.lock().await;
         inner.opt_in.derived.insert(desc.rel_name.clone(), mapping);
         inner.opt_in.note_partition(desc);
+        self.republish(&inner).await;
+    }
+
+    /// Move a Snowflake relation's source name at a fenced DDL barrier.
+    /// Suppress the old configured name so a later republish cannot restore
+    /// a stale route to the renamed warehouse view.
+    pub async fn rename_snowflake_mapping(
+        &self,
+        old: &RelName,
+        new: &RelName,
+        mapping: TableMapping,
+    ) {
+        let mut inner = self.inner.lock().await;
+        inner.opt_in.mappings.remove(old);
+        inner.opt_in.derived.remove(old);
+        inner.opt_in.pending_decl.remove(old);
+        inner.opt_in.excluded.insert(old.clone());
+        inner.opt_in.excluded.remove(new);
+        inner.opt_in.derived.insert(new.clone(), mapping);
         self.republish(&inner).await;
     }
 
@@ -680,6 +860,11 @@ impl ConfigResolver {
             &inner.opt_in,
             &prev.column_rules,
         );
+        if let Err(e) = self.check_destinations(&resolved) {
+            self.rejections.store(rejections + 1, Ordering::Relaxed);
+            tracing::warn!(target: "walshadow::config", error = %e, "routing update rejected; keeping prior snapshot");
+            return;
+        }
         self.rejections.store(rejections, Ordering::Relaxed);
         self.mapping
             .publish(Arc::new(crate::mapping::shared(resolved.tables.clone())))
@@ -717,7 +902,8 @@ impl ConfigResolver {
         }
         let (rules, rule_rejections) = rules.finish();
         rejections += rule_rejections;
-        let rules = Arc::new(rules);
+        // Snowflake keeps each partition a table of its own
+        let rules = Arc::new(rules.with_own_partitions(base.snowflake.is_some()));
 
         let mut column_rules = ColumnRulesBuilder::new();
         for e in &base.column_entries {
@@ -790,6 +976,7 @@ impl ConfigResolver {
             source: base.source.clone(),
             table_opt_ins: base.table_opt_ins.clone(),
             paused: base.paused,
+            replicate_all: base.replicate_all,
             skip_attribution: base.skip_attribution,
             partitions: opt_in.partitions.clone(),
         };
@@ -980,9 +1167,65 @@ impl ConfigResolver {
             return Ok(());
         };
         let mut inner = self.inner.lock().await;
-        let merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
+        let mut merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
+        crate::tenants::reject_database_sections(&merged)
+            .map_err(|e| EmitterError::Config(format!("{e:#}")))?;
+        if merged.contains_key("tenants") || merged.contains_key("tenant") {
+            crate::ops::tenant_ctl::validate(&merged)
+                .map_err(|e| EmitterError::Config(format!("{e:#}")))?;
+        }
+        if let Some(id) = self.tenant.get() {
+            let tenants = crate::tenants::TenantsConfig::from_table(&merged)
+                .map_err(|e| EmitterError::Config(format!("{e:#}")))?
+                .ok_or_else(|| EmitterError::Config("tenants are no longer configured".into()))?;
+            // Removal and detach are the tenant supervisor's; this tenant's
+            // snapshot stays until it tears the tenant down
+            let Some(decl) = tenants.get(id) else {
+                return Ok(());
+            };
+            merged = decl.effective_table(&merged);
+        }
+        let selection = crate::destination::config::DestinationConfig::from_table(&merged)
+            .map_err(|e| EmitterError::Config(e.to_string()))?;
         // This resolver's own database, not whichever one `[source]` names
-        inner.base = EmitterConfig::for_database(&merged, &self.dbname)?;
+        let mut base = EmitterConfig::for_database(&merged, &self.dbname)?;
+        match (&inner.base.snowflake, selection.snowflake) {
+            (Some(runtime), Some(config)) => {
+                if base.source.dbname != inner.base.source.dbname {
+                    return Err(EmitterError::Config("the source database is bound for the session; detach and re-attach the tenant to follow another".into()));
+                }
+                // Credentials, role, warehouse and timing apply live; what
+                // durable state is bound to, and pool sizes, do not
+                crate::destination::config::check_snowflake_routing(&base)
+                    .map_err(|e| EmitterError::Config(e.to_string()))?;
+                runtime
+                    .update_settings(&config)
+                    .map_err(|e| EmitterError::Config(format!("{e:#}")))?;
+                if !base.column_entries.is_empty() || !base.tables.is_empty() {
+                    return Err(EmitterError::Config(
+                        "Snowflake requires source-shaped tables without explicit column mappings"
+                            .into(),
+                    ));
+                }
+                base.row_budget = config.batch_rows;
+                base.byte_budget = config.batch_bytes;
+                base.flush_timeout = Duration::from_millis(config.flush_interval_ms);
+                base.snowflake = Some(runtime.clone());
+                base.snowflake_snapshots = inner.base.snowflake_snapshots.clone();
+            }
+            (None, None) => {}
+            _ => {
+                return Err(EmitterError::Config(
+                    "changing the destination requires a daemon restart and separate durable state"
+                        .into(),
+                ));
+            }
+        }
+        self.activation.lock().unwrap().apply(&mut base);
+        let prev = self.tx.borrow().column_rules.clone();
+        let (resolved, _) = Self::resolve(&base, &inner.overlay, &self.cli, &inner.opt_in, &prev);
+        self.check_destinations(&resolved)?;
+        inner.base = base;
         self.republish(&inner).await;
         Ok(())
     }
@@ -1003,6 +1246,38 @@ mod tests {
 
     fn dummy_handles() -> MappingHandle {
         crate::mapping::mapping_handle(HashMap::new())
+    }
+
+    /// A tenant's start scope carries its initial load onto a table rule that
+    /// names none, and leaves one that does alone
+    #[test]
+    fn activation_fills_a_missing_initial_load_only() {
+        let mut base = EmitterConfig::from_toml_str(
+            "[ch]\n[table.public.early]\nreplicate = true\ntarget_table = \"early\"\n\
+             [table.public.kept]\nreplicate = true\ninitial_load = \"none\"\n",
+        )
+        .unwrap();
+        let row = |load: &str| TableRow {
+            replicate: Some(true),
+            initial_load: Some(load.into()),
+            ..TableRow::default()
+        };
+        let early = RelName::new("public", "early");
+        let kept = RelName::new("public", "kept");
+        Activation {
+            priming: false,
+            opt_ins: [(early.clone(), row("copy")), (kept.clone(), row("copy"))]
+                .into_iter()
+                .collect(),
+        }
+        .apply(&mut base);
+        let load = |rel: &RelName| base.table_opt_ins[rel].initial_load.clone();
+        assert_eq!(load(&early).as_deref(), Some("copy"));
+        assert_eq!(load(&kept).as_deref(), Some("none"));
+        assert_eq!(
+            base.table_opt_ins[&early].target_table.as_deref(),
+            Some("early")
+        );
     }
 
     #[test]
@@ -1729,6 +2004,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tenant_runtime_retarget_keeps_both_published_maps_in_reserved_scope() {
+        let base = base_with("retain");
+        let mapping = dummy_handles();
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            mapping.clone(),
+            ResolverBoot::default(),
+        );
+        resolver
+            .reserve_destinations(Arc::new(crate::tenants::clickhouse_scopes(&base)))
+            .unwrap();
+        let desc = rel_desc("public", "events");
+        resolver.materialize_opt_in(&desc, None, None).await;
+        let prior = rx.borrow().clone();
+        resolver
+            .apply_config_event(ConfigEvent::TableUpserted {
+                rel: desc.rel_name.clone(),
+                row: TableRow {
+                    target_database: Some("another_tenant".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert!(Arc::ptr_eq(&prior, &rx.borrow()));
+        assert_eq!(resolver.rejections(), 1);
+        assert_eq!(
+            mapping.snapshot().await[&desc.rel_name].target.database,
+            "default"
+        );
+        resolver
+            .apply_config_event(ConfigEvent::TableUpserted {
+                rel: desc.rel_name.clone(),
+                row: TableRow {
+                    target_table: Some("renamed".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(rx.borrow().tables[&desc.rel_name].target.table, "renamed");
+        assert_eq!(resolver.rejections(), 0);
+    }
+
+    #[tokio::test]
+    async fn tenant_seed_and_tees_cannot_publish_unreserved_routes() {
+        let base = base_with("retain");
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        let desc = rel_desc("public", "events");
+        resolver
+            .materialize_opt_in(&desc, Some("another_tenant".into()), None)
+            .await;
+        assert!(
+            resolver
+                .reserve_destinations(Arc::new(crate::tenants::clickhouse_scopes(&base)))
+                .is_err()
+        );
+        assert_eq!(
+            rx.borrow().tables[&desc.rel_name].target.database,
+            "another_tenant"
+        );
+
+        let tee_base = EmitterConfig::from_toml_str(
+            "[ch]\n[table.public.events]\nreplicate = true\n\
+             tee = [{ database = 'another_tenant', table = 'audit' }]\n",
+        )
+        .unwrap();
+        let (resolver, rx) = ConfigResolver::new(
+            &tee_base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        resolver
+            .reserve_destinations(Arc::new(crate::tenants::clickhouse_scopes(&base)))
+            .unwrap();
+        let mapping = TableMapping {
+            target: TableTarget::new("default", "events"),
+            columns: Vec::new(),
+            tees: vec![crate::mapping::Tee {
+                database: Some("another_tenant".into()),
+                table: "audit".into(),
+                instance: None,
+                engine: None,
+                order_by: Vec::new(),
+                primary_key: Vec::new(),
+            }],
+        };
+        resolver.register_derived_mapping(&desc, mapping).await;
+        assert!(rx.borrow().tables.is_empty());
+        assert_eq!(resolver.rejections(), 1);
+    }
+
+    #[tokio::test]
     async fn materialize_opt_in_derives_maps() {
         let base = base_with("retain");
         let mapping = dummy_handles();
@@ -1970,6 +2349,50 @@ mod tests {
         assert!(!mapping.with(|m| m.contains_key(&rel)).await);
         assert!(rx.changed().await.is_ok());
         assert!(!rx.borrow_and_update().tables.contains_key(&rel));
+    }
+
+    #[tokio::test]
+    async fn snowflake_rename_moves_mapping_and_suppresses_old_name_on_republish() {
+        let base = base_with("retain");
+        let mapping = dummy_handles();
+        let (resolver, _rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            mapping.clone(),
+            ResolverBoot::default(),
+        );
+        let old = RelName::new("public", "before");
+        let new = RelName::new("public", "after");
+        resolver
+            .register_derived_mapping(
+                &crate::schema::int4_rel(16400, "before", 'r', &[(1, "id")]),
+                TableMapping {
+                    tees: Vec::new(),
+                    target: TableTarget::new("default", "before"),
+                    columns: Vec::new(),
+                },
+            )
+            .await;
+        resolver
+            .rename_snowflake_mapping(
+                &old,
+                &new,
+                TableMapping {
+                    tees: Vec::new(),
+                    target: TableTarget::new("default", "after"),
+                    columns: Vec::new(),
+                },
+            )
+            .await;
+        assert!(!mapping.with(|m| m.contains_key(&old)).await);
+        assert!(mapping.with(|m| m.contains_key(&new)).await);
+        resolver
+            .apply_config_event(ConfigEvent::GlobalCleared)
+            .await;
+        assert!(!mapping.with(|m| m.contains_key(&old)).await);
+        assert!(mapping.with(|m| m.contains_key(&new)).await);
     }
 
     #[tokio::test]
@@ -2417,6 +2840,38 @@ mod tests {
     }
 
     #[test]
+    fn source_conn_replica_overrides_host_and_user() {
+        let root: toml::Table = toml::from_str(
+            "[source]\nhost = \"primary\"\nuser = \"repl\"\npassword = \"pw\"\n\
+             dbname = \"app\"\nreplica_user = \"repl|replica\"\n",
+        )
+        .unwrap();
+        let conn = SourceConn::from_table(&root).unwrap();
+        let replica = conn.replica_pg_config().expect("replica configured");
+        assert_eq!(
+            (replica.host.as_str(), replica.user.as_str()),
+            ("primary", "repl|replica")
+        );
+        assert_eq!(replica.password.as_deref(), Some("pw"));
+        assert_eq!(replica.database, "app");
+        assert_eq!(conn.to_pg_config().user, "repl");
+
+        let moved: toml::Table =
+            toml::from_str("[source]\nhost = \"primary\"\nreplica_host = \"standby\"\n").unwrap();
+        let replica = SourceConn::from_table(&moved).unwrap().replica_pg_config();
+        assert_eq!(replica.map(|r| r.host), Some("standby".into()));
+
+        let bare: toml::Table =
+            toml::from_str("[source]\nhost = \"primary\"\nreplica_user = \"\"\n").unwrap();
+        assert!(
+            SourceConn::from_table(&bare)
+                .unwrap()
+                .replica_pg_config()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn source_conn_parses_string_and_integer_port() {
         let root: toml::Table = toml::from_str(
             "[source]\nhost = \"db.internal\"\nport = 5433\nuser = \"repl\"\n\
@@ -2521,6 +2976,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tenant_reload_cannot_repoint_an_empty_pipeline_outside_reserved_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let base = base_with("retain");
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            Some(path.clone()),
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        resolver
+            .reserve_destinations(Arc::new(crate::tenants::clickhouse_scopes(&base)))
+            .unwrap();
+        let prior = rx.borrow().clone();
+        tokio::fs::write(&path, "[ch]\nhost = 'another_tenant'\n")
+            .await
+            .unwrap();
+        let err = resolver.reload().await.unwrap_err().to_string();
+        assert!(
+            err.contains("outside this tenant's reserved destinations"),
+            "{err}"
+        );
+        assert!(Arc::ptr_eq(&prior, &rx.borrow()));
+        assert!(rx.borrow().tables.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tenant_reload_rejects_shared_destinations_before_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = |database: &str| {
+            format!(
+                "[source]\ndbname = 'postgres'\n[tenants]\n\
+             [tenant.a]\ndbname = 'app'\n[tenant.a.ch]\nhost = 'ch'\ndatabase = 'a'\n\
+             [tenant.b]\ndbname = 'other'\n[tenant.b.ch]\nhost = 'ch'\ndatabase = '{database}'\n",
+            )
+        };
+        let root: toml::Table = toml::from_str(&config("b")).unwrap();
+        let tenants = crate::tenants::TenantsConfig::from_table(&root)
+            .unwrap()
+            .unwrap();
+        let base =
+            EmitterConfig::from_table(&tenants.get("a").unwrap().effective_table(&root)).unwrap();
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            Some(path.clone()),
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        resolver.bind_tenant("a");
+        tokio::fs::write(&path, config("b")).await.unwrap();
+        resolver.reload().await.unwrap();
+        let prior = rx.borrow().clone();
+        tokio::fs::write(&path, config("a")).await.unwrap();
+        let err = resolver.reload().await.unwrap_err().to_string();
+        assert!(err.contains("both reach ClickHouse database"), "{err}");
+        assert!(Arc::ptr_eq(&prior, &rx.borrow()));
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_destination_change_without_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let base = EmitterConfig::default();
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            Some(path.clone()),
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        tokio::fs::write(&path, include_str!("../config/snowflake.toml"))
+            .await
+            .unwrap();
+        assert!(
+            resolver
+                .reload()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("destination requires")
+        );
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[tokio::test]
     async fn reload_republishes_moved_source_endpoint() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ch-config.toml");
@@ -2576,7 +3122,7 @@ mod tests {
 
     /// A reload republishes each database's own entries, not the primary's
     #[tokio::test]
-    async fn reload_keeps_the_resolver_scoped_to_its_database() {
+    async fn reload_refuses_database_sections_and_keeps_the_snapshot() {
         const DOC: &str = "[ch]\nhost = \"ch\"\n[source]\ndbname = \"app\"\n\
              [table.public.orders]\nreplicate = true\n\
              [database.billing.table.public.ledger]\nreplicate = true\n";
@@ -2601,11 +3147,11 @@ mod tests {
             billing_rels(&mut rx),
             vec![crate::schema::RelName::new("public", "ledger")]
         );
-        resolver.reload().await.unwrap();
-        assert_eq!(
-            billing_rels(&mut rx),
-            vec![crate::schema::RelName::new("public", "ledger")],
-            "a reload must not hand app's tables to billing"
+        let err = resolver.reload().await.unwrap_err().to_string();
+        assert!(err.contains("[tenant.<id>]"), "{err}");
+        assert!(
+            !rx.has_changed().unwrap(),
+            "a refused reload leaves the last snapshot in effect"
         );
     }
 

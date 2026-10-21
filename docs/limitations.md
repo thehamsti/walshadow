@@ -7,9 +7,9 @@ Review these limits before production use
 - PostgreSQL 16, 17, 18, and 19, daemon rejects unaudited majors
 - shadow PostgreSQL major must match source major
 - one process replicates every database its config names
-  ([several databases](multi-database.md)); adding or removing one needs a
-  restart, and existing rows load from a backup only for the database
-  `[source] dbname` names
+  ([several databases](multi-database.md)) as one [tenant](tenants.md) per
+  database beyond `[source] dbname`, each with its own destination, attached
+  or detached live; `[database.*]` sections are refused
 - `wal_level = logical` required
 - every replicated table needs usable replica identity
 - prepared transactions are not supported for production use; commit and abort
@@ -46,12 +46,10 @@ and workload limits before attaching
 - date and timestamp values are written without checking ClickHouse calendar
   limits. Values outside supported ranges can return incorrect dates or times
   without stopping replication
-- same-named tables from different PostgreSQL databases share one destination
-  and merge their rows into it, silently. Derived names carry `$schema$`, so
-  schemas do not collide, but databases do. Separate them with
-  `target_database`, `target_table`, or an `auto_create_name` carrying
-  `$database$`, see
-  [Choose shared or separate destinations](multi-database.md)
+- tenants write disjoint destinations: the daemon and `ctl` refuse two
+  tenants reaching one ClickHouse database on one host (defaults, namespace
+  and table overrides, instances and tees), or one Snowflake database, see
+  [tenants](tenants.md#destinations)
 - `base_backup` and `object_store` table loads publish with staging-table swap, database must support `EXCHANGE TABLES`
 - backup rows inserted into staging do not fire destination materialized views, live rows copied back after swap can fire twice
 

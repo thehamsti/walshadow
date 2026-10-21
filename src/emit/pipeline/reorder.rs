@@ -445,6 +445,7 @@ impl ReorderSink {
             .iter()
             .map(|(rel, row)| (rel.clone(), row.clone()))
             .collect();
+        let mut deferred = crate::backfill::opt_in::DeferredBackfills::default();
         for (rel, row) in candidates {
             let known = scope
                 .db
@@ -463,7 +464,7 @@ impl ReorderSink {
                 );
                 continue;
             }
-            crate::backfill::opt_in::apply_table_opt_in(
+            crate::backfill::opt_in::apply_table_opt_in_deferred(
                 &resolver,
                 applicator,
                 &scope.db.catalog,
@@ -471,12 +472,14 @@ impl ReorderSink {
                 &rel,
                 &row,
                 commit_lsn,
+                &mut deferred,
             )
             .await
             .map_err(|e| SinkError::Other(format!("reload opt-in: {e}")))?;
             scope.pending_opt_ins.remove(&rel);
             scope.applied_opt_ins.insert(rel);
         }
+        deferred.start(scope.backfiller.as_ref()).await;
         Ok(())
     }
 
@@ -714,7 +717,7 @@ impl ReorderSink {
         let cut = self.resume_floor.get();
         for entry in self.retires.due(cut) {
             self.resolver
-                .retire_mirror(entry.db_oid, entry.toast_relid)
+                .retire_mirror_at(entry.db_oid, entry.toast_relid, entry.commit_lsn.get())
                 .await
                 .map_err(|e| SinkError::Other(format!("toast mirror retire: {e}")))?;
             self.retires
@@ -770,6 +773,14 @@ impl ReorderSink {
         &mut self,
         shadow_data_dir: Option<&std::path::Path>,
     ) -> Result<(), SinkError> {
+        if let Some(runtime) = &self.dest.current().snowflake {
+            self.pending_rows
+                .lock()
+                .await
+                .reconcile_snowflake(runtime)
+                .await
+                .map_err(SinkError::Other)?;
+        }
         if self.pending_rows.lock().await.is_empty() {
             return Ok(());
         }
@@ -860,13 +871,13 @@ impl ReorderSink {
         applicator
             .truncate(rel, at)
             .await
-            .map_err(|e| SinkError::Other(format!("ch truncate: {e}")))?;
+            .map_err(|e| SinkError::Other(format!("truncate: {e}")))?;
         self.stats.truncates_emitted.fetch_add(1, Ordering::Relaxed);
         // PG swaps TOAST relfilenode without listing it in `xl_heap_truncate`;
         // the descriptor carries the owner's toast oid
         if self.resolver.stores_chunks() && rel.toast_oid != 0 {
             self.resolver
-                .truncate_mirror(rel.rfn.db_node, rel.toast_oid)
+                .truncate_mirror_at(rel.rfn.db_node, rel.toast_oid, heap.decoded.source_lsn)
                 .await
                 .map_err(|e| SinkError::Other(format!("toast mirror truncate: {e}")))?;
         }
@@ -924,6 +935,7 @@ impl ReorderSink {
             &mut self.out.staged,
             &self.stats,
             chunk_rows,
+            self.dest.current().snowflake.is_some(),
             seq.seq(),
             commit_ts,
             commit_lsn,
@@ -1505,8 +1517,8 @@ impl PlanRouteView for ReorderRouteView<'_> {
         let Some(app) = self.applicator.as_deref_mut() else {
             return Ok(());
         };
-        if let Some((rel, m)) = app
-            .predict_route_mapping(ev, &mapping, config.as_deref())
+        for (rel, m) in app
+            .predict_route_effects(ev, &mapping, config.as_deref())
             .await
             .map_err(|e| e.to_string())?
         {
@@ -1589,6 +1601,10 @@ impl RecordSink for ReorderSink {
                 self.ack.trailing(lsn);
                 buf.advance_idle(Pos::new(lsn));
             }
+            // A quiet database never reaches a commit barrier, so apply
+            // reloaded opt-ins here: with nothing buffered, the idle position
+            // bounds their backfill exactly as a commit would
+            self.maybe_apply_reload(lsn).await?;
             // Quiescent source never re-enters on_commit; retire due drops
             // here so the flush doesn't wait for a later commit
             self.flush_due_retires().await

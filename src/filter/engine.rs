@@ -83,6 +83,10 @@ pub struct Verdict {
     /// the stream: decoder must not decode with live descriptors, hold raw
     /// until commit-time capture publishes the final layout
     pub defer_catalog_decode: bool,
+    /// Database a commit or abort record names in its `xl_xact_dbinfo`,
+    /// which `wal_level = logical` always writes. Routes the transaction's
+    /// end to the tenant that buffered its rows
+    pub xact_db: Option<u32>,
 }
 
 /// What one `Xact` rmgr record did to the dirty tree
@@ -90,6 +94,7 @@ pub struct Verdict {
 struct XactEnd {
     boundary: Option<Arc<BoundaryInfo>>,
     aborted_tree: Option<Arc<Vec<u32>>>,
+    xact_db: Option<u32>,
 }
 
 /// Pump-side `XLOG_SMGR_CREATE` main-fork markers: physical rfn → creation
@@ -216,6 +221,21 @@ impl Filter {
     /// [`set_target_db`](Self::set_target_db) for a multi-database stream
     pub fn set_target_dbs(&mut self, db_oids: impl IntoIterator<Item = u32>) {
         self.targets = db_oids.into_iter().collect();
+    }
+
+    /// Follow another database too: its catalog writes now dirty capture
+    /// trees and its commits become boundaries. Transactions already open
+    /// in it at this point were never tracked, so the tenant must start at
+    /// a position past them
+    pub fn add_target_db(&mut self, db_oid: u32) {
+        if !self.targets.contains(&db_oid) {
+            self.targets.push(db_oid);
+        }
+    }
+
+    /// Stop following a database. Dirty trees it left drain at their end
+    pub fn remove_target_db(&mut self, db_oid: u32) {
+        self.targets.retain(|db| *db != db_oid);
     }
 
     /// Route `rels` and relations created at or after `from_lsn` to both paths
@@ -422,6 +442,7 @@ impl Filter {
             boundary: end.boundary,
             aborted_tree: end.aborted_tree,
             defer_catalog_decode,
+            xact_db: end.xact_db,
         })
     }
 
@@ -448,6 +469,7 @@ impl Filter {
             return Ok(XactEnd {
                 boundary: self.observe_xact_invals(record, source_lsn, page_magic)?,
                 aborted_tree: None,
+                xact_db: None,
             });
         }
         if op == XLOG_XACT_ASSIGNMENT {
@@ -467,6 +489,7 @@ impl Filter {
             return Ok(XactEnd::default());
         }
         let payload = parse_xact_payload(info, &record.main_data, page_magic)?;
+        let xact_db = payload.db_id;
         let header_xid = record.header.xact_id;
         self.creating_dbs.remove(&header_xid);
         let (merged, members) =
@@ -485,6 +508,7 @@ impl Filter {
             return Ok(XactEnd {
                 boundary: None,
                 aborted_tree: merged.is_some().then(|| Arc::new(members)),
+                xact_db,
             });
         }
         // PostgreSQL transactions can write to only one database
@@ -540,7 +564,10 @@ impl Filter {
         }
         // Restart may lose statistics-only evidence, retain a durable empty batch
         if !dirty_hit && inval_oids.is_empty() && !capture_all && !stats_only {
-            return Ok(XactEnd::default());
+            return Ok(XactEnd {
+                xact_db,
+                ..XactEnd::default()
+            });
         }
         // Inval-only boundary (dirty tracker missed the writes): the
         // commit record itself is the only LSN at hand. Later than any
@@ -577,6 +604,7 @@ impl Filter {
                 stats_only,
             })),
             aborted_tree: None,
+            xact_db,
         })
     }
 

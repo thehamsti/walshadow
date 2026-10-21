@@ -37,6 +37,7 @@ pub mod config;
 #[cfg(feature = "test-support")]
 pub mod crash_test;
 pub mod decode;
+pub mod destination;
 pub mod dsn;
 pub mod emit;
 pub mod filter;
@@ -51,6 +52,7 @@ pub mod schema;
 pub mod source;
 pub mod source_db;
 pub mod table_rules;
+pub mod tenants;
 pub mod ticker;
 pub mod toast;
 mod toml_de;
@@ -79,7 +81,7 @@ pub use ops::{
 #[doc(hidden)]
 pub use source::{
     archive, boundary_hold, catalog_capture, manifest, queueing_record_sink, segment_sink,
-    shadow_stream, source_feed, timeline, transition, wal_stream,
+    shadow_stream, source_feed, tenant_router, timeline, transition, wal_stream,
 };
 #[doc(hidden)]
 pub use toast::toast_retire;

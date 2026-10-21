@@ -9,9 +9,11 @@ Start with path matching your environment:
 
 Use remaining guides as needed:
 
+- [Snowflake destination](snowflake.md), configuration, recovery, and qualification
+- [Tenants](tenants.md), many client databases through one daemon and slot
 - [Configuration](configuration.md), connection settings and live control
 - [Table selection](table-selection.md), replication scope and initial load
-- [Several databases](multi-database.md), replicating several databases of one cluster
+- [Several databases](multi-database.md), replicating several databases of one cluster as tenants
 - [Destination tables](destination-tables.md), generated ClickHouse schema and
   query patterns
 - [Schema changes](schema-changes.md), supported DDL behavior

@@ -422,6 +422,7 @@ impl WalStream {
                 boundary_info: verdict.boundary,
                 aborted_tree: verdict.aborted_tree,
                 defer_catalog_decode: verdict.defer_catalog_decode,
+                xact_db: verdict.xact_db,
             };
             let parks = record_sink.may_park(&record);
             self.staged.push(record);

@@ -23,7 +23,7 @@ use walshadow::backfill_bootstrap::{
     spawn_greenfield_bootstrap,
 };
 use walshadow::backup_source::BackupSource;
-use walshadow::backup_source_direct::DirectSource;
+use walshadow::backup_source_direct::{DirectSource, WalLeg};
 use walshadow::backup_source_object_store::ObjectStoreSource;
 use walshadow::bootstrap_marker::{self, BootstrapMarker};
 use walshadow::ch_emitter::{BootstrapMode, EmitterConfig, EmitterStats};
@@ -119,8 +119,10 @@ pub(crate) fn shadow_data_dir_initialized(dir: &std::path::Path) -> bool {
 /// `wait_through(K)` proves every bootstrap seq durable on CH before
 /// teardown, so the WAL pump resumes against a fully-shipped baseline.
 /// `None`: rows drain to a metrics-only observer via `drain_backfill`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_bootstrap(
     src_cfg: &PgConfig,
+    replica_cfg: Option<&PgConfig>,
     feed: &mut SourceFeed,
     args: &Args,
     plan: &BootstrapPlan,
@@ -149,6 +151,7 @@ pub(crate) async fn run_bootstrap(
     // Seed catalog map inside a REPEATABLE READ snapshot. DDL between the
     // seed COMMIT and BASE_BACKUP's checkpoint window is operator-quiesced
     // per the bootstrap out-of-scope contract.
+    let source_cfg = feed.pg_config().clone();
     let sql_client = feed
         .sql_client()
         .await
@@ -159,8 +162,7 @@ pub(crate) async fn run_bootstrap(
     // The landing and `filter_landed_wal` must agree on what counts as
     // catalog, or redo re-creates a file the landing skipped
     let mut landing_tracker = walshadow::catalog_tracker::CatalogTracker::new();
-    landing_tracker
-        .seed_from_source(sql_client)
+    walshadow::source_feed::seed_all_databases(&mut landing_tracker, sql_client, &source_cfg)
         .await
         .context("bootstrap: seed catalog filenodes")?;
     let catalog_filenodes: Vec<_> = landing_tracker.nodes().collect();
@@ -175,6 +177,8 @@ pub(crate) async fn run_bootstrap(
 
     type WalHydrate = (walrus::config::Settings, walrus::storage::DynStorage);
     let mut pinned_backup: Option<String> = None;
+    let snowflake_target = ch_config.as_ref().is_some_and(|c| c.snowflake.is_some());
+    let mut object_store_start_lsn = None;
     let (source, mut wal_hydrate): (Box<dyn BackupSource>, Option<WalHydrate>) = match plan.mode {
         BootstrapMode::Direct => {
             let hydrate = if args.bootstrap_wal_from_archive {
@@ -189,16 +193,49 @@ pub(crate) async fn run_bootstrap(
             } else {
                 None
             };
+            // A standby serves the data files only where nothing reads the
+            // window off the feed: a greenfield load's window leg starts at
+            // the primary's position, above a standby's backup start
+            let replica = match replica_cfg {
+                Some(_) if ch_config.is_some() => {
+                    tracing::warn!(
+                        target: "walshadow::bootstrap",
+                        "[source] replica ignored: a greenfield bootstrap reads the primary",
+                    );
+                    None
+                }
+                r => r,
+            };
+            // Without an archive, the window's WAL streams from the primary
+            // beside a standby's backup: the standby recycles it mid-copy
+            let wal_leg = replica.is_some() && hydrate.is_none();
             let opts = BaseBackupOpts {
                 // `basic()` stamp lets `pg_stat_progress_basebackup` and
                 // `backup_label` read the label as a wall-clock instant
                 label: format!("walshadow-bootstrap-{}", Timestamp::now().basic()),
-                fast_checkpoint: args.bootstrap_fast_checkpoint,
+                // A standby otherwise starts at its last restartpoint, which
+                // can sit below what the primary's slot still retains
+                fast_checkpoint: args.bootstrap_fast_checkpoint || replica.is_some(),
                 no_verify_checksums: false,
                 max_rate_kib: args.bootstrap_max_rate_kib,
-                wal: hydrate.is_none(),
+                wal: hydrate.is_none() && !wal_leg,
             };
-            (Box::new(DirectSource::new(src_cfg.clone(), opts)), hydrate)
+            let mut direct = DirectSource::new(replica.unwrap_or(src_cfg).clone(), opts);
+            if let Some(replica) = replica {
+                tracing::info!(
+                    target: "walshadow::bootstrap",
+                    host = %replica.host,
+                    user = %replica.user,
+                    wal_leg,
+                    "BASE_BACKUP reads a standby",
+                );
+            }
+            if wal_leg {
+                direct = direct.with_wal_leg(WalLeg {
+                    source: src_cfg.clone(),
+                });
+            }
+            (Box::new(direct), hydrate)
         }
         BootstrapMode::ObjectStore => {
             let settings = ch_config
@@ -211,6 +248,18 @@ pub(crate) async fn run_bootstrap(
             let resolved =
                 bootstrap_marker::resolve_backup(&storage, &plan.backup_name, previous.as_ref())
                     .await?;
+            if snowflake_target {
+                let sentinel = walrus::pg::backup::fetch::fetch_sentinel(&storage, &resolved)
+                    .await
+                    .context("bootstrap: fetch pinned backup sentinel")?;
+                object_store_start_lsn = Some(
+                    sentinel
+                        .sentinel
+                        .backup_start_lsn
+                        .context("bootstrap: pinned backup sentinel missing start LSN")?
+                        .into(),
+                );
+            }
             pinned_backup = Some(resolved.clone());
             let mut src = ObjectStoreSource::new(
                 settings.clone(),
@@ -268,7 +317,7 @@ pub(crate) async fn run_bootstrap(
     };
     let store_toast = resolver.stores_chunks();
 
-    let ch_target = match ch_config {
+    let mut ch_target = match ch_config {
         Some(emitter_cfg) => {
             let (mapping, resolved) = bootstrap_build_mapping(&emitter_cfg, &drain_catalog, args)
                 .await
@@ -278,29 +327,8 @@ pub(crate) async fn run_bootstrap(
             // but don't page-walk its existing rows.
             let skip_initial: HashSet<_> = drain_catalog
                 .descriptors()
-                .filter_map(|d| {
-                    // A partition loads as its root's `initial_load` says
-                    let rn = &routing(d, Some(&resolved.rules))
-                        .owner(d)
-                        .unwrap_or(d)
-                        .rel_name;
-                    let table_mode = emitter_cfg
-                        .table_opt_ins
-                        .get(rn)
-                        .and_then(|r| r.initial_load.as_deref())
-                        .or_else(|| emitter_cfg.table_initial_loads.get(rn).map(String::as_str));
-                    let none = match table_mode {
-                        Some(s) => s.parse::<InitialLoadMode>() == Ok(InitialLoadMode::None),
-                        None => {
-                            resolved
-                                .namespaces
-                                .get(rn.namespace.as_ref())
-                                .and_then(|n| n.initial_load)
-                                == Some(InitialLoadMode::None)
-                        }
-                    };
-                    none.then(|| d.rel_name.clone())
-                })
+                .filter(|d| bootstrap_skips_initial(&emitter_cfg, &resolved, d))
+                .map(|d| d.rel_name.clone())
                 .collect();
             Some((emitter_cfg, mapping, resolved, skip_initial))
         }
@@ -309,8 +337,8 @@ pub(crate) async fn run_bootstrap(
 
     // Decline unmapped relations at `begin` so their pages never decode.
     // Metrics-only (no CH) has no mapping to filter against, so it walks all
-    let (tap_filenodes, needs_oracle, routes) = match &ch_target {
-        Some((_, mapping, resolved, skip_initial)) => {
+    let (tap_filenodes, needs_oracle, mut routes) = match &ch_target {
+        Some((emitter_cfg, mapping, resolved, skip_initial)) => {
             let routed = mapping.snapshot().await;
             let is_routed = |d: &RelDescriptor| {
                 routing(d, Some(&resolved.rules))
@@ -321,11 +349,18 @@ pub(crate) async fn run_bootstrap(
             (
                 walshadow::backfill_bootstrap::tap_filenode_set(&drain_catalog, is_routed, walked)
                     .map(Arc::new),
-                walshadow::backfill::bootstrap_oracle::needs_oracle(
-                    &drain_catalog,
-                    &routed,
-                    &resolved.column_rules,
-                ),
+                if emitter_cfg.snowflake.is_some() {
+                    walshadow::backfill::bootstrap_oracle::snowflake_needs_oracle(
+                        &drain_catalog,
+                        &routed,
+                    )
+                } else {
+                    walshadow::backfill::bootstrap_oracle::needs_oracle(
+                        &drain_catalog,
+                        &routed,
+                        &resolved.column_rules,
+                    )
+                },
                 routed,
             )
         }
@@ -380,10 +415,10 @@ pub(crate) async fn run_bootstrap(
     };
     let oracle = bootstrap_oracle.as_ref().map(|o| o.oracle());
 
-    let marker = bootstrap_marker::begin_attempt(&shadow_data_dir, previous, pinned_backup)
+    let mut marker = bootstrap_marker::begin_attempt(&shadow_data_dir, previous, pinned_backup)
         .await
         .context("prepare shadow data dir for bootstrap")?;
-    let resume =
+    let mut resume =
         bootstrap_marker::resumable_extraction(&shadow_data_dir, marker.backup_name.as_deref())?;
 
     // Sample window floor before BASE_BACKUP
@@ -393,6 +428,53 @@ pub(crate) async fn run_bootstrap(
         .context("bootstrap: sample source write head for the window leg")?;
     let source_major = (feed.server_version_num() / 10000) as u32;
 
+    let mut snowflake_plan = None;
+    let mut snowflake_runtime = None;
+    let mut snowflake_floor = 0u64;
+    let mut snowflake_emitter = None;
+    let mut snowflake_mapping = None;
+    if let Some((emitter, mapping, resolved, skip_initial)) = ch_target.as_mut()
+        && let Some(runtime) = emitter.snowflake.clone()
+    {
+        let floor = marker
+            .pin_snapshot_lsn(
+                &shadow_data_dir,
+                object_store_start_lsn
+                    .map(|b: u64| b.min(source_ident.xlogpos))
+                    .unwrap_or(source_ident.xlogpos),
+            )
+            .await
+            .context("pin Snowflake greenfield WAL floor")?;
+        snowflake_floor = floor;
+        if resume.take().is_some() {
+            bootstrap_marker::restart_extraction(&shadow_data_dir)
+                .await
+                .context("restart Snowflake greenfield extraction")?;
+        }
+        let plan = walshadow::backfill_bootstrap::prepare_greenfield_snapshots(
+            &runtime,
+            emitter,
+            mapping,
+            &drain_catalog,
+            skip_initial,
+            resolved,
+            floor,
+        )
+        .await
+        .context("prepare Snowflake greenfield generations")?;
+        for rel in &plan.rels {
+            if rel.phase == walshadow::destination::snowflake::state::GenerationPhase::Replayed {
+                skip_initial.insert(rel.desc.rel_name.clone());
+            }
+        }
+        routes = plan.mapping.snapshot().await;
+        emitter.snowflake_snapshots = Arc::new(plan.operations.clone());
+        snowflake_plan = Some(plan);
+        snowflake_runtime = Some(runtime);
+        snowflake_emitter = Some(Arc::new(emitter.clone()));
+        snowflake_mapping = Some(mapping.clone());
+    }
+
     let mut cfg = BootstrapConfig::new(shadow_data_dir.clone()).with_catalog_filenodes(
         catalog_filenodes
             .into_iter()
@@ -400,6 +482,9 @@ pub(crate) async fn run_bootstrap(
     );
     if let Some(set) = tap_filenodes {
         cfg = cfg.with_tap_filenodes(set);
+    }
+    if let Some(floor) = marker.snapshot_lsn {
+        cfg = cfg.with_snapshot_lsn(floor);
     }
     let progress = cfg.progress.clone();
     // Only writer of the registry until the status loop starts. Publishing the
@@ -538,9 +623,11 @@ pub(crate) async fn run_bootstrap(
         );
 
         // Run WAL window beside page walk when user relations exist
+        let mut window_emitter = emitter_cfg.clone();
+        window_emitter.snowflake_snapshots = Arc::default();
         let mut window_cfg = (!drain_catalog.is_empty()).then(|| {
             walshadow::backfill::bootstrap_window::WindowLegConfig {
-                dest: bootstrap_dest.clone(),
+                dest: walshadow::config::DestEmitter::new(Arc::new(window_emitter), None),
                 mapping: mapping.clone(),
                 config: resolved.clone(),
                 stats: stats.clone(),
@@ -1123,10 +1210,18 @@ pub(crate) async fn run_bootstrap(
         )
         .await
         .context("bootstrap: load pending visibility ledger")?;
-        let recorded = ledger
-            .record(&pending_tables)
-            .await
-            .context("bootstrap: persist pending visibility ledger")?;
+        // Snowflake keeps pending tables in its runtime state, not this ledger
+        let recorded = if let Some(runtime) = &snowflake_runtime {
+            ledger
+                .reconcile_snowflake(runtime)
+                .await
+                .map_err(anyhow::Error::msg)
+                .context("bootstrap: reconcile Snowflake pending visibility")?;
+            ledger.record(&[]).await
+        } else {
+            ledger.record(&pending_tables).await
+        }
+        .context("bootstrap: persist pending visibility ledger")?;
         tracing::info!(
             target: "walshadow::bootstrap",
             emitted = gate.emitted,
@@ -1143,6 +1238,52 @@ pub(crate) async fn run_bootstrap(
     } else {
         PendingRecorded::nothing_pending()
     };
+
+    if let (Some(runtime), Some(plan), Some(emitter), Some(mapping)) = (
+        &snowflake_runtime,
+        &snowflake_plan,
+        snowflake_emitter,
+        snowflake_mapping,
+    ) {
+        let system_id: u64 = source_ident
+            .sysid
+            .parse()
+            .context("IDENTIFY_SYSTEM sysid")?;
+        walshadow::backfill_bootstrap::publish_greenfield_snapshots(runtime, plan, &mapping)
+            .await
+            .context("publish Snowflake greenfield generations")?;
+        // Published generations are the tables' initial load; without a done
+        // ledger entry boot's `initial_load` opt-in seed would copy them again
+        let recorded = walshadow::copy_backfill::record_bootstrap_loaded(
+            &args.spill_dir,
+            system_id,
+            plan.rels.iter().map(|rel| rel.desc.rel_name.clone()),
+            snowflake_floor,
+        )
+        .await
+        .context("record Snowflake greenfield loads in backfill ledger")?;
+        tracing::info!(target: "walshadow::bootstrap", recorded,
+            "greenfield loads recorded as completed initial loads");
+        let mut ledger =
+            walshadow::visibility_pending::PendingLedger::load(&args.spill_dir, system_id)
+                .await
+                .context("load Snowflake greenfield pending ledger")?;
+        ledger
+            .reconcile_snowflake(runtime)
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("reconcile Snowflake greenfield pending rows")?;
+        if !ledger.is_empty() {
+            let mut session = walshadow::backfill_staging::StagingSession::connect(
+                walshadow::config::DestEmitter::new(emitter, None),
+            )
+            .await
+            .context("open Snowflake pending settlement")?;
+            walshadow::visibility_pending::settle(&mut ledger, &mut session, &bootstrap_stats)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
 
     // PG refuses to start on a data dir whose mode isn't 0700 or 0750.
     // BASE_BACKUP tar carries no entry for the root, so extraction leaves
@@ -1210,6 +1351,41 @@ impl BootstrapHandoff {
     }
 }
 
+/// `initial_load = "none"` (table override, else namespace) opts a relation
+/// out of the greenfield snapshot: create it and stream CDC, but don't
+/// page-walk its existing rows
+fn bootstrap_skips_initial(
+    emitter: &EmitterConfig,
+    resolved: &walshadow::config::ResolvedConfig,
+    desc: &RelDescriptor,
+) -> bool {
+    // A partition loads as its root's `initial_load` says
+    let relation = &routing(desc, Some(&resolved.rules))
+        .owner(desc)
+        .unwrap_or(desc)
+        .rel_name;
+    let table_mode = emitter
+        .table_opt_ins
+        .get(relation)
+        .and_then(|row| row.initial_load.as_deref())
+        .or_else(|| {
+            emitter
+                .table_initial_loads
+                .get(relation)
+                .map(String::as_str)
+        });
+    match table_mode {
+        Some(mode) => mode.parse::<InitialLoadMode>() == Ok(InitialLoadMode::None),
+        None => {
+            resolved
+                .namespaces
+                .get(relation.namespace.as_ref())
+                .and_then(|ns| ns.initial_load)
+                == Some(InitialLoadMode::None)
+        }
+    }
+}
+
 /// Routing map for the bootstrap drain: explicit `[table.*]` seeded up front,
 /// then every seeded relation run through the DDL applicator's `Added` path so
 /// `auto_create` namespaces get their CH table created and mapping registered.
@@ -1249,14 +1425,49 @@ pub(crate) async fn bootstrap_build_mapping(
     };
     // Publish rule-adjusted targets before creating tables
     mapping.publish(merged_tables).await;
-    let mut applicator = walshadow::ch_ddl::DdlApplicator::new(
-        walshadow::config::DestEmitter::new(Arc::new(emitter_cfg.clone()), Some(config_rx.clone())),
-        ddl_cfg,
-        mapping.clone(),
-        config_rx,
-    )
-    .await
-    .context("bootstrap: init DDL applicator")?;
+    let dest =
+        walshadow::config::DestEmitter::new(Arc::new(emitter_cfg.clone()), Some(config_rx.clone()));
+    if let Some(runtime) = &emitter_cfg.snowflake {
+        use futures::{StreamExt, TryStreamExt};
+        // Relations have independent storage and durable journals. Bound remote
+        // setup without serializing thousands of SQL round trips on one lane.
+        futures::stream::iter(catalog.descriptors())
+            .map(|desc| {
+                let dest = dest.clone();
+                let ddl_cfg = ddl_cfg.clone();
+                let config_rx = config_rx.clone();
+                let mapping = mapping.clone();
+                let resolved = resolved.clone();
+                async move {
+                    let mut applicator = walshadow::ch_ddl::DdlApplicator::new(
+                        dest,
+                        ddl_cfg,
+                        mapping.clone(),
+                        config_rx,
+                    )
+                    .await?;
+                    if !bootstrap_skips_initial(emitter_cfg, &resolved, desc)
+                        && mapping.with(|m| m.contains_key(&desc.rel_name)).await
+                    {
+                        runtime.defer_publication(desc)?;
+                    }
+                    applicator.add(desc).await.with_context(|| {
+                        format!("bootstrap: ensure Snowflake table {}", desc.rel_name)
+                    })
+                }
+            })
+            .buffer_unordered(runtime.config.metadata_concurrency)
+            .try_collect::<Vec<_>>()
+            .await?;
+        tracing::info!(target: "walshadow::bootstrap",
+            tables = mapping.with(|m| m.len()).await,
+            "Snowflake bootstrap table setup complete");
+        return Ok((mapping, resolved));
+    }
+    let mut applicator =
+        walshadow::ch_ddl::DdlApplicator::new(dest, ddl_cfg, mapping.clone(), config_rx)
+            .await
+            .context("bootstrap: init DDL applicator")?;
     // Partitions check against their root's destination, so roots first
     let mut descs: Vec<_> = catalog.partitioned().chain(catalog.descriptors()).collect();
     descs.sort_by_key(|d| d.ancestors.len());

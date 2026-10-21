@@ -18,3 +18,13 @@ pgext/log/
 architecture/*.png
 
 regression.out
+__pycache__/
+
+# Environment-specific experiment tooling and notes (kept locally, not public)
+/docs/johns-test-datax-experiment.md
+/scripts/*johns-test-datax*.py
+/scripts/snowflake-jtdx-ab.py
+/scripts/mt-run.py
+/scripts/mt-validate.py
+/scripts/provision-datax-dev.py
+/scripts/c2-run.py

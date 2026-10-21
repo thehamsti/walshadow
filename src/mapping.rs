@@ -11,7 +11,7 @@ use crate::table_rules::set_if;
 use ahash::HashMap;
 use tokio::sync::RwLock;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableMapping {
     pub target: TableTarget,
     pub columns: Vec<ColumnMapping>,
@@ -217,7 +217,7 @@ impl std::str::FromStr for DropTableStrategy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnMapping {
     pub src_attnum: i16,
     pub target_name: String,
@@ -491,6 +491,21 @@ impl MappingCell {
     /// identity answers "has the map moved since I looked?"
     pub async fn unmoved(&self, at: &MappingSnapshot) -> bool {
         Arc::ptr_eq(&*self.inner.read().await, at)
+    }
+
+    /// Hold the selected relations fixed across an async publication. Unrelated
+    /// routing changes may proceed before this guard, but writers block until
+    /// it is dropped.
+    pub async fn guard_matches(
+        &self,
+        at: &MappingSnapshot,
+        relations: &[RelName],
+    ) -> Option<tokio::sync::RwLockReadGuard<'_, MappingSnapshot>> {
+        let guard = self.inner.read().await;
+        relations
+            .iter()
+            .all(|rel| guard.get(rel) == at.get(rel))
+            .then_some(guard)
     }
 
     pub async fn mutate<R>(&self, f: impl FnOnce(&mut MappingSnapshot) -> R) -> R {
@@ -881,6 +896,48 @@ mod tests {
         handle.publish(Arc::new(shared(map2))).await;
         assert!(!planned.contains_key(&rel2), "snapshot predates the swap");
         assert!(handle.with(|m| m.contains_key(&rel2)).await);
+    }
+
+    #[tokio::test]
+    async fn publication_guard_rejects_stale_route_and_blocks_republish() {
+        let (rel, map) = one_table();
+        let handle = mapping_handle(map);
+        let planned = handle.snapshot().await;
+        let selected = [rel.clone()];
+        let guard = handle.guard_matches(&planned, &selected).await.unwrap();
+        let writer = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.publish(Arc::new(HashMap::default())).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!writer.is_finished());
+        drop(guard);
+        writer.await.unwrap();
+        assert!(handle.guard_matches(&planned, &selected).await.is_none());
+
+        let handle = mapping_handle(
+            planned
+                .iter()
+                .map(|(rel, m)| (rel.clone(), (**m).clone()))
+                .collect(),
+        );
+        let mut unrelated = (*planned).clone();
+        unrelated.insert(
+            RelName::new("public", "other"),
+            Arc::new(TableMapping {
+                tees: Vec::new(),
+                target: TableTarget::new("db", "other"),
+                columns: vec![],
+            }),
+        );
+        handle.publish(Arc::new(unrelated)).await;
+        assert!(handle.guard_matches(&planned, &selected).await.is_some());
+        handle
+            .mutate(|map| {
+                Arc::make_mut(map).remove(&rel);
+            })
+            .await;
+        assert!(handle.guard_matches(&planned, &selected).await.is_none());
     }
 
     fn attr(attnum: i16, name: &str, type_oid: u32) -> crate::schema::RelAttr {

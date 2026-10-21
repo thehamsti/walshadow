@@ -90,6 +90,9 @@ impl<'a> Routing<'a> {
 /// topmost ancestor. Only exact rules exclude partitions. Pattern rules
 /// apply to partitions only through `route = "self"`
 pub fn routing<'a>(desc: &'a RelDescriptor, rules: Option<&TableRules>) -> Routing<'a> {
+    if rules.is_some_and(TableRules::own_partitions) {
+        return Routing::Own;
+    }
     let ancestors = &desc.ancestors;
     let Some(top) = ancestors.last() else {
         return Routing::Own;
@@ -356,6 +359,31 @@ mod tests {
         )]);
         assert_eq!(owner(&a1, Some(&excluded)), None);
         assert!(route_via(&a1, Some(&excluded), |_| unreachable!()).is_none());
+    }
+
+    /// Snowflake keeps the pre-partition-routing shape: every partition is a
+    /// plain table of its own, which patterns reach like any other table
+    #[test]
+    fn own_partitions_route_every_partition_to_itself() {
+        let (m, a, a1) = tree();
+        let glob = rules(&[(
+            "a*",
+            MatchKind::Glob,
+            TableRule {
+                replicate: Some(true),
+                ..TableRule::default()
+            },
+        )])
+        .with_own_partitions(true);
+        for desc in [&m, &a, &a1] {
+            assert_eq!(owner(desc, Some(&glob)), Some(&*desc.rel_name.name));
+        }
+        assert_eq!(glob.settings_for(&a1).replicate, Some(true));
+        assert_eq!(
+            owner(&a1, Some(&rules(&[]))),
+            Some("m"),
+            "default routes to root"
+        );
     }
 
     #[test]

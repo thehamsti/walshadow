@@ -18,6 +18,7 @@
 #define WS_OP_SCAN 0x03
 #define WS_OP_REPLAY_LSN 0x04
 #define WS_OP_FETCH_TOAST 0x05
+#define WS_OP_RENDER_TEXT 0x06
 
 /* per-value result in a FETCH_TOAST response */
 #define WS_FETCH_OK 0x00
@@ -58,6 +59,8 @@ typedef enum WsCatalog {
 
 extern void
 ws_handle_encode_native(StringInfo req, StringInfo resp);
+extern void
+ws_handle_render_text(StringInfo req, StringInfo resp);
 
 /* toast.c */
 extern void

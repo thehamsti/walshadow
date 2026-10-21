@@ -180,6 +180,7 @@ impl Record<'_> {
             boundary_info: self.boundary_info.clone(),
             aborted_tree: self.aborted_tree.clone(),
             defer_catalog_decode: self.defer_catalog_decode,
+            xact_db: self.xact_db,
         }
     }
 }
@@ -216,6 +217,8 @@ pub struct Record<'a> {
     /// commit-time capture publishes the layout this tuple was written
     /// under
     pub defer_catalog_decode: bool,
+    /// Database named by a commit or abort record's dbinfo
+    pub xact_db: Option<u32>,
 }
 
 pub trait RecordSink: Send {

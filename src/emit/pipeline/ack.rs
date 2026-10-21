@@ -333,6 +333,13 @@ impl AckHandle {
         self.send_acked(counts);
     }
 
+    /// Snowflake tail: its delivery resolves only once the rows are durable,
+    /// applied or in the outbox per `ack_after`, which stands in for the
+    /// ClickHouse [`EndOfStream`] proof
+    pub(super) fn delivered(&self, counts: Vec<(u64, u64)>) {
+        self.send_acked(counts);
+    }
+
     fn send_acked(&self, counts: Vec<(u64, u64)>) {
         if !counts.is_empty() {
             let _ = self.tx.send(AckEvent::Acked { counts });

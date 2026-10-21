@@ -2,6 +2,10 @@ walshadow replicates PostgreSQL rows into ClickHouse from physical WAL,
 including initial load, continuous changes, schema evolution, restarts, and
 planned source switchover
 
+An opt-in [Snowflake destination](docs/snowflake.md) adds durable ingestion,
+typed current-state views, and snapshot publication. Live Snowflake performance
+qualification is still required; ClickHouse remains the default.
+
 ## Get Started
 
 - Follow [Quickstart](docs/quickstart.md) to run PostgreSQL, ClickHouse, and
@@ -18,7 +22,7 @@ PostgreSQL major version
 - [Architecture](architecture/README.md)
 - [Configuration](docs/configuration.md)
 - [Table selection](docs/table-selection.md)
-- [Several databases](docs/multi-database.md)
+- [Several databases](docs/multi-database.md), as tenants
 - [Destination tables](docs/destination-tables.md)
 - [Schema changes](docs/schema-changes.md)
 - [Operations](docs/operations.md)

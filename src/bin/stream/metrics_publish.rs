@@ -214,6 +214,7 @@ impl DbMetricSources {
 }
 
 /// Drain-resident + spool gauge readings taken under one buffer lock
+#[derive(Default)]
 pub(crate) struct DrainResident {
     pub(crate) total: u64,
     pub(crate) chunks: u64,

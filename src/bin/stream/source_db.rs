@@ -25,7 +25,6 @@ pub(crate) struct SourceDbInputs<'a> {
     pub(crate) conn: &'a DbLink,
     /// `[source] dbname`: the one database a cluster backup can load
     pub(crate) primary: bool,
-    /// Destinations every followed database has claimed
     pub(crate) desc_log: &'a Arc<walshadow::desc_log::DescriptorLog>,
     /// Backfill ledger lives here, beside this database's descriptor log
     pub(crate) spill_dir: PathBuf,
@@ -41,7 +40,13 @@ pub(crate) struct SourceDbInputs<'a> {
     pub(crate) shadow_toast_held: Option<&'a walshadow::filter::shadow_relations::ShadowHeld>,
     pub(crate) system_id: u64,
     pub(crate) pending_rows: &'a walshadow::visibility_pending::SharedPendingLedger,
-    pub(crate) tasks: &'a mut SessionTasks,
+    /// Session-lifetime tasks; `None` for a tenant, whose tasks end with it
+    pub(crate) tasks: Option<&'a mut SessionTasks>,
+    /// Declared tenant this database serves: its resolver reloads through
+    /// the tenant's `[tenant.<id>]` view
+    pub(crate) tenant: Option<&'a str>,
+    /// Scope a tenant attached mid-stream holds over what the config says
+    pub(crate) activation: walshadow::config::Activation,
 }
 
 pub(crate) struct BuiltSourceDb {
@@ -64,6 +69,29 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
             backfiller: None,
         });
     };
+    // A tenant's ClickHouse scopes come from its whole file config, before
+    // priming narrows the table rules
+    let reserved = (input.tenant.is_some() && cfg.snowflake.is_none())
+        .then(|| Arc::new(walshadow::tenants::clickhouse_scopes(&cfg)));
+    let priming = input.activation.priming;
+    if priming {
+        // Nothing in scope until every transaction the tenant saw only
+        // part of has finished; the session then publishes its tables
+        cfg.replicate_all = false;
+        cfg.table_opt_ins.clear();
+        cfg.table_initial_loads.clear();
+        cfg.table_entries.clear();
+    }
+    for (rel, row) in &input.activation.opt_ins {
+        let entry = cfg
+            .table_opt_ins
+            .entry(rel.clone())
+            .or_insert_with(|| row.clone());
+        // Same fill as `Activation`: a rule naming no load takes the start's
+        if entry.initial_load.is_none() {
+            entry.initial_load.clone_from(&row.initial_load);
+        }
+    }
     // Live routing map shared by DDL applicator + route planning. The
     // refresher below rewrites it on every republished snapshot.
     let mapping = walshadow::mapping::mapping_handle(cfg.tables.clone());
@@ -91,6 +119,10 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         (overlay, seeded_table_rows) = load_runtime_config(&client, &schema)
             .await
             .context("seed runtime config overlay")?;
+        if priming {
+            // A priming tenant publishes its scope on activation
+            seeded_table_rows.clear();
+        }
     }
     let (resolver, config_rx) = ConfigResolver::new(
         &cfg,
@@ -103,6 +135,13 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
             shadow_toast: input.shadow_toast_held.cloned(),
         },
     );
+    if let Some(id) = input.tenant {
+        resolver.bind_tenant(id);
+    }
+    if let Some(scopes) = &reserved {
+        resolver.reserve_destinations(scopes.clone())?;
+    }
+    resolver.set_activation(input.activation);
     if let Some(held) = input.shadow_toast_held {
         // Check configured tables here because they bypass opt-in
         // Preserve exclusions across SIGHUP reloads
@@ -118,10 +157,12 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
             resolver.exclude_table(&rel).await;
         }
     }
-    input.tasks.spawn(
-        "mapping refresher",
-        refresh_mapping(config_rx.clone(), mapping.clone()),
-    );
+    let refresher = refresh_mapping(config_rx.clone(), mapping.clone());
+    match input.tasks {
+        Some(tasks) => tasks.spawn("mapping refresher", refresher),
+        // Ends once the tenant drops its resolver
+        None => drop(tokio::spawn(refresher)),
+    }
     {
         let rc = config_rx.borrow();
         cfg.row_budget = rc.row_budget;
@@ -149,6 +190,9 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     .context("init DDL applicator")?
     .with_resolver(resolver.clone())
     .with_oracle(input.oracle.clone());
+    if let Some(scopes) = reserved {
+        applicator.reserve_destinations(scopes);
+    }
     // Backfiller for `initial_load` opt-ins (COPY / backup-sourced):
     // own source session + CH tail per backfill or pass, spill-dir
     // ledger dedups restarts. Wired whenever the emitter runs, since an
@@ -156,6 +200,10 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     // otherwise silently skip its backfill; idle it costs one ledger read.
     let mut pg = input.source.to_pg_config();
     pg.database = conn.name.clone();
+    let replica = input.source.replica_pg_config().map(|mut r| {
+        r.database = conn.name.clone();
+        r
+    });
     let backfiller = Arc::new(
         walshadow::copy_backfill::CopyBackfiller::new(
             pg,
@@ -175,6 +223,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         )
         .await
         .context("load backfill ledger")?
+        .with_replica(replica)
         .with_backup_loads(input.primary),
     );
     let backfiller_effects: Option<Arc<dyn walshadow::opt_in::Backfiller>> =
@@ -186,9 +235,21 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     // `raw_start` is the backfill boundary S for a first-seen
     // `initial_load` row: COPY covers commits before it, WAL the rest;
     // the ledger resumes/no-ops rows seen on an earlier boot.
+    prewarm_snowflake_opt_ins(
+        &cfg,
+        &mut applicator,
+        &conn.catalog,
+        seeded_table_rows
+            .iter()
+            .filter(|(_, row)| !row.is_pattern())
+            .map(|(rel, row)| (rel, row))
+            .chain(cfg.table_opt_ins.iter()),
+    )
+    .await;
+    let mut deferred = walshadow::opt_in::DeferredBackfills::default();
     for (rel, row) in &seeded_table_rows {
         if row.replicate.is_some() && !row.is_pattern() {
-            walshadow::opt_in::apply_table_opt_in(
+            walshadow::opt_in::apply_table_opt_in_deferred(
                 &resolver,
                 &mut applicator,
                 &conn.catalog,
@@ -196,6 +257,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
                 rel,
                 row,
                 raw_start.get(),
+                &mut deferred,
             )
             .await
             .with_context(|| format!("seed opt-in for {rel}"))?;
@@ -203,7 +265,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     }
     for (rel, row) in &cfg.table_opt_ins {
         if row.replicate.is_some() {
-            walshadow::opt_in::apply_table_opt_in(
+            walshadow::opt_in::apply_table_opt_in_deferred(
                 &resolver,
                 &mut applicator,
                 &conn.catalog,
@@ -211,6 +273,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
                 rel,
                 row,
                 raw_start.get(),
+                &mut deferred,
             )
             .await
             .with_context(|| format!("config opt-in for {rel}"))?;
@@ -225,7 +288,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         )
     };
     for (rel, row) in &pattern_scoped {
-        walshadow::opt_in::apply_table_opt_in(
+        walshadow::opt_in::apply_table_opt_in_deferred(
             &resolver,
             &mut applicator,
             &conn.catalog,
@@ -233,10 +296,14 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
             rel,
             row,
             raw_start.get(),
+            &mut deferred,
         )
         .await
         .with_context(|| format!("pattern opt-in for {rel}"))?;
     }
+    // Every mapping is in place: start the loads without each waiting on
+    // the next opt-in's mapping publication
+    deferred.start(backfiller_effects.as_ref()).await;
     let sql_scoped_tables: HashSet<RelName> = seeded_table_rows
         .iter()
         .filter(|(_, row)| row.replicate.is_some() && !row.is_pattern())
@@ -288,6 +355,70 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         applicator: Some(applicator),
         backfiller: Some(backfiller),
     })
+}
+
+/// Create the Snowflake storage of every exact `replicate = true` opt-in
+/// concurrently before boot's serial opt-in seed, which then finds each
+/// table ready. Validation and publication deferral match the seed's own
+/// order, so a pending initial load stays hidden. Best effort: a failure
+/// here resurfaces, with context, from the seed.
+async fn prewarm_snowflake_opt_ins<'a>(
+    emitter_cfg: &EmitterConfig,
+    applicator: &mut walshadow::ch_ddl::DdlApplicator,
+    catalog: &Arc<Mutex<ShadowCatalog>>,
+    rows: impl Iterator<Item = (&'a RelName, &'a walshadow::runtime_config::TableRow)>,
+) {
+    use futures::StreamExt;
+    let Some(runtime) = emitter_cfg.snowflake.clone() else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let mut seen = HashSet::default();
+    let mut descs = Vec::new();
+    for (rel, row) in rows {
+        if row.replicate != Some(true) || !seen.insert(rel.clone()) {
+            continue;
+        }
+        let Ok(Some(desc)) = catalog.lock().await.descriptor_by_name(rel).await else {
+            continue;
+        };
+        let Ok(Some(_)) = applicator
+            .snowflake_opt_in_mapping(
+                &desc,
+                row.target_database.as_deref(),
+                row.target_table.as_deref(),
+            )
+            .await
+        else {
+            continue;
+        };
+        if row
+            .initial_load
+            .as_deref()
+            .is_some_and(|mode| mode != "none")
+            && applicator.defer_snowflake_publication(&desc).is_err()
+        {
+            continue;
+        }
+        descs.push(desc);
+    }
+    let total = descs.len();
+    let failed = futures::stream::iter(descs)
+        .map(|desc| {
+            let runtime = runtime.clone();
+            async move { runtime.ensure_table(&desc).await.is_err() }
+        })
+        .buffer_unordered(runtime.config.metadata_concurrency)
+        .filter(|failed| std::future::ready(*failed))
+        .count()
+        .await;
+    tracing::info!(
+        target: "walshadow::config",
+        tables = total,
+        failed,
+        elapsed_secs = started.elapsed().as_secs_f64(),
+        "Snowflake opt-in storage prewarmed",
+    );
 }
 
 /// Without `[ch]` a database routes nothing, so it needs no mapping or resolver

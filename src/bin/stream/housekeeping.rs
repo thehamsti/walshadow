@@ -90,6 +90,34 @@ pub(crate) fn spawn_desc_log_gc(
     })
 }
 
+const SNOWFLAKE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Reclaim Snowflake state below each persisted resume floor, at most once
+/// per [`SNOWFLAKE_MAINTENANCE_INTERVAL`]. Failures only delay reclamation
+pub(crate) fn spawn_snowflake_maintenance(
+    runtime: Arc<walshadow::destination::snowflake::runtime::SnowflakeRuntime>,
+    floor: Gate<Floor>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut cut = floor.current();
+        loop {
+            tokio::time::sleep(SNOWFLAKE_MAINTENANCE_INTERVAL).await;
+            let Ok(next) = floor.advance(cut).await else {
+                return;
+            };
+            cut = next;
+            if let Err(e) = runtime.maintain(cut.get()).await {
+                tracing::warn!(
+                    target: "walshadow::snowflake",
+                    floor = %cut,
+                    error = %format!("{e:#}"),
+                    "Snowflake state maintenance failed; retrying next interval",
+                );
+            }
+        }
+    })
+}
+
 /// Every [`DEFAULT_TRIM_INTERVAL`], read last restartpoint REDO LSN and trim
 /// below `min(replay_lsn - retention_bytes, redo)`
 /// Keep WAL from restartpoint because shadow resumes recovery there

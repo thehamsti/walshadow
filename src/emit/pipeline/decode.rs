@@ -31,6 +31,8 @@ pub fn place_rows(
     staged: &mut Vec<RowChunk>,
     stats: &EmitterStats,
     chunk_rows: usize,
+    // Snowflake keeps deletes and renders extension types itself
+    snowflake: bool,
     seq: u64,
     commit_ts: i64,
     commit_lsn: u64,
@@ -48,7 +50,10 @@ pub fn place_rows(
         };
         // No delete-marker column: a DELETE would land as a phantom insert of
         // the old image, so drop it (append-only destination)
-        if route.drops_deletes() && matches!(envelope.described.decoded.op, HeapOp::Delete) {
+        if !snowflake
+            && route.drops_deletes()
+            && matches!(envelope.described.decoded.op, HeapOp::Delete)
+        {
             stats.deletes_discarded.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -62,13 +67,17 @@ pub fn place_rows(
             commit_lsn,
         };
         // PostGIS WKT differs from typoutput HEXEWKB
-        if let Some(t) = committed.decoded.new.as_mut() {
-            crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
+        if !snowflake {
+            if let Some(t) = committed.decoded.new.as_mut() {
+                crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
+            }
+            if let Some(t) = committed.decoded.old.as_mut() {
+                crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
+            }
         }
-        if let Some(t) = committed.decoded.old.as_mut() {
-            crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
-        }
-        if !route.drops_deletes()
+        // Snowflake splits key changes itself when it encodes the batch
+        if !snowflake
+            && !route.drops_deletes()
             && let Some(tomb) = take_key_change_tombstone(&mut committed.decoded, &rel)
         {
             let tomb = CommittedTuple {
@@ -211,6 +220,7 @@ mod tests {
             &mut staged,
             &stats,
             8,
+            false,
             0,
             0,
             0x2000,
@@ -230,6 +240,7 @@ mod tests {
             &mut staged,
             &stats,
             8,
+            false,
             1,
             0,
             0x3000,
@@ -240,24 +251,87 @@ mod tests {
         assert_eq!(stats.deletes_discarded.load(Ordering::Relaxed), 1);
     }
 
+    /// Snowflake keeps a delete the CH routing policy would drop, and leaves
+    /// extension values for its own renderer
+    #[test]
+    fn snowflake_preserves_delete_and_pending_geometry() {
+        let stats = EmitterStats::default();
+        let no_marker = route(SystemColumns {
+            is_deleted: None,
+            ..SystemColumns::default()
+        });
+        let mut row = heap(HeapOp::Delete, no_marker);
+        Arc::make_mut(&mut row.described.descriptor).attributes[0].type_name = "geometry".into();
+        row.described.decoded.old.as_mut().unwrap().columns[0] = Some(ColumnValue::PgPending {
+            type_oid: 23,
+            raw: vec![0; 24],
+        });
+        let mut staged = Vec::new();
+        assert_eq!(
+            place_rows(&mut staged, &stats, 8, true, 0, 0, 0x2000, vec![row], None),
+            1
+        );
+        let [chunk] = &staged[..] else {
+            panic!("missing Snowflake row")
+        };
+        assert_eq!(stats.deletes_discarded.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            chunk.rows[0]
+                .committed
+                .decoded
+                .old
+                .as_ref()
+                .unwrap()
+                .columns[0],
+            Some(ColumnValue::PgPending { .. })
+        ));
+    }
+
+    fn key_change(route: Arc<RouteSnapshot>) -> RoutedHeap {
+        let mut h = heap(HeapOp::Update, route);
+        h.described.descriptor = Arc::new(RelDescriptor {
+            replident: ReplIdent::Default {
+                pk_attnums: Some(vec![1]),
+            },
+            ..(*rel()).clone()
+        });
+        h.described.decoded.old = Some(DecodedTuple {
+            columns: vec![Some(ColumnValue::Int4(0))],
+            partial: false,
+        });
+        h
+    }
+
+    /// Snowflake splits a key change itself when it encodes the update, so
+    /// placement passes it whole: one row, no tombstone ahead of it
+    #[test]
+    fn snowflake_key_change_places_one_update() {
+        let stats = EmitterStats::default();
+        let mut staged = Vec::new();
+        let routed = place_rows(
+            &mut staged,
+            &stats,
+            8,
+            true,
+            0,
+            0,
+            0x2000,
+            vec![key_change(route(SystemColumns::default()))],
+            None,
+        );
+        assert_eq!(routed, 1);
+        let ops: Vec<_> = staged[0]
+            .rows
+            .iter()
+            .map(|r| r.committed.decoded.op)
+            .collect();
+        assert_eq!(ops, [HeapOp::Update]);
+    }
+
     /// Emit and count old-key delete marker before new row unless deletes are disabled
     #[tokio::test]
     async fn key_change_places_tombstone_first() {
         let stats = EmitterStats::default();
-        let update = |route| {
-            let mut h = heap(HeapOp::Update, route);
-            h.described.descriptor = Arc::new(RelDescriptor {
-                replident: ReplIdent::Default {
-                    pk_attnums: Some(vec![1]),
-                },
-                ..(*rel()).clone()
-            });
-            h.described.decoded.old = Some(DecodedTuple {
-                columns: vec![Some(ColumnValue::Int4(0))],
-                partial: false,
-            });
-            h
-        };
         for (system, placed) in [
             (SystemColumns::default(), 2),
             (
@@ -273,10 +347,11 @@ mod tests {
                 &mut staged,
                 &stats,
                 8,
+                false,
                 0,
                 0,
                 0x2000,
-                vec![update(route(system))],
+                vec![key_change(route(system))],
                 None,
             );
             assert_eq!(routed, placed);

@@ -5,38 +5,31 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use ahash::{HashMap, HashMapExt};
 use anyhow::{Context, Result};
 use backon::{ExponentialBuilder, Retryable};
 use tokio::sync::{Mutex, watch};
-use tokio_postgres::types::Oid;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use walrus::pg::backup::format_pg_lsn;
 use walshadow::archive::Archive;
-use walshadow::boundary_hold::{
-    AttachSlot, BoundaryGateConfig, BoundaryHoldSink, CatalogBoundaryGate, PendingDatabase,
-    PendingDatabases,
-};
+use walshadow::boundary_hold::{AttachSlot, PendingDatabase, PendingDatabases};
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
-use walshadow::config::{ConfigResolver, SourceConn};
+use walshadow::config::{CliOverrides, ConfigResolver, SourceConn};
 #[cfg(feature = "test-support")]
 use walshadow::crash_test;
 use walshadow::manifest;
 use walshadow::metrics::{MetricsRegistry, RateEstimator};
 use walshadow::pg::socket_conninfo;
-use walshadow::pipeline::{PipelineConfig, TailKind};
 use walshadow::pos::{
     EmitterAck, FilterDurable, Floor, Monotone, Pos, RawStart, ShadowFlush, ShadowReplay,
     SourceReceived,
 };
 use walshadow::queueing_record_sink::{
-    DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
+    DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
 };
 use walshadow::record::{MetricsRecordSink, WAL_SEG_SIZE};
 use walshadow::retention::max_segment_end;
 use walshadow::segment_sink::{DirSegmentSink, SegFsync};
-use walshadow::source_db::{DbLink, DbLinkConfig, SourceDb, SourceDbs};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::timeline::TimelineHistory;
 use walshadow::transition::{
@@ -44,16 +37,13 @@ use walshadow::transition::{
     seed_shadow_branches,
 };
 use walshadow::wal_stream::WalStream;
-use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
 
-use crate::args::{Args, cli_base, finish_ch_config, positive_usize};
+use crate::args::{Args, TENANT_BRIDGES, build_emitter_config, cli_base, positive_usize};
 use crate::bootstrap::{
     BootstrapHandoff, BootstrapMetrics, BootstrapObservers, ShadowStart, resolve_bootstrap,
     resolve_shadow_start, run_bootstrap,
 };
-use crate::housekeeping::{
-    SEGMENT_FSYNC_QUEUE, spawn_desc_log_gc, spawn_segment_fsync, trim_retention,
-};
+use crate::housekeeping::{SEGMENT_FSYNC_QUEUE, spawn_segment_fsync, trim_retention};
 use crate::metrics_publish::{
     DbMetricSources, DrainResident, ShadowMetricsView, SourceSwap, StageCounters, TimelineView,
     populate_metrics,
@@ -63,17 +53,19 @@ use crate::shadow_proc::{
     OwnedShadow, ShadowLifecycle, bridge_pool_size, build_owned_shadow, open_shadow_sql_client,
     probe_blocking, start_owned_shadow, walsender_primary_conninfo,
 };
-use crate::sinks::{DaemonSinks, DecoderXactPair};
-use crate::source_db::{
-    ATTACH_MARKER, DescLogInputs, SourceDbInputs, build_source_db, list_databases, metrics_only_db,
-    open_db_desc_log, open_source_sql_client,
-};
+use crate::sinks::DaemonSinks;
+use crate::source_db::{ATTACH_MARKER, list_databases};
 use crate::source_recovery::{
     BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PauseState, PromotionGate,
     ReconnectBackoff, ResumePoint, SOURCE_SWAP_RETRY, SourcePath, SourceRecovery,
     commit_fork_resume, connect_source_waiting, promotion_gate, resume_manifest,
     resume_source_feed, stream_branch, swap_reason,
 };
+use crate::tenant;
+
+/// Stall limit without tenants: a single pipeline has always been allowed
+/// to backpressure the pump indefinitely
+const NO_STALL_LIMIT: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
 
 /// Wait out an unreachable ClickHouse at boot rather than exit, which leaves
 /// a supervisor restart-looping the daemon until the destination returns
@@ -130,7 +122,7 @@ async fn session_body(
     let mut tasks = SessionTasks::default();
     tasks.spawn("sighup reload", sighup_reload(sighup, reloader.clone()));
 
-    let merged: toml::Table = match args.ch_config.as_deref() {
+    let mut merged: toml::Table = match args.ch_config.as_deref() {
         Some(p) => walshadow::ch_emitter::load_effective(p, cli_base(args))
             .await
             .with_context(|| format!("load config {}", p.display()))?,
@@ -159,28 +151,37 @@ async fn session_body(
         "source identified",
     );
 
-    // `[ch]` presence decides emitter vs metrics-only.
-    let ch_config = if merged.contains_key("ch") {
-        let cfg = finish_ch_config(
-            EmitterConfig::from_table(&merged).context("parse ch config")?,
-            args,
+    walshadow::ops::tenant_ctl::validate(&merged)?;
+    let mut tenants_cfg = walshadow::tenants::TenantsConfig::from_table(&merged)
+        .context("parse [tenants] / [tenant.*]")?;
+    if let Some(tcfg) = &tenants_cfg {
+        let _ = TENANT_BRIDGES.set((tcfg.bridge_workers, tcfg.capacity));
+        anyhow::ensure!(
+            args.start_lsn.is_none(),
+            "--start-lsn applies to the single-tenant layout only"
         );
-        if cfg.databases.len() > 1 {
-            tracing::info!(
-                target: "walshadow::config",
-                dbname = %cfg.source.dbname,
-                databases = ?cfg.databases,
-                "following several source databases",
-            );
-        }
-        Some(cfg)
-    } else {
-        None
+    }
+    let sysid: u64 = ident.sysid.parse().context("source system identifier")?;
+    // Single-tenant layout: its config drives bootstrap too. With tenants
+    // each opens its own below, and bootstrap builds shadow only
+    let ch_config = match &tenants_cfg {
+        None => build_emitter_config(args, &merged, sysid, &source_conn.dbname, None).await?,
+        Some(_) => None,
     };
+    if let Some(cfg) = ch_config.as_ref()
+        && cfg.databases.len() > 1
+    {
+        tracing::info!(
+            target: "walshadow::config",
+            dbname = %cfg.source.dbname,
+            databases = ?cfg.databases,
+            "following several source databases",
+        );
+    }
     // Before anything dials CH naming that database in its handshake — the
     // bootstrap insert tail is first, and its failure there reads as a
     // bootstrap fault rather than a missing destination
-    if let Some(cfg) = ch_config.as_ref() {
+    if let Some(cfg) = ch_config.as_ref().filter(|cfg| cfg.snowflake.is_none()) {
         or_signal(shutdown, ensure_boot_database_waiting(cfg)).await?;
     }
     // QueueingRecordSink knobs feed both the CH and metrics-only pipelines,
@@ -232,6 +233,7 @@ async fn session_body(
     };
     if let Some(cfg) = ch_config
         .as_ref()
+        .filter(|c| c.snowflake.is_none())
         .filter(|c| c.toast.mode == walshadow::ch_emitter::ToastMode::Clickhouse)
     {
         let renamed = walshadow::toast::adopt_legacy_mirrors(cfg, legacy_owner)
@@ -245,7 +247,12 @@ async fn session_body(
             );
         }
     }
-    let bootstrap_plan = resolve_bootstrap(args, ch_config.as_ref())?;
+    // Cluster-wide sections ([bootstrap], [backup], [memory]) with tenants
+    let cluster_cfg = match &tenants_cfg {
+        Some(_) => Some(EmitterConfig::from_table(&merged).context("parse cluster config")?),
+        None => None,
+    };
+    let bootstrap_plan = resolve_bootstrap(args, ch_config.as_ref().or(cluster_cfg.as_ref()))?;
     let shadow_start = resolve_shadow_start(args, bootstrap_plan.mode)?;
     if ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow())
         && let ShadowStart::Resume(dir) = &shadow_start
@@ -294,6 +301,7 @@ async fn session_body(
             shutdown,
             run_bootstrap(
                 &cfg,
+                source_conn.replica_pg_config().as_ref(),
                 &mut feed,
                 args,
                 &bootstrap_plan,
@@ -400,6 +408,7 @@ async fn session_body(
         ShadowLifecycle::spawn(owned, walsender_primary_conninfo(args.walsender_bind));
     let archive = ch_config
         .as_ref()
+        .or(cluster_cfg.as_ref())
         .and_then(|c| c.backup.clone())
         .map(Archive::open)
         .transpose()?;
@@ -628,16 +637,18 @@ async fn session_body(
     // START_REPLICATION. Closes the "source rotated a mapped catalog above
     // 16384 pre-attach" hole the < 16384 bootstrap rule misses. Idempotent.
     {
+        let source_cfg = feed.pg_config().clone();
         let sql_client = feed
             .sql_client()
             .await
             .context("open sidecar sql client for seed_from_source")?;
-        let added = stream
-            .filter_mut()
-            .tracker_mut()
-            .seed_from_source(sql_client)
-            .await
-            .context("seed_from_source")?;
+        let added = walshadow::source_feed::seed_all_databases(
+            stream.filter_mut().tracker_mut(),
+            sql_client,
+            &source_cfg,
+        )
+        .await
+        .context("seed_from_source")?;
         let observed_from = stream
             .filter_mut()
             .seed_observed_from_source(sql_client)
@@ -655,54 +666,17 @@ async fn session_body(
         );
     }
 
-    // Connect bridge and shadow catalog before START_REPLICATION so the
-    // tracker→drain wire is hot from the first record. One pair per followed
-    // database: catalog reads and value conversion answer from the database
-    // that wrote the bytes
-    let connect_budget = Duration::from_secs(args.shadow_connect_timeout);
-    let bridge_path = args.bridge_socket_path();
-    let socket_dir = args
-        .shadow_socket_dir
-        .to_str()
-        .context("shadow-socket-dir not UTF-8")?;
+    // Cluster-wide shadow session (retention sweeper): the database the pump
+    // connects to, the followed one or, with tenants, the admin one
     let primary_dbname = stand_in
         .clone()
         .unwrap_or_else(|| source_conn.dbname.clone());
-    let primary_position = source_databases
-        .iter()
-        .position(|db| *db == primary_dbname)
-        .unwrap_or(0);
-    let link_for = |index: usize| -> Result<_> {
-        let name = &source_databases[index];
-        let emitter = match ch_config.as_ref() {
-            Some(_) => Some(finish_ch_config(
-                EmitterConfig::for_database(&merged, name)
-                    .with_context(|| format!("parse ch config for database {name}"))?,
-                args,
-            )),
-            None => None,
-        };
-        let conninfo = socket_conninfo(socket_dir, args.shadow_port, &args.shadow_user, name);
-        Ok((name, emitter, conninfo))
-    };
-    let mut links: Vec<Option<DbLink>> = (0..source_databases.len()).map(|_| None).collect();
-    {
-        let (name, emitter, conninfo) = link_for(primary_position)?;
-        links[primary_position] = Some(
-            DbLink::connect(DbLinkConfig {
-                name,
-                index: primary_position,
-                workers: bridge_workers,
-                bridge_path: &bridge_path,
-                shadow_conninfo: &conninfo,
-                budget: connect_budget,
-                emitter,
-            })
-            .await?,
-        );
-    }
+    let connect_budget = Duration::from_secs(args.shadow_connect_timeout);
+    // `[source] dbname` created after the shadow's backup: the single-database
+    // layout follows the stand-in until replay creates it, then the session
+    // restarts to follow it. Tenants attach their databases themselves
     let mut pending_dbs: Vec<PendingDatabase> = Vec::new();
-    if stand_in.is_some() {
+    if stand_in.is_some() && tenants_cfg.is_none() {
         tokio::fs::write(args.spill_dir.join(ATTACH_MARKER), b"")
             .await
             .with_context(|| format!("mark {} as attaching", args.spill_dir.display()))?;
@@ -730,97 +704,10 @@ async fn session_body(
             oid,
             name: source_conn.dbname.clone(),
             visible_at,
-            bridge_socket: walshadow::bridge::slot_path(
-                &bridge_path,
-                primary_position * bridge_workers.clamp(1, walshadow::bridge::MAX_BRIDGE_WORKERS),
-            ),
+            // The primary's bridge slots come first
+            bridge_socket: walshadow::bridge::slot_path(&args.bridge_socket_path(), 0),
         });
     }
-    if source_databases.len() > 1 {
-        let shadow_dbs = list_databases(
-            &open_shadow_sql_client(
-                &args.shadow_socket_dir,
-                args.shadow_port,
-                &args.shadow_user,
-                &primary_dbname,
-            )
-            .await?,
-        )
-        .await
-        .context("list shadow databases")?;
-        let source_sql = feed
-            .sql_client()
-            .await
-            .context("source sidecar sql for database list")?;
-        let visible_at = source_sql
-            .query_one("SELECT pg_current_wal_lsn()::text", &[])
-            .await
-            .context("source WAL position for database list")?;
-        let visible_at = walshadow::pg::parse_pg_lsn(visible_at.get::<_, &str>(0))
-            .context("parse source WAL position")?;
-        let source_dbs = list_databases(source_sql)
-            .await
-            .context("list source databases")?;
-        for (index, link) in links.iter_mut().enumerate() {
-            if index == primary_position {
-                continue;
-            }
-            let (name, emitter, conninfo) = link_for(index)?;
-            let source_oid = *source_dbs
-                .get(name.as_str())
-                .with_context(|| format!("database {name} is configured but not on the source"))?;
-            match shadow_dbs.get(name.as_str()) {
-                Some(&oid) if oid == source_oid => {
-                    *link = Some(
-                        DbLink::connect(DbLinkConfig {
-                            name,
-                            index,
-                            workers: bridge_workers,
-                            bridge_path: &bridge_path,
-                            shadow_conninfo: &conninfo,
-                            budget: connect_budget,
-                            emitter,
-                        })
-                        .await?,
-                    );
-                }
-                Some(&oid) => anyhow::bail!(
-                    "database {name} is oid {source_oid} on the source but oid {oid} on the \
-                     shadow: it was recreated after the shadow's backup, re-bootstrap"
-                ),
-                None => {
-                    let dir = args.spill_dir.join(format!("db-{source_oid}"));
-                    tokio::fs::create_dir_all(&dir)
-                        .await
-                        .with_context(|| format!("create {}", dir.display()))?;
-                    tokio::fs::write(dir.join(ATTACH_MARKER), b"")
-                        .await
-                        .with_context(|| format!("mark {} as attaching", dir.display()))?;
-                    tracing::warn!(
-                        target: "walshadow",
-                        database = %name,
-                        oid = source_oid,
-                        visible_at = %format_pg_lsn(visible_at),
-                        "database not in the shadow yet; following it once the shadow replays its creation",
-                    );
-                    pending_dbs.push(PendingDatabase {
-                        oid: source_oid,
-                        name: name.clone(),
-                        visible_at,
-                        bridge_socket: walshadow::bridge::slot_path(
-                            &bridge_path,
-                            index * bridge_workers.clamp(1, walshadow::bridge::MAX_BRIDGE_WORKERS),
-                        ),
-                    });
-                }
-            }
-        }
-    }
-    let db_conns: Vec<DbLink> = links.into_iter().flatten().collect();
-    let primary_index = db_conns
-        .iter()
-        .position(|db| db.name == source_conn.dbname)
-        .unwrap_or(0);
     let shadow_conninfo = socket_conninfo(
         args.shadow_socket_dir
             .to_str()
@@ -829,93 +716,10 @@ async fn session_body(
         &args.shadow_user,
         &primary_dbname,
     );
-    let bridge = db_conns[primary_index].bridge.clone();
-    let primary_db_oid = db_conns[primary_index].oid;
-
-    // Pre-flight validators run after both source + shadow SQL clients
-    // are up so every check has its connection.
-    if !args.skip_preflight {
-        let source_version_num = feed.server_version_num();
-        let source_sql = feed
-            .sql_client()
-            .await
-            .context("source sidecar sql for preflight")?;
-        let shadow_sql = open_shadow_sql_client(
-            &args.shadow_socket_dir,
-            args.shadow_port,
-            &args.shadow_user,
-            &primary_dbname,
-        )
-        .await?;
-        let mut report = walshadow::preflight::run(walshadow::preflight::Inputs {
-            source_version_num,
-            source_sql,
-            shadow_sql: &shadow_sql,
-            slot: source_conn.slot.as_deref(),
-            ch_config: ch_config.as_ref(),
-        })
-        .await
-        .context("pre-flight probe")?;
-        // Relations of another database resolve over a connection to it
-        for conn in &db_conns {
-            if conn.name == source_conn.dbname {
-                continue;
-            }
-            let Some(cfg) = &conn.emitter else {
-                continue;
-            };
-            let client = open_source_sql_client(&source_conn, &conn.name)
-                .await
-                .with_context(|| format!("source sql for database {}", conn.name))?;
-            report.errors.extend(
-                walshadow::preflight::mapped_relations(&client, cfg)
-                    .await
-                    .with_context(|| format!("pre-flight probe for database {}", conn.name))?,
-            );
-        }
-        report
-            .into_result()
-            .context("pre-flight rejected daemon start")?;
-        tracing::info!(target: "walshadow::preflight", "pre-flight passed");
-    }
 
     // Share pump's xid samples with shadow TOAST reads to detect reused IDs
     let xid_ceiling = Arc::new(walshadow::toast::xid_ceiling::XidCeiling::default());
     stream.filter_mut().set_xid_ceiling(xid_ceiling.clone());
-    let oracle = Some(Arc::new(
-        walshadow::oracle::Oracle::per_database(
-            db_conns
-                .iter()
-                .map(|conn| (conn.oid, conn.bridge.clone()))
-                .collect(),
-        )
-        .with_xid_ceiling(xid_ceiling),
-    ));
-
-    // START_REPLICATION runs after sinks are built so archive fallback can
-    // advance identical filter and decode paths.
-    // Spill dir wiped every startup: cursor file commits drains
-    // atomically, so leftover spill from a prior crash is redundant or stale.
-    let mut xact_buf_cfg = XactBufferConfig {
-        xact_buffer_max: args.xact_buffer_max,
-        ..XactBufferConfig::new(args.spill_dir.clone())
-    };
-    if let Some(cfg) = ch_config.as_ref() {
-        xact_buf_cfg.drain_batch_rows = cfg.drain_batch_rows;
-        xact_buf_cfg.drain_batch_bytes = cfg.drain_batch_bytes;
-    }
-    let xact_buffer = XactBuffer::new(xact_buf_cfg).context("init xact buffer / spill dir")?;
-    xact_buffer
-        .clear_spill_dir()
-        .await
-        .context("clear stale spill files")?;
-    let xact_buffer = Arc::new(Mutex::new(xact_buffer));
-    tracing::info!(
-        target: "walshadow",
-        spill_dir = %args.spill_dir.display(),
-        xact_buffer_max = args.xact_buffer_max,
-        "spill dir ready",
-    );
 
     // Persist handoff before streaming can advance manifest
     if let (Some(end_lsn), Some(resume)) = (bootstrap_end_lsn, bootstrap_resume_lsn) {
@@ -952,16 +756,11 @@ async fn session_body(
             .context("write initial resume manifest after bootstrap")?;
     }
 
-    // Descriptor log: durable shape history captured at catalog boundaries,
-    // bound to this source + shadow pairing. Sole schema-event source.
     let source_major = (feed.server_version_num() / 10000) as u32;
     anyhow::ensure!(
         (16..=19).contains(&source_major),
         "source PG major {source_major} unsupported (commit-record sinval layout audited for 16-19)",
     );
-    stream
-        .filter_mut()
-        .set_target_dbs(db_conns.iter().map(|conn| conn.oid));
     let shadow_toast = ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow());
     // Check TOAST availability for opt-in and configured relations
     let mut shadow_toast_held = None;
@@ -981,350 +780,219 @@ async fn session_body(
         );
         shadow_toast_held = Some(rels.held());
     }
-    let pending_cfg = ch_config
-        .as_ref()
-        .map(|c| c.pending_capture)
-        .unwrap_or_default();
-    let pending_catalog = Arc::new(walshadow::pending::PendingCatalog::default());
-    let smgr_markers = stream.filter().smgr_markers();
     let mut stream = stream.start();
-    // One log per database, each in its own spill subdirectory; the primary
-    // keeps the spill root so a single-database resume reads where it wrote
-    let mut desc_logs: Vec<Arc<walshadow::desc_log::DescriptorLog>> =
-        Vec::with_capacity(db_conns.len());
-    for conn in db_conns.iter() {
-        let dir = if conn.name == source_conn.dbname {
-            args.spill_dir.clone()
-        } else {
-            let dir = args.spill_dir.join(format!("db-{}", conn.oid));
-            tokio::fs::create_dir_all(&dir)
-                .await
-                .with_context(|| format!("create descriptor log dir {}", dir.display()))?;
-            dir
-        };
-        desc_logs.push(
-            open_db_desc_log(DescLogInputs {
-                args,
-                dir: &dir,
-                dbname: &conn.name,
-                catalog: &conn.catalog,
-                identity: walshadow::desc_log::DescLogIdentity {
-                    pg_major: source_major,
-                    system_id: ident.sysid.clone(),
-                    // Resume branch, which a crossing moves without moving the
-                    // log: the stored header names wherever the log last
-                    // rewrote itself, so `lineage` is what places it
-                    timeline: start_timeline,
-                    db_oid: conn.oid,
-                    wal_seg_size: WAL_SEG_SIZE as u32,
-                },
-                lineage: &lineage,
-                manifest_present: manifest_at_boot.is_some(),
-                start_lsn_override,
-                raw_start,
-                aligned,
-            })
-            .await?,
-        );
-    }
-    let desc_log = desc_logs[primary_index].clone();
-    let all_desc_logs = walshadow::desc_log::DescriptorLogs::new(desc_logs.clone());
-
-    // Txn-span registry, shared by pump + decoder; `Some` only with OTLP on.
-    let span_registry =
-        if args.otlp_endpoint.is_some() || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
-            Some(xact_buffer.lock().await.span_registry())
-        } else {
-            None
-        };
-    let stash_live = xact_buffer.lock().await.stash_live();
-    let mut decoder = BufferingDecoderSink::new(all_desc_logs.clone(), xact_buffer.clone())
-        .with_stash_live(stash_live);
-    if let Some(schema) = ch_config
-        .as_ref()
-        .and_then(|c| c.runtime_config_schema.as_deref())
-    {
-        decoder = decoder.with_config_schema(Arc::from(schema));
-    }
-    if let Some(reg) = &span_registry {
-        decoder = decoder.with_span_registry(reg.clone());
-    }
-    let decoder_stats_handle = decoder.stats_handle();
-    stream
-        .filter_mut()
-        .set_skip_stats(decoder_stats_handle.clone());
-    let skip_attribution_stats = decoder_stats_handle.clone();
-
-    let mut emitter_stats_handle: Option<Arc<EmitterStats>> = None;
-    // Seed at resume point so first status write cannot replace persisted ack
-    // with zero before WAL re-read catches up
-    let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(raw_start.retag()));
     // Persisted resolved floor. Seed with the resolved start: aligned +
     // archive-clamped, the exact position a crash-now restart replays from.
     // Any Dropped queued during the boot re-read of [aligned, raw_start] has
     // commit_lsn ≥ aligned, so its retire holds until a later manifest write
     // moves the floor past it.
     let resume_floor = Arc::new(Monotone::<Floor>::new(aligned));
-    // Deferred retires queued before a stop; entries below `aligned` never
-    // replay their drop, so the post-spawn flush below is their only route
-    // to the wipe. Loaded in metrics-only runs too (inert without a chunk
-    // store), preserved for a later CH run over the same spill dir.
-    let retires = walshadow::toast_retire::RetireLedger::load(
-        &args.spill_dir,
-        live_identity.system_id,
-        legacy_owner,
-    )
-    .await
-    .context("load toast retire ledger")?;
-    // Pending tables a bootstrap or backup pass left holding undecided rows.
-    // Settling needs ClickHouse, so a metrics-only run leaves the ledger for
-    // a later CH run over the same spill dir
-    let pending_rows = walshadow::visibility_pending::PendingLedger::load(
-        &args.spill_dir,
-        live_identity.system_id,
-    )
-    .await
-    .context("load pending visibility ledger")?
-    .shared();
-    // Layered config resolvers (CLI > TOML), one per database. The SIGHUP
-    // task re-reads TOML and republishes each
-    let mut config_resolvers: Vec<Arc<ConfigResolver>> = Vec::new();
-    // Same resolvers keyed by database, for the `database=` labelled series
-    let mut resolvers_by_db: HashMap<Oid, Arc<ConfigResolver>> = HashMap::new();
-    // COPY backfillers for `initial_load='copy'`, one per database
-    let mut copy_backfillers: HashMap<Oid, Arc<walshadow::copy_backfill::CopyBackfiller>> =
-        HashMap::new();
-
-    let pcfg = if ch_config.is_some() {
-        let mut emitter_cfg = ch_config.clone().expect("[ch] present");
-        let addr = format!("{}:{}", emitter_cfg.conn.host, emitter_cfg.conn.port);
-        let stats = emitter_stats.clone();
-        emitter_stats_handle = Some(stats.clone());
-        // One validated resident-payload pool for the pipeline and every
-        // concurrent backup pass
-        let pipeline_budget =
-            walshadow::pipeline::build_budget(&emitter_cfg, emitter_cfg.decoder_pool_size)
-                .map_err(|e| anyhow::anyhow!("memory budget: {e}"))?;
-        let mut dbs: Vec<Arc<SourceDb>> = Vec::with_capacity(db_conns.len());
-        let mut applicators: HashMap<Oid, walshadow::ch_ddl::DdlApplicator> = HashMap::new();
-        let mut backfillers: HashMap<Oid, Arc<dyn walshadow::opt_in::Backfiller>> = HashMap::new();
-        let mut resolvers: Vec<Arc<ConfigResolver>> = Vec::with_capacity(db_conns.len());
-        for (i, conn) in db_conns.iter().enumerate() {
-            let built = build_source_db(SourceDbInputs {
-                args,
-                conn,
-                primary: i == primary_index,
-                desc_log: &desc_logs[i],
-                spill_dir: if conn.name == source_conn.dbname {
-                    args.spill_dir.clone()
-                } else {
-                    args.spill_dir.join(format!("db-{}", conn.oid))
-                },
-                source: &source_conn,
-                oracle: &oracle,
-                history_rx: history_rx.clone(),
-                budget: &pipeline_budget,
-                stats: &stats,
-                source_major,
-                raw_start,
-                shadow_toast_held: shadow_toast_held.as_ref(),
-                system_id: live_identity.system_id,
-                pending_rows: &pending_rows,
-                tasks: &mut tasks,
-            })
-            .await
-            .with_context(|| format!("wire source database {}", conn.name))?;
-            if i == primary_index {
-                // Seeded + CLI values the initial batcher/inserter run with;
-                // they track the watch channel live thereafter
-                let rc = built.db.config_rx.as_ref().expect("resolver wired");
-                let rc = rc.borrow();
-                emitter_cfg.row_budget = rc.row_budget;
-                emitter_cfg.byte_budget = rc.byte_budget;
-                emitter_cfg.flush_timeout = rc.flush_timeout;
-                emitter_cfg.conn.compression = rc.conn.compression;
-                emitter_cfg.retry.max_attempts = rc.retry_max_attempts;
-            }
-            if let Some(applicator) = built.applicator {
-                applicators.insert(conn.oid, applicator);
-            }
-            if let Some(backfiller) = built.backfiller.clone() {
-                backfillers.insert(conn.oid, backfiller as _);
-                copy_backfillers.insert(conn.oid, built.backfiller.expect("just cloned"));
-            }
-            if let Some(resolver) = &built.db.resolver {
-                resolvers.push(resolver.clone());
-                resolvers_by_db.insert(conn.oid, resolver.clone());
-            }
-            dbs.push(built.db);
-        }
-        // SIGHUP and `ctl reload` republish every database's scope
-        reloader.set_resolvers(resolvers.clone()).await;
-        config_resolvers = resolvers;
-        let (decoders, inserters) = (
-            emitter_cfg.decoder_pool_size,
-            emitter_cfg.inserter_pool_size,
-        );
-        tracing::info!(
-            target: "walshadow::pipeline",
-            addr = %addr,
-            decoders,
-            inserters,
-            databases = dbs.len(),
-            resolvers = bridge.pool_size(),
-            "parallel decode+insert pipeline starting",
-        );
-        PipelineConfig {
-            emitter: emitter_cfg,
-            decoder_pool_size: decoders,
-            inserter_pool_size: inserters,
-            dbs: Arc::new(SourceDbs::new(dbs, primary_db_oid)),
-            oracle: oracle.clone(),
-            applicators,
-            tail: TailKind::ClickHouse,
-            buffer: xact_buffer.clone(),
-            subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
-            pending: pending_catalog.clone(),
-            stats: stats.clone(),
-            span_registry: span_registry.clone(),
-            backfillers,
-            retires,
-            pending_rows,
-            resume_floor: resume_floor.clone(),
-            budget: Some(pipeline_budget),
-        }
-    } else {
-        // Metrics-only (no CH): the identical pipeline with a null tail —
-        // zero CH connections, no DDL applicator, no oracle (nothing ships,
-        // PgPending stays raw). The empty mapping routes nothing, so seqs
-        // complete at placement and the watermark + slot advance move as in
-        // a CH run. Emitter stats stay unexported (`emitter_stats_handle`
-        // None), matching the old serial surface.
-        // No `[ch]` here, so the CLI layers straight onto the constants.
-        let decoders = positive_usize(
-            "decoder_pool_size",
-            args.decoder_pool_size,
-            walshadow::ch_emitter::DEFAULT_DECODER_POOL,
-        );
-        let inserters = positive_usize(
-            "inserter_pool_size",
-            args.inserter_pool_size,
-            walshadow::ch_emitter::default_inserter_pool(),
-        );
-        tracing::info!(
-            target: "walshadow::pipeline",
-            decoders,
-            "metrics-only pipeline (null tail) starting",
-        );
-        let dbs: Vec<Arc<SourceDb>> = db_conns
-            .iter()
-            .zip(&desc_logs)
-            .map(|(conn, desc_log)| Arc::new(metrics_only_db(conn, desc_log)))
-            .collect();
-        PipelineConfig {
-            emitter: EmitterConfig::default(),
-            decoder_pool_size: decoders,
-            inserter_pool_size: inserters,
-            dbs: Arc::new(SourceDbs::new(dbs, primary_db_oid)),
-            oracle: None,
-            applicators: HashMap::new(),
-            tail: TailKind::Null,
-            buffer: xact_buffer.clone(),
-            subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
-            pending: pending_catalog.clone(),
-            stats: Arc::new(EmitterStats::default()),
-            span_registry: span_registry.clone(),
-            backfillers: HashMap::new(),
-            retires,
-            pending_rows: walshadow::visibility_pending::PendingLedger::empty().shared(),
-            resume_floor: resume_floor.clone(),
-            budget: None,
-        }
-    };
-
-    let (booting_reorder, pipeline_handle) = pcfg
-        .spawn(emitter_ack.clone())
-        .await
-        .context("spawn decode+insert pipeline")?;
-    let ack_probe = pipeline_handle.ack_probe.clone();
-    let reorder_sink = booting_reorder
-        .boot(
-            Some(&args.bootstrap_shadow_data_dir),
-            desc_log.active_present_at(raw_start.get()),
-            raw_start.get(),
-        )
-        .await?;
-    let predecode = Arc::new(decoder.predecoder());
-    let decoder_xact = QueueingRecordSink::spawn(
-        DecoderXactPair {
-            decoder,
-            xact_drain: reorder_sink,
-        },
+    let shared = tenant::SessionShared {
+        sysid: ident.sysid.clone(),
+        sysid_num: sysid,
+        source_conn: source_conn.clone(),
+        source_major,
+        source_version_num: feed.server_version_num(),
+        start_timeline,
+        lineage: lineage.clone(),
+        history_rx: history_rx.clone(),
+        shadow_state: shadow_state.clone(),
+        smgr_markers: stream.filter_mut().smgr_markers(),
+        xid_ceiling: xid_ceiling.clone(),
+        resume_floor: resume_floor.clone(),
         decoder_batch_size,
         decoder_queue_capacity,
-        span_registry.clone(),
-    )
-    .with_predecode(predecode);
-    let boundary_gate = CatalogBoundaryGate::new(
-        shadow_state.clone(),
-        BoundaryGateConfig {
-            hold_timeout: Duration::from_secs(args.catalog_hold_timeout),
-            ..BoundaryGateConfig::default()
-        },
+        span_tracing: args.otlp_endpoint.is_some()
+            || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok(),
+        io: io.clone(),
+    };
+    drop(history_rx);
+    let mut router = walshadow::tenant_router::TenantRouter::new(
+        tenants_cfg
+            .as_ref()
+            .map_or(NO_STALL_LIMIT, |t| t.stall_timeout),
+        tenants_cfg.is_some(),
     );
-    let boundary_hold_stats = boundary_gate.stats.clone();
-    // One capture per database: a boundary's catalog reads answer over the
-    // connection to the database that wrote them
-    let mut captures = walshadow::catalog_capture::CaptureSet::default();
-    for (conn, log) in db_conns.iter().zip(&desc_logs) {
-        captures.insert(
-            conn.oid,
-            walshadow::catalog_capture::CatalogCapture::new(
-                log.clone(),
-                conn.catalog.clone(),
-                xact_buffer.clone(),
-                smgr_markers.clone(),
-                pending_catalog.clone(),
-                pending_cfg,
-            ),
-        );
+    let mut tenants: Vec<tenant::Tenant> = Vec::new();
+    let mut supervisor = tenant::Supervisor::default();
+    // Cluster knobs (pause, source endpoint) with tenants: a destination-less
+    // resolver over the cluster sections, which the control socket reloads
+    let mut cluster_resolver: Option<Arc<ConfigResolver>> = None;
+    let mut registry_poller: Option<tokio::task::JoinHandle<()>> = None;
+    match &tenants_cfg {
+        None => {
+            // Same document per database, scoped to that database's entries;
+            // the primary's copy already carries its opened destination
+            let primary_index = source_databases
+                .iter()
+                .position(|db| *db == source_conn.dbname)
+                .unwrap_or(0);
+            let mut databases = Vec::with_capacity(source_databases.len());
+            for (i, name) in source_databases.iter().enumerate() {
+                let emitter = if i == primary_index {
+                    ch_config.clone()
+                } else if ch_config.is_some() {
+                    build_emitter_config(args, &merged, sysid, name, None).await?
+                } else {
+                    None
+                };
+                databases.push(tenant::BootDb {
+                    name: name.clone(),
+                    emitter,
+                });
+            }
+            // Records of a database the shadow lacks reach this tenant too,
+            // so its pending gate attaches at the first one, as before tenants
+            let pending_oids: Vec<u32> = pending_dbs.iter().map(|p| p.oid).collect();
+            let boot = tenant::TenantBoot {
+                args,
+                id: walshadow::tenants::LEGACY_TENANT.into(),
+                databases,
+                primary: primary_index,
+                dir: args.spill_dir.clone(),
+                emitter_stats: emitter_stats.clone(),
+                source_conn: source_conn.clone(),
+                preflight_slot: source_conn.slot.clone(),
+                sysid: shared.sysid.clone(),
+                sysid_num: sysid,
+                source_major,
+                source_version_num: shared.source_version_num,
+                start_timeline,
+                lineage: lineage.clone(),
+                raw_start,
+                aligned,
+                expect_log: manifest_at_boot.is_some(),
+                start_lsn_override,
+                history_rx: shared.history_rx.clone(),
+                shadow_state: shadow_state.clone(),
+                smgr_markers: shared.smgr_markers.clone(),
+                xid_ceiling: xid_ceiling.clone(),
+                bridge_path: args.bridge_socket_path(),
+                bridge_workers,
+                resume_floor: resume_floor.clone(),
+                shadow_toast_held: shadow_toast_held.clone(),
+                decoder_batch_size,
+                decoder_queue_capacity,
+                span_tracing: shared.span_tracing,
+                min_commit_lsn: 0,
+                priming: false,
+                activation_opt_ins: Default::default(),
+                legacy_owner,
+                pending: PendingDatabases::new(
+                    std::mem::take(&mut pending_dbs),
+                    connect_budget,
+                    attach.clone(),
+                ),
+                io: io.clone(),
+            };
+            let (mut t, sink) = tenant::open_tenant(boot, Some(&mut tasks)).await?;
+            // SIGHUP and `ctl reload` republish every database's scope
+            reloader.set_resolvers(t.config_resolvers.clone()).await;
+            // Bootstrap's throwaway oracle bridge counts under the database it
+            // restored, so its totals carry across handoff rather than reading
+            // as a reset once the live bridge takes over
+            if let Some(b) = &bootstrap_metrics
+                && let Some(db) = t
+                    .metrics_dbs
+                    .iter_mut()
+                    .find(|db| db.database == source_conn.dbname)
+            {
+                db.bridge[1] = Some(b.bridge.clone());
+            }
+            for db in &t.db_oids {
+                stream.filter_mut().add_target_db(*db);
+            }
+            router.attach(walshadow::tenant_router::RoutedTenant::new(
+                t.id.clone(),
+                t.db_oids.iter().copied().chain(pending_oids).collect(),
+                0,
+                sink,
+            ));
+            tenants.push(t);
+        }
+        Some(tcfg) => {
+            let cluster = cluster_cfg.clone().unwrap_or_default();
+            let (resolver, _rx) = ConfigResolver::new(
+                &cluster,
+                CliOverrides {
+                    drop_table_strategy: args.drop_table_strategy,
+                    flush_timeout: None,
+                    source_slot: args.slot.clone(),
+                },
+                args.ch_config.clone(),
+                cli_base(args),
+                walshadow::mapping::mapping_handle(Default::default()),
+                walshadow::config::ResolverBoot::default(),
+            );
+            reloader.set_resolvers(vec![resolver.clone()]).await;
+            cluster_resolver = Some(resolver);
+            if let (walshadow::tenants::Registry::Sql { schema, poll }, Some(path)) =
+                (&tcfg.registry, args.ch_config.clone())
+            {
+                registry_poller = Some(tenant::spawn_registry_poller(
+                    path,
+                    cli_base(args),
+                    schema.clone(),
+                    *poll,
+                    reloader.clone(),
+                ));
+            }
+            let active: Vec<_> = tcfg
+                .decls
+                .iter()
+                .filter(|d| d.desired == walshadow::tenants::Desired::Active)
+                .collect();
+            tenant::publish_tenant_bridges(
+                &shadow_lifecycle,
+                active.iter().map(|d| d.dbname.clone()).collect(),
+            )
+            .await?;
+            for decl in active {
+                match supervisor
+                    .boot_existing(
+                        &shared, args, &merged, tcfg, decl, raw_start, aligned, reloader,
+                    )
+                    .await
+                {
+                    Ok(Some((t, sink, from_lsn))) => {
+                        for db in &t.db_oids {
+                            stream.filter_mut().add_target_db(*db);
+                        }
+                        router.attach(walshadow::tenant_router::RoutedTenant::new(
+                            t.id.clone(),
+                            t.db_oids.clone(),
+                            from_lsn,
+                            sink,
+                        ));
+                        tenants.push(t);
+                    }
+                    Ok(None) => supervisor.queue_attach(&decl.id),
+                    Err(e) => {
+                        tracing::error!(
+                            target: "walshadow::tenant",
+                            tenant = %decl.id,
+                            error = %format!("{e:#}"),
+                            "tenant failed to open; detaching it, other tenants continue",
+                        );
+                        supervisor
+                            .record_detached(&args.spill_dir, decl, format!("open failed: {e:#}"))
+                            .await;
+                    }
+                }
+            }
+        }
     }
-    let capture_stats: HashMap<Oid, Arc<walshadow::catalog_capture::CaptureStats>> =
-        captures.stats_handles().collect();
-    // Bootstrap's throwaway oracle bridge counts under the database it
-    // restored, so its totals carry across handoff rather than reading as a
-    // reset once the live bridge takes over
-    let metrics_dbs: Vec<DbMetricSources> = db_conns
-        .iter()
-        .zip(&desc_logs)
-        .map(|(conn, log)| DbMetricSources {
-            database: conn.name.clone(),
-            bridge: [
-                Some(conn.bridge.stats.clone()),
-                bootstrap_metrics
-                    .as_ref()
-                    .filter(|_| conn.oid == primary_db_oid)
-                    .map(|b| b.bridge.clone()),
-            ],
-            desc_log: Some(log.clone()),
-            capture: capture_stats.get(&conn.oid).cloned(),
-            resolver: resolvers_by_db.get(&conn.oid).cloned(),
-            backfiller: copy_backfillers.get(&conn.oid).cloned(),
-        })
-        .collect();
-    let decoder_xact = BoundaryHoldSink::new(decoder_xact, boundary_gate)
-        .with_capture(captures)
-        .with_pending(PendingDatabases::new(
-            pending_dbs,
-            connect_budget,
-            attach.clone(),
-        ));
+    // Records the filter drops count under the boot tenant's decoder: the
+    // single-database layout's one, or the first tenant's, since the filter
+    // sees the stream before any routing
+    if let Some(t) = tenants.first() {
+        stream.filter_mut().set_skip_stats(t.decoder_stats.clone());
+    }
+    let config_resolver = tenants.first().and_then(|t| t.config_resolver.clone());
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
-        decoder_xact,
-        decoder_stats: decoder_stats_handle,
-        emitter_stats: emitter_stats_handle,
-        span_registry,
+        decoder_xact: router,
+        span_registry: tenants.first().and_then(|t| t.span_registry.clone()),
     };
     // Segment fsync off the hot path: sink writes+renames, the task fsyncs and
     // publishes `durable_lsn`. Seed at the resume point.
@@ -1342,21 +1010,13 @@ async fn session_body(
     let mut segment_sink =
         DirSegmentSink::with_durability(args.out_dir.clone(), WAL_SEG_SIZE, fsync_tx, io.clone())
             .context("open out-dir")?;
-    // Descriptor-log GC off the pump task: the pump publishes each persisted
-    // floor, the task compacts. Coalesces by construction — a watch holds
-    // only the latest floor.
-    let gc_fatal = walshadow::pipeline::Fatal::new();
-    // Pruner's own cell, not `resume_floor`: dropping it is what tells the gc
-    // task the session is done
+    // Pruners' floor for the crossing commit; each tenant's descriptor-log
+    // GC follows the floors the pump publishes to it
     let gc_floor = Monotone::<Floor>::default();
-    let mut gc_task = spawn_desc_log_gc(desc_log.clone(), gc_floor.watch(), gc_fatal.clone(), io);
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
     // Metrics endpoint + control socket + SIGHUP are process-lifetime (bound in
     // `run`); the session only writes into the shared registry.
-    // config_resolvers stay owned here (dropped at session end → mapping
-    // refreshers exit); mapping/budget live-reload arrives via the WAL overlay.
-    let _ = &config_resolvers;
 
     // Walreceiver apply LSN (shadow's `GetXLogReplayRecPtr`), joined each pump
     // iteration; feeds the manifest's `shadow_replay`, the shadow floor, the
@@ -1485,20 +1145,10 @@ async fn session_body(
     // anything down, and a moved `[source]` swaps the feed in place.
     // Pause and the source endpoint are cluster-wide, so the primary's
     // resolver is the one the pump watches
-    let pump_config_rx = config_resolvers.first().map(|r| r.subscribe());
-    if let Some(mut rx) = config_resolvers.first().map(|r| r.subscribe()) {
-        tokio::spawn(async move {
-            loop {
-                let on = rx.borrow_and_update().skip_attribution;
-                skip_attribution_stats
-                    .attribute_skips
-                    .store(on, std::sync::atomic::Ordering::Relaxed);
-                if rx.changed().await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    let pump_config_rx = config_resolver
+        .as_ref()
+        .or(cluster_resolver.as_ref())
+        .map(|r| r.subscribe());
     let mut swap = SourceSwap::default();
     // Frontier frozen when the pump observes a pause, so a promotion decision
     // reads one that cannot move under it. Cleared on resume: a value left over
@@ -1665,6 +1315,208 @@ async fn session_body(
                 }
             }
         }
+        // Tenant lifecycle, between chunks where no record is mid-flight
+        if tenants_cfg.is_some() {
+            // A reload (control socket, SIGHUP) may add, remove, detach or
+            // re-bind tenants; tenant resolvers already took their own knobs
+            if reloader.take_reconcile()
+                && let Some(path) = args.ch_config.as_deref()
+            {
+                match walshadow::ch_emitter::load_effective(path, cli_base(args))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .and_then(|m| {
+                        walshadow::ops::tenant_ctl::validate(&m)?;
+                        walshadow::tenants::TenantsConfig::from_table(&m).map(|t| (m, t))
+                    }) {
+                    Ok((next_merged, Some(next))) => {
+                        let old = tenants_cfg.take().expect("tenants mode");
+                        let plan = tenant::reconcile_plan(
+                            &old,
+                            &next,
+                            &merged,
+                            &next_merged,
+                            tenants.iter().map(|t| t.id.as_str()),
+                        );
+                        merged = next_merged;
+                        tenants_cfg = Some(next);
+                        let tcfg = tenants_cfg.as_ref().expect("just set");
+                        for (id, reason) in plan.detach {
+                            tenant::detach(
+                                &id,
+                                reason,
+                                true,
+                                tcfg.stall_timeout,
+                                &mut tenants,
+                                &mut record_sink.decoder_xact,
+                                &mut stream,
+                                &mut supervisor,
+                                reloader,
+                                &args.spill_dir,
+                                tcfg.get(&id),
+                            )
+                            .await;
+                        }
+                        for id in plan.attach {
+                            supervisor.queue_attach(&id);
+                        }
+                        if let Err(e) = tenant::publish_tenant_bridges(
+                            &shadow_lifecycle,
+                            tenant::wanted_databases(tcfg),
+                        )
+                        .await
+                        {
+                            tracing::warn!(target: "walshadow::tenant", error = %format!("{e:#}"), "publishing tenant bridges failed");
+                        }
+                    }
+                    Ok((_, None)) => tracing::warn!(
+                        target: "walshadow::tenant",
+                        "config no longer declares tenants; restart to change layouts",
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "walshadow::tenant",
+                        error = %format!("{e:#}"),
+                        "tenant reconcile skipped: config does not parse",
+                    ),
+                }
+            }
+            let tcfg = tenants_cfg.as_ref().expect("tenants mode");
+            // Evict tenants the router gave up on, or that trail too far
+            let mut evict = record_sink.decoder_xact.evictions();
+            let head = record_sink.decoder_xact.last_record_end();
+            for t in &tenants {
+                let limit = tcfg
+                    .get(&t.id)
+                    .and_then(|d| d.max_lag_bytes)
+                    .or(tcfg.max_lag_bytes);
+                if let Some(limit) = limit
+                    && !evict.iter().any(|(id, _)| id == &t.id)
+                {
+                    let lag = head.saturating_sub(t.resume_safe().await.get());
+                    if lag > limit {
+                        evict.push((
+                            t.id.clone(),
+                            format!("fell {lag} bytes behind the pump, over its {limit} limit"),
+                        ));
+                    }
+                }
+            }
+            for (id, reason) in evict {
+                tenant::detach(
+                    &id,
+                    reason,
+                    false,
+                    tcfg.stall_timeout,
+                    &mut tenants,
+                    &mut record_sink.decoder_xact,
+                    &mut stream,
+                    &mut supervisor,
+                    reloader,
+                    &args.spill_dir,
+                    tcfg.get(&id),
+                )
+                .await;
+            }
+            // Attach at most one queued tenant per iteration, at a position
+            // every earlier record has been routed up to and shadow replayed
+            if !paused
+                && !crossing.pending()
+                && let Some(id) = supervisor.next_attach()
+                && let Some(decl) = tcfg
+                    .get(&id)
+                    .filter(|d| d.desired == walshadow::tenants::Desired::Active)
+                && !tenants.iter().any(|t| t.id == id)
+            {
+                let attached = async {
+                    record_sink.decoder_xact.flush().await?;
+                    let p0 = match record_sink.decoder_xact.last_record_end() {
+                        0 => stream.next_lsn().get(),
+                        end => end,
+                    };
+                    tenant::wait_shadow_replay(
+                        &shadow_state,
+                        record_sink.decoder_xact.last_record_start(),
+                        Duration::from_secs(args.catalog_hold_timeout),
+                    )
+                    .await?;
+                    let shadow_sql = open_shadow_sql_client(
+                        &args.shadow_socket_dir,
+                        args.shadow_port,
+                        &args.shadow_user,
+                        &primary_dbname,
+                    )
+                    .await?;
+                    if !tenant::attachment_ready(
+                        feed.sql_client().await?,
+                        &shadow_sql,
+                        &decl.dbname,
+                    )
+                    .await?
+                    {
+                        return Ok(None);
+                    }
+                    tenant::publish_tenant_bridges(
+                        &shadow_lifecycle,
+                        tenant::wanted_databases(tcfg),
+                    )
+                    .await?;
+                    let (t, sink) = supervisor
+                        .attach(&shared, args, &merged, tcfg, decl, p0, reloader)
+                        .await?;
+                    anyhow::Ok(Some((t, sink, p0)))
+                }
+                .await;
+                match attached {
+                    Ok(None) => supervisor.retry_attach(&id, Duration::from_secs(1)),
+                    Ok(Some((t, sink, p0))) => {
+                        for db in &t.db_oids {
+                            stream.filter_mut().add_target_db(*db);
+                        }
+                        record_sink.decoder_xact.attach(
+                            walshadow::tenant_router::RoutedTenant::new(
+                                t.id.clone(),
+                                t.db_oids.clone(),
+                                p0,
+                                sink,
+                            ),
+                        );
+                        tenants.push(t);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "walshadow::tenant",
+                            tenant = %id,
+                            error = %format!("{e:#}"),
+                            "tenant attach failed; it stays detached",
+                        );
+                        supervisor
+                            .record_detached(&args.spill_dir, decl, format!("attach failed: {e:#}"))
+                            .await;
+                    }
+                }
+            }
+            // Primed tenants publish their start scope
+            let head = record_sink.decoder_xact.last_record_end();
+            for (id, start) in supervisor.primed(head) {
+                let Some(t) = tenants.iter().find(|t| t.id == id) else {
+                    continue;
+                };
+                let Some(decl) = tcfg.get(&id) else {
+                    continue;
+                };
+                if let Err(e) = tenant::activate(t, args, &merged, decl, start).await {
+                    tracing::error!(
+                        target: "walshadow::tenant",
+                        tenant = %id,
+                        error = %format!("{e:#}"),
+                        "tenant activation failed; evicting",
+                    );
+                    record_sink
+                        .decoder_xact
+                        .mark_evicted(&id, format!("activation failed: {e:#}"));
+                }
+            }
+        }
         // `durable` (fsynced) lags `dispatched`; advertise it as flush/cursor.
         let dispatched = stream.dispatched_lsn();
         let durable = durable_lsn.get();
@@ -1744,14 +1596,9 @@ async fn session_body(
         if let Some(flush) = shadow_agg.min_flush_lsn {
             shadow_flush_lsn.join(flush);
         }
-        let (drain_lsn, resume_safe_lsn) = {
-            let mut b = xact_buffer.lock().await;
-            let ea = emitter_ack.get();
-            let drain_lsn = b.stats().drain_lsn;
-            // Keep every undurable transaction reachable after restart
-            // Read acknowledgment first so no transaction escapes floor
-            (drain_lsn, b.resume_safe_lsn(ea))
-        };
+        // Keep every tenant's undurable transactions reachable after restart
+        let progress = tenant::aggregate(&tenants, durable).await;
+        let (drain_lsn, resume_safe_lsn) = (progress.drain, progress.resume_safe);
         let shadow_floor =
             manifest::ShadowFloor::new(shadow_toast, shadow_replay.get(), shadow_replay_seed);
         let cur = resume_manifest(
@@ -1777,10 +1624,13 @@ async fn session_body(
             crash_test::hit(crash_test::Point::AfterManifest, cur.floor.get());
             last_cursor_write = Some(Instant::now());
             resume_floor.publish(persisted);
-            // Descriptor log prunes against the same floor, off this task: a
+            // Descriptor logs prune against the same floor, off this task: a
             // compaction rewrites the whole ckpt inline and would stall WAL
             // consumption past the source's wal_sender_timeout
             gc_floor.publish(persisted);
+            for t in &tenants {
+                t.publish_floor(persisted);
+            }
         }
         // flush caps physical slot's restart_lsn.
         // Manifest writes are cadence-gated above while keepalive replies inside
@@ -1802,9 +1652,6 @@ async fn session_body(
             () = shutdown.cancelled() => break "signal",
             Some(err) = tasks.exited() => return Err(err),
             res = &mut fsync_task => return Err(task_stopped("segment fsync", res, &fsync_fatal)),
-            res = &mut gc_task => return Err(task_stopped("descriptor log gc", res, &gc_fatal)),
-            // Surfaced by the check after the crossing step
-            () = pipeline_handle.fatal.wait() => None,
             // Idle tick so metrics/cursor keep tracking, and so a `paused` flip
             // is picked up promptly.
             _ = tokio::time::sleep(metrics_tick) => None,
@@ -1923,8 +1770,7 @@ async fn session_body(
         }
         metrics
             .update(|snap| {
-                snap.pump_queue_wait_seconds_total =
-                    record_sink.decoder_xact.inner.send_wait_seconds();
+                snap.pump_queue_wait_seconds_total = record_sink.decoder_xact.send_wait_seconds();
                 snap.archive_restore_active = 0;
                 if let SourcePath::Archive(reader) = &path {
                     snap.archive_restore_active = 1;
@@ -2047,16 +1893,13 @@ async fn session_body(
                 );
             }
             let (guards, resume_safe) = {
-                let mut b = xact_buffer.lock().await;
-                let ea = emitter_ack.get();
-                let resume_safe = b.resume_safe_lsn(ea);
-                let stats = b.stats();
+                let progress = tenant::aggregate(&tenants, durable).await;
                 (
                     ForkGuards {
-                        drain_lsn: stats.drain_lsn,
-                        open_xacts: stats.xacts_active as usize,
+                        drain_lsn: progress.drain,
+                        open_xacts: progress.open_xacts,
                     },
-                    resume_safe,
+                    progress.resume_safe,
                 )
             };
             // Barrier: every consumer past the position about to be committed,
@@ -2090,6 +1933,10 @@ async fn session_body(
             };
             if let Some(open) = open {
                 barrier_logged = None;
+                // Every tenant's descriptor-log pruning rebases with the session's
+                let gc_floors: Vec<&Monotone<Floor>> = std::iter::once(&gc_floor)
+                    .chain(tenants.iter().filter_map(tenant::Tenant::gc_floor))
+                    .collect();
                 let commit = async |resume: walshadow::transition::ForkResume| {
                     commit_fork_resume(
                         &args.spill_dir,
@@ -2105,7 +1952,7 @@ async fn session_body(
                             shadow_flush: shadow_flush_lsn.get(),
                         },
                         &resume_floor,
-                        &gc_floor,
+                        &gc_floors,
                     )
                     .await
                 };
@@ -2176,9 +2023,17 @@ async fn session_body(
             .await
             .context("flush queueing decoder sink")?;
         // Surface a pipeline-stage failure as a clean daemon exit with the
-        // root cause rather than a silently pinned watermark.
-        if let Some(msg) = pipeline_handle.fatal.message() {
-            anyhow::bail!("decode+insert pipeline failed: {msg}");
+        // root cause rather than a silently pinned watermark. With tenants a
+        // failure evicts only its tenant
+        for t in &tenants {
+            if let Some(msg) = t.fatal() {
+                if tenants_cfg.is_none() {
+                    anyhow::bail!("decode+insert pipeline failed: {msg}");
+                }
+                record_sink
+                    .decoder_xact
+                    .mark_evicted(&t.id, format!("pipeline failed: {msg}"));
+            }
         }
         let now_dispatched = stream.dispatched_lsn();
         let advanced = now_dispatched != prev_dispatched;
@@ -2198,35 +2053,47 @@ async fn session_body(
             stream.timeline(),
             WAL_SEG_SIZE,
         );
-        let (xact_stats, drain_resident, xact_line) = {
-            let b = xact_buffer.lock().await;
-            let stats = b.stats().clone();
-            let line = stats.summary();
-            let resident = DrainResident::from_buffer(&b);
-            (stats, resident, line)
+        let now_dispatched = stream.dispatched_lsn();
+        let advanced = now_dispatched != prev_dispatched;
+        // Pipeline-shaped metrics describe the first tenant; every tenant
+        // also reports under its own label, and every followed database
+        // under its `database` label
+        let primary = tenants.first();
+        let (xact_stats, drain_resident, xact_line) = match primary {
+            Some(t) => {
+                let b = t.xact_buffer.lock().await;
+                let stats = b.stats().clone();
+                let line = stats.summary();
+                let resident = DrainResident::from_buffer(&b);
+                (stats, resident, line)
+            }
+            None => Default::default(),
         };
-        let oracle_line = oracle
-            .as_ref()
-            .map(|o| o.stats.summary())
-            .unwrap_or_default();
-        let oracle_stats = oracle.as_ref().map(|o| o.stats.as_ref());
+        let oracle = primary.and_then(|t| t.oracle.as_ref());
+        let oracle_line = oracle.map(|o| o.stats.summary()).unwrap_or_default();
+        let oracle_stats = oracle.map(|o| o.stats.as_ref());
         // Per database, since each dials its own sockets and one can be down
         // while the rest answer
-        let bridge_line = db_conns
+        let bridge_line = tenants
             .iter()
-            .map(|conn| format!("{}={}", conn.name, conn.bridge.stats.summary()))
+            .map(|t| t.bridge_line())
             .collect::<Vec<_>>()
             .join(" ");
-        let decoder_stats: &walshadow::decoder_sink::DecoderStats = &record_sink.decoder_stats;
+        let decoder_stats_default = walshadow::decoder_sink::DecoderStats::default();
+        let decoder_stats: &walshadow::decoder_sink::DecoderStats =
+            primary.map_or(&decoder_stats_default, |t| &*t.decoder_stats);
         let emitter_stats: Option<&walshadow::ch_emitter::EmitterStats> =
-            record_sink.emitter_stats.as_deref();
-        let shadow_apply_lsn = shadow_replay.get();
+            primary.and_then(|t| t.emitter_stats.as_deref());
+        let boundary_hold_default = walshadow::boundary_hold::BoundaryHoldStats::default();
+        let boundary_hold_stats =
+            primary.map_or(&boundary_hold_default, |t| &*t.boundary_hold_stats);
+        let shadow_apply_lsn = shadow_agg.min_apply_lsn.map_or(0, Pos::get);
         let lag_bytes = received.get().saturating_sub(shadow_apply_lsn);
         rate_estimator.observe(Instant::now(), received.get());
         let lag_seconds = rate_estimator.seconds_for(lag_bytes);
         // Post-worker snapshots so the metric reflects what the worker
         // drained, not the top-of-iteration values.
-        let emitter_ack_for_metric = emitter_ack.get();
+        let emitter_ack_for_metric = progress.emitter_ack;
         let drain_for_metric = xact_stats.drain_lsn;
         populate_metrics(
             &metrics,
@@ -2240,7 +2107,7 @@ async fn session_body(
             record_sink.decoder_xact.processed(),
             &xact_stats,
             drain_resident,
-            Some(&pipeline_handle.budget),
+            primary.and_then(|t| t.pipeline.as_ref()).map(|p| &p.budget),
             decoder_stats,
             &swap,
             TimelineView {
@@ -2262,15 +2129,19 @@ async fn session_body(
                 active_connections: shadow_agg.active_connections as u64,
                 dropped_total: shadow_agg.dropped_total,
             },
-            &boundary_hold_stats,
-            metrics_dbs.iter().map(DbMetricSources::series).collect(),
+            boundary_hold_stats,
+            tenants
+                .iter()
+                .flat_map(|t| &t.metrics_dbs)
+                .map(DbMetricSources::series)
+                .collect(),
             StageCounters {
                 emitter: emitter_stats,
                 db_name: &|oid| {
-                    db_conns
+                    tenants
                         .iter()
-                        .find(|c| c.oid == oid)
-                        .map(|c| c.name.clone())
+                        .find(|t| t.db_oids.contains(&oid))
+                        .map(|t| t.dbname.clone())
                         .unwrap_or_default()
                 },
                 oracle: [oracle_stats, bootstrap_metrics.as_ref().map(|b| &*b.oracle)],
@@ -2280,6 +2151,11 @@ async fn session_body(
             },
         )
         .await;
+        if let Some(tcfg) = &tenants_cfg {
+            let view =
+                tenant::metrics_view(&tenants, tcfg, &supervisor, &record_sink.decoder_xact).await;
+            metrics.update(|snap| snap.tenants = view).await;
+        }
         if advanced {
             let new_segs = (now_dispatched - prev_dispatched) / WAL_SEG_SIZE;
             segments_shipped += new_segs;
@@ -2319,11 +2195,10 @@ async fn session_body(
             inflight_stall_logged = false;
         }
         // Ack can pin after transaction leaves buffer
-        let ack_snap = *ack_probe.borrow();
-        if xact_stats.xacts_active > 0 || !ack_snap.all_done() || ack_snap.wedged != 0 {
+        if let Some((pin, ack_snap)) = tenant::pinning(&tenants).await {
             let since = inflight_stall_since.get_or_insert(Instant::now());
             if !inflight_stall_logged && since.elapsed() >= Duration::from_secs(5) {
-                let snap = xact_buffer.lock().await.inflight_snapshot();
+                let snap = pin.xact_buffer.lock().await.inflight_snapshot();
                 let summary: String = snap
                     .iter()
                     .map(|e| {
@@ -2344,6 +2219,7 @@ async fn session_body(
                     .join(" | ");
                 tracing::warn!(
                     target: "walshadow",
+                    tenant = %pin.id,
                     xacts_active = xact_stats.xacts_active,
                     emitter_ack_lsn = %emitter_ack_for_metric,
                     drain_lsn = %xact_stats.drain_lsn,
@@ -2380,33 +2256,39 @@ async fn session_body(
     if res.is_err() || fsync_fatal.is_set() {
         return Err(task_stopped("segment fsync", res, &fsync_fatal));
     }
-    // Close the floor channel and join: nothing else may own desc_log.ckpt
-    // after the session returns
     drop(gc_floor);
-    let res = gc_task.await;
-    if res.is_err() || gc_fatal.is_set() {
-        return Err(task_stopped("descriptor log gc", res, &gc_fatal));
+    if let Some(task) = registry_poller.take() {
+        task.abort();
     }
-    // Drain queueing worker so enqueued-but-undispatched records run
-    // through decoder + xact_drain before exit; surfaces worker-parked errors.
-    let DaemonSinks { decoder_xact, .. } = record_sink;
-    decoder_xact
-        .close()
-        .await
-        .context("drain queueing decoder sink on shutdown")?;
-    // Worker close dropped the reorder sink. Drain rest in order
-    // (batcher force-flush → inserters to
-    // EndOfStream → ack collector) so no rows are lost + final watermark durable.
-    pipeline_handle
-        .join()
-        .await
-        .map_err(|m| anyhow::anyhow!("decode+insert pipeline drain failed: {m}"))?;
-    let (drain, resume_safe) = {
-        let mut b = xact_buffer.lock().await;
-        let ea = emitter_ack.get();
-        let drain = b.stats().drain_lsn;
-        (drain, b.resume_safe_lsn(ea))
-    };
+    // Drain every tenant: queueing worker so enqueued-but-undispatched
+    // records run through decoder + xact_drain, then the pipeline cascade
+    // (batcher force-flush → inserters to EndOfStream → ack collector) so no
+    // rows are lost + final watermark durable. Nothing else may own a
+    // tenant's desc_log.ckpt after the session returns
+    let DaemonSinks {
+        decoder_xact: mut router,
+        ..
+    } = record_sink;
+    let final_durable = durable_lsn.get();
+    let mut drain = Pos::<walshadow::pos::Drain>::new(final_durable.get());
+    let mut resume_safe = Pos::<walshadow::pos::ResumeSafe>::new(final_durable.get());
+    let mut first_err = None;
+    for t in tenants {
+        let sink = router.detach(&t.id).map(|r| r.sink);
+        let tenant_drain = t.xact_buffer.lock().await.stats().drain_lsn;
+        match t.shutdown(sink).await {
+            Ok(safe) => {
+                drain = drain.min(tenant_drain);
+                resume_safe = resume_safe.min(safe);
+            }
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e.context("drain tenants on shutdown"));
+    }
     let shadow_replay = shadow_replay_lsn.get();
     let durable = durable_lsn.get();
     manifest::write(

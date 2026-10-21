@@ -69,7 +69,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential liblz4-dev libzstd-dev curl gnupg lsb-release \
+            build-essential libclang-dev cmake liblz4-dev libzstd-dev curl gnupg lsb-release \
             gcovr
 
       # The runner's preinstalled postgresql-common ships only one major
@@ -279,11 +279,13 @@ jobs:
           printf 'merging %s\n' "${inputs[@]}"
           awk -f ci/lcov_merge.awk "${inputs[@]}" >merged.lcov
 
-      # Lower ceiling as tests land, zero means every DA line hit
+      # Lower ceiling as tests land, zero means every DA line hit.
+      # Upstream's 2950 covers upstream's code; this fork's Snowflake
+      # destination and tenants add ~4250 missed lines (7046 at the merge)
       - name: Coverage summary
         working-directory: walshadow
         env:
-          MAX_MISSED_LINES: 2950
+          MAX_MISSED_LINES: 7200
         run: |
           awk -F'[:,]' -v max="$MAX_MISSED_LINES" '
             /^DA:/ { f++; if ($3 > 0) h++ }
@@ -368,7 +370,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential liblz4-dev libzstd-dev
+            build-essential libclang-dev cmake liblz4-dev libzstd-dev
 
       - name: cargo fmt
         working-directory: walshadow

@@ -121,6 +121,8 @@ pub fn default_database<'a>(
 /// database of the cluster; entries outside `[database.*]` use `[source] dbname`
 #[derive(Debug, Clone)]
 pub struct EmitterConfig {
+    pub snowflake: Option<Arc<crate::destination::snowflake::runtime::SnowflakeRuntime>>,
+    pub snowflake_snapshots: Arc<HashMap<RelName, String>>,
     pub instances: BTreeMap<String, InstanceConfig>,
     pub conn: InstanceConfig,
     /// Custom rustls roots/config for `secure` path: private CA, pinned
@@ -311,6 +313,10 @@ pub struct BootstrapSettings {
     /// at most one chunk. `None` uses
     /// [`COPY_CHUNK_BLOCKS`](crate::backfill::copy_backfill::COPY_CHUNK_BLOCKS)
     pub copy_chunk_blocks: Option<NonZeroU32>,
+    /// `copy_concurrency`: COPY initial loads running at once, each one
+    /// source session. Default 8; a tenant attaching with hundreds of tables
+    /// would otherwise open a connection per table at once
+    pub copy_concurrency: Option<NonZeroUsize>,
 }
 
 /// Where external TOAST values live.
@@ -1002,6 +1008,8 @@ struct ColumnPatch {
 impl EmitterConfig {
     fn from_sections(ch: ChSection, memory: MemorySection, stream: StreamSection) -> Self {
         Self {
+            snowflake: None,
+            snowflake_snapshots: Arc::new(HashMap::default()),
             instances: ch.instances,
             conn: InstanceConfig {
                 host: ch.host,

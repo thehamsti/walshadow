@@ -177,6 +177,7 @@ pub async fn drain(
     resolver: ToastResolver,
     deferral: Deferral,
     skip_initial: HashSet<RelName>,
+    neutral_values: bool,
     barrier: Option<Arc<WalkBarrier>>,
 ) -> Result<BootstrapDrainOutcome, String> {
     let (mut deferred, handback) = match deferral {
@@ -261,7 +262,9 @@ pub async fn drain(
                     .await?
                     .map(Arc::new);
             }
-            render_ext_columns(&rel.attributes, &mut tuple.columns);
+            if !neutral_values {
+                render_ext_columns(&rel.attributes, &mut tuple.columns);
+            }
             out.push(&msg_tx, seq, rel, route, tuple, permit).await?;
             bump(&mut open, &mut rows_routed);
         }
@@ -319,6 +322,7 @@ pub async fn drain(
                 &stats,
                 &resolver,
                 next_seq,
+                neutral_values,
                 None,
             )
             .await?;
@@ -353,11 +357,21 @@ pub async fn drain_deferred(
     row_policy: &RowPolicy,
     config: Option<&ResolvedConfig>,
     first_seq: u64,
+    neutral_values: bool,
     checkpoint: Option<ReplayCheckpoint<'_>>,
 ) -> Result<BootstrapDrainOutcome, String> {
     let routes = freeze_routes(mapping, config, row_policy);
     resolve_spooled(
-        spool, &routes, catalog, msg_tx, ack, stats, resolver, first_seq, checkpoint,
+        spool,
+        &routes,
+        catalog,
+        msg_tx,
+        ack,
+        stats,
+        resolver,
+        first_seq,
+        neutral_values,
+        checkpoint,
     )
     .await
 }
@@ -380,6 +394,7 @@ async fn resolve_spooled(
     stats: &EmitterStats,
     resolver: &ToastResolver,
     first_seq: u64,
+    neutral_values: bool,
     mut checkpoint: Option<ReplayCheckpoint<'_>>,
 ) -> Result<BootstrapDrainOutcome, String> {
     tracing::info!(
@@ -410,7 +425,15 @@ async fn resolve_spooled(
         let remaining = replay.remaining_file_bytes();
         let (next, routed) = tokio::join!(
             prepare_batch(&mut replay, routes, catalog, stats, resolver),
-            route_batch(batch, &mut out, msg_tx, &mut seqs, &mut seq, &mut placed),
+            route_batch(
+                batch,
+                &mut out,
+                msg_tx,
+                &mut seqs,
+                &mut seq,
+                &mut placed,
+                neutral_values,
+            ),
         );
         routed?;
         progress.advance(remaining);
@@ -607,6 +630,7 @@ async fn prepare_batch(
 }
 
 /// Route a resolved batch's rows, each under the replay's trailing seq
+#[allow(clippy::too_many_arguments)]
 async fn route_batch(
     batch: ResolvedReplayBatch,
     out: &mut RowBuf,
@@ -614,6 +638,7 @@ async fn route_batch(
     seqs: &mut SeqAlloc,
     seq: &mut Option<OpenSeq>,
     placed: &mut u64,
+    neutral_values: bool,
 ) -> Result<(), String> {
     let ResolvedReplayBatch { rows, permit } = batch;
     for row in rows {
@@ -621,7 +646,9 @@ async fn route_batch(
         let at = seq
             .get_or_insert_with(|| seqs.open(tuple.source_lsn, Publish::Commit))
             .seq();
-        render_ext_columns(&row.rel.attributes, &mut tuple.columns);
+        if !neutral_values {
+            render_ext_columns(&row.rel.attributes, &mut tuple.columns);
+        }
         out.push(msg_tx, at, row.rel, row.route, tuple, permit.clone())
             .await?;
         *placed += 1;
@@ -806,7 +833,7 @@ fn apply_fetched(
 /// Resolve mapped TOAST pointers or fill in disabled mode. Value cap
 /// checked before any fetch; the returned leaf permit is shrunk to the
 /// retained decoded bytes and rides the routed row to insert ack
-async fn resolve_or_fill_toast(
+pub(crate) async fn resolve_or_fill_toast(
     tuple: &mut BackfillTuple,
     rel: &RelDescriptor,
     mapping: &TableMapping,
@@ -1246,6 +1273,7 @@ mod tests {
             ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats),
             Deferral::Rejected,
             HashSet::new(),
+            false,
             None,
         )
         .await
@@ -1290,6 +1318,7 @@ mod tests {
             ToastResolver::disabled(),
             Deferral::Local(mem_spool()),
             HashSet::new(),
+            false,
             None,
         ));
 
@@ -1342,6 +1371,7 @@ mod tests {
             ToastResolver::disabled(),
             Deferral::Local(mem_spool()),
             HashSet::new(),
+            false,
             None,
         ));
 
@@ -1392,6 +1422,7 @@ mod tests {
             resolver,
             Deferral::Local(mem_spool()),
             HashSet::new(),
+            false,
             None,
         ));
 
@@ -1446,6 +1477,7 @@ mod tests {
             resolver,
             Deferral::Local(mem_spool()),
             HashSet::new(),
+            false,
             None,
         ));
 
@@ -1511,6 +1543,7 @@ mod tests {
                 0,
             )),
             HashSet::new(),
+            false,
             None,
         ));
 
@@ -1564,6 +1597,7 @@ mod tests {
             resolver.clone(),
             Deferral::Handback(mem_spool()),
             HashSet::new(),
+            false,
             None,
         )
         .await
@@ -1588,6 +1622,7 @@ mod tests {
             &Default::default(),
             None,
             outcome.next_seq,
+            false,
             None,
         )
         .await
@@ -1646,6 +1681,7 @@ mod tests {
                 resolver.clone(),
                 Deferral::Handback(mem_spool()),
                 HashSet::new(),
+                false,
                 None,
             )
             .await
@@ -1675,6 +1711,7 @@ mod tests {
                 &Default::default(),
                 None,
                 first_seq,
+                false,
                 None,
             )
             .await
@@ -1726,6 +1763,7 @@ mod tests {
             ToastResolver::with_store(store, stats.clone()),
             Deferral::Local(mem_spool()),
             HashSet::new(),
+            false,
             None,
         ));
         drop(tup_tx);
@@ -1790,6 +1828,7 @@ mod tests {
                 0,
             )),
             HashSet::new(),
+            false,
             None,
         ));
 
@@ -1886,6 +1925,7 @@ mod tests {
             &Default::default(),
             None,
             0,
+            false,
             Some(ReplayCheckpoint {
                 state: &mut state,
                 dir: dir.path(),
@@ -1918,6 +1958,7 @@ mod tests {
             &Default::default(),
             None,
             0,
+            false,
             Some(ReplayCheckpoint {
                 state: &mut saved,
                 dir: dir.path(),
@@ -2045,6 +2086,7 @@ mod tests {
                 0,
             )),
             HashSet::new(),
+            false,
             None,
         ));
 

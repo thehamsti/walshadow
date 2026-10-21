@@ -185,6 +185,7 @@ async fn bootstrap_tail_fans_out_n2() {
         ToastResolver::disabled(),
         bootstrap::Deferral::Rejected,
         ahash::HashSet::default(),
+        false,
         None,
     ));
     let outcome = drain.await.expect("drain join").expect("drain ok");

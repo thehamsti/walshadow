@@ -309,6 +309,7 @@ impl GreenfieldSink {
                     None => DeferredSpool::new(spool, DEFERRED_SPOOL_MEM_MAX),
                 }),
                 self.skip_initial.clone(),
+                self.dest.current().snowflake.is_some(),
                 None,
             ));
             senders.push(tx);
@@ -329,7 +330,9 @@ impl GreenfieldSink {
             let stats = self.stats.clone();
             let resolver = self.resolver.clone();
             let config = self.config.clone();
-            let row_policy = self.dest.current().row_policy();
+            let emitter = self.dest.current();
+            let row_policy = emitter.row_policy();
+            let neutral_values = emitter.snowflake.is_some();
             async move {
                 bootstrap::drain_deferred(
                     lane.spool.into(),
@@ -342,6 +345,7 @@ impl GreenfieldSink {
                     &row_policy,
                     Some(&config),
                     lane.first_seq,
+                    neutral_values,
                     None,
                 )
                 .await

@@ -439,6 +439,7 @@ async fn walk_and_ship(
                 &ctx.dest.current().row_policy(),
                 config.as_deref(),
                 next_seq,
+                ctx.dest.current().snowflake.is_some(),
                 replay_checkpoint,
             )
             .await
@@ -625,6 +626,7 @@ async fn run_walk(
         resolver.clone(),
         bootstrap::Deferral::Handback(toast_spool),
         HashSet::new(),
+        ctx.dest.current().snowflake.is_some(),
         barrier.clone(),
     ));
 

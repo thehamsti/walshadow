@@ -1,11 +1,8 @@
 //! `RecordSink` composites the WAL pump feeds.
 
-use std::sync::Arc;
-
 use anyhow::Result;
 use std::future::Future;
 use std::pin::Pin;
-use walshadow::boundary_hold::BoundaryHoldSink;
 use walshadow::heap_decoder::Predecoded;
 use walshadow::record::{MetricsRecordSink, Record, RecordSink, SinkError};
 use walshadow::xact_buffer::BufferingDecoderSink;
@@ -79,17 +76,11 @@ impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
 /// couple wire pacing to decode.
 pub(crate) struct DaemonSinks {
     pub(crate) metrics: MetricsRecordSink,
-    /// Queueing sink wrapped with the catalog-boundary publication hold:
-    /// at a catalog-mutating commit the pump parks here until shadow
-    /// replays through the commit's `next_lsn`, so successor bytes reach
-    /// neither the shadow wire nor the archive while held.
-    pub(crate) decoder_xact: BoundaryHoldSink,
-    /// Shared with the `BufferingDecoderSink` on the queueing worker;
-    /// status loop polls without contending on the worker.
-    pub(crate) decoder_stats: Arc<walshadow::decoder_sink::DecoderStats>,
-    /// Shared with parallel pipeline's inserter pool (bumps counters
-    /// post-`EndOfStream`). `None` when no CH pipeline is wired.
-    pub(crate) emitter_stats: Option<Arc<walshadow::ch_emitter::EmitterStats>>,
+    /// Per-tenant queueing sinks, each wrapped with the catalog-boundary
+    /// publication hold: at a catalog-mutating commit the pump parks there
+    /// until shadow replays through the commit's `next_lsn`, so successor
+    /// bytes reach neither the shadow wire nor the archive while held.
+    pub(crate) decoder_xact: walshadow::tenant_router::TenantRouter,
     /// Per-txn span map; `Some` only with OTLP on. Registering at WAL read
     /// (here) makes the `txn` span cover the pump→worker channel wait.
     pub(crate) span_registry: Option<walshadow::trace::TxnSpanRegistry>,

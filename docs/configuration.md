@@ -59,16 +59,16 @@ including tables created later. `init` writes `[source]`, `[ch]`, and chosen
 `[table.*]` blocks, leaving that broad default in place
 
 `[table.<schema>.<relname>]` names a table in source database selected by
-`dbname` in `[source]`. Use `[database.<dbname>.table.<schema>.<relname>]` to
-name a table in another database of the same cluster, which one process
-replicates alongside. See [several databases](multi-database.md)
+`dbname` in `[source]`. To replicate other databases of the same cluster
+through the same process and slot, declare a [tenant](tenants.md) per
+database, see [several databases](multi-database.md)
 
 Pass file with `--ch-config`. Loader also merges sibling directory formed by
 replacing `.toml` with `.d`, for example `ch-config.d/*.toml`
 
 Invalid values and incompatible mapping fields fail validation instead of
-falling back silently. Unknown keys in `[table.*]`, `[namespace.*]`, and
-`[database.*]` are errors; other sections ignore them, so check spelling there
+falling back silently. Unknown keys in `[table.*]` and `[namespace.*]` are
+errors, and `[database.*]` sections are refused; other sections ignore them, so check spelling there
 when a setting has no effect
 
 ## Precedence
@@ -459,6 +459,11 @@ same `_lsn = S` and collapse.
 `[bootstrap] copy_chunk_blocks` sets the chunk size in 8 KiB pages, defaulting
 to 131072 (1 GiB, PostgreSQL's segment size). A table smaller than one chunk
 issues a single unqualified COPY.
+
+`[bootstrap] copy_concurrency` bounds how many tables COPY at once, each on its
+own source session (default 8). Opt-ins that arrive together, such as a
+tenant attaching with hundreds of tables, publish every mapping first and then
+queue their loads behind this limit.
 
 The cursor is paired with the relation's filenode. `VACUUM FULL`, `CLUSTER`,
 `TRUNCATE` and rewriting `ALTER TABLE` relocate rows, so a filenode change

@@ -35,8 +35,8 @@ replicate = false
 ```
 
 Use this mode to replicate all tables by default. It covers the source database
-`dbname` in `[source]` names; entries prefixed with another database name bring
-that database in too, see [several databases](multi-database.md)
+`dbname` in `[source]` names; other databases replicate as
+[tenants](tenants.md), see [several databases](multi-database.md)
 
 ## Replicate an explicit set
 

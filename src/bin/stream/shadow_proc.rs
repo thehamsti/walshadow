@@ -60,6 +60,10 @@ pub(crate) fn build_owned_shadow(
     bridge.library_dir = args.bridge_lib_dir.clone();
     bridge.workers = workers;
     bridge.databases = databases.to_vec();
+    if let Some(&(tenant_workers, capacity)) = crate::args::TENANT_BRIDGES.get() {
+        bridge.tenant_workers = tenant_workers;
+        bridge.tenant_capacity = capacity;
+    }
     cfg.bridge = Some(bridge);
     Shadow::new(cfg)
 }
@@ -356,7 +360,8 @@ mod tests {
             if let Some(want) = expect {
                 assert_eq!(workers, want, "{toml:?}");
             }
-            let slots = workers + 1;
+            // Static pool plus the tenant launcher, over the floor of 1
+            let slots = workers + 1 + 1;
             let shadow = build_owned_shadow(
                 &args,
                 "postgres",

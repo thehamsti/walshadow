@@ -54,14 +54,16 @@ pub enum Op {
     Scan = 0x03,
     ReplayLsn = 0x04,
     FetchToast = 0x05,
+    RenderText = 0x06,
 }
 
-pub const OP_LABELS: [&str; 5] = [
+pub const OP_LABELS: [&str; 6] = [
     "hello",
     "encode_native",
     "scan",
     "replay_lsn",
     "fetch_toast",
+    "render_text",
 ];
 pub const OP_COUNT: usize = OP_LABELS.len();
 
@@ -480,6 +482,11 @@ impl Bridge {
             .native_bytes
             .fetch_add((frame.len() - 1) as u64, Ordering::Relaxed);
         Ok(NativeResponse { frame })
+    }
+
+    /// Neutral text rendering for source Datums. The caller validates response framing.
+    pub async fn render_text(&self, frame: Vec<u8>) -> Result<Response<'_>, BridgeError> {
+        self.call(Op::RenderText, frame).await
     }
 
     /// Read `cat` as transaction `top_xid` sees it, or the committed view when

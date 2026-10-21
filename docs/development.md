@@ -1,5 +1,9 @@
 # Build and test
 
+The Rust build needs a C/C++ toolchain, libclang (RocksDB bindings), CMake,
+and the existing LZ4/Zstandard development libraries. On Debian/Ubuntu:
+`apt-get install build-essential libclang-dev cmake liblz4-dev libzstd-dev`.
+
 Build Rust binaries with `cargo build --release`. Build PostgreSQL module before
 integration tests, using server headers for PostgreSQL major under test
 See [module build guide](../pgext/README.md) for PG_CONFIG and installation
