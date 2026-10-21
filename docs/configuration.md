@@ -118,6 +118,20 @@ Control writes `50-api.toml` in config fragment directory, override with
 `--control-fragment`. Invalid merged config is rejected and previous fragment is
 restored
 
+Every change, from `ctl`, SIGHUP or the [HTTP API](api.md), goes through
+one reload at a time: the merged config is read once, applied to every
+resolver, then published as a numbered revision the session reconciles.
+Control-socket mutations are recorded in the audit log,
+`<spill-dir>/api/audit/audit.jsonl` (`--api-state-dir` moves it), with the
+caller's uid
+
+## HTTP API
+
+`--api-bind` serves an authenticated HTTP API: health and readiness,
+metrics, crash points and recent errors, jobs and tenant status, and tenant
+control. It needs `--ch-config` and an API key file, and TLS off loopback.
+See [HTTP API](api.md) for keys, scopes, endpoints and the audit log
+
 ## Live and startup-only settings
 
 Apply live:
