@@ -1301,6 +1301,7 @@ pub(crate) async fn activate(
     merged: &toml::Table,
     decl: &walshadow::tenants::TenantDecl,
     start: u64,
+    reloader: &walshadow::control::Reloader,
 ) -> Result<usize> {
     use walshadow::tenants::{Phase, StartTable, TenantState};
     t.xact_buffer.lock().await.set_min_commit_lsn(start);
@@ -1349,8 +1350,11 @@ pub(crate) async fn activate(
             priming: false,
             opt_ins: start_opt_ins(&tables),
         });
+        // The accepted revision, never the files: the activation alone
+        // forces a rebuild even when the resolver is already at it
+        let rev = reloader.current();
         resolver
-            .reload()
+            .reload_from(&rev.merged, Some(rev.generation))
             .await
             .map_err(|e| anyhow::anyhow!("tenant {}: publish start scope: {e}", t.id))?;
     }
@@ -1505,6 +1509,7 @@ pub(crate) fn reconcile_plan<'a>(
     old_root: &toml::Table,
     next_root: &toml::Table,
     attached: impl Iterator<Item = &'a str>,
+    force_rebind: &std::collections::BTreeSet<String>,
 ) -> ReconcilePlan {
     use walshadow::tenants::Desired;
     let attached: std::collections::BTreeSet<&str> = attached.collect();
@@ -1518,13 +1523,16 @@ pub(crate) fn reconcile_plan<'a>(
                 .detach
                 .push((id.to_string(), "detached by operator".into())),
             Some(d) => {
-                let rebind = old
-                    .get(id)
-                    .map(|o| {
-                        o.identity_differs_across(d, old_root, next_root)
-                            .unwrap_or(true)
-                    })
-                    .unwrap_or(false);
+                // A revision may re-bind what identity alone would not: an
+                // acknowledged change to state the tenant was built with
+                let rebind = force_rebind.contains(*id)
+                    || old
+                        .get(id)
+                        .map(|o| {
+                            o.identity_differs_across(d, old_root, next_root)
+                                .unwrap_or(true)
+                        })
+                        .unwrap_or(false);
                 if rebind {
                     plan.detach.push((
                         id.to_string(),
@@ -1541,6 +1549,34 @@ pub(crate) fn reconcile_plan<'a>(
         }
     }
     plan
+}
+
+/// Bring every attached tenant's resolvers up to `rev` before the session
+/// reports it reconciled: one registered after the reload iterated, or
+/// opened from an older revision, catches up here. `reload_from` is
+/// monotonic, so a resolver already at `rev` is untouched. Re-binding
+/// tenants keep their old resolver until their replacement attaches
+pub(crate) async fn catch_up(
+    tenants: &[Tenant],
+    rev: &walshadow::control::ConfigRevision,
+    reloader: &walshadow::control::Reloader,
+) {
+    for t in tenants {
+        if rev.force_rebind.contains(&t.id) || reloader.is_rebinding(&t.id) {
+            continue;
+        }
+        for r in &t.config_resolvers {
+            if let Err(e) = r.reload_from(&rev.merged, Some(rev.generation)).await {
+                tracing::warn!(
+                    target: "walshadow::tenant",
+                    tenant = %t.id,
+                    generation = rev.generation,
+                    error = %e,
+                    "resolver kept its last config; it refused the reconciled revision",
+                );
+            }
+        }
+    }
 }
 
 /// Databases shadow should serve bridges for
@@ -1675,19 +1711,31 @@ pub(crate) fn spawn_registry_poller(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
+            // Mirror and publication under one reload lock, like every
+            // other config writer
             let pass = async {
+                let mut tx = reloader.begin().await;
                 let root = walshadow::ch_emitter::load_effective(&config, cli_base.clone())
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                walshadow::ops::tenant_ctl::mirror_registry(&config, &root, &schema).await
+                if !walshadow::ops::tenant_ctl::mirror_registry(&tx, &config, &root, &schema)
+                    .await?
+                {
+                    return anyhow::Ok(false);
+                }
+                let published = tx
+                    .publish(
+                        walshadow::control::ReloadCause::SqlRegistry,
+                        walshadow::control::PublishOpts::default(),
+                    )
+                    .await;
+                if let Err(e) = published {
+                    tracing::warn!(target: "walshadow::tenant", error = %format!("{e:#}"), "reload after registry change failed");
+                }
+                anyhow::Ok(true)
             };
             match pass.await {
-                Ok(true) => {
-                    if let Err(e) = reloader.reload().await {
-                        tracing::warn!(target: "walshadow::tenant", error = %format!("{e:#}"), "reload after registry change failed");
-                    }
-                }
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(e) => tracing::warn!(
                     target: "walshadow::tenant",
                     error = %format!("{e:#}"),

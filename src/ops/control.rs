@@ -12,7 +12,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
 use tokio_postgres::Client;
 use toml::{Table, Value};
 
@@ -25,108 +24,9 @@ use crate::metrics::MetricsRegistry;
 use crate::schema::RelName;
 use crate::source_feed::open_sql_client;
 
-/// Holds the running session's resolvers so the control socket + SIGHUP can
-/// trigger a live `reload()`. The daemon streams one session; there is no
-/// start/stop/restart lifecycle — pause is a config flag applied by reload.
-///
-/// With tenants, the session resolver carries cluster-wide knobs (pause, the
-/// source endpoint) and each tenant has its own. Every reload also flags the
-/// session to reconcile its tenant set against the new config
-#[derive(Default)]
-pub struct Reloader {
-    /// One per followed database: a reload republishes each database's own
-    /// scope of the same document
-    resolvers: Mutex<Vec<Arc<crate::config::ConfigResolver>>>,
-    tenants: Mutex<std::collections::BTreeMap<String, Arc<crate::config::ConfigResolver>>>,
-    reconcile: std::sync::atomic::AtomicBool,
-}
-
-impl Reloader {
-    pub async fn set_resolvers(&self, r: Vec<Arc<crate::config::ConfigResolver>>) {
-        *self.resolvers.lock().await = r.clone();
-        // Control socket serves before the session wires a resolver;
-        // apply/reload in that window persist fragments but republish
-        // nothing (reload() below no-ops while empty). Sweep once at wiring
-        // so file state and published config converge
-        for r in &r {
-            if let Err(e) = r.reload().await {
-                tracing::warn!(
-                    target: "walshadow::control",
-                    error = %e,
-                    "config sweep at resolver wiring failed",
-                );
-            }
-        }
-    }
-
-    /// Register or drop a tenant's resolver
-    pub async fn set_tenant_resolver(
-        &self,
-        id: &str,
-        r: Option<Arc<crate::config::ConfigResolver>>,
-    ) {
-        let mut tenants = self.tenants.lock().await;
-        match r {
-            Some(r) => {
-                tenants.insert(id.to_string(), r);
-            }
-            None => {
-                tenants.remove(id);
-            }
-        }
-    }
-
-    /// Whether a reload happened since the last call
-    pub fn take_reconcile(&self) -> bool {
-        self.reconcile
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-    }
-
-    /// Live reconfigure: re-read the merged config + republish. No restart.
-    /// Return databases the config now names that this process does not
-    /// follow: shadow registers its bridge workers at startup, so they need a
-    /// restart rather than a reload. A tenant whose reload fails keeps its
-    /// last snapshot; the first error is reported after every tenant had its
-    /// turn
-    pub async fn reload(&self) -> anyhow::Result<Vec<String>> {
-        self.reconcile
-            .store(true, std::sync::atomic::Ordering::Release);
-        let resolvers = self.resolvers.lock().await.clone();
-        for r in &resolvers {
-            r.reload()
-                .await
-                .map_err(|e| anyhow::anyhow!("reload: {e}"))?;
-        }
-        let mut first_err = None;
-        let tenants: Vec<_> = self
-            .tenants
-            .lock()
-            .await
-            .iter()
-            .map(|(id, r)| (id.clone(), r.clone()))
-            .collect();
-        for (id, r) in tenants {
-            if let Err(e) = r.reload().await {
-                tracing::warn!(
-                    target: "walshadow::control",
-                    tenant = %id,
-                    error = %e,
-                    "tenant reload failed; its last config stays in effect",
-                );
-                first_err.get_or_insert(anyhow::anyhow!("reload tenant {id}: {e}"));
-            }
-        }
-        if let Some(e) = first_err {
-            return Err(e);
-        }
-        let Some(first) = resolvers.first() else {
-            return Ok(Vec::new());
-        };
-        let mut unfollowed = first.configured_databases().await;
-        unfollowed.retain(|db| !resolvers.iter().any(|r| r.dbname() == db));
-        Ok(unfollowed)
-    }
-}
+pub use crate::ops::reload::{
+    ConfigRevision, PublishError, PublishOpts, Published, ReloadCause, ReloadTx, Reloader,
+};
 
 // ---------------------------------------------------------------------------
 // Shared context handed to the socket handlers
@@ -145,8 +45,18 @@ pub struct SharedCtx {
     pub cli_base: Table,
     pub metrics: MetricsRegistry,
     pub reloader: Arc<Reloader>,
-    /// Prevents concurrent fragment updates from overwriting each other
-    pub frag_lock: Arc<Mutex<()>>,
+    /// One control-plane mutation at a time, socket and HTTP API alike.
+    /// Ranks above the reload lock, which every config write also holds
+    pub mutation_lock: Arc<crate::ops::lock_rank::RankedMutex<()>>,
+}
+
+/// The mutation lock a [`SharedCtx`] holds
+pub fn mutation_lock() -> Arc<crate::ops::lock_rank::RankedMutex<()>> {
+    Arc::new(crate::ops::lock_rank::RankedMutex::new(
+        crate::ops::lock_rank::MUTATION,
+        "mutation",
+        (),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -288,18 +198,20 @@ async fn apply(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
     if req.config.is_empty() {
         bail!("empty apply (send a TOML fragment as the body)");
     }
-    let _guard = ctx.frag_lock.lock().await;
+    let _mutation = ctx.mutation_lock.lock().await;
+    let mut tx = ctx.reloader.begin().await;
     let mut root = load(&ctx.fragment).await?;
     crate::ch_emitter::merge_tables(&mut root, req.config.clone());
-    commit(ctx, &ctx.fragment, &root).await
+    commit(ctx, &mut tx, &ctx.fragment, &root).await
 }
 
 /// Removes named keys without touching operator-owned base config
 async fn unset(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
-    let _guard = ctx.frag_lock.lock().await;
+    let _mutation = ctx.mutation_lock.lock().await;
+    let mut tx = ctx.reloader.begin().await;
     let mut root = load(&ctx.fragment).await?;
     apply_mask(&mut root, &req.config);
-    commit(ctx, &ctx.fragment, &root).await
+    commit(ctx, &mut tx, &ctx.fragment, &root).await
 }
 
 fn apply_mask(root: &mut Table, mask: &Table) {
@@ -315,14 +227,26 @@ fn apply_mask(root: &mut Table, mask: &Table) {
 }
 
 /// Persist `root` as fragment `frag` only once merged config accepts it, so
-/// file never holds a rejected fragment, not even briefly
-async fn commit(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<String> {
+/// file never holds a rejected fragment, not even briefly. `tx` holds the
+/// reload lock from the write through publication
+async fn commit(
+    ctx: &SharedCtx,
+    tx: &mut ReloadTx<'_>,
+    frag: &Path,
+    root: &Table,
+) -> Result<String> {
     validate(ctx, frag, root)
         .await
         .context("rejected: merged config invalid")?;
     save(frag, root).await?;
-    let unfollowed = ctx.reloader.reload().await?;
-    Ok(ok_note(&unfollowed))
+    let published = tx
+        .publish(ReloadCause::Control, PublishOpts::default())
+        .await
+        .map_err(|e| anyhow::anyhow!("reload: {e}"))?;
+    if let Some((id, e)) = published.tenant_errors.first() {
+        bail!("reload tenant {id}: {e}");
+    }
+    Ok(ok_note(&published.unfollowed))
 }
 
 /// Matches startup validation so accepted fragments remain restart-safe
@@ -867,7 +791,7 @@ mod tests {
             cli_base: Table::new(),
             metrics: MetricsRegistry::new(),
             reloader: Arc::new(Reloader::default()),
-            frag_lock: Arc::new(Mutex::new(())),
+            mutation_lock: mutation_lock(),
         }
     }
 

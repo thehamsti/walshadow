@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 
 use clickhouse_c::{Allocator, TypeAst};
 use walrus::pg::replication::conn::PgConfig;
@@ -381,6 +381,19 @@ struct MergeInputs {
     overlay: ConfigOverlay,
     /// Per-table opt-in state (§per-table opt-in). Merged into `resolved.tables`.
     opt_in: OptInState,
+    /// Revision and activation `base` was last built from, see
+    /// [`ConfigResolver::reload_from`]
+    applied: Option<Applied>,
+}
+
+/// What a resolver's base was last built from: a reload never regresses to
+/// an older revision, and a changed activation alone rebuilds from the same
+/// merged table, since [`Activation::apply`] clears the base it narrows
+struct Applied {
+    /// Published generation, `None` for a reload read straight off disk
+    generation: Option<u64>,
+    merged: Arc<toml::Table>,
+    activation_seq: u64,
 }
 
 /// Owns the `watch::Sender` and the layers it merges. Shared (`Arc`) between
@@ -396,7 +409,7 @@ pub struct ConfigResolver {
     /// boot's `load_effective`).
     cli_base: toml::Table,
     cli: CliOverrides,
-    inner: Mutex<MergeInputs>,
+    inner: crate::ops::lock_rank::RankedMutex<MergeInputs>,
     tx: watch::Sender<Arc<ResolvedConfig>>,
     /// Live routing map shared with the decode pool. A WAL config apply writes
     /// it synchronously under the barrier fence (plan §6) so trailing rows in
@@ -415,8 +428,10 @@ pub struct ConfigResolver {
     /// Tenant this resolver serves: a reload reads the merged file through
     /// that tenant's `[tenant.<id>]` view. Unset for the single-database layout
     tenant: std::sync::OnceLock<String>,
-    /// Scope a tenant attached mid-stream holds over what the file says
-    activation: std::sync::Mutex<Activation>,
+    /// Scope a tenant attached mid-stream holds over what the file says, and
+    /// a sequence bumped on every change. A leaf lock, never taken under
+    /// `inner`: reloads snapshot it first
+    activation: std::sync::Mutex<(Activation, u64)>,
     reserved: std::sync::OnceLock<Arc<crate::tenants::ChScopes>>,
 }
 
@@ -488,11 +503,16 @@ impl ConfigResolver {
             toml_path,
             cli_base,
             cli,
-            inner: Mutex::new(MergeInputs {
-                base: base.clone(),
-                overlay,
-                opt_in,
-            }),
+            inner: crate::ops::lock_rank::RankedMutex::new(
+                crate::ops::lock_rank::RESOLVER,
+                "resolver.inner",
+                MergeInputs {
+                    base: base.clone(),
+                    overlay,
+                    opt_in,
+                    applied: None,
+                },
+            ),
             tx,
             mapping,
             rejections: AtomicU64::new(0),
@@ -501,16 +521,43 @@ impl ConfigResolver {
             opt_out_total: AtomicU64::new(0),
             shadow_toast,
             tenant: std::sync::OnceLock::new(),
-            activation: std::sync::Mutex::new(Activation::default()),
+            activation: std::sync::Mutex::new((Activation::default(), 0)),
             reserved: std::sync::OnceLock::new(),
         });
         (this, rx)
     }
 
-    /// Replace the activation layer; the next [`reload`](Self::reload)
-    /// publishes it
+    /// Replace the activation layer; the next [`reload`](Self::reload) or
+    /// [`reload_from`](Self::reload_from) publishes it, whatever revision it
+    /// carries
     pub fn set_activation(&self, activation: Activation) {
-        *self.activation.lock().unwrap() = activation;
+        let mut held = self.activation.lock().unwrap();
+        held.0 = activation;
+        held.1 += 1;
+    }
+
+    fn activation_snapshot(&self) -> (Activation, u64) {
+        let held = self.activation.lock().unwrap();
+        (held.0.clone(), held.1)
+    }
+
+    /// The file a reload reads and the CLI base under it, `None` when this
+    /// resolver never reloads
+    pub fn config_source(&self) -> Option<(PathBuf, toml::Table)> {
+        self.toml_path
+            .clone()
+            .map(|path| (path, self.cli_base.clone()))
+    }
+
+    /// Generation this resolver last applied, `None` before any published
+    /// revision reached it
+    pub async fn applied_generation(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .await
+            .applied
+            .as_ref()
+            .and_then(|a| a.generation)
     }
 
     /// What `base` would resolve to under this resolver's overlay and CLI
@@ -1158,7 +1205,10 @@ impl ConfigResolver {
     }
 
     /// Re-read the config (base `--ch-config` + conf.d, CLI-source base under
-    /// it), re-merge with overlay + CLI, publish. Carries the CH connection +
+    /// it) and apply it through [`reload_from`](Self::reload_from), outside
+    /// any published revision. The daemon reloads through `Reloader`, which
+    /// reads the file once for every resolver; this stays for resolvers
+    /// driven alone. Carries the CH connection +
     /// table opt-ins live; the source connection isn't in scope here. Parse /
     /// read errors surface to the caller and leave the last snapshot in effect.
     /// Reads under `inner` so concurrent reloads publish in read order.
@@ -1166,8 +1216,60 @@ impl ConfigResolver {
         let Some(path) = &self.toml_path else {
             return Ok(());
         };
+        let (activation, activation_seq) = self.activation_snapshot();
+        // Read under `inner`, so a reload queued behind another publishes
+        // what it reads once it holds the lock
         let mut inner = self.inner.lock().await;
-        let mut merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
+        let merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
+        self.apply_locked(
+            &mut inner,
+            Arc::new(merged),
+            None,
+            activation,
+            activation_seq,
+        )
+        .await
+    }
+
+    /// Apply merged config `merged`, published as `generation`. Monotonic: a
+    /// generation older than the one applied re-applies the applied revision
+    /// rather than regressing to it, and the same generation is a no-op
+    /// unless the activation layer changed since, which rebuilds from that
+    /// revision's merged table. `None` (a direct reload) always applies.
+    /// Parse errors leave the last snapshot in effect
+    pub async fn reload_from(
+        &self,
+        merged: &Arc<toml::Table>,
+        generation: Option<u64>,
+    ) -> Result<(), EmitterError> {
+        if self.toml_path.is_none() {
+            return Ok(());
+        }
+        // Leaf lock, read before `inner`
+        let (activation, activation_seq) = self.activation_snapshot();
+        let mut inner = self.inner.lock().await;
+        let (generation, source) = match (&inner.applied, generation) {
+            (Some(applied), Some(g)) if applied.generation.is_some_and(|a| a >= g) => {
+                if applied.activation_seq == activation_seq {
+                    return Ok(());
+                }
+                (applied.generation, applied.merged.clone())
+            }
+            _ => (generation, merged.clone()),
+        };
+        self.apply_locked(&mut inner, source, generation, activation, activation_seq)
+            .await
+    }
+
+    async fn apply_locked(
+        &self,
+        inner: &mut MergeInputs,
+        source: Arc<toml::Table>,
+        generation: Option<u64>,
+        activation: Activation,
+        activation_seq: u64,
+    ) -> Result<(), EmitterError> {
+        let mut merged = (*source).clone();
         crate::tenants::reject_database_sections(&merged)
             .map_err(|e| EmitterError::Config(format!("{e:#}")))?;
         if merged.contains_key("tenants") || merged.contains_key("tenant") {
@@ -1221,12 +1323,17 @@ impl ConfigResolver {
                 ));
             }
         }
-        self.activation.lock().unwrap().apply(&mut base);
+        activation.apply(&mut base);
         let prev = self.tx.borrow().column_rules.clone();
         let (resolved, _) = Self::resolve(&base, &inner.overlay, &self.cli, &inner.opt_in, &prev);
         self.check_destinations(&resolved)?;
         inner.base = base;
-        self.republish(&inner).await;
+        inner.applied = Some(Applied {
+            generation,
+            merged: source,
+            activation_seq,
+        });
+        self.republish(inner).await;
         Ok(())
     }
 }
@@ -2973,6 +3080,86 @@ mod tests {
             &ColumnRules::default(),
         );
         assert_eq!(r.source.slot.as_deref(), Some("pinned"));
+    }
+
+    /// R3-M2 (Sol plan review r3): activation is tracked apart from the config
+    /// generation. A reload applies generation 2 to a priming resolver before
+    /// it publishes; activation then runs against the last published
+    /// generation, 1. A generation-only rule would ignore that older revision
+    /// and leave the tenant primed for good. The activated scope must land on
+    /// generation 2's base, and the sweep that follows publication must leave
+    /// it in place
+    #[tokio::test]
+    async fn activation_survives_publish_gap() {
+        let doc = |extra: &str| -> Arc<toml::Table> {
+            Arc::new(
+                toml::from_str(&format!(
+                    "[source]\ndbname = 'postgres'\n[tenants]\n\
+                     [tenant.a]\ndbname = 'app'\n[tenant.a.ch]\nhost = 'ch'\ndatabase = 'a'\n\
+                     [tenant.a.table.public.orders]\nreplicate = true\n{extra}"
+                ))
+                .unwrap(),
+            )
+        };
+        let published = doc("");
+        let applied = doc("[tenant.a.table.public.items]\nreplicate = true\n");
+        let tenants = crate::tenants::TenantsConfig::from_table(&published)
+            .unwrap()
+            .unwrap();
+        let base =
+            EmitterConfig::from_table(&tenants.get("a").unwrap().effective_table(&published))
+                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            Some(dir.path().join("config.toml")),
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        resolver.bind_tenant("a");
+        let orders = RelName::new("public", "orders");
+        let items = RelName::new("public", "items");
+        resolver.set_activation(Activation {
+            priming: true,
+            opt_ins: HashMap::new(),
+        });
+        resolver.reload_from(&published, Some(1)).await.unwrap();
+        assert_eq!(
+            rx.borrow().rules.settings(&orders).replicate,
+            None,
+            "primed"
+        );
+
+        // The reload applies 2, then is preempted before it publishes
+        resolver.reload_from(&applied, Some(2)).await.unwrap();
+        // Activation reads the revision published so far, 1
+        let row = TableRow {
+            replicate: Some(true),
+            initial_load: Some("copy".into()),
+            ..TableRow::default()
+        };
+        resolver.set_activation(Activation {
+            priming: false,
+            opt_ins: [(orders.clone(), row)].into_iter().collect(),
+        });
+        resolver.reload_from(&published, Some(1)).await.unwrap();
+        let snap = rx.borrow().clone();
+        assert!(snap.table_opt_ins.contains_key(&orders), "activated");
+        assert_eq!(
+            snap.rules.settings(&items).replicate,
+            Some(true),
+            "on generation 2's base, never back on 1's"
+        );
+        assert_eq!(resolver.applied_generation().await, Some(2));
+
+        // Generation 2 publishes; the session's sweep finds nothing to do
+        resolver.reload_from(&applied, Some(2)).await.unwrap();
+        assert!(Arc::ptr_eq(&snap, &rx.borrow()), "sweep is a no-op");
+        // A stale revision with nothing new is a no-op too
+        resolver.reload_from(&published, Some(1)).await.unwrap();
+        assert!(Arc::ptr_eq(&snap, &rx.borrow()));
     }
 
     #[tokio::test]

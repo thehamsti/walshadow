@@ -20,7 +20,10 @@ pub(crate) async fn sighup_reload(
 ) {
     while sig.recv().await.is_some() {
         tracing::info!(target: "walshadow", "SIGHUP — live reload");
-        match reloader.reload().await {
+        match reloader
+            .reload_with(walshadow::control::ReloadCause::Sighup)
+            .await
+        {
             Err(e) => {
                 tracing::warn!(target: "walshadow", error = %format!("{e:#}"), "reload failed")
             }

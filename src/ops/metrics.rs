@@ -170,6 +170,11 @@ snapshot! {
     custom {
         /// One entry per configured tenant, rendered `tenant=` labelled
         tenants: Vec<TenantMetrics>,
+        /// Revision stream the session follows, see `ops::reload`
+        config_epoch: String,
+        /// Last revision the session reconciled: tenants attached, detached
+        /// or re-bound, and every resolver brought up to it
+        reconciled_generation: u64,
         /// `route` is `"to_shadow"` / `"to_decoder"`
         records_by_rm_route: BTreeMap<(String, &'static str), u64>,
         /// Raw-stash records `[dirty, marker]` x op, rendered `kind=`/`op=`

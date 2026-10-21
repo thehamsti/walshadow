@@ -58,7 +58,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::Mutex;
 use walshadow::boundary_hold::AttachSlot;
 use walshadow::metrics::MetricsRegistry;
 
@@ -170,7 +169,7 @@ async fn run(mut args: Args) -> Result<()> {
     let shutdown = spawn_shutdown_signals()?;
 
     let metrics = MetricsRegistry::new();
-    let reloader = Arc::new(Reloader::default());
+    let reloader = Arc::new(Reloader::new(args.ch_config.clone(), cli_base(&args)));
 
     let _metrics_server = if let Some(addr) = args.metrics_bind {
         let (bound, h) = walshadow::metrics::serve(addr, metrics.clone())
@@ -193,7 +192,7 @@ async fn run(mut args: Args) -> Result<()> {
             cli_base: cli_base(&args),
             metrics: metrics.clone(),
             reloader: reloader.clone(),
-            frag_lock: Arc::new(Mutex::new(())),
+            mutation_lock: walshadow::control::mutation_lock(),
         };
         Some(
             walshadow::control::serve(sock, ctx)

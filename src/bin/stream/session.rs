@@ -128,6 +128,12 @@ async fn session_body(
             .with_context(|| format!("load config {}", p.display()))?,
         None => cli_base(args),
     };
+    // The revision this session boots from. The tenant reconcile follows
+    // every later revision the Reloader publishes, in order, and never
+    // re-reads the files itself
+    let mut revisions = reloader.subscribe();
+    reloader.seed(merged.clone()).await;
+    revisions.borrow_and_update();
     // Applied source endpoint. Boot resolves it file-over-CLI; a later reload
     // republishes it on the config watch and the pump swaps its feed.
     let mut source_conn =
@@ -1315,20 +1321,22 @@ async fn session_body(
                 }
             }
         }
-        // Tenant lifecycle, between chunks where no record is mid-flight
+        // Config revisions, between chunks where no record is mid-flight.
+        // Every resolver already applied the revision before it published;
+        // the session acts on exactly that merged config
+        let revision = revisions
+            .has_changed()
+            .unwrap_or(false)
+            .then(|| revisions.borrow_and_update().clone());
+        // Tenant lifecycle
         if tenants_cfg.is_some() {
-            // A reload (control socket, SIGHUP) may add, remove, detach or
-            // re-bind tenants; tenant resolvers already took their own knobs
-            if reloader.take_reconcile()
-                && let Some(path) = args.ch_config.as_deref()
-            {
-                match walshadow::ch_emitter::load_effective(path, cli_base(args))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-                    .and_then(|m| {
-                        walshadow::ops::tenant_ctl::validate(&m)?;
-                        walshadow::tenants::TenantsConfig::from_table(&m).map(|t| (m, t))
-                    }) {
+            // A revision (HTTP API, control socket, SIGHUP, SQL registry) may
+            // add, remove, detach or re-bind tenants
+            if let Some(rev) = &revision {
+                match walshadow::ops::tenant_ctl::validate(&rev.merged).and_then(|()| {
+                    walshadow::tenants::TenantsConfig::from_table(&rev.merged)
+                        .map(|t| ((*rev.merged).clone(), t))
+                }) {
                     Ok((next_merged, Some(next))) => {
                         let old = tenants_cfg.take().expect("tenants mode");
                         let plan = tenant::reconcile_plan(
@@ -1337,6 +1345,7 @@ async fn session_body(
                             &merged,
                             &next_merged,
                             tenants.iter().map(|t| t.id.as_str()),
+                            &rev.force_rebind,
                         );
                         merged = next_merged;
                         tenants_cfg = Some(next);
@@ -1379,6 +1388,10 @@ async fn session_body(
                         "tenant reconcile skipped: config does not parse",
                     ),
                 }
+                // Resolvers registered after the reload iterated them, or
+                // attached from an older revision, catch up before this
+                // revision counts as reconciled
+                tenant::catch_up(&tenants, rev, reloader).await;
             }
             let tcfg = tenants_cfg.as_ref().expect("tenants mode");
             // Evict tenants the router gave up on, or that trail too far
@@ -1504,7 +1517,7 @@ async fn session_body(
                 let Some(decl) = tcfg.get(&id) else {
                     continue;
                 };
-                if let Err(e) = tenant::activate(t, args, &merged, decl, start).await {
+                if let Err(e) = tenant::activate(t, args, &merged, decl, start, reloader).await {
                     tracing::error!(
                         target: "walshadow::tenant",
                         tenant = %id,
@@ -1516,6 +1529,19 @@ async fn session_body(
                         .mark_evicted(&id, format!("activation failed: {e:#}"));
                 }
             }
+        }
+        if let Some(rev) = &revision {
+            if tenants_cfg.is_none() {
+                tenant::catch_up(&tenants, rev, reloader).await;
+            }
+            let epoch = rev.epoch.to_string();
+            let generation = rev.generation;
+            metrics
+                .update(|snap| {
+                    snap.config_epoch = epoch;
+                    snap.reconciled_generation = generation;
+                })
+                .await;
         }
         // `durable` (fsynced) lags `dispatched`; advertise it as flush/cursor.
         let dispatched = stream.dispatched_lsn();

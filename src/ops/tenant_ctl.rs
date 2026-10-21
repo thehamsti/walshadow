@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use toml::{Table, Value};
 
-use crate::control::{SharedCtx, ok, ok_toml};
+use crate::control::{PublishOpts, ReloadCause, ReloadTx, SharedCtx, ok, ok_toml};
 use crate::tenants::{
     Registry, TenantDecl, TenantsConfig, decls_from_rows, registry_ddl, validate_id,
 };
@@ -174,12 +174,14 @@ pub async fn show(ctx: &SharedCtx, body: &Table) -> Result<String> {
 pub async fn put(ctx: &SharedCtx, body: &Table) -> Result<String> {
     let (id, tenant_body) = single_tenant(body)?;
     let decl = TenantDecl::parse(&id, &tenant_body)?;
+    let _mutation = ctx.mutation_lock.lock().await;
+    let mut tx = ctx.reloader.begin().await;
     let root = merged(ctx).await?;
     let tenants = tenants_of(&root)?;
     match tenants.registry {
         Registry::Config => {
             let path = tenant_fragment_path(&ctx.ch_config, &id);
-            write_validated(ctx, &path, Some(decl.to_fragment())).await?
+            write_validated(ctx, &tx, &path, Some(decl.to_fragment())).await?
         }
         Registry::Sql { schema, .. } => {
             let mut spec = decl.to_fragment();
@@ -217,15 +219,28 @@ pub async fn put(ctx: &SharedCtx, body: &Table) -> Result<String> {
                 )
                 .await
                 .context("upsert registry row")?;
-            mirror_registry(&ctx.ch_config, &root, &schema).await?;
+            mirror_registry(&tx, &ctx.ch_config, &root, &schema).await?;
         }
     }
-    ctx.reloader.reload().await?;
+    publish(&mut tx).await
+}
+
+/// Publish what a tenant verb wrote, still under its reload lock
+async fn publish(tx: &mut ReloadTx<'_>) -> Result<String> {
+    let published = tx
+        .publish(ReloadCause::Control, PublishOpts::default())
+        .await
+        .map_err(|e| anyhow!("reload: {e}"))?;
+    if let Some((id, e)) = published.tenant_errors.first() {
+        bail!("reload tenant {id}: {e}");
+    }
     Ok(ok())
 }
 
 pub async fn remove(ctx: &SharedCtx, body: &Table) -> Result<String> {
     let id = id_of(body)?;
+    let _mutation = ctx.mutation_lock.lock().await;
+    let mut tx = ctx.reloader.begin().await;
     let root = merged(ctx).await?;
     let tenants = tenants_of(&root)?;
     ensure!(tenants.get(&id).is_some(), "no tenant {id}");
@@ -237,7 +252,7 @@ pub async fn remove(ctx: &SharedCtx, body: &Table) -> Result<String> {
                 "tenant {id} is declared outside {}; edit the operator config to remove it",
                 path.display()
             );
-            write_validated(ctx, &path, None).await?
+            write_validated(ctx, &tx, &path, None).await?
         }
         Registry::Sql { schema, .. } => {
             let client = crate::control::pg_connect(&root, None).await?;
@@ -245,11 +260,10 @@ pub async fn remove(ctx: &SharedCtx, body: &Table) -> Result<String> {
             client
                 .execute(&format!("DELETE FROM {s}.tenant WHERE id = $1"), &[&id])
                 .await?;
-            mirror_registry(&ctx.ch_config, &root, &schema).await?;
+            mirror_registry(&tx, &ctx.ch_config, &root, &schema).await?;
         }
     }
-    ctx.reloader.reload().await?;
-    Ok(ok())
+    publish(&mut tx).await
 }
 
 pub async fn set_state(ctx: &SharedCtx, body: &Table) -> Result<String> {
@@ -262,6 +276,8 @@ pub async fn set_state(ctx: &SharedCtx, body: &Table) -> Result<String> {
         matches!(state, "active" | "detached"),
         "state must be active or detached"
     );
+    let _mutation = ctx.mutation_lock.lock().await;
+    let mut tx = ctx.reloader.begin().await;
     let root = merged(ctx).await?;
     let tenants = tenants_of(&root)?;
     let decl = tenants
@@ -276,7 +292,7 @@ pub async fn set_state(ctx: &SharedCtx, body: &Table) -> Result<String> {
     match tenants.registry {
         Registry::Config => {
             let path = tenant_fragment_path(&ctx.ch_config, &id);
-            write_validated(ctx, &path, Some(next.to_fragment())).await?
+            write_validated(ctx, &tx, &path, Some(next.to_fragment())).await?
         }
         Registry::Sql { schema, .. } => {
             let client = crate::control::pg_connect(&root, None).await?;
@@ -287,17 +303,20 @@ pub async fn set_state(ctx: &SharedCtx, body: &Table) -> Result<String> {
                     &[&id, &state],
                 )
                 .await?;
-            mirror_registry(&ctx.ch_config, &root, &schema).await?;
+            mirror_registry(&tx, &ctx.ch_config, &root, &schema).await?;
         }
     }
-    ctx.reloader.reload().await?;
-    Ok(ok())
+    publish(&mut tx).await
 }
 
 /// Write or delete `path`, keeping the change only if the merged config
-/// still validates
-async fn write_validated(ctx: &SharedCtx, path: &Path, fragment: Option<Table>) -> Result<()> {
-    let _guard = ctx.frag_lock.lock().await;
+/// still validates. `_tx` proves the reload lock is held
+async fn write_validated(
+    ctx: &SharedCtx,
+    _tx: &ReloadTx<'_>,
+    path: &Path,
+    fragment: Option<Table>,
+) -> Result<()> {
     let prev = tokio::fs::read(path).await.ok();
     match &fragment {
         Some(f) => {
@@ -324,8 +343,14 @@ async fn write_validated(ctx: &SharedCtx, path: &Path, fragment: Option<Table>) 
 }
 
 /// Rewrite the registry mirror from the rows; returns whether it changed.
-/// The daemon polls this, so rows edited straight in SQL also take effect
-pub async fn mirror_registry(config: &Path, root: &Table, schema: &str) -> Result<bool> {
+/// The daemon polls this, so rows edited straight in SQL also take effect.
+/// `_tx` proves the reload lock is held: every mirror writer serializes on it
+pub async fn mirror_registry(
+    _tx: &ReloadTx<'_>,
+    config: &Path,
+    root: &Table,
+    schema: &str,
+) -> Result<bool> {
     let client = crate::control::pg_connect(root, None).await?;
     client.batch_execute(&registry_ddl(schema)).await?;
     let s = crate::pg::quote_ident(schema);
