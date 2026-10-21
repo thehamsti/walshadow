@@ -112,6 +112,13 @@ pub enum Precondition {
 #[derive(Debug, Clone)]
 pub struct Mutation {
     pub request_id: String,
+    /// Who asks, for the audit record
+    pub actor: crate::ops::audit::Actor,
+    /// Audit action, eg `tenant.update`
+    pub action: String,
+    /// HTTP method and path, `None` from the control socket
+    pub method: Option<String>,
+    pub path: Option<String>,
     pub precondition: Precondition,
     pub acknowledge_resync: bool,
     /// The control socket's compatibility: it re-binds identity changes and
@@ -124,6 +131,10 @@ impl Mutation {
     pub fn new(request_id: impl Into<String>) -> Self {
         Self {
             request_id: request_id.into(),
+            actor: crate::ops::audit::Actor::default(),
+            action: "tenant.update".into(),
+            method: None,
+            path: None,
             precondition: Precondition::Any,
             acknowledge_resync: false,
             legacy_ack: false,
@@ -178,8 +189,85 @@ impl TenantService {
 
     /// Apply `edit` to tenant `id`: it maps the current declaration (`None`:
     /// absent) to the next (`None`: remove). Every step runs under the
-    /// mutation lock, then the reload lock
+    /// mutation lock, then the reload lock. Audited: one that runs writes an
+    /// attempt before changing anything and a result after; one refused
+    /// before it runs writes a single result. Dry runs are not audited
     pub async fn mutate<F>(&self, id: &str, m: &Mutation, edit: F) -> ServiceResult<Outcome>
+    where
+        F: FnOnce(Option<&TenantDecl>) -> ServiceResult<Option<TenantDecl>>,
+    {
+        let mut audit = AuditState::default();
+        let res = self.mutate_inner(id, m, edit, &mut audit).await;
+        if m.dry_run && res.is_ok() {
+            tracing::info!(
+                target: "walshadow::api",
+                request_id = %m.request_id,
+                tenant = %id,
+                action = %m.action,
+                "dry run",
+            );
+            return res;
+        }
+        if let Some(log) = self.ctx.reloader.audit() {
+            let (outcome, error) = match &res {
+                Ok(_) => ("applied", None),
+                Err(e) if !audit.attempted => ("rejected", Some(e.to_string())),
+                Err(e) if e.code == "apply_refused" => ("rolled_back", Some(e.to_string())),
+                Err(e) if e.code == "conflict_after_failed_apply" => {
+                    ("conflict", Some(e.to_string()))
+                }
+                Err(e) => ("failed", Some(e.to_string())),
+            };
+            let mut draft = self.draft(id, m, "result", &audit);
+            draft.outcome = outcome.into();
+            draft.error = error;
+            if let Ok(out) = &res {
+                draft.epoch = Some(out.epoch.clone());
+                draft.generation = Some(out.generation);
+            }
+            if let Err(e) = log.append(draft).await {
+                crate::ops::metrics::API_AUDIT_WRITE_FAILURES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    target: "walshadow::audit",
+                    request_id = %m.request_id,
+                    error = %format!("{e:#}"),
+                    "could not record the outcome of a mutation",
+                );
+            }
+        }
+        res
+    }
+
+    fn draft(
+        &self,
+        id: &str,
+        m: &Mutation,
+        phase: &str,
+        audit: &AuditState,
+    ) -> crate::ops::audit::Draft {
+        crate::ops::audit::Draft {
+            request_id: m.request_id.clone(),
+            phase: phase.into(),
+            actor: m.actor.clone(),
+            action: m.action.clone(),
+            tenant: Some(id.to_string()),
+            method: m.method.clone(),
+            path: m.path.clone(),
+            before: audit.before.clone(),
+            after: audit.after.clone(),
+            classification: audit.classification.clone(),
+            ..Default::default()
+        }
+    }
+
+    async fn mutate_inner<F>(
+        &self,
+        id: &str,
+        m: &Mutation,
+        edit: F,
+        audit: &mut AuditState,
+    ) -> ServiceResult<Outcome>
     where
         F: FnOnce(Option<&TenantDecl>) -> ServiceResult<Option<TenantDecl>>,
     {
@@ -302,8 +390,28 @@ impl TenantService {
             generation: revision.generation,
             dry_run: m.dry_run,
         };
+        let (before, after) = crate::ops::redact::redact_pair(
+            current.as_ref().map(TenantDecl::to_table).as_ref(),
+            next.as_ref().map(TenantDecl::to_table).as_ref(),
+        );
+        audit.before = before;
+        audit.after = after;
+        audit.classification = Some(change.label().into());
         if m.dry_run || (change == Change::None && current == next) {
             return Ok(outcome);
+        }
+        // Write-ahead: nothing changes unless the attempt is durable
+        if let Some(log) = self.ctx.reloader.audit() {
+            log.append(self.draft(id, m, "attempt", audit))
+                .await
+                .map_err(|e| {
+                    ServiceError::new(
+                        503,
+                        "audit_unavailable",
+                        format!("the audit log refused the attempt, so nothing changed: {e:#}"),
+                    )
+                })?;
+            audit.attempted = true;
         }
         let fence = match (&dir, fence_rebind, &next) {
             (Some(dir), true, Some(next)) => {
@@ -687,6 +795,15 @@ impl TenantService {
         txn.commit().await.map_err(ServiceError::internal)?;
         Ok(())
     }
+}
+
+/// What the audit records of one mutation carry
+#[derive(Default)]
+struct AuditState {
+    attempted: bool,
+    before: serde_json::Value,
+    after: serde_json::Value,
+    classification: Option<String>,
 }
 
 enum Written {

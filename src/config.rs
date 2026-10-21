@@ -433,7 +433,13 @@ pub struct ConfigResolver {
     /// `inner`: reloads snapshot it first
     activation: std::sync::Mutex<(Activation, u64)>,
     reserved: std::sync::OnceLock<Arc<crate::tenants::ChScopes>>,
+    /// Tests: refuse every reload, running the hook first
+    #[cfg(any(test, feature = "test-support"))]
+    refuse: std::sync::Mutex<Option<RefuseHook>>,
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub type RefuseHook = Arc<dyn Fn() + Send + Sync>;
 
 /// State fixed before the pump consumes WAL
 #[derive(Default)]
@@ -523,6 +529,8 @@ impl ConfigResolver {
             tenant: std::sync::OnceLock::new(),
             activation: std::sync::Mutex::new((Activation::default(), 0)),
             reserved: std::sync::OnceLock::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            refuse: std::sync::Mutex::new(None),
         });
         (this, rx)
     }
@@ -534,6 +542,13 @@ impl ConfigResolver {
         let mut held = self.activation.lock().unwrap();
         held.0 = activation;
         held.1 += 1;
+    }
+
+    /// Tests: refuse every reload from now on, running `hook` as each one
+    /// refuses; `None` stops refusing
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn refuse_reloads(&self, hook: Option<RefuseHook>) {
+        *self.refuse.lock().unwrap() = hook;
     }
 
     fn activation_snapshot(&self) -> (Activation, u64) {
@@ -1244,6 +1259,11 @@ impl ConfigResolver {
     ) -> Result<(), EmitterError> {
         if self.toml_path.is_none() {
             return Ok(());
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(hook) = self.refuse.lock().unwrap().clone() {
+            hook();
+            return Err(EmitterError::Config("reload refused for a test".into()));
         }
         // Leaf lock, read before `inner`
         let (activation, activation_seq) = self.activation_snapshot();

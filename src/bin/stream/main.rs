@@ -38,6 +38,7 @@ fn enable_tracing() {
     let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
 }
 
+mod api;
 mod archive;
 mod args;
 mod bootstrap;
@@ -61,7 +62,7 @@ use clap::Parser;
 use walshadow::boundary_hold::AttachSlot;
 use walshadow::metrics::MetricsRegistry;
 
-use crate::args::{Args, InitArgs, cli_base, url_base, validate_transport_args};
+use crate::args::{ApiKeyArgs, Args, InitArgs, cli_base, url_base, validate_transport_args};
 use crate::runtime_cfg::spawn_shutdown_signals;
 use crate::session::run_session;
 use crate::tracing_setup::init_tracing;
@@ -74,6 +75,10 @@ fn main() -> Result<()> {
         let rest = std::iter::once(format!("{} ctl", argv[0])).chain(argv.into_iter().skip(2));
         let (socket, command) = walshadow::ctl::Cli::parse_from(rest).into_parts()?;
         return runtime(NonZeroUsize::new(1))?.block_on(run_ctl(&socket, command));
+    }
+    if argv.get(1).map(String::as_str) == Some("api-key") {
+        let rest = std::iter::once(format!("{} api-key", argv[0])).chain(argv.into_iter().skip(2));
+        return api::mint(ApiKeyArgs::parse_from(rest).command);
     }
     if argv.get(1).map(String::as_str) == Some("init") {
         let rest = std::iter::once(format!("{} init", argv[0])).chain(argv.into_iter().skip(2));
@@ -103,7 +108,19 @@ async fn daemon(args: Args) -> Result<()> {
         .clone()
         .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok());
     let tracer_provider = init_tracing(otlp_endpoint.as_deref());
-    let result = run(args).await;
+    // Where and why this process stops, readable after a restart
+    let crashes = walshadow::ops::crash::CrashStore::open(&api::state_dir(&args))?;
+    crashes.install_panic_hook();
+    if let Some(prior) = crashes.mark_running()? {
+        tracing::warn!(target: "walshadow", record = %prior.id, "{}", prior.message);
+    }
+    let result = run(args, crashes.clone()).await;
+    match &result {
+        Ok(()) => crashes.clean_exit(),
+        Err(e) => {
+            let _ = crashes.record_exit(&format!("{e:#}"));
+        }
+    }
     // The batch span processor lives on a background thread, so a bare
     // process exit drops whatever it hasn't flushed. Drain it before we
     // return (best-effort — a failed flush must not mask `run`'s result).
@@ -153,7 +170,7 @@ async fn run_ctl(socket: &Path, cmd: walshadow::ctl::Command) -> Result<()> {
 /// Process-lifetime entry: bind metrics + control socket + SIGHUP, then stream
 /// one session. Every reconfigure (socket / SIGHUP) is a live reload — no
 /// restart. SIGINT/SIGTERM break the pump loop and drain gracefully.
-async fn run(mut args: Args) -> Result<()> {
+async fn run(mut args: Args, crashes: Arc<walshadow::ops::crash::CrashStore>) -> Result<()> {
     use walshadow::control::{Reloader, SharedCtx};
 
     args.url_base = url_base(&args)?;
@@ -170,6 +187,12 @@ async fn run(mut args: Args) -> Result<()> {
 
     let metrics = MetricsRegistry::new();
     let reloader = Arc::new(Reloader::new(args.ch_config.clone(), cli_base(&args)));
+    // Every control-plane mutation, control socket and HTTP API alike
+    reloader.set_audit(
+        walshadow::ops::audit::AuditLog::open(&api::state_dir(&args), 64 << 20, 10)
+            .context("open the audit log")?,
+    );
+    let api_config = api::config(&args)?;
 
     let _metrics_server = if let Some(addr) = args.metrics_bind {
         let (bound, h) = walshadow::metrics::serve(addr, metrics.clone())
@@ -181,19 +204,24 @@ async fn run(mut args: Args) -> Result<()> {
         None
     };
 
-    let _control_server = if let Some(sock) = args.control_socket.clone() {
-        let ch_config = args
-            .ch_config
-            .clone()
-            .context("--control-socket requires --ch-config")?;
-        let ctx = SharedCtx {
+    // The control socket and the HTTP API share one context: one mutation
+    // lock, one reload pipeline
+    let ctx = match args.ch_config.clone() {
+        Some(ch_config) => Some(SharedCtx {
             fragment: walshadow::control::fragment_path(&ch_config, &args.control_fragment)?,
             ch_config,
             cli_base: cli_base(&args),
             metrics: metrics.clone(),
             reloader: reloader.clone(),
             mutation_lock: walshadow::control::mutation_lock(),
-        };
+            spill_dir: Some(args.spill_dir.clone()),
+        }),
+        None => None,
+    };
+    let _control_server = if let Some(sock) = args.control_socket.clone() {
+        let ctx = ctx
+            .clone()
+            .context("--control-socket requires --ch-config")?;
         Some(
             walshadow::control::serve(sock, ctx)
                 .await
@@ -201,6 +229,17 @@ async fn run(mut args: Args) -> Result<()> {
         )
     } else {
         None
+    };
+    let _api_server = match api_config {
+        Some(cfg) => {
+            let ctx = ctx.clone().context("--api-bind requires --ch-config")?;
+            Some(
+                api::start(cfg, ctx, crashes)
+                    .await
+                    .context("start the HTTP API")?,
+            )
+        }
+        None => None,
     };
 
     let mut sighup = sighup;
@@ -210,6 +249,9 @@ async fn run(mut args: Args) -> Result<()> {
         let Some(attached) = attach.lock().expect("attach slot poisoned").take() else {
             return result;
         };
+        metrics
+            .update(|snap| snap.session_state = "restarting")
+            .await;
         tracing::info!(
             target: "walshadow",
             database = %attached.name,

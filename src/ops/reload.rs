@@ -118,6 +118,9 @@ pub struct Reloader {
     /// Exclusive resources of attached and tearing-down tenants, shared by
     /// the session and the control plane across session restarts
     reservations: Arc<crate::tenants::Reservations>,
+    /// Where every control-plane mutation is recorded, once the daemon set
+    /// it up
+    audit: std::sync::OnceLock<Arc<crate::ops::audit::AuditLog>>,
 }
 
 impl Default for Reloader {
@@ -148,7 +151,16 @@ impl Reloader {
             epoch,
             tx,
             reservations: Arc::default(),
+            audit: std::sync::OnceLock::new(),
         }
+    }
+
+    pub fn set_audit(&self, log: Arc<crate::ops::audit::AuditLog>) {
+        let _ = self.audit.set(log);
+    }
+
+    pub fn audit(&self) -> Option<&Arc<crate::ops::audit::AuditLog>> {
+        self.audit.get()
     }
 
     pub fn reservations(&self) -> &Arc<crate::tenants::Reservations> {

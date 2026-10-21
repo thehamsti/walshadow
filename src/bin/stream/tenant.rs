@@ -1194,6 +1194,15 @@ impl Supervisor {
         self.tearing_down.contains_key(id) || self.stuck.contains(id)
     }
 
+    /// Teardowns still running, and those that left a writer running
+    pub fn teardowns(&self) -> (Vec<String>, Vec<String>) {
+        let mut running: Vec<String> = self.tearing_down.keys().cloned().collect();
+        let mut stuck: Vec<String> = self.stuck.iter().cloned().collect();
+        running.sort();
+        stuck.sort();
+        (running, stuck)
+    }
+
     /// Run `t`'s teardown off the session loop
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_teardown(
@@ -1822,6 +1831,65 @@ pub(crate) fn reconcile_plan<'a>(
     plan
 }
 
+/// A revision nobody audited at its source (a hand edit and SIGHUP, rows
+/// written straight into the SQL registry): record each tenant it changed,
+/// off the pump
+pub(crate) fn audit_external(
+    reloader: &walshadow::control::Reloader,
+    rev: &walshadow::control::ConfigRevision,
+    old: &walshadow::tenants::TenantsConfig,
+    next: &walshadow::tenants::TenantsConfig,
+) {
+    let Some(log) = reloader.audit().cloned() else {
+        return;
+    };
+    let source = match rev.cause {
+        walshadow::control::ReloadCause::Sighup => "sighup",
+        walshadow::control::ReloadCause::SqlRegistry => "sql_registry",
+        _ => return,
+    };
+    let ids: std::collections::BTreeSet<&str> = old
+        .decls
+        .iter()
+        .chain(&next.decls)
+        .map(|d| d.id.as_str())
+        .collect();
+    let mut drafts = Vec::new();
+    for id in ids {
+        let (a, b) = (old.get(id), next.get(id));
+        if a == b {
+            continue;
+        }
+        let (before, after) = walshadow::ops::redact::redact_pair(
+            a.map(|d| d.to_table()).as_ref(),
+            b.map(|d| d.to_table()).as_ref(),
+        );
+        drafts.push(walshadow::ops::audit::Draft {
+            request_id: format!("{}-{}", rev.epoch, rev.generation),
+            phase: "result".into(),
+            actor: walshadow::ops::audit::Actor::external(source),
+            action: "tenant_set.external_change".into(),
+            tenant: Some(id.to_string()),
+            before,
+            after,
+            outcome: "applied".into(),
+            epoch: Some(rev.epoch.to_string()),
+            generation: Some(rev.generation),
+            ..Default::default()
+        });
+    }
+    if drafts.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        for d in drafts {
+            if let Err(e) = log.append(d).await {
+                tracing::error!(target: "walshadow::audit", error = %format!("{e:#}"), "could not record an external tenant change");
+            }
+        }
+    });
+}
+
 /// Bring every attached tenant's resolvers up to `rev` before the session
 /// reports it reconciled: one registered after the reload iterated, or
 /// opened from an older revision, catches up here. `reload_from` is
@@ -1919,6 +1987,7 @@ pub(crate) async fn metrics_view(
     config: &walshadow::tenants::TenantsConfig,
     supervisor: &Supervisor,
     router: &walshadow::tenant_router::TenantRouter,
+    with_jobs: bool,
 ) -> Vec<walshadow::metrics::TenantMetrics> {
     let head = router.last_record_end();
     let mut out = Vec::with_capacity(config.decls.len());
@@ -1971,6 +2040,21 @@ pub(crate) async fn metrics_view(
             xacts_active,
             rows_emitted: emitted.0,
             backfill_copy_rows: emitted.1,
+            backfills_pending: t
+                .metrics_dbs
+                .iter()
+                .filter_map(|db| db.backfiller.as_ref())
+                .map(|b| b.pending_count())
+                .sum(),
+            jobs: if with_jobs {
+                let mut jobs = Vec::new();
+                for b in t.metrics_dbs.iter().filter_map(|db| db.backfiller.as_ref()) {
+                    jobs.extend(b.jobs().await);
+                }
+                jobs
+            } else {
+                Vec::new()
+            },
         });
     }
     out

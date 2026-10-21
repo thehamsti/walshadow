@@ -93,6 +93,34 @@ pub async fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()
     fsync_dir(dir).await
 }
 
+/// Blocking [`fsync_dir`], for code already off the runtime
+pub fn sync_dir_blocking(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Blocking [`write_private`], for code already off the runtime (or with
+/// none, like a panic hook)
+pub fn write_private_blocking(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp_path = dir.join(format!("{name}.tmp"));
+    match std::fs::remove_file(&tmp_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp_path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp_path, dir.join(name))?;
+    sync_dir_blocking(dir)
+}
+
 /// [`write_atomic`] for files only the daemon may read: the temp file is
 /// created 0600 before any byte lands in it, and an existing temp is
 /// replaced rather than reused with its old mode

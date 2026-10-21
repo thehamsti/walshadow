@@ -24,6 +24,34 @@ pub(crate) fn positive_usize(name: &str, cli: Option<usize>, toml: usize) -> usi
     }
 }
 
+/// `walshadow-stream api-key new`: mint an HTTP API key
+#[derive(Parser, Debug)]
+#[command(
+    name = "walshadow-stream api-key",
+    version = walshadow::VERSION,
+    about = "Make an HTTP API key: the token prints once on stdout, the key file stanza on stderr."
+)]
+pub(crate) struct ApiKeyArgs {
+    #[command(subcommand)]
+    pub(crate) command: ApiKeyCommand,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub(crate) enum ApiKeyCommand {
+    /// A new random key
+    New {
+        /// Key id, 1-32 of [a-z0-9-]; audit records name it
+        #[arg(long)]
+        id: String,
+        /// `read` or `admin` (admin implies read). Repeatable
+        #[arg(long = "scope", required = true)]
+        scopes: Vec<String>,
+        /// Expiry, RFC 3339, eg 2027-01-01T00:00:00Z
+        #[arg(long)]
+        expires: Option<String>,
+    },
+}
+
 /// `walshadow-stream init`: write a config from two connection URLs, so a
 /// first run needs no TOML. Detected before daemon-arg parsing, same as `ctl`.
 #[derive(Debug, Parser)]
@@ -268,6 +296,46 @@ pub(crate) struct Args {
     /// neither clobbers the other; lexical order decides which wins
     #[arg(long, default_value = walshadow::control::DEFAULT_FRAGMENT)]
     pub(crate) control_fragment: String,
+    /// HTTP API bind address: health, metrics, crash and error reports,
+    /// jobs, tenant status and control (docs/api.md). Off when absent. Off
+    /// loopback it needs `--api-tls-cert` and `--api-tls-key`, or
+    /// `--api-allow-plaintext` behind a TLS-terminating proxy
+    #[arg(long, env = "WALSHADOW_API_BIND")]
+    pub(crate) api_bind: Option<SocketAddr>,
+    /// API key file, TOML `[[key]]` entries, readable by the owner only.
+    /// Required with `--api-bind`; `walshadow-stream api-key new` makes keys
+    #[arg(long, env = "WALSHADOW_API_KEYS_FILE")]
+    pub(crate) api_keys_file: Option<PathBuf>,
+    /// PEM certificate chain the API serves TLS with
+    #[arg(long, env = "WALSHADOW_API_TLS_CERT", requires = "api_tls_key")]
+    pub(crate) api_tls_cert: Option<PathBuf>,
+    /// PEM private key for `--api-tls-cert`
+    #[arg(long, env = "WALSHADOW_API_TLS_KEY", requires = "api_tls_cert")]
+    pub(crate) api_tls_key: Option<PathBuf>,
+    /// Serve plaintext off loopback: only behind a proxy that terminates TLS
+    #[arg(long, env = "WALSHADOW_API_ALLOW_PLAINTEXT")]
+    pub(crate) api_allow_plaintext: bool,
+    /// Audit log, crash records, tombstones and the ETag key. Defaults to
+    /// `<spill-dir>/api`
+    #[arg(long, env = "WALSHADOW_API_STATE_DIR")]
+    pub(crate) api_state_dir: Option<PathBuf>,
+    /// Serve `GET /livez` (a constant `ok`) without a key, for orchestrator
+    /// probes that cannot present one. Every other route still needs a key
+    #[arg(long, env = "WALSHADOW_API_PUBLIC_LIVEZ")]
+    pub(crate) api_public_livez: bool,
+    /// Proxies whose `X-Forwarded-For` names the client, as CIDRs
+    #[arg(long, env = "WALSHADOW_API_TRUSTED_PROXIES", value_delimiter = ',')]
+    pub(crate) api_trusted_proxies: Vec<String>,
+    /// Override a rate limit, `<class>=<n>/<s|m|h>:<burst>`; classes are
+    /// `preauth`, `auth_failure`, `read`, `expensive`, `mutate`. Repeatable
+    #[arg(long = "api-rate-limit")]
+    pub(crate) api_rate_limit: Vec<String>,
+    /// Days a deleted tenant's tombstone stays restorable
+    #[arg(long, default_value_t = 30)]
+    pub(crate) api_deleted_retention_days: u64,
+    /// Seconds a session may take to start streaming before readiness fails
+    #[arg(long, default_value_t = 600)]
+    pub(crate) api_ready_grace_secs: u64,
     /// OTLP/gRPC endpoint for traces, e.g. `http://localhost:4317`. Absent
     /// disables tracing (zero overhead); falls back to
     /// `OTEL_EXPORTER_OTLP_ENDPOINT`. Spans emit at the `walshadow::trace`

@@ -348,6 +348,21 @@ impl TenantDecl {
         out
     }
 
+    /// The `[tenant.<id>]` table itself, `dbname` and all
+    pub fn to_table(&self) -> toml::Table {
+        self.to_fragment()
+            .remove("tenant")
+            .and_then(|t| match t {
+                toml::Value::Table(mut t) => t.remove(&self.id),
+                _ => None,
+            })
+            .and_then(|t| match t {
+                toml::Value::Table(t) => Some(t),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
     /// Declaration as a `[tenant.<id>]` fragment, the form `ctl tenant add`
     /// writes and the SQL registry stores
     pub fn to_fragment(&self) -> toml::Table {

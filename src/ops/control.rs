@@ -48,6 +48,9 @@ pub struct SharedCtx {
     /// One control-plane mutation at a time, socket and HTTP API alike.
     /// Ranks above the reload lock, which every config write also holds
     pub mutation_lock: Arc<crate::ops::lock_rank::RankedMutex<()>>,
+    /// Daemon `--spill-dir`: tenant directories, their recovery fences.
+    /// `None` where no daemon runs
+    pub spill_dir: Option<PathBuf>,
 }
 
 /// The mutation lock a [`SharedCtx`] holds
@@ -160,22 +163,27 @@ async fn handle_conn(mut stream: UnixStream, ctx: &SharedCtx) -> std::io::Result
     // EOF framing allows newlines in TOML values
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
-    let resp = dispatch(&buf, ctx).await;
+    // Who is on the other end, for the audit log
+    let actor = crate::ops::audit::Actor::unix(stream.peer_cred().ok().map(|c| c.uid()));
+    let resp = dispatch(&buf, ctx, &actor).await;
     stream.write_all(resp.as_bytes()).await?;
     stream.flush().await?;
     let _ = stream.shutdown().await;
     Ok(())
 }
 
-async fn dispatch(buf: &[u8], ctx: &SharedCtx) -> String {
+async fn dispatch(buf: &[u8], ctx: &SharedCtx, actor: &crate::ops::audit::Actor) -> String {
     let req = match Request::parse(buf) {
         Ok(r) => r,
         Err(e) => return err(format!("{e:#}")),
     };
     let res: Result<String> = match req.verb {
-        "apply" => apply(ctx, &req).await,
-        "unset" => unset(ctx, &req).await,
-        "reload" => ctx.reloader.reload().await.map(|dbs| ok_note(&dbs)),
+        "apply" => apply(ctx, &req, actor).await,
+        "unset" => unset(ctx, &req, actor).await,
+        "reload" => reload_audited(ctx, actor, None)
+            .await
+            .map(|dbs| ok_note(&dbs))
+            .map_err(|e| anyhow::anyhow!("{e}")),
         "show" => config_show(ctx).await,
         "status" => stream_status(ctx).await,
         "tables" => tables_list(ctx, &req).await,
@@ -183,9 +191,9 @@ async fn dispatch(buf: &[u8], ctx: &SharedCtx) -> String {
         "columns" => columns_list(ctx, &req).await,
         "tenants" => crate::ops::tenant_ctl::list(ctx).await,
         "tenant-show" => crate::ops::tenant_ctl::show(ctx, &req.config).await,
-        "tenant-put" => crate::ops::tenant_ctl::put(ctx, &req.config).await,
-        "tenant-remove" => crate::ops::tenant_ctl::remove(ctx, &req.config).await,
-        "tenant-state" => crate::ops::tenant_ctl::set_state(ctx, &req.config).await,
+        "tenant-put" => crate::ops::tenant_ctl::put(ctx, &req.config, actor).await,
+        "tenant-remove" => crate::ops::tenant_ctl::remove(ctx, &req.config, actor).await,
+        "tenant-state" => crate::ops::tenant_ctl::set_state(ctx, &req.config, actor).await,
         other => Err(anyhow::anyhow!("unknown command {other}")),
     };
     res.unwrap_or_else(|e| err(format!("{e:#}")))
@@ -194,24 +202,142 @@ async fn dispatch(buf: &[u8], ctx: &SharedCtx) -> String {
 // ---- handlers -------------------------------------------------------------
 
 /// Keeps invalid fragments from breaking reloads or later starts
-async fn apply(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
+async fn apply(
+    ctx: &SharedCtx,
+    req: &Request<'_>,
+    actor: &crate::ops::audit::Actor,
+) -> Result<String> {
     if req.config.is_empty() {
         bail!("empty apply (send a TOML fragment as the body)");
     }
-    let _mutation = ctx.mutation_lock.lock().await;
-    let mut tx = ctx.reloader.begin().await;
-    let mut root = load(&ctx.fragment).await?;
-    crate::ch_emitter::merge_tables(&mut root, req.config.clone());
-    commit(ctx, &mut tx, &ctx.fragment, &root).await
+    let config = req.config.clone();
+    let unfollowed = apply_fragment(ctx, actor, "config.apply", None, move |root| {
+        crate::ch_emitter::merge_tables(root, config);
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(ok_note(&unfollowed))
 }
 
 /// Removes named keys without touching operator-owned base config
-async fn unset(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
+async fn unset(
+    ctx: &SharedCtx,
+    req: &Request<'_>,
+    actor: &crate::ops::audit::Actor,
+) -> Result<String> {
+    let mask = req.config.clone();
+    let unfollowed = apply_fragment(ctx, actor, "config.unset", None, move |root| {
+        apply_mask(root, &mask);
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(ok_note(&unfollowed))
+}
+
+/// HTTP method and path of a mutation, when it came over HTTP
+pub type Origin = Option<(String, String)>;
+
+/// Edit the control fragment and publish, under the mutation lock and then
+/// the reload lock, audited like a tenant mutation: rejected before it ran,
+/// or an attempt before the write and a result after
+pub async fn apply_fragment(
+    ctx: &SharedCtx,
+    actor: &crate::ops::audit::Actor,
+    action: &str,
+    origin: Origin,
+    edit: impl FnOnce(&mut Table),
+) -> std::result::Result<Vec<String>, crate::ops::tenant_service::ServiceError> {
+    use crate::ops::tenant_service::ServiceError;
+    let request_id = uuid::Uuid::new_v4().simple().to_string();
     let _mutation = ctx.mutation_lock.lock().await;
     let mut tx = ctx.reloader.begin().await;
-    let mut root = load(&ctx.fragment).await?;
-    apply_mask(&mut root, &req.config);
-    commit(ctx, &mut tx, &ctx.fragment, &root).await
+    let before = load(&ctx.fragment)
+        .await
+        .map_err(|e| ServiceError::new(500, "internal", format!("{e:#}")))?;
+    let mut root = before.clone();
+    edit(&mut root);
+    let (b, a) = crate::ops::redact::redact_pair(Some(&before), Some(&root));
+    let draft = |phase: &str| crate::ops::audit::Draft {
+        request_id: request_id.clone(),
+        phase: phase.into(),
+        actor: actor.clone(),
+        action: action.into(),
+        method: origin.as_ref().map(|o| o.0.clone()),
+        path: origin.as_ref().map(|o| o.1.clone()),
+        before: b.clone(),
+        after: a.clone(),
+        ..Default::default()
+    };
+    let audit = ctx.reloader.audit().cloned();
+    let record = |mut d: crate::ops::audit::Draft, outcome: &str, error: Option<String>| {
+        d.outcome = outcome.into();
+        d.error = error;
+        d
+    };
+    if let Err(e) = validate(ctx, &ctx.fragment, &root).await {
+        let e = ServiceError::new(
+            422,
+            "invalid_config",
+            format!("rejected: merged config invalid: {e:#}"),
+        );
+        if let Some(log) = &audit {
+            let _ = log
+                .append(record(draft("result"), "rejected", Some(e.to_string())))
+                .await;
+        }
+        return Err(e);
+    }
+    if let Some(log) = &audit {
+        log.append(draft("attempt")).await.map_err(|e| {
+            ServiceError::new(
+                503,
+                "audit_unavailable",
+                format!("the audit log refused the attempt, so nothing changed: {e:#}"),
+            )
+        })?;
+    }
+    let outcome = async {
+        save(&ctx.fragment, &root)
+            .await
+            .map_err(|e| ServiceError::new(500, "internal", format!("{e:#}")))?;
+        let published = tx
+            .publish(ReloadCause::Control, PublishOpts::default())
+            .await
+            .map_err(|e| ServiceError::new(422, "apply_refused", format!("reload: {e}")))?;
+        if let Some((id, e)) = published.tenant_errors.first() {
+            return Err(ServiceError::new(
+                422,
+                "apply_refused",
+                format!("reload tenant {id}: {e}"),
+            ));
+        }
+        Ok((published.unfollowed, published.revision))
+    }
+    .await;
+    if let Some(log) = &audit {
+        let d = match &outcome {
+            Ok((_, rev)) => {
+                let mut d = record(draft("result"), "applied", None);
+                d.epoch = Some(rev.epoch.to_string());
+                d.generation = Some(rev.generation);
+                d
+            }
+            Err(e) => record(draft("result"), "failed", Some(e.to_string())),
+        };
+        if let Err(e) = log.append(d).await {
+            tracing::error!(target: "walshadow::audit", error = %format!("{e:#}"), "could not record a config mutation's outcome");
+        }
+    }
+    outcome.map(|(unfollowed, _)| unfollowed)
+}
+
+/// `reload`, audited
+pub async fn reload_audited(
+    ctx: &SharedCtx,
+    actor: &crate::ops::audit::Actor,
+    origin: Origin,
+) -> std::result::Result<Vec<String>, crate::ops::tenant_service::ServiceError> {
+    apply_fragment(ctx, actor, "config.reload", origin, |_| {}).await
 }
 
 fn apply_mask(root: &mut Table, mask: &Table) {
@@ -226,31 +352,8 @@ fn apply_mask(root: &mut Table, mask: &Table) {
     }
 }
 
-/// Persist `root` as fragment `frag` only once merged config accepts it, so
-/// file never holds a rejected fragment, not even briefly. `tx` holds the
-/// reload lock from the write through publication
-async fn commit(
-    ctx: &SharedCtx,
-    tx: &mut ReloadTx<'_>,
-    frag: &Path,
-    root: &Table,
-) -> Result<String> {
-    validate(ctx, frag, root)
-        .await
-        .context("rejected: merged config invalid")?;
-    save(frag, root).await?;
-    let published = tx
-        .publish(ReloadCause::Control, PublishOpts::default())
-        .await
-        .map_err(|e| anyhow::anyhow!("reload: {e}"))?;
-    if let Some((id, e)) = published.tenant_errors.first() {
-        bail!("reload tenant {id}: {e}");
-    }
-    Ok(ok_note(&published.unfollowed))
-}
-
 /// Matches startup validation so accepted fragments remain restart-safe
-async fn validate(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<()> {
+pub(crate) async fn validate(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<()> {
     let mut merged = ctx.cli_base.clone();
     crate::ch_emitter::merge_tables(
         &mut merged,
@@ -288,6 +391,23 @@ pub fn fragment_path(ch_config: &Path, name: &str) -> Result<PathBuf> {
 
 async fn get_config(ctx: &SharedCtx) -> Result<Table> {
     Ok(crate::ch_emitter::load_effective(&ctx.ch_config, ctx.cli_base.clone()).await?)
+}
+
+/// `ctl --tenant <id> tables`, as a table
+pub async fn tenant_tables(ctx: &SharedCtx, tenant: &str) -> Result<Table> {
+    let mut config = Table::new();
+    config.insert("tenant".into(), tenant.into());
+    let req = Request {
+        verb: "tables",
+        config,
+    };
+    let text = tables_list(ctx, &req).await?;
+    Ok(text.strip_prefix("OK\n").unwrap_or(&text).parse()?)
+}
+
+/// The merged config, every secret masked by the API's redactor
+pub async fn config_redacted(ctx: &SharedCtx) -> Result<serde_json::Value> {
+    Ok(crate::ops::redact::redact_toml(&get_config(ctx).await?))
 }
 
 async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
@@ -472,6 +592,11 @@ fn status_tables(
 }
 
 async fn stream_status(ctx: &SharedCtx) -> Result<String> {
+    Ok(ok_toml(&status_table(ctx).await?))
+}
+
+/// What `ctl status` prints, as a table
+pub async fn status_table(ctx: &SharedCtx) -> Result<Table> {
     let root = get_config(ctx).await?;
     let paused = root
         .get("stream")
@@ -623,7 +748,7 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
     ] {
         out.insert(key.into(), format_pg_lsn(lsn).to_string().into());
     }
-    Ok(ok_toml(&out))
+    Ok(out)
 }
 
 async fn config_show(ctx: &SharedCtx) -> Result<String> {
@@ -792,6 +917,7 @@ mod tests {
             metrics: MetricsRegistry::new(),
             reloader: Arc::new(Reloader::default()),
             mutation_lock: mutation_lock(),
+            spill_dir: None,
         }
     }
 

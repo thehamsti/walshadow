@@ -175,6 +175,11 @@ snapshot! {
         /// Last revision the session reconciled: tenants attached, detached
         /// or re-bound, and every resolver brought up to it
         reconciled_generation: u64,
+        /// `starting`, `streaming`, `restarting` or `stopped`
+        session_state: &'static str,
+        /// Tenants whose teardown still runs, and those it left stuck
+        tearing_down: Vec<String>,
+        stuck_teardowns: Vec<String>,
         /// `route` is `"to_shadow"` / `"to_decoder"`
         records_by_rm_route: BTreeMap<(String, &'static str), u64>,
         /// Raw-stash records `[dirty, marker]` x op, rendered `kind=`/`op=`
@@ -643,6 +648,8 @@ db_snapshot! {
 #[derive(Debug, Clone, Default)]
 pub struct MetricsRegistry {
     inner: Arc<RwLock<MetricsSnapshot>>,
+    /// When the session last published, for staleness
+    published: Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
 impl MetricsRegistry {
@@ -653,10 +660,27 @@ impl MetricsRegistry {
     /// Single writer (status-line loop), so the write lock is uncontended.
     pub async fn set(&self, snap: MetricsSnapshot) {
         *self.inner.write().await = snap;
+        self.touch();
     }
 
     pub async fn update(&self, edit: impl FnOnce(&mut MetricsSnapshot)) {
         edit(&mut *self.inner.write().await);
+        self.touch();
+    }
+
+    fn touch(&self) {
+        *self
+            .published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    /// Time since the session last published, `None` before it ever did
+    pub fn age(&self) -> Option<Duration> {
+        self.published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(|at| at.elapsed())
     }
 
     pub async fn snapshot(&self) -> MetricsSnapshot {
@@ -921,6 +945,24 @@ impl<K> EncodeGaugeValue for Pos<K> {
     }
 }
 
+/// Audit records the daemon could not write after a mutation ran
+pub static API_AUDIT_WRITE_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// One job the API reports: an initial load, a priming wait, a teardown
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct JobView {
+    pub kind: &'static str,
+    pub namespace: String,
+    pub name: String,
+    pub mode: &'static str,
+    /// `queued`, `running`, `pending`, `swapping` or `done`
+    pub state: &'static str,
+    pub s_lsn: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy_next_block: Option<u32>,
+}
+
 /// One tenant's view: where it stands and how far it trails the pump
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TenantMetrics {
@@ -936,6 +978,10 @@ pub struct TenantMetrics {
     pub xacts_active: u64,
     pub rows_emitted: u64,
     pub backfill_copy_rows: u64,
+    /// Initial loads still recorded for the tenant
+    pub backfills_pending: u64,
+    /// Initial loads, for `GET /v1/jobs`; not rendered
+    pub jobs: Vec<JobView>,
 }
 
 fn encode_tenants(tenants: &[TenantMetrics], enc: &mut DescriptorEncoder<'_>) -> fmt::Result {
@@ -1114,6 +1160,7 @@ pub fn render(snap: MetricsSnapshot) -> String {
     registry.register_collector(Box::new(SnapshotCollector(snap)));
     registry.register_collector(Box::new(crate::ops::stages::StageCollector));
     registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
+    registry.register_collector(Box::new(crate::ops::api::metrics::ApiCollector));
     let mut out = String::with_capacity(16 << 10);
     text::encode(&mut out, &registry).expect("String write cannot fail");
     out

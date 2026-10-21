@@ -1158,6 +1158,8 @@ async fn session_body(
     // Streaming publish cadence; idle ticks and segment advances always publish
     const PUBLISH_MIN_INTERVAL: Duration = Duration::from_millis(50);
     let mut last_publish = Instant::now();
+    // Initial-load views refresh less often than the rest of a publish
+    let mut last_jobs: Option<Instant> = None;
     // Inflight-stall watchdog: xacts_active > 0 with stalled
     // `emitter_ack_lsn` dumps the parked xids holding the slot. One-shot
     // per stall, re-arms when ack advances.
@@ -1167,11 +1169,12 @@ async fn session_body(
     // Pump reads `paused` and the source endpoint live off the resolver watch;
     // when paused it idles (stops consuming source WAL) without tearing
     // anything down, and a moved `[source]` swaps the feed in place.
-    // Pause and the source endpoint are cluster-wide, so the primary's
-    // resolver is the one the pump watches
-    let pump_config_rx = config_resolver
+    // Pause and the source endpoint are cluster-wide: with tenants the
+    // cluster resolver, which no detach or re-bind drops, else the
+    // primary's
+    let pump_config_rx = cluster_resolver
         .as_ref()
-        .or(cluster_resolver.as_ref())
+        .or(config_resolver.as_ref())
         .map(|r| r.subscribe());
     let mut swap = SourceSwap::default();
     // Frontier frozen when the pump observes a pause, so a promotion decision
@@ -1357,6 +1360,9 @@ async fn session_body(
                 }) {
                     Ok((next_merged, Some(next))) => {
                         let old = tenants_cfg.take().expect("tenants mode");
+                        if rev.cause.is_external() {
+                            tenant::audit_external(reloader, rev, &old, &next);
+                        }
                         let plan = tenant::reconcile_plan(
                             &old,
                             &next,
@@ -2230,9 +2236,40 @@ async fn session_body(
         )
         .await;
         if let Some(tcfg) = &tenants_cfg {
-            let view =
-                tenant::metrics_view(&tenants, tcfg, &supervisor, &record_sink.decoder_xact).await;
-            metrics.update(|snap| snap.tenants = view).await;
+            // Initial loads are a ledger walk per tenant: every 2 s, not
+            // every publish
+            let with_jobs = last_jobs.is_none_or(|at| at.elapsed() >= Duration::from_secs(2));
+            if with_jobs {
+                last_jobs = Some(Instant::now());
+            }
+            let mut view = tenant::metrics_view(
+                &tenants,
+                tcfg,
+                &supervisor,
+                &record_sink.decoder_xact,
+                with_jobs,
+            )
+            .await;
+            let (running, stuck) = supervisor.teardowns();
+            metrics
+                .update(|snap| {
+                    if !with_jobs {
+                        for t in &mut view {
+                            if let Some(old) = snap.tenants.iter().find(|o| o.id == t.id) {
+                                t.jobs.clone_from(&old.jobs);
+                            }
+                        }
+                    }
+                    snap.tenants = view;
+                    snap.tearing_down = running;
+                    snap.stuck_teardowns = stuck;
+                    snap.session_state = "streaming";
+                })
+                .await;
+        } else {
+            metrics
+                .update(|snap| snap.session_state = "streaming")
+                .await;
         }
         if advanced {
             let new_segs = (now_dispatched - prev_dispatched) / WAL_SEG_SIZE;

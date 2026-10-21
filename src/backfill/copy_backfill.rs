@@ -919,6 +919,42 @@ impl CopyBackfiller {
         &self.writers
     }
 
+    /// Every initial load the ledger holds, as `GET /v1/jobs` reports it
+    pub async fn jobs(&self) -> Vec<crate::ops::metrics::JobView> {
+        let inner = self.inner.lock().await;
+        let queued: HashSet<&RelName> = inner
+            .queued
+            .values()
+            .flatten()
+            .map(|r| &r.desc.rel_name)
+            .collect();
+        let mut out: Vec<_> = inner
+            .ledger
+            .entries
+            .iter()
+            .map(|(rel, rec)| crate::ops::metrics::JobView {
+                kind: "initial_load",
+                namespace: rel.namespace.to_string(),
+                name: rel.name.to_string(),
+                mode: rec.mode.as_str(),
+                state: match &rec.phase {
+                    Phase::Done => "done",
+                    _ if queued.contains(rel) => "queued",
+                    _ if inner.active.contains(rel) => "running",
+                    Phase::Swapped { .. } => "swapping",
+                    Phase::Pending { .. } => "pending",
+                },
+                s_lsn: format_pg_lsn(rec.s_lsn.get()).to_string(),
+                copy_next_block: match &rec.phase {
+                    Phase::Pending { copy: Some(c) } => Some(c.next_block),
+                    _ => None,
+                },
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+        out
+    }
+
     /// Ledger entries awaiting backfill completion.
     pub fn pending_count(&self) -> u64 {
         self.pending.load(Ordering::Relaxed)
