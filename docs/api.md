@@ -76,6 +76,38 @@ Every response carries `X-Request-Id`, `Cache-Control: no-store` and
 {"error": {"code": "resync_not_acknowledged", "message": "…", "request_id": "…"}}
 ```
 
+| Status | Code | Meaning |
+|---|---|---|
+| 400 | `invalid_body` | The body or query does not have the route's shape, or names another tenant |
+| 400 | `invalid_id` | A tenant id is not 1–63 characters of `[a-z0-9_-]`, or is reserved |
+| 400 | `invalid_tenant` | The tenant declaration does not parse |
+| 4xx | `invalid_request` | Rejected before the route ran: malformed JSON, a missing `Content-Type`, an oversized body |
+| 401 | `unauthenticated` | No valid key |
+| 403 | `forbidden` | The key lacks the route's scope |
+| 404 | `not_found` | No such tenant, tombstone, operation or crash record |
+| 409 | `exists` | The tenant exists already, also when restoring onto a live id |
+| 409 | `resync_not_acknowledged` | The change attaches the tenant afresh; resend with `acknowledge_resync` |
+| 409 | `rebind_pending` | A re-bind of the tenant is still pending |
+| 409 | `change_rejected` | The daemon cannot apply this change while running, or the new Snowflake state directory is unusable |
+| 409 | `conflict_after_failed_apply` | A change the daemon refused could not be rolled back: someone changed the tenant meanwhile |
+| 409 | `confirmation_invalid` | The delete token is unknown, used, or void |
+| 409 | `managed_outside_api` | The tenant is declared outside the registry the API edits |
+| 409 | `tenants_not_configured` | No `[tenants]`: the daemon runs the single-database layout |
+| 409 | `invalid_config` | The running config's tenants do not parse |
+| 410 | `confirmation_expired` | The delete token expired; ask again |
+| 412 | `precondition_failed` | `If-Match` names an ETag the tenant no longer has |
+| 422 | `invalid_config` | The config the change would produce does not validate |
+| 422 | `apply_refused` | The tenant's resolver refused the change; it was rolled back |
+| 428 | `precondition_required` | `If-Match` is missing |
+| 428 | `confirmation_required` | `DELETE` without `X-Confirm-Delete` |
+| 429 | `rate_limited` | Over a rate limit; wait `Retry-After` seconds |
+| 500 | `internal` | An unexpected failure; the message says what |
+| 503 | `audit_unavailable` | The audit log refused the attempt, so nothing changed |
+| 503 | `detach_not_recorded` | The detach could not be recorded, so nothing changed; retry |
+| 503 | `registry_unavailable` | The SQL tenant registry is unreachable |
+| 503 | `source_unavailable` | The source database is unreachable |
+| 503 | `busy` | Too many requests in flight; retry shortly |
+
 ## Endpoints
 
 | Method | Path | Scope | |

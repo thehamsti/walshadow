@@ -1230,7 +1230,14 @@ async fn sql_registry_api_updates_compare_authoritative_rows_and_delete_safely()
 /// C4: a re-bind accepted while the daemon resumes the tenant, its
 /// destination still opening, never lets the runtime opened for the old
 /// binding route WAL: the rows written while the daemon was down land only
-/// in the new database, after a fresh attach, never in the old one
+/// in the new database, after a fresh attach, never in the old one.
+///
+/// Before the fence, the stale runtime was routed and then detached by the
+/// reconcile, which the log assertions below catch. Even then no WAL landed
+/// in the old database: the session applies config revisions at the top of
+/// each loop iteration, before it reads WAL, so the reconcile detached the
+/// stale runtime before a record reached it. The row assertion guards that
+/// outcome; the routing assertions are what fail on the code before the fix
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rebind_during_resume_never_routes_the_old_runtime() {
     if !fx::tools::requirements_available() {

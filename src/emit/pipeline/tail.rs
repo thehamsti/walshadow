@@ -988,6 +988,27 @@ where
 mod tests {
     use super::*;
 
+    /// A leg over `parts`, counted as a writer of `token`'s set
+    fn counted(
+        msg_tx: mpsc::Sender<BatcherMsg>,
+        ack: AckHandle,
+        parts: TailParts,
+        fatal: Fatal,
+        token: crate::ops::writers::WriterToken,
+    ) -> OwnedTail {
+        OwnedTail {
+            msg_tx,
+            ack,
+            stages: Stages {
+                parts: Some(parts),
+                writer: None,
+            },
+            fatal,
+            context: "test",
+        }
+        .counted(Some(token))
+    }
+
     /// C1: a leg's completion cancelled mid-await, its stage blocked in a
     /// synchronous call, never lets its owner's join report the stage gone
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1005,17 +1026,7 @@ mod tests {
                 let _ = held.recv();
             }));
             started.await.unwrap();
-            let tail = OwnedTail {
-                msg_tx,
-                ack,
-                stages: Stages {
-                    parts: Some(parts),
-                    writer: None,
-                },
-                fatal,
-                context: "c1",
-            }
-            .counted(Some(set.token()));
+            let tail = counted(msg_tx, ack, parts, fatal, set.token());
             let (polled_tx, polled) = oneshot::channel();
             let completion = tokio::spawn(async move {
                 let mut completion = Box::pin(async move {
@@ -1042,29 +1053,30 @@ mod tests {
     }
 
     /// C1: a leg whose ClickHouse insert is blocked, its completion
-    /// cancelled, holds its owner's join until the insert's stage has
-    /// exited and closed its connection
+    /// cancelled, keeps its owner's writer count until that stage has gone
+    /// away. The stage cannot finish going away until the test releases it,
+    /// so the count is checked at a point the stage is known to be alive
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_blocked_clickhouse_insert_holds_the_join_until_its_stage_exits() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        struct Exited(Arc<AtomicBool>);
-        impl Drop for Exited {
+        /// Blocks the stage's teardown until released, or until the test
+        /// panics and drops the sender
+        struct Parked(std::sync::mpsc::Receiver<()>);
+        impl Drop for Parked {
             fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
+                let _ = self.0.recv();
             }
         }
         let (config, closed) = crate::ch::test_support::stalled_server().await;
         let set = crate::ops::writers::WriterSet::new();
         let fatal = Fatal::new();
         let (msg_tx, ack, mut parts) = spawn_null(Arc::new(Monotone::default()), fatal.clone());
-        let exited = Arc::new(AtomicBool::new(false));
-        let guard = Exited(exited.clone());
+        let (release, held) = std::sync::mpsc::channel::<()>();
         let (sent_tx, sent) = oneshot::channel();
-        // An inserter stage, waiting on its INSERT's answer
+        // An inserter stage waiting on its INSERT's answer, which never comes
         parts
             .inserters
             .push(AbortOnDropHandle::new(tokio::spawn(async move {
-                let _guard = guard;
+                let _parked = Parked(held);
                 let mut client = crate::ch::connect_client(&config).await.unwrap();
                 client
                     .send_query("INSERT INTO t (x) VALUES", None)
@@ -1074,32 +1086,30 @@ mod tests {
                 let _ = client.recv_event().await;
             })));
         sent.await.unwrap();
-        let tail = OwnedTail {
-            msg_tx,
-            ack,
-            stages: Stages {
-                parts: Some(parts),
-                writer: None,
-            },
-            fatal,
-            context: "c1",
-        }
-        .counted(Some(set.token()));
-        // Its completion waits on the blocked insert, and is cancelled
-        let completion = tokio::spawn(tail.quiesce());
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!completion.is_finished(), "the insert never blocked");
+        let tail = counted(msg_tx, ack, parts, fatal, set.token());
+        // Its completion is pending on the insert when it is cancelled
+        let (polled_tx, polled) = oneshot::channel();
+        let completion = tokio::spawn(async move {
+            let mut quiesce = Box::pin(tail.quiesce());
+            assert!(futures::poll!(&mut quiesce).is_pending());
+            let _ = polled_tx.send(());
+            quiesce.await;
+        });
+        polled.await.unwrap();
         completion.abort();
         assert!(completion.await.unwrap_err().is_cancelled());
-        assert!(set.abort_and_join(Duration::from_secs(5)).await);
-        assert!(
-            exited.load(Ordering::SeqCst),
-            "joined before the blocked insert's stage exited"
+        // The insert's stage is still going away: the hold stays
+        assert_eq!(
+            set.live_count(),
+            1,
+            "the cancelled completion released its hold before the insert's stage exited"
         );
-        tokio::time::timeout(Duration::from_secs(5), closed)
+        release.send(()).unwrap();
+        assert!(set.abort_and_join(Duration::from_secs(5)).await);
+        assert_eq!(set.live_count(), 0);
+        closed
             .await
-            .expect("the blocked insert's connection closed")
-            .unwrap();
+            .expect("the blocked insert's connection closed");
     }
 
     /// H3: an abandoned leg's stages count as their owner's writers until
@@ -1122,17 +1132,7 @@ mod tests {
             flag.store(true, Ordering::SeqCst);
         }));
         started.await.unwrap();
-        let tail = OwnedTail {
-            msg_tx,
-            ack,
-            stages: Stages {
-                parts: Some(parts),
-                writer: None,
-            },
-            fatal,
-            context: "test",
-        }
-        .counted(Some(set.token()));
+        let tail = counted(msg_tx, ack, parts, fatal, set.token());
         drop(tail);
         assert!(
             !set.abort_and_join(Duration::from_millis(200)).await,
