@@ -719,8 +719,8 @@ async fn pause_resume_via_ctl_and_sighup_no_restart() {
         let frag = fs::read_to_string(&h.frag_path).context("read fragment")?;
         assert!(frag.contains("paused = true"), "fragment: {frag}");
 
-        // Wait past idle tick so next write cannot race pause
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        h.wait_log("pause observed", Duration::from_secs(15))
+            .await?;
         // A write made once paused has settled must not reach CH.
         h.psql("UPDATE demo.users SET email = 'while-paused@x' WHERE id = 1")?;
         h.assert_ch_stable(USER_EMAIL, "baseline@x", Duration::from_secs(5))
@@ -748,8 +748,16 @@ async fn pause_resume_via_ctl_and_sighup_no_restart() {
             .context("fragment write alone must not pause the pump")?;
 
         // SIGHUP applies paused=true; the next write is frozen.
+        let previous_pause = h.lsn_field("pause_consumed_lsn")?;
         h.sighup()?;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while h.lsn_field("pause_consumed_lsn")? <= previous_pause {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "pump did not publish a new pause frontier"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         h.psql("UPDATE demo.users SET email = 'post-sighup@x' WHERE id = 1")?;
         h.assert_ch_stable(USER_EMAIL, "pre-sighup@x", Duration::from_secs(5))
             .await

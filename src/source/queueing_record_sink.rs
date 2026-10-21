@@ -919,4 +919,28 @@ mod tests {
         // Pump stamps ship, worker pop then builds the span from it
         assert!(reg.txn_span(7).is_some());
     }
+    #[tokio::test]
+    async fn close_or_abort_cancels_a_worker_that_cannot_drain() {
+        struct Blocked;
+        impl RecordSink for Blocked {
+            fn on_record<'a>(
+                &'a mut self,
+                _: &'a Record<'a>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+                Box::pin(std::future::pending())
+            }
+        }
+        let mut q = QueueingRecordSink::spawn(Blocked, 1, 1, None);
+        q.on_record(&synth(1)).await.unwrap();
+        let (result, joined) = q
+            .close_or_abort(
+                tokio::time::Instant::now() + Duration::from_millis(30),
+                Duration::from_secs(1),
+            )
+            .await;
+        assert!(joined, "aborted worker must join");
+        assert!(
+            matches!(result, Err(SinkError::Other(s)) if s.contains("did not drain in time; aborted"))
+        );
+    }
 }

@@ -5,7 +5,7 @@
 //! ([`keys`]) with the scope [`routes::ROUTES`] names, except `/livez` with
 //! `--api-public-livez`. Requests are rate-limited per client IP and per
 //! key ([`rate_limit`]). Mutations go through
-//! [`TenantService`](crate::ops::tenant_service::TenantService) and the
+//! [`TenantService`] and the
 //! audit log. A non-loopback bind needs TLS unless `--api-allow-plaintext`
 //! says a proxy in front terminates it.
 
@@ -238,9 +238,15 @@ pub struct RequestCtx {
     pub ip: IpAddr,
     pub principal: Option<Principal>,
     pub route: Option<&'static Route>,
+    audit_handled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RequestCtx {
+    fn audit_handled(&self) {
+        self.audit_handled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn actor(&self) -> crate::ops::audit::Actor {
         crate::ops::audit::Actor::api_key(
             self.principal.as_ref().map_or("", |p| p.key_id.as_str()),
@@ -251,6 +257,7 @@ impl RequestCtx {
 
 /// The error body every route returns
 pub fn error_response(status: StatusCode, code: &str, message: &str, request_id: &str) -> Response {
+    let message = crate::ops::redact::redact_text(message);
     (
         status,
         axum::Json(json!({"error": {"code": code, "message": message, "request_id": request_id}})),
@@ -305,12 +312,59 @@ async fn guard(State(state): State<ApiState>, mut req: Request, next: Next) -> R
         .and_then(|p| routes::find(req.method().as_str(), p.as_str()));
     let label = route.map_or("unmatched", |r| r.path);
     let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
     let resp = authorize(&state, &mut req, ip, route, &request_id).await;
     let mut resp = match resp {
         Ok(()) => match state.in_flight.clone().try_acquire_owned() {
             Ok(permit) => {
-                let resp = next.run(req).await;
+                let ctx = req
+                    .extensions()
+                    .get::<RequestCtx>()
+                    .expect("authorized request context")
+                    .clone();
+                let route = ctx.route.expect("authorized route");
+                let mut resp = next.run(req).await;
                 drop(permit);
+                if resp.status().is_client_error()
+                    && !resp
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .is_some_and(|v| v.as_bytes().starts_with(b"application/json"))
+                {
+                    resp = error_response(
+                        resp.status(),
+                        "invalid_request",
+                        "check the route's JSON body and query parameters; send JSON with Content-Type: application/json",
+                        &request_id,
+                    );
+                }
+                if route.class == Class::Mutate
+                    && !ctx.audit_handled.load(std::sync::atomic::Ordering::Relaxed)
+                    && resp.status().is_client_error()
+                    && let Some(log) = state.ctx.reloader.audit()
+                {
+                    let draft = crate::ops::audit::Draft {
+                        request_id: request_id.clone(),
+                        phase: "result".into(),
+                        actor: ctx.actor(),
+                        action: route.action.unwrap_or("unknown").into(),
+                        method: Some(method.clone()),
+                        path: Some(path.clone()),
+                        // `/v1/tenants/{id}…` and `/v1/tenants-deleted/{id}…`
+                        // name a tenant; `/v1/stream/pause` does not
+                        tenant: path
+                            .strip_prefix("/v1/tenants/")
+                            .or_else(|| path.strip_prefix("/v1/tenants-deleted/"))
+                            .and_then(|rest| rest.split('/').next())
+                            .map(str::to_owned),
+                        outcome: "rejected".into(),
+                        error: Some(format!("HTTP {}", resp.status())),
+                        ..Default::default()
+                    };
+                    if let Err(e) = log.append(draft).await {
+                        tracing::error!(target: "walshadow::audit", error = %e, "could not audit a rejected API mutation");
+                    }
+                }
                 resp
             }
             Err(_) => error_response(
@@ -350,6 +404,7 @@ async fn authorize(
         ip,
         principal: None,
         route,
+        audit_handled: Arc::default(),
     };
     if route.is_some_and(|r| r.class == Class::Public) && state.cfg.public_livez {
         req.extensions_mut().insert(ctx);
@@ -439,8 +494,8 @@ pub fn router(state: ApiState) -> Router {
     }
     router
         .fallback(|| async { StatusCode::NOT_FOUND })
-        .layer(axum::middleware::from_fn_with_state(state.clone(), guard))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(1 << 20))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), guard))
         .layer(tower_http::catch_panic::CatchPanicLayer::new())
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,

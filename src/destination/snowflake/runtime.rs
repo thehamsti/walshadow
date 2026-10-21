@@ -1539,6 +1539,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_enqueue_and_maintenance_keep_unapplied_batches() {
+        let (_dir, runtime, batch, _plan, _requests) = fixture(Vec::new()).await;
+        let runtime = Arc::new(runtime);
+        runtime.enqueue_durable(&batch).await.unwrap();
+        runtime.enqueue_durable(&batch).await.unwrap();
+        assert_eq!(runtime.state.pending().unwrap().len(), 1);
+        assert_eq!(
+            runtime.state.phase(&batch.id).unwrap(),
+            Some(super::super::state::BatchPhase::Queued)
+        );
+        runtime.maintain(100).await.unwrap();
+        assert_eq!(
+            runtime.state.pending().unwrap().len(),
+            1,
+            "maintenance retains the only durable copy"
+        );
+        assert_eq!(runtime.writers().live_count(), 0);
+        assert!(
+            runtime
+                .writers()
+                .abort_and_join(Duration::from_secs(1))
+                .await
+        );
+    }
+
+    #[tokio::test]
     async fn incomplete_ingestion_never_submits_merge_or_retires_payload() {
         let (_dir, runtime, batch, plan, requests) =
             fixture(vec![(200, sql_result(json!([])))]).await;

@@ -2,7 +2,7 @@
 //!
 //! The control socket, SIGHUP, the SQL registry poller, resolver wiring and
 //! the HTTP API all reload through [`Reloader`]. Each reload holds the
-//! reload lock ([`RELOAD`](crate::ops::lock_rank::RELOAD)), reads the merged
+//! reload lock ([`RELOAD`]), reads the merged
 //! config once, applies it to every resolver and only then publishes an
 //! immutable [`ConfigRevision`]. The session reconciles exactly the
 //! revisions published, never re-reading the files, so a candidate a caller

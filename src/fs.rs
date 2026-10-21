@@ -211,4 +211,16 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
+    #[tokio::test]
+    async fn private_writes_replace_stale_temps_and_refuse_directory_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("key.tmp"), b"stale").unwrap();
+        write_private_blocking(dir.path(), "key", b"fresh").unwrap();
+        assert_eq!(std::fs::read(dir.path().join("key")).unwrap(), b"fresh");
+        std::fs::create_dir(dir.path().join("blocked.tmp")).unwrap();
+        assert!(write_private_blocking(dir.path(), "blocked", b"no").is_err());
+        assert!(write_private(dir.path(), "blocked", b"no").await.is_err());
+        assert!(!dir.path().join("blocked").exists());
+        assert_eq!(std::fs::read(dir.path().join("key")).unwrap(), b"fresh");
+    }
 }

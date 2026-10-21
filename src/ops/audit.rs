@@ -265,7 +265,8 @@ impl AuditLog {
             .context("audit write task")?
     }
 
-    fn append_blocking(&self, draft: Draft) -> Result<Record> {
+    fn append_blocking(&self, mut draft: Draft) -> Result<Record> {
+        draft.error = draft.error.map(|e| crate::ops::redact::redact_text(&e));
         let mut tail = self.tail.lock().unwrap_or_else(PoisonError::into_inner);
         let mut record = Record {
             v: VERSION,
@@ -505,5 +506,23 @@ mod tests {
         let res = log.append(draft("r1", "attempt", "")).await;
         std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(res.is_err());
+    }
+    #[tokio::test]
+    async fn reopening_an_empty_active_file_continues_the_rotated_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::open(dir.path(), 1 << 20, 3).unwrap();
+        let mut entry = draft("r1", "result", "failed");
+        entry.error = Some("connect postgres://u:secret@host/db password=hidden".into());
+        let last = log.append(entry).await.unwrap();
+        assert!(!last.draft.error.as_ref().unwrap().contains("secret"));
+        assert!(!last.draft.error.as_ref().unwrap().contains("hidden"));
+        let audit = dir.path().join("audit");
+        std::fs::rename(audit.join(FILE), audit.join(format!("{FILE}.1"))).unwrap();
+        drop(log);
+        let log = AuditLog::open(dir.path(), 1 << 20, 3).unwrap();
+        let next = log.append(draft("r2", "result", "applied")).await.unwrap();
+        assert_eq!(next.seq, last.seq + 1);
+        assert_eq!(next.prev_hash, last.hash);
+        assert!(log.read(&Filter::default()).unwrap().chain_ok);
     }
 }

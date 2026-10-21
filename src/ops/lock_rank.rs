@@ -11,9 +11,11 @@
 //! | [`MUTATION`] | one control-plane mutation at a time (API and socket) |
 //! | [`RELOAD`] | `Reloader`: config writes, resolver application, publication |
 //! | [`RESOLVER`] | a `ConfigResolver`'s merge inputs |
+//! | R31 | Snowflake HTTP settings and credential caches: std leaf locks |
 //! | [`MAPPING_WRITE`] | the routing map's write side |
 //!
-//! Locks below these are leaves: std locks never held across `.await` that
+//! R31 locks never span `.await` or acquire another ranked lock. Other
+//! locks below these are leaves: std locks never held across `.await` that
 //! acquire nothing (Snowflake HTTP settings, a resolver's activation layer,
 //! the audit writer, rate-limit buckets).
 

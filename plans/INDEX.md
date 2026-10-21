@@ -45,7 +45,7 @@ writes. A documented limitation does not imply code rejects it
 | [Dependencies](dependencies.md) | Replace generic protocol code when an adapter preserves behavior |
 | [Tier 2 containers](tier2.md) | Remove shadow round trips for array, map, and vector columns |
 | [Optional capabilities](extensions.md) | Meet a concrete routing, export, vector, or durability requirement |
-| [Authenticated HTTP API](T-1021-01.md) | Give external tools authenticated access to health, metrics, crash reports, jobs, and tenant create, edit, detach, delete; waits on requester decisions in its §18 |
+| [Authenticated HTTP API](T-1021-01.md) | Give external tools authenticated access to health, metrics, crash reports, jobs, and tenant create, edit, detach, delete; implemented and in review |
 
 Remove completed proposals instead of keeping a second implementation reference
 Keep unresolved acceptance tests even when their proposed implementation has

@@ -146,6 +146,7 @@ impl SnowflakeHttp {
     /// Swap role, warehouse and credential settings. The endpoint, database
     /// and schema stay: durable request ids and receipts are scoped to them.
     /// Cached credentials are dropped so the next request uses the new ones
+    /// R31 leaf locks: no await or acquisition of a resolver or mapping lock
     pub fn update_config(&self, next: HttpConfig) -> Result<()> {
         let current = self.cfg();
         ensure!(

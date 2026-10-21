@@ -234,8 +234,8 @@ async fn unset(
     Ok(ok_note(&unfollowed))
 }
 
-/// HTTP method and path of a mutation, when it came over HTTP
-pub type Origin = Option<(String, String)>;
+/// Request id, HTTP method and path of a mutation, when it came over HTTP
+pub type Origin = Option<(String, String, String)>;
 
 /// Edit the control fragment and publish, under the mutation lock and then
 /// the reload lock, audited like a tenant mutation: rejected before it ran,
@@ -248,7 +248,10 @@ pub async fn apply_fragment(
     edit: impl FnOnce(&mut Table),
 ) -> std::result::Result<Vec<String>, crate::ops::tenant_service::ServiceError> {
     use crate::ops::tenant_service::ServiceError;
-    let request_id = uuid::Uuid::new_v4().simple().to_string();
+    let request_id = origin
+        .as_ref()
+        .map(|o| o.0.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
     let _mutation = ctx.mutation_lock.lock().await;
     let mut tx = ctx.reloader.begin().await;
     let before = load(&ctx.fragment)
@@ -262,8 +265,8 @@ pub async fn apply_fragment(
         phase: phase.into(),
         actor: actor.clone(),
         action: action.into(),
-        method: origin.as_ref().map(|o| o.0.clone()),
-        path: origin.as_ref().map(|o| o.1.clone()),
+        method: origin.as_ref().map(|o| o.1.clone()),
+        path: origin.as_ref().map(|o| o.2.clone()),
         before: b.clone(),
         after: a.clone(),
         ..Default::default()

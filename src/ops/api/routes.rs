@@ -115,3 +115,37 @@ pub const ROUTES: &[Route] = &[
 pub fn find(method: &str, path: &str) -> Option<&'static Route> {
     ROUTES.iter().find(|r| r.method == method && r.path == path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructors_match_the_scope_and_audit_contract() {
+        for route in ROUTES {
+            let expected = match route.class {
+                Class::Mutate => mutate(
+                    route.method,
+                    route.path,
+                    route.action.expect("audit action"),
+                ),
+                Class::Read if route.scope == Scope::Admin => admin_read(route.path),
+                Class::Read => read(route.method, route.path),
+                Class::Public => {
+                    assert_eq!(
+                        (route.method, route.path, route.scope),
+                        ("GET", "/livez", Scope::Read)
+                    );
+                    assert!(route.action.is_none());
+                    continue;
+                }
+                Class::Expensive => {
+                    assert_eq!(route.scope, Scope::Read);
+                    assert!(route.action.is_none());
+                    continue;
+                }
+            };
+            assert_eq!(*route, expected);
+        }
+    }
+}

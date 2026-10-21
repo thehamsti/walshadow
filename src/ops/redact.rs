@@ -40,7 +40,7 @@ pub fn redact_json(mut value: Value) -> Value {
         match v {
             Value::Object(map) => {
                 for (k, v) in map.iter_mut() {
-                    if is_secret_key(k) && !v.is_object() {
+                    if is_secret_key(k) {
                         *v = Value::String(MASK.into());
                     } else {
                         walk(v);
@@ -62,10 +62,15 @@ pub fn redact_pair(before: Option<&toml::Table>, after: Option<&toml::Table>) ->
     let b = before.map(|t| toml_to_json(&toml::Value::Table(t.clone())));
     let a = after.map(|t| toml_to_json(&toml::Value::Table(t.clone())));
     fn walk(after: &mut Value, before: Option<&Value>) {
+        if let Value::Array(items) = after {
+            for (i, item) in items.iter_mut().enumerate() {
+                walk(item, before.and_then(|b| b.get(i)));
+            }
+        }
         if let Value::Object(map) = after {
             for (k, v) in map.iter_mut() {
                 let prior = before.and_then(|b| b.get(k));
-                if is_secret_key(k) && !v.is_object() {
+                if is_secret_key(k) {
                     let same = prior == Some(&*v);
                     *v = Value::String(if same { MASK } else { CHANGED }.into());
                 } else {
@@ -261,6 +266,36 @@ access_key = "ak"
         let (b, a) = redact_pair(None, Some(&before));
         assert!(b.is_null());
         assert_eq!(a["ch"]["password"], CHANGED);
+    }
+
+    #[test]
+    fn audit_pairs_redact_secrets_inside_arrays() {
+        let before: toml::Table = "items = [{password = 'old', token = 'same'}]"
+            .parse()
+            .unwrap();
+        let after: toml::Table =
+            "items = [{password = 'new', token = 'same'}, {password = 'added'}]"
+                .parse()
+                .unwrap();
+        let (b, a) = redact_pair(Some(&before), Some(&after));
+        let nested: toml::Table = "credentials = {value = 'hidden'}".parse().unwrap();
+        assert_eq!(redact_pair(None, Some(&nested)).1["credentials"], CHANGED);
+        assert_eq!(redact_toml(&nested)["credentials"], MASK);
+
+        assert_eq!(b["items"][0]["password"], MASK);
+        assert_eq!(a["items"][0]["password"], CHANGED);
+        assert_eq!(a["items"][0]["token"], MASK);
+        assert_eq!(a["items"][1]["password"], CHANGED);
+        assert_eq!(
+            redact_json(serde_json::json!([{"password": "pw"}])),
+            serde_json::json!([{"password": MASK}])
+        );
+        let date: toml::Value = toml::from_str("at = 2026-10-21T12:00:00Z").unwrap();
+        assert_eq!(toml_to_json(&date)["at"], "2026-10-21T12:00:00Z");
+        assert_eq!(
+            redact_text("https://user@host/a https://host/b"),
+            "https://user@host/a https://host/b"
+        );
     }
 
     #[test]

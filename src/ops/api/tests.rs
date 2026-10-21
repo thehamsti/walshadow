@@ -498,6 +498,16 @@ async fn every_mutation_is_audited() {
     ] {
         let (s, _, body) = api.call("POST", path, Some(&api.admin), &[], None).await;
         assert_eq!(s, StatusCode::ACCEPTED, "{path}: {body}");
+        let records = api.audit();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r.draft.request_id == body["request_id"].as_str().unwrap())
+                .count(),
+            2,
+            "HTTP request id correlates attempt and result"
+        );
+
         assert!(
             api.audit()
                 .iter()
@@ -1090,4 +1100,785 @@ fn self_signed(dir: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf, st
         dir.join("leaf.pem"),
         dir.join("leaf.key"),
     ))
+}
+
+#[tokio::test]
+async fn invalid_mutation_bodies_are_rejected_once_and_audited() {
+    let api = Api::new(false, generous()).await;
+    let etag = api.etag("a").await;
+    let before = api.frag("a");
+    for (method, path, body, code) in [
+        ("PUT", "/v1/tenants/a", json!([]), "invalid_body"),
+        (
+            "PUT",
+            "/v1/tenants/a",
+            json!({"id": "b", "dbname": "a_db"}),
+            "invalid_id",
+        ),
+        (
+            "PUT",
+            "/v1/tenants/a",
+            json!({"dbname": "a_db", "ch": null}),
+            "invalid_body",
+        ),
+        (
+            "PUT",
+            "/v1/tenants/a",
+            json!({"dbname": 42}),
+            "invalid_tenant",
+        ),
+        ("PATCH", "/v1/tenants/a", json!(false), "invalid_body"),
+        (
+            "PATCH",
+            "/v1/tenants/a",
+            json!({"ch": {"items": [null]}}),
+            "invalid_body",
+        ),
+        (
+            "PATCH",
+            "/v1/tenants/a",
+            json!({"dbname": null}),
+            "invalid_tenant",
+        ),
+        ("POST", "/v1/tenants", json!({}), "invalid_body"),
+        ("POST", "/v1/tenants", json!({"id": "../bad"}), "invalid_id"),
+    ] {
+        let (s, h, out) = api
+            .call(
+                method,
+                path,
+                Some(&api.admin),
+                &[("if-match", &etag)],
+                Some(body),
+            )
+            .await;
+        assert_eq!(
+            (s, out["error"]["code"].clone()),
+            (StatusCode::BAD_REQUEST, json!(code)),
+            "{method} {path}: {out}"
+        );
+        let records: Vec<_> = api
+            .audit()
+            .into_iter()
+            .filter(|r| r.draft.request_id == h["x-request-id"].to_str().unwrap())
+            .collect();
+        assert_eq!(records.len(), 1, "{method} {path}");
+        assert_eq!(
+            (
+                records[0].draft.phase.as_str(),
+                records[0].draft.outcome.as_str()
+            ),
+            ("result", "rejected")
+        );
+        assert_eq!(records[0].draft.actor.id.as_deref(), Some("ops"));
+        assert_eq!(api.frag("a"), before);
+    }
+    let (s, h, _) = api
+        .call(
+            "PATCH",
+            "/v1/tenants/a",
+            Some(&api.admin),
+            &[],
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::PRECONDITION_REQUIRED);
+    assert_eq!(
+        api.audit()
+            .iter()
+            .filter(|r| r.draft.request_id == h["x-request-id"].to_str().unwrap())
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn pending_rebind_is_refused_by_api_and_socket_after_detach() {
+    let api = Api::new(false, generous()).await;
+    api.attach_on_disk("a").await;
+    let etag = api.etag("a").await;
+    let (s, _, out) = api
+        .call(
+            "PATCH",
+            "/v1/tenants/a?acknowledge_resync=true",
+            Some(&api.admin),
+            &[("if-match", &etag)],
+            Some(json!({"ch": {"database": "b"}})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{out}");
+    let dir = tenant_dir(&api.dir.path().join("spill"), "a");
+    let fence = crate::tenants::RebindFence::load(&dir)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = api.frag("a");
+    for phase in [Phase::Active, Phase::Detached] {
+        let mut state = TenantState::load(&dir).await.unwrap().unwrap();
+        state.phase = phase;
+        state.store(&dir).await.unwrap();
+        let etag = api.etag("a").await;
+        let (s, _, out) = api
+            .call(
+                "PATCH",
+                "/v1/tenants/a?acknowledge_resync=true",
+                Some(&api.admin),
+                &[("if-match", &etag)],
+                Some(json!({"ch": {"database": "c"}})),
+            )
+            .await;
+        assert_eq!(
+            (s, out["error"]["code"].clone()),
+            (StatusCode::CONFLICT, json!("rebind_pending"))
+        );
+        let (s, _, out) = api
+            .call(
+                "PATCH",
+                "/v1/tenants/a",
+                Some(&api.admin),
+                &[("if-match", &etag)],
+                Some(json!({"ch": {"database": "c"}})),
+            )
+            .await;
+        assert_eq!(
+            (s, out["error"]["code"].clone()),
+            (StatusCode::CONFLICT, json!("rebind_pending"))
+        );
+        let body: toml::Table = format!(
+            "acknowledge_resync = true\n{}",
+            tenant_a().replace("database = 'a'", "database = 'c'")
+        )
+        .parse()
+        .unwrap();
+        let err = crate::ops::tenant_ctl::put(
+            &api.state.ctx,
+            &body,
+            &crate::ops::audit::Actor::unix(Some(42)),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("rebind_pending"), "{err}");
+        assert_eq!(
+            crate::tenants::RebindFence::load(&dir).await.unwrap(),
+            Some(fence.clone())
+        );
+        assert_eq!(api.frag("a"), before);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_delete_and_invalid_restore_leave_the_tenant_unchanged() {
+    let api = Api::new(false, generous()).await;
+    let etag = api.etag("a").await;
+    let (_, _, intent) = api
+        .call(
+            "POST",
+            "/v1/tenants/a/delete-intent",
+            Some(&api.admin),
+            &[],
+            None,
+        )
+        .await;
+    let token = intent["confirm_token"].as_str().unwrap();
+    tokio::time::advance(super::deleted::TOKEN_TTL + Duration::from_secs(1)).await;
+    let (s, _, out) = api
+        .call(
+            "DELETE",
+            "/v1/tenants/a",
+            Some(&api.admin),
+            &[("if-match", &etag), ("x-confirm-delete", token)],
+            None,
+        )
+        .await;
+    assert_eq!(
+        (s, out["error"]["code"].clone()),
+        (StatusCode::GONE, json!("confirmation_expired"))
+    );
+    assert!(!api.frag("a").is_empty());
+    let (s, _, out) = api
+        .call(
+            "POST",
+            "/v1/tenants-deleted/unknown/restore",
+            Some(&api.admin),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(
+        (s, out["error"]["code"].clone()),
+        (StatusCode::NOT_FOUND, json!("not_found"))
+    );
+    let root = crate::ch_emitter::load_effective(&api.state.ctx.ch_config, toml::Table::new())
+        .await
+        .unwrap();
+    let decl = crate::tenants::TenantsConfig::from_table(&root)
+        .unwrap()
+        .unwrap()
+        .get("a")
+        .unwrap()
+        .clone();
+    api.state
+        .deletes
+        .write_tombstone(&decl, "ops", "deleted", None)
+        .unwrap();
+    let (s, _, out) = api
+        .call(
+            "POST",
+            "/v1/tenants-deleted/a/restore",
+            Some(&api.admin),
+            &[],
+            Some(json!({"desired": "paused"})),
+        )
+        .await;
+    assert_eq!(
+        (s, out["error"]["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invalid_body"))
+    );
+    assert_eq!(api.state.deletes.list().len(), 1);
+    for (field, value, want) in [
+        ("stuck_teardowns", vec!["a".to_string()], "stuck"),
+        ("tearing_down", vec!["a".to_string()], "draining"),
+    ] {
+        api.state
+            .ctx
+            .metrics
+            .update(|snap| {
+                snap.stuck_teardowns.clear();
+                snap.tearing_down.clear();
+                if field == "stuck_teardowns" {
+                    snap.stuck_teardowns = value;
+                } else {
+                    snap.tearing_down = value;
+                }
+            })
+            .await;
+        let (s, _, out) = api.get("/v1/tenants-deleted/a", &api.admin).await;
+        assert_eq!((s, out["teardown"].clone()), (StatusCode::OK, json!(want)));
+    }
+}
+
+#[tokio::test]
+async fn single_layout_and_missing_audit_have_explicit_responses() {
+    let mut api = Api::new(false, generous()).await;
+    std::fs::write(&api.state.ctx.ch_config, "[source]\ndbname = 'postgres'\n").unwrap();
+    std::fs::remove_file(crate::ops::tenant_ctl::tenant_fragment_path(
+        &api.state.ctx.ch_config,
+        "a",
+    ))
+    .unwrap();
+    api.state.ctx.reloader = Arc::new(Reloader::new(
+        Some(api.state.ctx.ch_config.clone()),
+        toml::Table::new(),
+    ));
+    api.router = router(api.state.clone());
+    let (s, _, out) = api.get("/v1/tenants", &api.admin).await;
+    assert_eq!(
+        (s, out),
+        (StatusCode::OK, json!({"layout": "single", "tenants": []}))
+    );
+    let (s, _, out) = api.get("/v1/audit", &api.admin).await;
+    assert_eq!(
+        (s, out["error"]["code"].clone()),
+        (StatusCode::SERVICE_UNAVAILABLE, json!("audit_unavailable"))
+    );
+    let (s, _, out) = api.get("/v1/health/ready", &api.admin).await;
+    assert!(
+        matches!(s, StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn trusted_proxy_preauth_and_busy_limits_are_enforced() {
+    let mut api = Api::new(false, generous()).await;
+    Arc::make_mut(&mut api.state.cfg).trusted_proxies = vec![Cidr::parse("10.0.0.0/8").unwrap()];
+    let req = Request::builder()
+        .header("x-forwarded-for", "192.0.2.1, 192.0.2.2")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        client_ip(&api.state, "10.0.0.5:4".parse().unwrap(), &req),
+        "192.0.2.2".parse::<std::net::IpAddr>().unwrap()
+    );
+    assert_eq!(
+        client_ip(&api.state, "198.51.100.1:4".parse().unwrap(), &req),
+        "198.51.100.1".parse::<std::net::IpAddr>().unwrap()
+    );
+    let bad = Request::builder()
+        .header("x-forwarded-for", "bogus")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        client_ip(&api.state, "10.0.0.5:4".parse().unwrap(), &bad),
+        "10.0.0.5".parse::<std::net::IpAddr>().unwrap()
+    );
+    assert!(
+        !Cidr::parse("10.0.0.0/8")
+            .unwrap()
+            .contains("2001:db8::1".parse().unwrap())
+    );
+    api.state.in_flight = Arc::new(tokio::sync::Semaphore::new(1));
+    let held = api.state.in_flight.clone().acquire_owned().await.unwrap();
+    api.router = router(api.state.clone());
+    let (s, _, out) = api.get("/v1/status", &api.admin).await;
+    assert_eq!(
+        (s, out["error"]["code"].clone()),
+        (StatusCode::SERVICE_UNAVAILABLE, json!("busy"))
+    );
+    drop(held);
+    let (s, ..) = api.get("/v1/status", &api.admin).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, ..) = api.get("/v1/status?token=bad", &api.admin).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let mut rates = generous();
+    rates.preauth = Rate::new(0.001, 1.0);
+    let api = Api::new(false, rates).await;
+    let (s, ..) = api.get("/v1/status", &api.admin).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, h, out) = api.get("/v1/status", &api.admin).await;
+    assert_eq!(
+        (s, out["error"]["code"].clone()),
+        (StatusCode::TOO_MANY_REQUESTS, json!("rate_limited"))
+    );
+    assert!(h.contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn config_and_socket_failures_are_audited_without_unwanted_writes() {
+    use crate::config::{CliOverrides, ConfigResolver, ResolverBoot};
+    let api = Api::new(false, generous()).await;
+    let actor = crate::ops::audit::Actor::unix(Some(42));
+    let unknown: toml::Table = "id = 'unknown'".parse().unwrap();
+    let err = crate::ops::tenant_ctl::remove(&api.state.ctx, &unknown, &actor)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not_found"));
+    let bad: toml::Table = "id = 'a'\nstate = 'bad'".parse().unwrap();
+    let err = crate::ops::tenant_ctl::set_state(&api.state.ctx, &bad, &actor)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("state must be active or detached"));
+    assert!(api.audit().iter().any(|r| r.draft.action == "tenant.state"
+        && r.draft.outcome == "rejected"
+        && r.draft.actor.uid == Some(42)));
+    for invalid in [
+        toml::Table::new(),
+        "[tenant.a]\ndbname = 42".parse().unwrap(),
+    ] {
+        let before = api.audit().len();
+        assert!(
+            crate::ops::tenant_ctl::put(&api.state.ctx, &invalid, &actor)
+                .await
+                .is_err()
+        );
+        assert_eq!(api.audit().len(), before + 1);
+    }
+    let before = api.audit().len();
+    assert!(
+        crate::ops::tenant_ctl::remove(&api.state.ctx, &toml::Table::new(), &actor)
+            .await
+            .is_err()
+    );
+    assert_eq!(api.audit().len(), before + 1);
+
+    let active: toml::Table = "id = 'a'\nstate = 'active'".parse().unwrap();
+    assert_eq!(
+        crate::ops::tenant_ctl::set_state(&api.state.ctx, &active, &actor)
+            .await
+            .unwrap(),
+        "OK\n"
+    );
+    let before = api.frag("a");
+    let err =
+        crate::control::apply_fragment(&api.state.ctx, &actor, "config.apply", None, |root| {
+            root.insert("database".into(), toml::Value::Table(toml::Table::new()));
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "invalid_config");
+    assert!(!api.state.ctx.fragment.exists());
+    let merged = crate::ch_emitter::load_effective(&api.state.ctx.ch_config, toml::Table::new())
+        .await
+        .unwrap();
+    let decl = crate::tenants::TenantsConfig::from_table(&merged)
+        .unwrap()
+        .unwrap()
+        .get("a")
+        .unwrap()
+        .clone();
+    let base =
+        crate::ch_emitter::EmitterConfig::from_table(&decl.effective_table(&merged)).unwrap();
+    let (resolver, _) = ConfigResolver::new(
+        &base,
+        CliOverrides::default(),
+        Some(api.state.ctx.ch_config.clone()),
+        toml::Table::new(),
+        crate::mapping::mapping_handle(Default::default()),
+        ResolverBoot::default(),
+    );
+    resolver.bind_tenant("a");
+    resolver.refuse_reloads(Some(Arc::new(|| {})));
+    api.state
+        .ctx
+        .reloader
+        .set_tenant_resolver("a", Some(resolver))
+        .await;
+    let (s, _, out) = api
+        .call("POST", "/v1/reload", Some(&api.admin), &[], None)
+        .await;
+    assert_eq!(
+        (s, out["error"]["code"].clone()),
+        (StatusCode::UNPROCESSABLE_ENTITY, json!("apply_refused"))
+    );
+    let err = api.state.ctx.reloader.reload().await.unwrap_err();
+    assert!(err.to_string().contains("reload tenant a"));
+    assert_eq!(api.frag("a"), before);
+    assert!(
+        api.audit()
+            .iter()
+            .any(|r| r.draft.action == "config.reload" && r.draft.outcome == "failed")
+    );
+    use std::os::unix::fs::PermissionsExt;
+    let audit = api.dir.path().join("api/audit");
+    std::fs::remove_file(audit.join("audit.jsonl")).unwrap();
+    std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (s, _, out) = api
+        .call("POST", "/v1/stream/pause", Some(&api.admin), &[], None)
+        .await;
+    std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        (s, out["error"]["code"].clone()),
+        (StatusCode::SERVICE_UNAVAILABLE, json!("audit_unavailable"))
+    );
+    assert!(
+        !api.state.ctx.fragment.exists(),
+        "audit refusal precedes persist"
+    );
+}
+
+#[tokio::test]
+async fn snowflake_views_show_retained_outbox_and_teardown_jobs() {
+    let api = Api::new(false, generous()).await;
+    let body = format!(
+        r#"[tenant.a]
+dbname = 'a_db'
+[tenant.a.destination]
+kind = 'snowflake'
+[tenant.a.snowflake]
+account_url = 'https://acme-test.snowflakecomputing.com'
+user = 'REPLICATOR'
+role = 'REPLICATION'
+warehouse = 'INGEST'
+database = 'DB'
+ack_after = 'outbox'
+[tenant.a.snowflake.auth]
+method = 'oauth'
+token_file = '/run/secrets/token'
+[tenant.a.snowflake.state]
+directory = '{}'
+max_bytes = 10737418240
+[tenant.a.snowflake.stage]
+bucket = 'replication'
+prefix = 'a/'
+region = 'us-east-1'
+name = 'DB.INTERNAL.LOAD_STAGE'
+"#,
+        api.dir.path().join("sf").display()
+    );
+    std::fs::write(
+        crate::ops::tenant_ctl::tenant_fragment_path(&api.state.ctx.ch_config, "a"),
+        body,
+    )
+    .unwrap();
+    api.state
+        .ctx
+        .metrics
+        .update(|snap| {
+            snap.stuck_teardowns = vec!["b".into()];
+            snap.session_state = "starting";
+            snap.uptime_seconds = 3600;
+        })
+        .await;
+    let (s, _, out) = api.get("/v1/tenants/a", &api.admin).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert_eq!(out["destination"]["kind"], "snowflake");
+    assert_eq!(out["destination"]["database"], "DB");
+    let (s, _, out) = api.get("/v1/jobs", &api.admin).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        out["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["kind"] == "teardown" && j["state"] == "stuck")
+    );
+    let (s, _, out) = api
+        .call(
+            "POST",
+            "/v1/tenants/a/delete-intent",
+            Some(&api.admin),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert_eq!(out["impact"]["warnings"].as_array().unwrap().len(), 1);
+    let (s, _, _) = api.get("/v1/health/ready", &api.admin).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(api.state.service.ctx().ch_config, api.state.ctx.ch_config);
+}
+
+#[tokio::test]
+async fn raw_request_rejections_use_the_error_envelope_and_authenticate_first() {
+    let api = Api::new(false, generous()).await;
+    let oversized = "x".repeat((1 << 20) + 1);
+    for (method, path, raw, content_type, authenticated, expected) in [
+        (
+            "POST",
+            "/v1/tenants",
+            "{",
+            Some("application/json"),
+            true,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "POST",
+            "/v1/tenants/a/detach",
+            "{",
+            Some("application/json"),
+            true,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "PUT",
+            "/v1/tenants/a",
+            "{}",
+            None,
+            true,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (
+            "PATCH",
+            "/v1/tenants/a?dry_run=bogus",
+            "{}",
+            Some("application/json"),
+            true,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "POST",
+            "/v1/tenants",
+            oversized.as_str(),
+            Some("application/json"),
+            true,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            "POST",
+            "/v1/tenants",
+            oversized.as_str(),
+            Some("application/json"),
+            false,
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let mut req = Request::builder().method(method).uri(path);
+        if authenticated {
+            req = req.header("authorization", format!("Bearer {}", api.admin));
+        }
+        if let Some(content_type) = content_type {
+            req = req.header("content-type", content_type);
+        }
+        let res = api
+            .router
+            .clone()
+            .oneshot(req.body(Body::from(raw.to_string())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), expected, "{method} {path}");
+        let request_id = res.headers()["x-request-id"].to_str().unwrap().to_string();
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(out["error"]["request_id"], request_id);
+        assert_eq!(
+            out["error"]["code"],
+            if authenticated {
+                "invalid_request"
+            } else {
+                "unauthenticated"
+            }
+        );
+        let records: Vec<_> = api
+            .audit()
+            .into_iter()
+            .filter(|r| r.draft.request_id == request_id)
+            .collect();
+        assert_eq!(records.len(), usize::from(authenticated));
+        if authenticated {
+            assert_eq!(records[0].draft.outcome, "rejected");
+        }
+    }
+    assert_eq!(api.frag("a"), tenant_a());
+}
+
+#[tokio::test]
+async fn rejected_dry_runs_never_append_audit_records() {
+    let api = Api::new(false, generous()).await;
+    let etag = api.etag("a").await;
+    for (method, path, body, expected) in [
+        (
+            "POST",
+            "/v1/tenants?dry_run=true",
+            json!({}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "PUT",
+            "/v1/tenants/a?dry_run=true",
+            json!([]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "PATCH",
+            "/v1/tenants/a?dry_run=true",
+            json!(false),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "PATCH",
+            "/v1/tenants/a?dry_run=true",
+            json!({"ch": {"made_up": 1}}),
+            StatusCode::CONFLICT,
+        ),
+        (
+            "POST",
+            "/v1/tenants-deleted/unknown/restore?dry_run=true",
+            json!({}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "POST",
+            "/v1/tenants/unknown/attach?dry_run=true",
+            json!({}),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (s, _, out) = api
+            .call(
+                method,
+                path,
+                Some(&api.admin),
+                &[("if-match", &etag)],
+                Some(body),
+            )
+            .await;
+        assert_eq!(s, expected, "{out}");
+        assert!(api.audit().is_empty());
+        assert_eq!(api.frag("a"), tenant_a());
+    }
+}
+
+#[tokio::test]
+async fn rollback_conflict_and_storage_failure_audit_their_actual_outcomes() {
+    use crate::config::{CliOverrides, ConfigResolver, ResolverBoot};
+    use std::os::unix::fs::PermissionsExt;
+    let api = Api::new(false, generous()).await;
+    api.attach_on_disk("a").await;
+    let root = crate::ch_emitter::load_effective(&api.state.ctx.ch_config, toml::Table::new())
+        .await
+        .unwrap();
+    let decl = crate::tenants::TenantsConfig::from_table(&root)
+        .unwrap()
+        .unwrap()
+        .get("a")
+        .unwrap()
+        .clone();
+    let base = crate::ch_emitter::EmitterConfig::from_table(&decl.effective_table(&root)).unwrap();
+    let (resolver, _) = ConfigResolver::new(
+        &base,
+        CliOverrides::default(),
+        Some(api.state.ctx.ch_config.clone()),
+        toml::Table::new(),
+        crate::mapping::mapping_handle(Default::default()),
+        ResolverBoot::default(),
+    );
+    resolver.bind_tenant("a");
+    api.state
+        .ctx
+        .reloader
+        .set_tenant_resolver("a", Some(resolver.clone()))
+        .await;
+    let path = crate::ops::tenant_ctl::tenant_fragment_path(&api.state.ctx.ch_config, "a");
+    let original = api.frag("a");
+    resolver.refuse_reloads(Some(Arc::new(|| {})));
+    for (want, outcome) in [
+        (StatusCode::UNPROCESSABLE_ENTITY, "rolled_back"),
+        (StatusCode::CONFLICT, "conflict"),
+    ] {
+        if want == StatusCode::CONFLICT {
+            let path = path.clone();
+            let hand = original.replace("dbname = 'a_db'", "dbname = 'a_db'\nmax_lag_bytes = 7");
+            resolver.refuse_reloads(Some(Arc::new(move || {
+                std::fs::write(&path, &hand).unwrap();
+            })));
+        }
+        let etag = api.etag("a").await;
+        let (s, h, out) = api
+            .call(
+                "PATCH",
+                "/v1/tenants/a",
+                Some(&api.admin),
+                &[("if-match", &etag)],
+                Some(json!({"max_lag_bytes": 99})),
+            )
+            .await;
+        assert_eq!(s, want, "{out}");
+        let records: Vec<_> = api
+            .audit()
+            .into_iter()
+            .filter(|r| r.draft.request_id == h["x-request-id"].to_str().unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].draft.outcome, outcome);
+    }
+    assert!(api.frag("a").contains("max_lag_bytes = 7"));
+    resolver.refuse_reloads(None);
+    std::fs::write(&path, &original).unwrap();
+    let etag = api.etag("a").await;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let (s, h, out) = api
+        .call(
+            "PATCH",
+            "/v1/tenants/a",
+            Some(&api.admin),
+            &[("if-match", &etag)],
+            Some(json!({"max_lag_bytes": 99})),
+        )
+        .await;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        (s, out["error"]["code"].clone()),
+        (StatusCode::INTERNAL_SERVER_ERROR, json!("internal"))
+    );
+    assert_eq!(api.frag("a"), original);
+    let records: Vec<_> = api
+        .audit()
+        .into_iter()
+        .filter(|r| r.draft.request_id == h["x-request-id"].to_str().unwrap())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].draft.outcome, "failed");
+    std::fs::write(
+        &api.state.ctx.ch_config,
+        "[source]\npassword = 'hidden'\ninvalid = [",
+    )
+    .unwrap();
+    let (s, _, out) = api.get("/v1/tenants", &api.admin).await;
+    assert_eq!(
+        (s, out["error"]["code"].clone()),
+        (StatusCode::INTERNAL_SERVER_ERROR, json!("internal"))
+    );
+    assert!(!out.to_string().contains("hidden"));
 }

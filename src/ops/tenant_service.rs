@@ -38,7 +38,7 @@ impl ServiceError {
         Self {
             status,
             code,
-            message: message.into(),
+            message: crate::ops::redact::redact_text(&message.into()),
         }
     }
 
@@ -198,7 +198,7 @@ impl TenantService {
     {
         let mut audit = AuditState::default();
         let res = self.mutate_inner(id, m, edit, &mut audit).await;
-        if m.dry_run && res.is_ok() {
+        if m.dry_run {
             tracing::info!(
                 target: "walshadow::api",
                 request_id = %m.request_id,
@@ -334,29 +334,11 @@ impl TenantService {
             _ => false,
         };
         let legacy_ok = m.legacy_ack && (matches!(change, Change::FreshAttach) || identity);
-        if change.resyncs() && !m.acknowledge_resync && !legacy_ok {
-            return Err(ServiceError::new(
-                409,
-                "resync_not_acknowledged",
-                format!(
-                    "this change attaches tenant {id} afresh with fresh initial loads ({}); \
-                     resend with acknowledge_resync",
-                    rebind_reasons(&change)
-                ),
-            ));
-        }
         let dir = self.ctx.spill_dir.as_deref().map(|s| tenant_dir(s, id));
-        let attached = match &dir {
-            Some(dir) => TenantState::load(dir)
-                .await
-                .map_err(ServiceError::internal)?
-                .is_some_and(|s| s.phase != Phase::Detached),
-            None => false,
-        };
-        let fence_rebind = matches!(change, Change::Rebind { .. }) && attached;
-        if fence_rebind && let Some(dir) = &dir {
-            // R3-M1: one re-bind in flight per tenant, so a second never
-            // replaces the fence that protects the first
+        if matches!(change, Change::Rebind { .. })
+            && let Some(dir) = &dir
+        {
+            // R3-M1: the fence outlives detach until fresh attach clears the directory
             if let Some(pending) = RebindFence::load(dir)
                 .await
                 .map_err(ServiceError::internal)?
@@ -371,6 +353,25 @@ impl TenantService {
                 ));
             }
         }
+        if change.resyncs() && !m.acknowledge_resync && !legacy_ok {
+            return Err(ServiceError::new(
+                409,
+                "resync_not_acknowledged",
+                format!(
+                    "this change attaches tenant {id} afresh with fresh initial loads ({}); \
+                     resend with acknowledge_resync",
+                    rebind_reasons(&change)
+                ),
+            ));
+        }
+        let attached = match &dir {
+            Some(dir) => TenantState::load(dir)
+                .await
+                .map_err(ServiceError::internal)?
+                .is_some_and(|s| s.phase != Phase::Detached),
+            None => false,
+        };
+        let fence_rebind = matches!(change, Change::Rebind { .. }) && attached;
         if let Change::Rebind {
             fresh_state_dir: Some(state_dir),
             ..
@@ -762,8 +763,15 @@ impl TenantService {
                     r.get::<_, String>(2),
                 )
             });
+        let conflict = || {
+            if from.is_none() && to.is_some() {
+                ServiceError::new(409, "exists", format!("tenant {id} already exists"))
+            } else {
+                changed_since()
+            }
+        };
         if current.as_ref() != from {
-            return Err(changed_since());
+            return Err(conflict());
         }
         let touched = match (from, to) {
             (_, None) => txn
@@ -790,7 +798,7 @@ impl TenantService {
         }
         .map_err(|e| ServiceError::new(422, "invalid_config", format!("registry write: {e}")))?;
         if touched != 1 && !(from.is_none() && to.is_none()) {
-            return Err(changed_since());
+            return Err(conflict());
         }
         txn.commit().await.map_err(ServiceError::internal)?;
         Ok(())
@@ -1365,5 +1373,226 @@ name = "{database}.INTERNAL.LOAD_STAGE"
             .unwrap_err()
             .to_string();
         assert!(err.contains("only `paused` stays cluster-wide"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn sql_registry_cas_and_rollback_preserve_external_edits() {
+        use crate::shadow::{Shadow, ShadowConfig};
+        // Needs a local PostgreSQL, like the e2e suites: skipped without
+        // one unless CI demands every tool
+        let initdb = std::process::Command::new("initdb")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !initdb {
+            assert!(
+                std::env::var_os("WALSHADOW_REQUIRE_TOOLS").is_none(),
+                "WALSHADOW_REQUIRE_TOOLS is set but initdb is not on PATH"
+            );
+            return;
+        }
+        struct LocalPg(Shadow);
+        impl Drop for LocalPg {
+            fn drop(&mut self) {
+                let _ = self.0.stop();
+            }
+        }
+        let f = Fixture::new(&[]).await;
+        let pgdir = f.dir.path().join("pg");
+        let socket = f.dir.path().join("sock");
+        std::fs::create_dir_all(&socket).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut cfg = ShadowConfig::new(pgdir, f.dir.path().join("filtered"));
+        cfg.socket_dir = socket.clone();
+        cfg.port = port;
+        let source = LocalPg(Shadow::new(cfg));
+        source.0.initdb().unwrap();
+        source.0.write_base_conf().unwrap();
+        source.0.start().unwrap();
+        std::fs::write(&f.svc.ctx.ch_config, format!(
+            "[source]\nhost = '{}'\nport = {port}\nuser = 'postgres'\ndbname = 'postgres'\nsslmode = 'disable'\n[tenants]\nregistry = 'sql'\nregistry_schema = 'walshadow'\n", socket.display()
+        )).unwrap();
+        let created = f
+            .put("a", &ch_body("a", "a", ""), &Mutation::new("sql-create"))
+            .await
+            .unwrap();
+        assert_eq!(created.change, Change::Live);
+        let original = f.svc.registry_row("walshadow", "a").await.unwrap().unwrap();
+        let err = f
+            .svc
+            .swap_row("walshadow", "a", None, Some(&original))
+            .await
+            .unwrap_err();
+        assert_eq!((err.status, err.code), (409, "exists"));
+        let wrong = ("different".into(), "".into(), "active".into());
+        let err = f
+            .svc
+            .swap_row("walshadow", "a", Some(&wrong), None)
+            .await
+            .unwrap_err();
+        assert_eq!((err.status, err.code), (412, "precondition_failed"));
+        assert_eq!(
+            f.svc.registry_row("walshadow", "a").await.unwrap(),
+            Some(original.clone())
+        );
+        f.attach("a").await;
+        let resolver = f.register("a").await;
+        resolver.refuse_reloads(Some(Arc::new(|| {})));
+        let body = ch_tenant("a", "a", "max_lag_bytes = 99\n", "");
+        let err = f
+            .put("a", &body, &Mutation::new("sql-rollback"))
+            .await
+            .unwrap_err();
+        assert_eq!((err.status, err.code), (422, "apply_refused"));
+        assert_eq!(
+            f.svc.registry_row("walshadow", "a").await.unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(
+            f.current("a").await.max_lag_bytes,
+            None,
+            "mirror restored too"
+        );
+        let socket_arg = socket.to_str().unwrap().to_string();
+        resolver.refuse_reloads(Some(Arc::new(move || {
+            let out = std::process::Command::new("psql")
+                .args([
+                    "-h",
+                    &socket_arg,
+                    "-p",
+                    &port.to_string(),
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "postgres",
+                    "-X",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-c",
+                    "UPDATE walshadow.tenant SET spec = 'max_lag_bytes = 7' WHERE id = 'a'",
+                ])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        })));
+        let err = f
+            .put("a", &body, &Mutation::new("sql-conflict"))
+            .await
+            .unwrap_err();
+        assert_eq!((err.status, err.code), (409, "conflict_after_failed_apply"));
+        let row = f.svc.registry_row("walshadow", "a").await.unwrap().unwrap();
+        assert_eq!(row.1, "max_lag_bytes = 7", "external write stands");
+        resolver.refuse_reloads(None);
+        let err = f
+            .svc
+            .swap_row("walshadow", "b", None, Some(&original))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code, "invalid_config",
+            "database uniqueness is enforced"
+        );
+        assert!(
+            f.svc
+                .registry_row("walshadow", "b")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        f.svc
+            .swap_row("walshadow", "a", Some(&row), None)
+            .await
+            .unwrap();
+        assert!(
+            f.svc
+                .registry_row("walshadow", "a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        f.svc.swap_row("walshadow", "a", None, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_failures_leave_config_and_fence_unchanged() {
+        let f = Fixture::new(&[("a", ch_body("a", "a", ""))]).await;
+        let original = f.frag("a");
+        let err = f
+            .svc
+            .mutate("a", &Mutation::new("wrong-id"), |_| {
+                Ok(Some(f.decl(&ch_body("b", "b", ""), "b")))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!((err.status, err.code), (400, "invalid_id"));
+        let path = tenant_fragment_path(&f.svc.ctx.ch_config, "a");
+        std::fs::write(&path, "[tenant.other]\ndbname = 'other'\n").unwrap();
+        let err = f
+            .put("a", &original, &Mutation::new("malformed-fragment"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "internal");
+        assert!(err.message.contains("holds no [tenant.a]"));
+        std::fs::write(&path, &original).unwrap();
+        f.attach("a").await;
+        let edited = path.clone();
+        let next = f.decl(&ch_body("a", "b", ""), "a");
+        let err = f
+            .svc
+            .mutate("a", &acked(Mutation::new("cas-conflict")), |_| {
+                std::fs::write(&edited, format!("{original}\n# external edit\n")).unwrap();
+                Ok(Some(next))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "precondition_failed");
+        assert!(f.frag("a").contains("# external edit"));
+        assert!(
+            RebindFence::load(&f.tenant_dir("a"))
+                .await
+                .unwrap()
+                .is_none(),
+            "failed CAS removes only its own fence"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_snowflake_state_cannot_overlap_a_tearing_down_tenant() {
+        let f = Fixture::new(&[("a", snowflake_body("a", "A_DB", Path::new("/old")))]).await;
+        let fresh = f.dir.path().join("fresh");
+        f.svc
+            .ctx
+            .reloader
+            .reservations()
+            .claim("b", [Resource::StateDir(fresh.join("nested"))].into())
+            .unwrap();
+        f.svc.ctx.reloader.reservations().tearing_down("b");
+        let err = f
+            .put(
+                "a",
+                &snowflake_body("a", "B_DB", &fresh),
+                &acked(Mutation::new("overlap")),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!((err.status, err.code), (409, "change_rejected"));
+        assert!(err.message.contains("tenant b"));
+        assert_eq!(
+            f.current("a").await,
+            f.decl(&snowflake_body("a", "A_DB", Path::new("/old")), "a")
+        );
+    }
+    #[test]
+    fn service_errors_scrub_credentials_before_operations_store_them() {
+        let err = ServiceError::new(
+            500,
+            "internal",
+            "connect postgres://u:secret@host/db password=hidden",
+        );
+        assert!(!err.message.contains("secret"));
+        assert!(!err.message.contains("hidden"));
+        assert!(err.message.contains("postgres://u:***@host/db"));
     }
 }

@@ -2165,3 +2165,119 @@ async fn prewarm_start_tables(t: &Tenant, tables: &[walshadow::tenants::StartTab
         "start tables prewarmed",
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use walshadow::tenants::{Reservations, Resource, TenantsConfig};
+
+    fn config() -> toml::Table {
+        "[source]\ndbname = 'postgres'\n[tenants]\n[tenant.a]\ndbname = 'app'\n[tenant.a.ch]\nhost = 'ch'\ndatabase = 'a'\n".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn teardown_results_release_only_joined_claims() {
+        let reservations = Reservations::default();
+        let mut supervisor = Supervisor::default();
+        for id in ["joined", "stuck", "panicked"] {
+            reservations
+                .claim(
+                    id,
+                    [Resource::ClickHouse("ch:9000".into(), id.into())].into(),
+                )
+                .unwrap();
+            reservations.tearing_down(id);
+        }
+        supervisor.tearing_down.insert(
+            "joined".into(),
+            tokio::spawn(async {
+                TeardownOutcome {
+                    drained: false,
+                    joined: true,
+                    error: Some("aborted".into()),
+                }
+            }),
+        );
+        supervisor.tearing_down.insert(
+            "stuck".into(),
+            tokio::spawn(async {
+                TeardownOutcome {
+                    drained: false,
+                    joined: false,
+                    error: None,
+                }
+            }),
+        );
+        supervisor.tearing_down.insert(
+            "panicked".into(),
+            tokio::spawn(async { panic!("writer teardown panicked") }),
+        );
+        supervisor
+            .await_teardowns(&reservations, Duration::from_secs(5))
+            .await;
+        assert!(!supervisor.is_tearing_down("joined"));
+        assert!(!reservations.is_tearing_down("joined"));
+        for id in ["stuck", "panicked"] {
+            assert!(supervisor.is_tearing_down(id));
+            assert!(reservations.is_tearing_down(id));
+            let err = reservations
+                .claim(
+                    "replacement",
+                    [Resource::ClickHouse("ch:9000".into(), id.into())].into(),
+                )
+                .unwrap_err();
+            assert_eq!(err.holder, id);
+        }
+        assert_eq!(supervisor.teardowns().1, ["panicked", "stuck"]);
+    }
+
+    #[tokio::test]
+    async fn waiting_tenants_and_external_changes_are_visible() {
+        let root = config();
+        let old = TenantsConfig::from_table(&root).unwrap().unwrap();
+        let mut supervisor = Supervisor::default();
+        supervisor.wait_for("a", "held by b".into());
+        let router = walshadow::tenant_router::TenantRouter::new(Duration::from_secs(30), true);
+        let view = metrics_view(&[], &old, &supervisor, &router, false).await;
+        assert_eq!(view[0].phase, "waiting");
+        supervisor.stop_waiting("a");
+        assert!(!supervisor.is_waiting("a"));
+        let dir = tempfile::tempdir().unwrap();
+        let reloader = walshadow::control::Reloader::default();
+        let log = walshadow::ops::audit::AuditLog::open(dir.path(), 1 << 20, 3).unwrap();
+        reloader.set_audit(log.clone());
+        let next_root: toml::Table = toml::to_string(&root)
+            .unwrap()
+            .replace("dbname = \"app\"", "dbname = \"other\"")
+            .parse()
+            .unwrap();
+        let next = TenantsConfig::from_table(&next_root).unwrap().unwrap();
+        let mut rev = walshadow::control::ConfigRevision {
+            epoch: reloader.epoch().clone(),
+            generation: 3,
+            merged: Arc::new(next_root),
+            force_rebind: Default::default(),
+            cause: walshadow::control::ReloadCause::Sighup,
+        };
+        audit_external(&reloader, &rev, &old, &next);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let page = log.read(&Default::default()).unwrap();
+            if let Some(record) = page.records.first() {
+                assert_eq!(page.records.len(), 1);
+                assert_eq!(record.draft.actor.id.as_deref(), Some("sighup"));
+                assert_eq!(record.draft.before["dbname"], "app");
+                assert_eq!(record.draft.after["dbname"], "other");
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        audit_external(&reloader, &rev, &next, &next);
+        rev.cause = walshadow::control::ReloadCause::Control;
+        audit_external(&reloader, &rev, &old, &next);
+        assert_eq!(log.read(&Default::default()).unwrap().records.len(), 1);
+        let unlogged = walshadow::control::Reloader::default();
+        audit_external(&unlogged, &rev, &old, &next);
+    }
+}

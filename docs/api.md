@@ -254,10 +254,11 @@ before the session streams. Paused, blocked and degraded stay ready.
 
 ## Crash points and errors
 
-`/v1/crashes` lists, newest first and across restarts: every panic with its
-thread, location and backtrace; every fatal exit with its error chain; and
-every unclean exit, a process that stopped without either (SIGKILL, the OOM
-killer, a host failure). `/v1/errors` keeps the last 1000 warnings and
+`/v1/crashes` lists, newest first and across restarts: every panic, every
+fatal exit with its error chain, and every unclean exit, a process that
+stopped without either (SIGKILL, the OOM killer, a host failure). Read
+`/v1/crashes/{id}` for a panic's thread, location and bounded backtrace.
+`/v1/errors` keeps the last 1000 warnings and
 errors with their tenant, database, error and reason fields. A tenant's
 detach and eviction reasons are on `/v1/tenants/{id}` and
 `/v1/tenants/{id}/errors`. Secrets are scrubbed from all of them.

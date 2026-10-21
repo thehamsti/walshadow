@@ -189,9 +189,38 @@ fn socket_err(e: ServiceError) -> anyhow::Error {
     anyhow!("{} ({})", e.message, e.code)
 }
 
+async fn parsed<T>(ctx: &SharedCtx, actor: &Actor, action: &str, result: Result<T>) -> Result<T> {
+    if let Err(e) = &result
+        && let Some(log) = ctx.reloader.audit()
+    {
+        let draft = crate::ops::audit::Draft {
+            request_id: uuid::Uuid::new_v4().simple().to_string(),
+            phase: "result".into(),
+            actor: actor.clone(),
+            action: action.into(),
+            outcome: "rejected".into(),
+            error: Some(format!("{e:#}")),
+            ..Default::default()
+        };
+        if let Err(e) = log.append(draft).await {
+            tracing::error!(target: "walshadow::audit", error = %e, "could not audit a rejected socket mutation");
+        }
+    }
+    result
+}
+
 pub async fn put(ctx: &SharedCtx, body: &Table, actor: &Actor) -> Result<String> {
-    let (id, tenant_body) = single_tenant(body)?;
-    let decl = TenantDecl::parse(&id, &tenant_body)?;
+    let (id, decl) = parsed(
+        ctx,
+        actor,
+        "tenant.put",
+        (|| {
+            let (id, tenant_body) = single_tenant(body)?;
+            let decl = TenantDecl::parse(&id, &tenant_body)?;
+            Ok((id, decl))
+        })(),
+    )
+    .await?;
     TenantService::new(ctx.clone(), None)
         .mutate(&id, &socket_mutation(body, actor, "tenant.put"), |_| {
             Ok(Some(decl))
@@ -202,7 +231,7 @@ pub async fn put(ctx: &SharedCtx, body: &Table, actor: &Actor) -> Result<String>
 }
 
 pub async fn remove(ctx: &SharedCtx, body: &Table, actor: &Actor) -> Result<String> {
-    let id = id_of(body)?;
+    let id = parsed(ctx, actor, "tenant.remove", id_of(body)).await?;
     TenantService::new(ctx.clone(), None)
         .mutate(
             &id,
@@ -218,16 +247,25 @@ pub async fn remove(ctx: &SharedCtx, body: &Table, actor: &Actor) -> Result<Stri
 }
 
 pub async fn set_state(ctx: &SharedCtx, body: &Table, actor: &Actor) -> Result<String> {
-    let id = id_of(body)?;
-    let state = body
-        .get("state")
-        .and_then(Value::as_str)
-        .context("state = \"active\" or \"detached\" required")?;
-    let desired = match state {
-        "active" => crate::tenants::Desired::Active,
-        "detached" => crate::tenants::Desired::Detached,
-        _ => bail!("state must be active or detached"),
-    };
+    let (id, desired) = parsed(
+        ctx,
+        actor,
+        "tenant.state",
+        (|| {
+            let id = id_of(body)?;
+            let state = body
+                .get("state")
+                .and_then(Value::as_str)
+                .context("state = \"active\" or \"detached\" required")?;
+            let desired = match state {
+                "active" => crate::tenants::Desired::Active,
+                "detached" => crate::tenants::Desired::Detached,
+                _ => bail!("state must be active or detached"),
+            };
+            Ok((id, desired))
+        })(),
+    )
+    .await?;
     let action = match desired {
         crate::tenants::Desired::Active => "tenant.attach",
         crate::tenants::Desired::Detached => "tenant.detach",

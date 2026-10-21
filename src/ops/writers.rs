@@ -215,4 +215,17 @@ mod tests {
         assert!(set.tasks.lock().unwrap().len() <= 1);
         assert!(set.abort_and_join(Duration::from_secs(1)).await);
     }
+    #[tokio::test]
+    async fn cancellation_and_debug_follow_the_writer_lifecycle() {
+        let set = WriterSet::new();
+        let cancel = set.cancelled();
+        assert!(!cancel.is_cancelled());
+        let token = set.token();
+        assert!(format!("{set:?}").contains("live: 1"));
+        assert!(!set.abort_and_join(Duration::ZERO).await);
+        assert!(cancel.is_cancelled());
+        assert!(format!("{set:?}").contains("closed: true"));
+        drop(token);
+        assert!(set.abort_and_join(Duration::from_secs(1)).await);
+    }
 }

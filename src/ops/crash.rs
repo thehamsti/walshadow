@@ -65,6 +65,17 @@ fn now() -> (String, u128) {
     (ts, ms)
 }
 
+fn cut_backtrace(mut backtrace: String) -> String {
+    if backtrace.len() > BACKTRACE_MAX {
+        let mut cut = BACKTRACE_MAX;
+        while !backtrace.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        backtrace.truncate(cut);
+    }
+    backtrace
+}
+
 impl CrashStore {
     pub fn open(state_dir: &Path) -> Result<Arc<Self>> {
         use std::os::unix::fs::DirBuilderExt;
@@ -140,14 +151,7 @@ impl CrashStore {
                 .location()
                 .map(|l| format!("{}:{}", l.file(), l.line()));
             let thread = std::thread::current().name().map(str::to_owned);
-            let mut backtrace = std::backtrace::Backtrace::force_capture().to_string();
-            if backtrace.len() > BACKTRACE_MAX {
-                let mut cut = BACKTRACE_MAX;
-                while !backtrace.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                backtrace.truncate(cut);
-            }
+            let backtrace = cut_backtrace(std::backtrace::Backtrace::force_capture().to_string());
             let _ = store.record("panic", &payload, |r| {
                 r.location = location;
                 r.thread = thread;
@@ -331,5 +335,17 @@ mod tests {
             store.record_exit(&format!("error {i}")).unwrap();
         }
         assert!(store.list().len() <= KEEP);
+    }
+    #[test]
+    fn backtraces_are_bounded_at_a_utf8_boundary() {
+        assert_eq!(cut_backtrace("short".into()), "short");
+        assert_eq!(
+            cut_backtrace("x".repeat(BACKTRACE_MAX + 1)).len(),
+            BACKTRACE_MAX
+        );
+        assert_eq!(
+            cut_backtrace("界".repeat(BACKTRACE_MAX)),
+            "界".repeat(BACKTRACE_MAX / 3)
+        );
     }
 }

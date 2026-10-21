@@ -220,4 +220,30 @@ mod tests {
         let s = cut("x".repeat(FIELD_MAX + 10));
         assert!(s.len() <= FIELD_MAX + '…'.len_utf8());
     }
+    #[test]
+    fn overflow_keeps_only_the_newest_and_truncates_utf8() {
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(ErrorRingLayer),
+            || {
+                for i in 0..CAPACITY + 3 {
+                    tracing::warn!(target: "walshadow::overflow_test", tenant = "overflow", "event {i}");
+                }
+            },
+        );
+        let events = recent(&Filter {
+            tenant: Some("overflow".into()),
+            limit: CAPACITY,
+            ..Filter::default()
+        });
+        assert_eq!(events.len(), CAPACITY);
+        assert_eq!(
+            events.first().unwrap().message,
+            format!("event {}", CAPACITY + 2)
+        );
+        assert_eq!(events.last().unwrap().message, "event 3");
+        assert_eq!(
+            cut("界".repeat(FIELD_MAX)),
+            format!("{}…", "界".repeat(FIELD_MAX / 3))
+        );
+    }
 }

@@ -1411,6 +1411,163 @@ mod tests {
         );
     }
 
+    #[test]
+    fn capability_matrix_covers_snowflake_and_instance_settings() {
+        let sf: toml::Table = r#"
+[source]
+dbname = 'postgres'
+[tenants]
+[tenant.a]
+dbname = 'app'
+[tenant.a.destination]
+kind = 'snowflake'
+[tenant.a.snowflake]
+account_url = 'https://acme-test.snowflakecomputing.com'
+user = 'REPLICATOR'
+role = 'REPLICATION'
+warehouse = 'INGEST'
+database = 'DB'
+[tenant.a.snowflake.auth]
+method = 'oauth'
+token_file = '/run/secrets/token'
+[tenant.a.snowflake.state]
+directory = '/state/a'
+max_bytes = 10737418240
+[tenant.a.snowflake.stage]
+bucket = 'replication'
+prefix = 'a/'
+region = 'us-east-1'
+name = 'DB.INTERNAL.LOAD_STAGE'
+"#
+        .parse()
+        .unwrap();
+        let old = decl_a(&sf);
+        for key in [
+            "channels_per_table",
+            "max_in_flight",
+            "merge_interval_ms",
+            "metadata_concurrency",
+            "merge_concurrency",
+            "ack_after",
+            "max_bytes",
+            "directory",
+        ] {
+            let mut next = sf.clone();
+            let tbl = if matches!(key, "max_bytes" | "directory") {
+                next["tenant"]["a"]["snowflake"]["state"]
+                    .as_table_mut()
+                    .unwrap()
+            } else {
+                next["tenant"]["a"]["snowflake"].as_table_mut().unwrap()
+            };
+            tbl.insert(
+                key.into(),
+                match key {
+                    "ack_after" => "outbox".into(),
+                    "directory" => "/state/new".into(),
+                    "max_bytes" => 20_000_000_000_i64.into(),
+                    _ => 17_i64.into(),
+                },
+            );
+            let change = classify_change(Some(&old), &decl_a(&next), &sf, &next).unwrap();
+            assert!(matches!(change, Change::Rejected(_)), "{key}: {change:?}");
+        }
+        let resources = old.resources(&sf, Path::new("/spill")).unwrap();
+        assert!(resources.contains(&Resource::Snowflake(
+            "https://acme-test.snowflakecomputing.com".into(),
+            "DB".into()
+        )));
+        assert!(resources.contains(&Resource::StateDir("/state/a".into())));
+        let r = Reservations::default();
+        r.claim("a", resources.clone()).unwrap();
+        assert!(!r.is_tearing_down("a"));
+        let conflict = r.claim("b", resources).unwrap_err();
+        assert!(conflict.to_string().contains("held by tenant a"));
+        r.tearing_down("a");
+        assert!(r.is_tearing_down("a"));
+        r.release("a");
+        assert!(!r.is_tearing_down("a"));
+        for (resource, want) in [
+            (
+                Resource::ClickHouse("ch:9000".into(), "a".into()),
+                "ClickHouse database a on ch:9000",
+            ),
+            (
+                Resource::Snowflake("sf".into(), "DB".into()),
+                "Snowflake database DB on sf",
+            ),
+            (
+                Resource::StateDir("/state/a".into()),
+                "state directory /state/a",
+            ),
+            (
+                Resource::TenantDir("/spill/tenants/a".into()),
+                "tenant directory /spill/tenants/a",
+            ),
+        ] {
+            assert_eq!(resource.to_string(), want);
+        }
+        assert_eq!(
+            normalize(Path::new("/state/old/.././a")),
+            PathBuf::from("/state/a")
+        );
+        let base = ch_tenant(
+            "database = 'a'\n[tenant.a.ch.instances.mirror]\nhost = 'mirror'\ndatabase = 'm'\n",
+        );
+        for (key, value) in [("user", "reader"), ("password", "pw")] {
+            let mut next = base.clone();
+            next["tenant"]["a"]["ch"]["instances"]["mirror"]
+                .as_table_mut()
+                .unwrap()
+                .insert(key.into(), value.into());
+            assert_eq!(
+                classify_change(Some(&decl_a(&base)), &decl_a(&next), &base, &next).unwrap(),
+                Change::Live
+            );
+        }
+        let mut next = base.clone();
+        next["tenant"]["a"].as_table_mut().unwrap().insert(
+            "system_columns".into(),
+            toml::Value::Table(root("lsn = '_position'")),
+        );
+        assert!(matches!(
+            classify_change(Some(&decl_a(&base)), &decl_a(&next), &base, &next).unwrap(),
+            Change::Rebind { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unreadable_and_unknown_fences_are_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(REBIND_FENCE);
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            RebindFence::load(dir.path())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("read")
+        );
+        assert!(
+            RebindFence::remove(dir.path())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("remove")
+        );
+        std::fs::remove_dir(&path).unwrap();
+        let mut fence = RebindFence::new("r", "binding".into());
+        fence.version = 99;
+        std::fs::write(&path, toml::to_string(&fence).unwrap()).unwrap();
+        assert!(
+            RebindFence::load(dir.path())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported version 99")
+        );
+    }
+
     #[tokio::test]
     async fn fence_round_trips_privately_and_removes() {
         use std::os::unix::fs::PermissionsExt;

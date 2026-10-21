@@ -1,5 +1,5 @@
 //! Route handlers. Reads take a snapshot and the config; mutations run in a
-//! spawned task through [`TenantService`], so a dropped connection never
+//! spawned task through [`TenantService`](crate::ops::tenant_service::TenantService), so a dropped connection never
 //! cancels one midway, and record their outcome under
 //! `/v1/operations/{request_id}`.
 
@@ -263,6 +263,7 @@ async fn mutate<F>(st: &ApiState, ctx: &RequestCtx, ask: Ask, edit: F) -> Reply
 where
     F: FnOnce(Option<&TenantDecl>) -> ServiceResult<Option<TenantDecl>> + Send + 'static,
 {
+    ctx.audit_handled();
     let m = Mutation {
         request_id: ctx.request_id.clone(),
         actor: ctx.actor(),
@@ -791,6 +792,9 @@ async fn create(
     Query(q): Query<MutationQuery>,
     Json(body): Json<Value>,
 ) -> Reply {
+    if q.dry_run {
+        ctx.audit_handled();
+    }
     let id = body
         .get("id")
         .and_then(Value::as_str)
@@ -819,6 +823,9 @@ async fn replace(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Reply {
+    if q.dry_run {
+        ctx.audit_handled();
+    }
     let etag = if_match(&ctx, &headers)?;
     let decl = decl_from_json(&ctx, &id, &body)?;
     let ask = Ask {
@@ -841,6 +848,9 @@ async fn patch_tenant(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Reply {
+    if q.dry_run {
+        ctx.audit_handled();
+    }
     let etag = if_match(&ctx, &headers)?;
     if !body.is_object() {
         return Err(fail(
@@ -905,6 +915,9 @@ async fn set_desired(
     body: Option<Json<StateBody>>,
     desired: Desired,
 ) -> Reply {
+    if q.dry_run {
+        ctx.audit_handled();
+    }
     let etag = if_match(ctx, headers)?;
     let body = body.map(|Json(b)| b).unwrap_or_default();
     if let Some(reason) = &body.reason {
@@ -993,6 +1006,7 @@ async fn delete_intent(
         );
     }
     if let Some(log) = st.ctx.reloader.audit() {
+        ctx.audit_handled();
         let _ = log
             .append(crate::ops::audit::Draft {
                 request_id: ctx.request_id.clone(),
@@ -1124,6 +1138,9 @@ async fn restore(
     Query(q): Query<MutationQuery>,
     body: Option<Json<StateBody>>,
 ) -> Reply {
+    if q.dry_run {
+        ctx.audit_handled();
+    }
     let body = body.map(|Json(b)| b).unwrap_or_default();
     let (tombstone, mut decl) = st
         .deletes
@@ -1174,7 +1191,8 @@ async fn config_mutation(
     path: &str,
     edit: impl FnOnce(&mut toml::Table),
 ) -> Reply {
-    let origin = Some(("POST".to_string(), path.to_string()));
+    ctx.audit_handled();
+    let origin = Some((ctx.request_id.clone(), "POST".to_string(), path.to_string()));
     let res = crate::control::apply_fragment(&st.ctx, &ctx.actor(), action, origin, edit).await;
     match res {
         Ok(unfollowed) => {

@@ -95,6 +95,17 @@ impl Harness {
         stall_secs: u64,
         rows: &[(&str, u64)],
     ) -> Result<Self> {
+        Self::up_with_registry(ports, dbs, tenants, stall_secs, rows, false).await
+    }
+
+    async fn up_with_registry(
+        ports: &fx::Ports,
+        dbs: &[&str],
+        tenants: &[Tenant],
+        stall_secs: u64,
+        rows: &[(&str, u64)],
+        sql: bool,
+    ) -> Result<Self> {
         let tmp = tempfile::tempdir().unwrap();
         let mut scfg = ShadowConfig::new(
             tmp.path().join("source-data"),
@@ -132,7 +143,12 @@ impl Harness {
         fs::write(
             &config,
             format!(
-                "[tenants]\nstall_timeout_secs = {stall_secs}\nbridge_workers = 1\ncapacity = 8\n"
+                "[tenants]\nstall_timeout_secs = {stall_secs}\nbridge_workers = 1\ncapacity = 8\n{}",
+                if sql {
+                    "registry = 'sql'\nregistry_schema = 'walshadow'\nregistry_poll_secs = 1\n"
+                } else {
+                    ""
+                }
             ),
         )?;
         let frag_dir = config.with_extension("d");
@@ -1073,4 +1089,140 @@ async fn teardown_waits_for_blocked_backfill() {
     )
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_registry_api_updates_compare_authoritative_rows_and_delete_safely() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let ports = fx::Ports::alloc();
+    let h = Harness::up_with_registry(&ports, &["app_a"], &[], 30, &[], true)
+        .await
+        .expect("SQL harness");
+    let pid = h.pid();
+    let t = Duration::from_secs(120);
+    let (s, out) = h
+        .admin(
+            "POST",
+            "/v1/tenants",
+            None,
+            Some(json!({
+                "id": "a", "dbname": "app_a",
+                "ch": {"host": "127.0.0.1", "port": ports.ch_tcp, "database": "tenant_a"},
+                "stream": {"replicate_all": false},
+                "table": {"app": {"orders": {"replicate": true, "initial_load": "copy"}}},
+                "namespace": {"app": {"target_database": "tenant_a", "auto_create": true}}
+            })),
+        )
+        .await;
+    assert_eq!(s, 202, "{out}");
+    h.wait_phase("a", "active", t).await.unwrap();
+    h.wait_rows("tenant_a", "app_orders", "app_a", 50, t)
+        .await
+        .unwrap();
+    let before = h.etag("a").await;
+    let (s, out) = h
+        .admin(
+            "PATCH",
+            "/v1/tenants/a",
+            Some(&before),
+            Some(json!({"max_lag_bytes": 1_000_000_000_u64})),
+        )
+        .await;
+    assert_eq!(s, 202, "{out}");
+    let pg = connect(&h.source, "postgres").await.unwrap();
+    let spec: String = pg
+        .query_one("SELECT spec FROM walshadow.tenant WHERE id = 'a'", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(spec.contains("max_lag_bytes = 1000000000"), "{spec}");
+    let stale = h.etag("a").await;
+    assert_ne!(stale, before);
+    let mut external: toml::Table = spec.parse().unwrap();
+    external.insert("max_lag_bytes".into(), 2_000_000_000_i64.into());
+    let external = toml::to_string(&external).unwrap();
+    assert_eq!(
+        pg.execute(
+            "UPDATE walshadow.tenant SET spec = $1, updated_at = now() WHERE id = 'a'",
+            &[&external]
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let (s, out) = h
+        .admin(
+            "PATCH",
+            "/v1/tenants/a",
+            Some(&stale),
+            Some(json!({"max_lag_bytes": 3_000_000_000_u64})),
+        )
+        .await;
+    assert_eq!(
+        (s, out["error"]["code"].clone()),
+        (412, json!("precondition_failed"))
+    );
+    let stored: String = pg
+        .query_one("SELECT spec FROM walshadow.tenant WHERE id = 'a'", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(stored, external, "stale API write must not overwrite SQL");
+    let deadline = Instant::now() + t;
+    loop {
+        let (_, page) = h
+            .admin(
+                "GET",
+                "/v1/audit?action=tenant_set.external_change",
+                None,
+                None,
+            )
+            .await;
+        if page["records"].as_array().is_some_and(|records| {
+            records
+                .iter()
+                .any(|r| r["actor"]["id"] == "sql_registry" && r["tenant"] == "a")
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "external SQL change not audited: {page}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let current = h.etag("a").await;
+    let (s, intent) = h
+        .admin("POST", "/v1/tenants/a/delete-intent", None, None)
+        .await;
+    assert_eq!(s, 200, "{intent}");
+    let resp = h
+        .http
+        .delete(format!("http://{}/v1/tenants/a", h.api))
+        .bearer_auth(&h.admin)
+        .header("if-match", format!("\"{current}\""))
+        .header(
+            "x-confirm-delete",
+            intent["confirm_token"].as_str().unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let s = resp.status().as_u16();
+    let out: Value = resp.json().await.unwrap();
+    assert_eq!(s, 202, "{out}");
+    let count: i64 = pg
+        .query_one("SELECT count(*) FROM walshadow.tenant WHERE id = 'a'", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0);
+    let (s, _) = h.admin("GET", "/v1/tenants/a", None, None).await;
+    assert_eq!(s, 404);
+    h.wait_rows("tenant_a", "app_orders", "app_a", 50, t)
+        .await
+        .unwrap();
+    assert_eq!(h.pid(), pid, "mutations never restart the daemon");
 }

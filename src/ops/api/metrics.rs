@@ -19,6 +19,12 @@ static RATE_LIMITED: LazyLock<Mutex<BTreeMap<&'static str, u64>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 pub fn request(route: &'static str, method: &str, status: u16) {
+    let method = match method {
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "CONNECT" | "TRACE" => {
+            method
+        }
+        _ => "OTHER",
+    };
     *REQUESTS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -88,5 +94,25 @@ impl Collector for ApiCollector {
             "Audit records the daemon could not write after a mutation ran.",
             crate::ops::metrics::API_AUDIT_WRITE_FAILURES.load(Ordering::Relaxed),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extension_methods_share_one_metric_label() {
+        for i in 0..32 {
+            request("/method-label-test", &format!("CUSTOM{i}"), 401);
+        }
+        let requests = REQUESTS.lock().unwrap();
+        let entries: Vec<_> = requests
+            .iter()
+            .filter(|((route, _, _), _)| *route == "/method-label-test")
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0.1, "OTHER");
+        assert_eq!(*entries[0].1, 32);
     }
 }
