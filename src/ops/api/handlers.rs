@@ -55,6 +55,8 @@ pub fn method_router(r: &Route) -> MethodRouter<ApiState> {
         ("GET", "/v1/tenants/{id}/jobs") => get(tenant_jobs),
         ("GET", "/v1/tenants/{id}/errors") => get(tenant_errors),
         ("GET", "/v1/tenants/{id}/tables") => get(tenant_tables),
+        ("GET", "/v1/openapi.json") => get(openapi_json),
+        ("GET", "/v1/docs") => get(docs_page),
         ("GET", "/v1/config") => get(config),
         ("GET", "/v1/audit") => get(audit),
         ("GET", "/v1/operations/{request_id}") => get(operation),
@@ -78,6 +80,7 @@ pub fn method_router(r: &Route) -> MethodRouter<ApiState> {
 // ---- helpers ----------------------------------------------------------------
 
 fn fail(ctx: &RequestCtx, status: u16, code: &str, message: impl std::fmt::Display) -> ApiError {
+    super::errors::check(code, status);
     ApiError {
         status: StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         code: code.to_string(),
@@ -369,6 +372,28 @@ async fn livez() -> &'static str {
 
 async fn whoami(Extension(ctx): Extension<RequestCtx>) -> Json<Value> {
     Json(json!({"principal": ctx.principal, "request_id": ctx.request_id}))
+}
+
+async fn openapi_json(State(st): State<ApiState>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        st.docs.json.clone(),
+    )
+        .into_response()
+}
+
+async fn docs_page(State(st): State<ApiState>) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, super::openapi::Media::Html.as_str()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                super::docs_html::CONTENT_SECURITY_POLICY,
+            ),
+        ],
+        st.docs.html.clone(),
+    )
+        .into_response()
 }
 
 async fn health_live() -> Json<Value> {

@@ -78,7 +78,7 @@ impl Tracker {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Ok,
@@ -89,14 +89,14 @@ pub enum Status {
     Unknown,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct Check {
     pub name: &'static str,
     pub status: Status,
     pub detail: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct Report {
     pub status: Status,
     pub ready: bool,

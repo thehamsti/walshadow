@@ -47,7 +47,7 @@ pub enum Refusal {
     Mismatch(&'static str),
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, utoipa::ToSchema)]
 pub struct Tombstone {
     pub tenant: String,
     pub deleted_at: String,

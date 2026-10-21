@@ -52,6 +52,27 @@ pub(crate) enum ApiKeyCommand {
     },
 }
 
+/// `walshadow-stream api-docs`: print the HTTP API's OpenAPI document, or
+/// its web page, without a running daemon
+#[derive(Parser, Debug)]
+#[command(
+    name = "walshadow-stream api-docs",
+    version = walshadow::VERSION,
+    about = "Print the HTTP API's OpenAPI 3.1 document (JSON) or its web page (HTML) on stdout."
+)]
+pub(crate) struct ApiDocsArgs {
+    /// `json` (the OpenAPI document) or `html` (the web page)
+    #[arg(long, default_value = "json", value_parser = ["json", "html"])]
+    pub(crate) format: String,
+    /// Describe `/v1/docs` and `/v1/openapi.json` as public, as a daemon with
+    /// `--api-public-docs` serves them
+    #[arg(long)]
+    pub(crate) public_docs: bool,
+    /// Describe `/livez` as public, as with `--api-public-livez`
+    #[arg(long)]
+    pub(crate) public_livez: bool,
+}
+
 /// `walshadow-stream init`: write a config from two connection URLs, so a
 /// first run needs no TOML. Detected before daemon-arg parsing, same as `ctl`.
 #[derive(Debug, Parser)]
@@ -320,9 +341,14 @@ pub(crate) struct Args {
     #[arg(long, env = "WALSHADOW_API_STATE_DIR")]
     pub(crate) api_state_dir: Option<PathBuf>,
     /// Serve `GET /livez` (a constant `ok`) without a key, for orchestrator
-    /// probes that cannot present one. Every other route still needs a key
+    /// probes that cannot present one
     #[arg(long, env = "WALSHADOW_API_PUBLIC_LIVEZ")]
     pub(crate) api_public_livez: bool,
+    /// Serve `GET /v1/docs` and `GET /v1/openapi.json` without a key, so a
+    /// browser can open the API docs; rate limited per client IP. They hold
+    /// no secrets. Other routes need a key unless `--api-public-livez` opens `/livez`
+    #[arg(long, env = "WALSHADOW_API_PUBLIC_DOCS")]
+    pub(crate) api_public_docs: bool,
     /// Proxies whose `X-Forwarded-For` names the client, as CIDRs
     #[arg(long, env = "WALSHADOW_API_TRUSTED_PROXIES", value_delimiter = ',')]
     pub(crate) api_trusted_proxies: Vec<String>,

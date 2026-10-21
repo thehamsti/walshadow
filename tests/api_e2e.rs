@@ -12,6 +12,11 @@
 //! writers past the drain limit, a re-attach waits for that, and a restart
 //! afterwards boots clean.
 //!
+//! `api_docs_prints_what_the_daemon_serves`: `walshadow-stream api-docs`
+//! prints the document and page a daemon with the same flags serves; no
+//! database needed. The live test checks a daemon serves the same, and
+//! holds `/v1/tenants/{id}/tables`, which needs a source, to its schema.
+//!
 //! Skipped silently when `initdb` or `clickhouse` is absent. Linux only
 
 #![cfg(target_os = "linux")]
@@ -66,6 +71,58 @@ fn fragment(t: &Tenant) -> String {
         db = t.db,
         port = t.ch_port,
     )
+}
+
+/// `walshadow-stream api-docs <args>`
+fn api_docs(args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_walshadow-stream"))
+        .arg("api-docs")
+        .args(args)
+        .output()
+        .expect("run api-docs");
+    assert!(
+        out.status.success(),
+        "api-docs {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("utf-8")
+}
+
+#[test]
+fn api_docs_prints_what_the_daemon_serves() {
+    use walshadow::ops::api::docs_html;
+    use walshadow::ops::api::openapi::{self, Exposure};
+    for (flags, exposure) in [
+        (&[][..], Exposure::default()),
+        (
+            &["--public-docs"][..],
+            Exposure {
+                public_livez: false,
+                public_docs: true,
+            },
+        ),
+        (
+            &["--public-livez", "--public-docs"][..],
+            Exposure {
+                public_livez: true,
+                public_docs: true,
+            },
+        ),
+    ] {
+        let doc = openapi::document(exposure);
+        let json: Value =
+            serde_json::from_str(&api_docs(&[&["--format", "json"][..], flags].concat())).unwrap();
+        assert_eq!(json, doc, "{flags:?}");
+        let html = api_docs(&[&["--format", "html"][..], flags].concat());
+        assert_eq!(html, docs_html::render(&doc), "{flags:?}");
+    }
+    let json: Value = serde_json::from_str(&api_docs(&[])).unwrap();
+    assert_eq!(json["openapi"], "3.1.0", "JSON is the default");
+    let out = Command::new(env!("CARGO_BIN_EXE_walshadow-stream"))
+        .args(["api-docs", "--format", "yaml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
 }
 
 /// `api-key new`, through the binary
@@ -510,6 +567,41 @@ async fn api_tenants_apply_live_without_restart() {
         .call("POST", "/v1/reload", Some(&h.read), None, None)
         .await;
     assert_eq!(s, 403);
+
+    // The document and page are what `api-docs` prints, and the tables
+    // route, which needs a source, answers as its schema says
+    let (s, served) = h
+        .call("GET", "/v1/openapi.json", Some(&h.read), None, None)
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        served,
+        serde_json::from_str::<Value>(&api_docs(&["--format", "json"])).unwrap()
+    );
+    let (s, page) = h.call("GET", "/v1/docs", Some(&h.read), None, None).await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        page.as_str(),
+        Some(api_docs(&["--format", "html"]).as_str())
+    );
+    let (s, tables) = h
+        .call("GET", "/v1/tenants/a/tables", Some(&h.read), None, None)
+        .await;
+    assert_eq!(s, 200, "{tables}");
+    assert!(
+        tables["tables"].as_array().is_some_and(|t| !t.is_empty()),
+        "{tables}"
+    );
+    let mut root = served.clone();
+    root["$ref"] = served["paths"]["/v1/tenants/{id}/tables"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["$ref"]
+        .clone();
+    let schema = jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .build(&root)
+        .expect("the document compiles");
+    let errors: Vec<String> = schema.iter_errors(&tables).map(|e| e.to_string()).collect();
+    assert!(errors.is_empty(), "{errors:?}\n{tables}");
 
     let (writer_a, stop_a) = keep_writing(&h.source, "app_a", 1000);
     let (writer_b, stop_b) = keep_writing(&h.source, "app_b", 1000);

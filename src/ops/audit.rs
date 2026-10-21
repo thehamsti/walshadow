@@ -22,7 +22,7 @@ const FILE: &str = "audit.jsonl";
 const VERSION: u32 = 1;
 const GENESIS: &str = "sha256:0";
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Actor {
     /// `api_key`, `unix` or `external`
     pub kind: String,
@@ -65,7 +65,7 @@ impl Actor {
 }
 
 /// What a caller fills in; [`AuditLog::append`] numbers, stamps and chains it
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct Draft {
     pub request_id: String,
     /// `attempt` or `result`
@@ -96,7 +96,7 @@ pub struct Draft {
     pub generation: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct Record {
     pub v: u32,
     pub seq: u64,
@@ -134,7 +134,7 @@ pub struct AuditLog {
 }
 
 /// Records a read returns, and whether their chain holds
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct Page {
     pub records: Vec<Record>,
     pub chain_ok: bool,

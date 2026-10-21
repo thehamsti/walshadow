@@ -62,7 +62,9 @@ use clap::Parser;
 use walshadow::boundary_hold::AttachSlot;
 use walshadow::metrics::MetricsRegistry;
 
-use crate::args::{ApiKeyArgs, Args, InitArgs, cli_base, url_base, validate_transport_args};
+use crate::args::{
+    ApiDocsArgs, ApiKeyArgs, Args, InitArgs, cli_base, url_base, validate_transport_args,
+};
 use crate::runtime_cfg::spawn_shutdown_signals;
 use crate::session::run_session;
 use crate::tracing_setup::init_tracing;
@@ -79,6 +81,10 @@ fn main() -> Result<()> {
     if argv.get(1).map(String::as_str) == Some("api-key") {
         let rest = std::iter::once(format!("{} api-key", argv[0])).chain(argv.into_iter().skip(2));
         return api::mint(ApiKeyArgs::parse_from(rest).command);
+    }
+    if argv.get(1).map(String::as_str) == Some("api-docs") {
+        let rest = std::iter::once(format!("{} api-docs", argv[0])).chain(argv.into_iter().skip(2));
+        return api::docs(ApiDocsArgs::parse_from(rest));
     }
     if argv.get(1).map(String::as_str) == Some("init") {
         let rest = std::iter::once(format!("{} init", argv[0])).chain(argv.into_iter().skip(2));

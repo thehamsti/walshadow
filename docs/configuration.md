@@ -130,7 +130,9 @@ caller's uid
 `--api-bind` serves an authenticated HTTP API: health and readiness,
 metrics, crash points and recent errors, jobs and tenant status, and tenant
 control. It needs `--ch-config` and an API key file, and TLS off loopback.
-See [HTTP API](api.md) for keys, scopes, endpoints and the audit log
+It documents itself at `GET /v1/docs` (a web page) and `GET /v1/openapi.json`
+(OpenAPI 3.1); `--api-public-docs` serves those two without a key. See
+[HTTP API](api.md) for keys, scopes, endpoints and the audit log
 
 ## Live and startup-only settings
 

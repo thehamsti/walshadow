@@ -1,4 +1,6 @@
-# T-1021-01 code pass, round 1
+# HTTP API code review, round 1
+
+Ticket: T-1021-01. Plan: [http_api.md](http_api.md).
 
 Client request: `t1021-01-code-r1`. Reviewer: Sol.
 
@@ -151,7 +153,7 @@ Coverage exclusions: **none**. `MAX_MISSED_LINES=7200` is unchanged.
 
 - `docs/api.md`
 - `plans/INDEX.md`
-- `plans/T-1021-01-code-r1.md`
+- `plans/http_api_review_r1.md`
 - `src/bin/stream/tenant.rs`
 - `src/destination/snowflake/http.rs`
 - `src/destination/snowflake/runtime.rs`

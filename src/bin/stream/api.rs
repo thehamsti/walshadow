@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use walshadow::ops::api::keys::Scope;
 use walshadow::ops::api::{ApiConfig, Cidr, Rates};
 
-use crate::args::{ApiKeyCommand, Args};
+use crate::args::{ApiDocsArgs, ApiKeyCommand, Args};
 
 /// Audit log, crash records, tombstones, ETag key
 pub(crate) fn state_dir(args: &Args) -> PathBuf {
@@ -42,6 +42,7 @@ pub(crate) fn config(args: &Args) -> Result<Option<ApiConfig>> {
         allow_plaintext: args.api_allow_plaintext,
         state_dir: state_dir(args),
         public_livez: args.api_public_livez,
+        public_docs: args.api_public_docs,
         trusted_proxies,
         rates,
         deleted_retention: Duration::from_secs(args.api_deleted_retention_days * 86_400),
@@ -94,4 +95,21 @@ pub(crate) fn mint(cmd: ApiKeyCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `walshadow-stream api-docs`: the same document and page a daemon serves
+pub(crate) fn docs(args: ApiDocsArgs) -> Result<()> {
+    use std::io::Write;
+    let exposure = walshadow::ops::api::openapi::Exposure {
+        public_livez: args.public_livez,
+        public_docs: args.public_docs,
+    };
+    let doc = walshadow::ops::api::openapi::document(exposure);
+    // The page byte for byte as `/v1/docs` serves it
+    let out = match args.format.as_str() {
+        "html" => walshadow::ops::api::docs_html::render(&doc),
+        _ => serde_json::to_string_pretty(&doc)? + "\n",
+    };
+    std::io::stdout().lock().write_all(out.as_bytes())?;
+    Ok(())
 }

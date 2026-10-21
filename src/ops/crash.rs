@@ -23,7 +23,7 @@ const MARKER: &str = "running.json";
 /// Tells apart records written in one millisecond
 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CrashRecord {
     pub v: u32,
     /// File stem, `<kind>-<unix ms>-<pid>-<n>`

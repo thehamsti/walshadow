@@ -35,6 +35,7 @@ pub struct ServiceError {
 
 impl ServiceError {
     pub fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
+        crate::ops::api::errors::check(code, status);
         Self {
             status,
             code,

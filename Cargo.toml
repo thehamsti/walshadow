@@ -99,6 +99,8 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 tower = { version = "0.5", features = ["util", "limit"] }
 tower-http = { version = "0.6", features = ["limit", "timeout", "catch-panic"] }
+# OpenAPI schemas for the HTTP API docs, derived from the types it serves
+utoipa = { version = "6", features = ["preserve_order"] }
 subtle = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 hex = "0.4"
@@ -129,6 +131,9 @@ name = "spool_read"
 harness = false
 
 [dev-dependencies]
+# Validates the API's OpenAPI document against the vendored 3.1 schema;
+# no network resolution
+jsonschema = { version = "0.59", default-features = false }
 walshadow = { path = ".", features = ["test-support"] }
 # Pre-main tracing subscriber for tests
 ctor = "1.0.13"

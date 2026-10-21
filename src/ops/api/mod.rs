@@ -3,19 +3,25 @@
 //!
 //! Opt-in with `--api-bind`. Every route needs a bearer API key
 //! ([`keys`]) with the scope [`routes::ROUTES`] names, except `/livez` with
-//! `--api-public-livez`. Requests are rate-limited per client IP and per
+//! `--api-public-livez`, and the two docs GETs with `--api-public-docs`.
+//! Requests are rate-limited per client IP and per
 //! key ([`rate_limit`]). Mutations go through
 //! [`TenantService`] and the
 //! audit log. A non-loopback bind needs TLS unless `--api-allow-plaintext`
 //! says a proxy in front terminates it.
 
 pub mod deleted;
+pub mod docs_html;
+pub mod errors;
 pub mod handlers;
 pub mod health;
 pub mod keys;
 pub mod metrics;
+pub mod openapi;
 pub mod rate_limit;
+pub mod route_docs;
 pub mod routes;
+pub mod schema;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -143,6 +149,8 @@ pub struct ApiConfig {
     pub allow_plaintext: bool,
     pub state_dir: PathBuf,
     pub public_livez: bool,
+    /// `GET /v1/docs` and `GET /v1/openapi.json` without a key
+    pub public_docs: bool,
     pub trusted_proxies: Vec<Cidr>,
     pub rates: Rates,
     pub deleted_retention: Duration,
@@ -164,6 +172,14 @@ impl ApiConfig {
         }
         Ok(())
     }
+
+    /// Which routes this daemon serves without a key
+    pub fn exposure(&self) -> openapi::Exposure {
+        openapi::Exposure {
+            public_livez: self.public_livez,
+            public_docs: self.public_docs,
+        }
+    }
 }
 
 /// Buckets, per class
@@ -173,6 +189,8 @@ pub struct Limits {
     pub read: Limiter<String>,
     pub expensive: Limiter<String>,
     pub mutate: Limiter<String>,
+    /// Public docs requests, per client IP, at the read rate
+    pub public_read: Limiter<IpAddr>,
 }
 
 const BUCKETS: usize = 10_000;
@@ -185,6 +203,7 @@ impl Limits {
             read: Limiter::new(r.read, BUCKETS),
             expensive: Limiter::new(r.expensive, BUCKETS),
             mutate: Limiter::new(r.mutate, BUCKETS),
+            public_read: Limiter::new(r.read, BUCKETS),
         }
     }
 }
@@ -201,7 +220,25 @@ pub struct ApiState {
     pub ops: Arc<handlers::Operations>,
     pub deletes: Arc<deleted::Deletes>,
     pub health: Arc<health::Tracker>,
+    /// The OpenAPI document and its page, built once for this exposure
+    pub docs: Arc<Docs>,
     in_flight: Arc<tokio::sync::Semaphore>,
+}
+
+/// What `/v1/openapi.json` and `/v1/docs` serve
+pub struct Docs {
+    pub json: String,
+    pub html: String,
+}
+
+impl Docs {
+    pub fn new(exposure: openapi::Exposure) -> Self {
+        let doc = openapi::document(exposure);
+        Self {
+            html: docs_html::render(&doc),
+            json: serde_json::to_string(&doc).expect("the document serializes"),
+        }
+    }
 }
 
 impl ApiState {
@@ -220,6 +257,7 @@ impl ApiState {
             limits: Arc::new(Limits::new(&cfg.rates)),
             in_flight: Arc::new(tokio::sync::Semaphore::new(cfg.max_in_flight.max(1))),
             health: Arc::new(health::Tracker::default()),
+            docs: Arc::new(Docs::new(cfg.exposure())),
             service: TenantService::new(ctx.clone(), Some(etag_key)),
             ops: Arc::new(handlers::Operations::default()),
             cfg: Arc::new(cfg),
@@ -257,6 +295,7 @@ impl RequestCtx {
 
 /// The error body every route returns
 pub fn error_response(status: StatusCode, code: &str, message: &str, request_id: &str) -> Response {
+    errors::check(code, status.as_u16());
     let message = crate::ops::redact::redact_text(message);
     (
         status,
@@ -406,7 +445,16 @@ async fn authorize(
         route,
         audit_handled: Arc::default(),
     };
-    if route.is_some_and(|r| r.class == Class::Public) && state.cfg.public_livez {
+    // Public routes skip the key, never the per-IP limits: `/livez` stays
+    // behind preauth, the docs also behind the per-IP read bucket
+    if let Some(r) = route
+        && state.cfg.exposure().is_public(r)
+    {
+        if r.class != Class::Public
+            && let Err(wait) = state.limits.public_read.check(&ip)
+        {
+            return Err(Box::new(too_many(wait, request_id, "public_read")));
+        }
         req.extensions_mut().insert(ctx);
         return Ok(());
     }

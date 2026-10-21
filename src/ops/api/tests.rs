@@ -20,6 +20,9 @@ use crate::control::Reloader;
 use crate::metrics::{MetricsRegistry, MetricsSnapshot};
 use crate::tenants::{Phase, TenantState, tenant_dir};
 
+#[path = "docs_tests.rs"]
+mod docs;
+
 const BASE: &str = "[source]\nhost = 'pg'\ndbname = 'postgres'\n[tenants]\n";
 
 fn tenant_a() -> String {
@@ -36,6 +39,9 @@ struct Api {
     disabled: String,
     admin2: String,
     state: ApiState,
+    /// Checks every response [`Api::call`] gets against the document this
+    /// API serves
+    conformance: docs::Conformance,
 }
 
 fn generous() -> Rates {
@@ -51,6 +57,17 @@ fn generous() -> Rates {
 
 impl Api {
     async fn new(public_livez: bool, rates: Rates) -> Self {
+        Self::exposed(
+            super::openapi::Exposure {
+                public_livez,
+                public_docs: false,
+            },
+            rates,
+        )
+        .await
+    }
+
+    async fn exposed(exposure: super::openapi::Exposure, rates: Rates) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("ch-config.toml");
         std::fs::write(&config, BASE).unwrap();
@@ -116,7 +133,8 @@ impl Api {
             tls: None,
             allow_plaintext: false,
             state_dir,
-            public_livez,
+            public_livez: exposure.public_livez,
+            public_docs: exposure.public_docs,
             trusted_proxies: Vec::new(),
             rates,
             deleted_retention: Duration::from_secs(3600),
@@ -126,6 +144,7 @@ impl Api {
         };
         let state = ApiState::new(cfg, ctx, keys, Some(crashes)).await.unwrap();
         Self {
+            conformance: docs::Conformance::new(&state.docs.json, exposure),
             router: router(state.clone()),
             admin: tokens[0].clone(),
             read: tokens[1].clone(),
@@ -167,6 +186,8 @@ impl Api {
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 22)
             .await
             .unwrap();
+        self.conformance
+            .check(method, path, status, &headers, &bytes);
         let body = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()));
         (status, headers, body)
@@ -928,6 +949,7 @@ fn config_checks_refuse_plaintext_off_loopback() {
         allow_plaintext: allow,
         state_dir: "/s".into(),
         public_livez: false,
+        public_docs: false,
         trusted_proxies: Vec::new(),
         rates: Rates::default(),
         deleted_retention: Duration::from_secs(1),
@@ -1715,10 +1737,13 @@ async fn raw_request_rejections_use_the_error_envelope_and_authenticate_first() 
             .await
             .unwrap();
         assert_eq!(res.status(), expected, "{method} {path}");
+        let headers = res.headers().clone();
         let request_id = res.headers()["x-request-id"].to_str().unwrap().to_string();
         let body = axum::body::to_bytes(res.into_body(), 1 << 20)
             .await
             .unwrap();
+        api.conformance
+            .check(method, path, expected, &headers, &body);
         let out: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(out["error"]["request_id"], request_id);
         assert_eq!(

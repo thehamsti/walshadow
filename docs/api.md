@@ -3,7 +3,8 @@
 An authenticated API for health checks, metrics, crash points and recent
 errors, jobs and tenant status, and full tenant control: create, edit,
 detach, attach, delete and restore. Every route needs an API key except
-`/livez` when you ask for it to be public.
+`/livez` with `--api-public-livez`, and the two docs GETs with
+`--api-public-docs`.
 
 ## Enable
 
@@ -49,6 +50,7 @@ secrets.
 | `--api-allow-plaintext` | `WALSHADOW_API_ALLOW_PLAINTEXT` | false |
 | `--api-state-dir` | `WALSHADOW_API_STATE_DIR` | `<spill-dir>/api` |
 | `--api-public-livez` | `WALSHADOW_API_PUBLIC_LIVEZ` | false |
+| `--api-public-docs` | `WALSHADOW_API_PUBLIC_DOCS` | false |
 | `--api-trusted-proxies` | `WALSHADOW_API_TRUSTED_PROXIES` | none |
 | `--api-rate-limit <class>=<n>/<s\|m\|h>:<burst>` | | see below |
 | `--api-deleted-retention-days` | | 30 |
@@ -69,8 +71,10 @@ refused. A missing, malformed, unknown, wrong, expired or disabled key gets
 the route's scope gets `403`. Paths that do not exist answer `401` before
 `404`, so nothing enumerates without a key.
 
-Every response carries `X-Request-Id`, `Cache-Control: no-store` and
-`X-Content-Type-Options: nosniff`. Errors share one body:
+Responses through the guard carry `X-Request-Id`, `Cache-Control: no-store`
+and `X-Content-Type-Options: nosniff`. The outer timeout layer answers `408`
+with an empty body; the panic layer answers `500` with plain text. Both
+omit the guard's headers. Other errors share one body:
 
 ```json
 {"error": {"code": "resync_not_acknowledged", "message": "…", "request_id": "…"}}
@@ -78,13 +82,16 @@ Every response carries `X-Request-Id`, `Cache-Control: no-store` and
 
 | Status | Code | Meaning |
 |---|---|---|
-| 400 | `invalid_body` | The body or query does not have the route's shape, or names another tenant |
-| 400 | `invalid_id` | A tenant id is not 1–63 characters of `[a-z0-9_-]`, or is reserved |
+| 400 | `invalid_body` | The body or query does not have the route's shape |
+| 400 | `invalid_id` | A tenant id is not 1–63 characters of `[a-z0-9_-]`, is reserved, or is not the path's |
 | 400 | `invalid_tenant` | The tenant declaration does not parse |
-| 4xx | `invalid_request` | Rejected before the route ran: malformed JSON, a missing `Content-Type`, an oversized body |
+| 400 | `invalid_request` | Rejected before the route ran: malformed JSON, or a query or path it cannot read |
+| 413 | `invalid_request` | Rejected before the route ran: the body is over 1 MiB |
+| 415 | `invalid_request` | Rejected before the route ran: the body is not `Content-Type: application/json` |
+| 422 | `invalid_request` | Rejected before the route ran: the JSON does not fit the route's body |
 | 401 | `unauthenticated` | No valid key |
 | 403 | `forbidden` | The key lacks the route's scope |
-| 404 | `not_found` | No such tenant, tombstone, operation or crash record |
+| 404 | `not_found` | No such route, tenant, tombstone, operation or crash record |
 | 409 | `exists` | The tenant exists already, also when restoring onto a live id |
 | 409 | `resync_not_acknowledged` | The change attaches the tenant afresh; resend with `acknowledge_resync` |
 | 409 | `rebind_pending` | A re-bind of the tenant is still pending |
@@ -126,6 +133,8 @@ Every response carries `X-Request-Id`, `Cache-Control: no-store` and
 | GET | `/v1/tenants/{id}` | read | One tenant, redacted spec, jobs; `ETag` header |
 | GET | `/v1/tenants/{id}/jobs`, `/v1/tenants/{id}/errors` | read | |
 | GET | `/v1/tenants/{id}/tables` | read | Source catalog and selection (opens a source connection) |
+| GET | `/v1/openapi.json` | none with `--api-public-docs`, else read | This API as an OpenAPI 3.1 document |
+| GET | `/v1/docs` | none with `--api-public-docs`, else read | The same, as a web page |
 | GET | `/v1/config` | admin | Merged config, secrets masked |
 | GET | `/v1/audit` | admin | Audit records: `since_seq`, `tenant`, `action`, `limit` |
 | GET | `/v1/operations/{request_id}` | admin | What a mutation did, for a client that timed out |
@@ -160,6 +169,34 @@ scrape_configs:
 
 `--metrics-bind` still serves the same metrics without authentication. Bind
 it to loopback, or drop it once Prometheus scrapes the API.
+
+## API docs
+
+The API documents itself. `GET /v1/openapi.json` is an OpenAPI 3.1 document
+of every route: its parameters, request and response bodies field by field,
+the scope it needs, its rate class, and every error it answers with.
+`GET /v1/docs` renders the same document as one self-contained page: no
+script, no external asset, served under a Content-Security-Policy that
+allows neither. Both are generated from the route table that also builds the
+router, so they list exactly the routes the daemon serves.
+
+A browser cannot send a key on a page load. Save the page and the document
+with a read key, then open the file:
+
+```bash
+curl -s https://walshadow:9485/v1/docs -H "Authorization: Bearer $(cat dash.token)" > walshadow-api.html
+curl -s https://walshadow:9485/v1/openapi.json -H "Authorization: Bearer $(cat dash.token)" > openapi.json
+open walshadow-api.html
+```
+
+Or start the daemon with `--api-public-docs` to serve just those two routes
+without a key. Like public `/livez`, they charge the preauth bucket per
+client IP; they also share a separate per-IP bucket at the read rate.
+Presenting a key on a public route does not bypass these limits. They hold no
+secrets; every other route still needs a key, and the document marks the two
+as public. Without a daemon, `walshadow-stream api-docs --format json` (or
+`--format html`) prints the same document or page. Import `openapi.json`
+into Postman, Swagger UI, Redoc or Scalar for an interactive view.
 
 ## Change tenants
 

@@ -1,4 +1,6 @@
-# T-1021-01 code pass, round 2
+# HTTP API code review, round 2
+
+Ticket: T-1021-01. Plan: [http_api.md](http_api.md).
 
 Client request: `t1021-01-code-r2`. Reviewer: Sol. Last code-pass round.
 
@@ -60,7 +62,7 @@ finding is the missing binding-required discard/catch-up boundary itself.
 
 ### Reproducing the held invariants
 
-`plans/T-1021-01-code-r2-repros.patch` contains three isolated test additions,
+`plans/http_api_review_r2_repros.patch` contains three isolated test additions,
 no production changes. It was applied and run, then removed from the source
 tree after recording the results. The default suite has no new ignored
 tests. The patch's tests are explicitly opt-in because they fail on this
@@ -104,8 +106,8 @@ they are not counted among the full suite's passes or skips.
 
 - `src/ops/api/handlers.rs`: config-mutation operation lifecycle.
 - `src/ops/api/tests.rs`: cancellation, lookup, audit and failure regression.
-- `plans/T-1021-01-code-r2-repros.patch`: reproducible core invariant failures.
-- `plans/T-1021-01-code-r2.md`: this report.
+- `plans/http_api_review_r2_repros.patch`: reproducible core invariant failures.
+- `plans/http_api_review_r2.md`: this report.
 
 ## 5. Commands and results
 

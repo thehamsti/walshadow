@@ -19,7 +19,7 @@ pub const CAPACITY: usize = 1000;
 pub const FIELD_MAX: usize = 2048;
 const FIELDS: [&str; 4] = ["tenant", "database", "error", "reason"];
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct ErrorEvent {
     /// Monotonic within the process
     pub seq: u64,

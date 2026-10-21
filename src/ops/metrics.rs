@@ -950,7 +950,7 @@ pub static API_AUDIT_WRITE_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// One job the API reports: an initial load, a priming wait, a teardown
-#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct JobView {
     pub kind: &'static str,
     pub namespace: String,

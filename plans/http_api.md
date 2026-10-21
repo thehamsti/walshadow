@@ -1,4 +1,6 @@
-# T-1021-01: Authenticated HTTP API for health, metrics, crash reports, jobs and tenant control
+# Authenticated HTTP API for health, metrics, crash reports, jobs and tenant control
+
+Tickets: T-1021-01 (the API), T-1021-06 (built-in API docs, plan file names).
 
 Status: **implemented on branch `t3/walshadow/t1021-ws-api-20261021-0846`,
 in review.** Sol plan reviews r1–r3 returned CHANGES_REQUESTED. The requester
@@ -1151,7 +1153,7 @@ to a real database, slot or publication.
 
 - **Code pass r1 (Sol, `t1021-01-code-r1`):** R3-M1, R3-M2 and R3-m1 pass;
   R3-M3 failed (H3). Ten bounded findings were fixed in the pass; the round's
-  report is `plans/T-1021-01-code-r1.md`. Seven core findings were held, and
+  report is `plans/http_api_review_r1.md`. Seven core findings were held, and
   the requester ruling of 10/21 1:22 PM MT had each fixed with its own
   regression test:
 
@@ -1213,3 +1215,70 @@ to a real database, slot or publication.
   bases with the DA-based 7,052 and overstates (7,185–7,200 for the same
   two runs). Run-to-run variation was about 20 DA lines, in
   `catalog/shadow.rs`.
+
+## 24. Built-in API docs (T-1021-06)
+
+Requester (John, 10/21 4:06 PM MT): an endpoint with built-in API docs, a
+web view and a JSON export, following best practices. None existed: no
+OpenAPI document, docs route or UI on `main` or this branch, only
+`docs/api.md`.
+
+- **Routes.** `GET /v1/openapi.json` (OpenAPI 3.1) and `GET /v1/docs` (a
+  web page rendered from that document), scope `read`, rate class `read`.
+  `--api-public-docs` (off by default) opens exactly those two `GET`s
+  without a key; they stay behind the per-IP preauth limiter and draw on
+  their own per-IP bucket at the read rate (`public_read`). The served
+  document's `security` follows the flags. `walshadow-stream api-docs
+  --format json|html [--public-docs] [--public-livez]` prints either
+  without a daemon: the same JSON document (pretty-printed by the CLI),
+  and byte for byte the HTML a daemon with the same flags serves.
+- **Sources.**
+  - Paths, methods, scopes, rate classes and audit actions come from
+    `ROUTES`, which also builds the router and drives the guard.
+  - Every `Route` carries a required `doc: RouteDoc` (`route_docs.rs`):
+    operation id, parameters, request body, replies and the route's own
+    errors.
+  - Schemas come from `utoipa` `ToSchema` on the types handlers serialize,
+    and on mirrors in `schema.rs` of the bodies built with `json!`.
+  - Error codes come from `ERROR_CODES` (`errors.rs`); every error
+    producer `debug_assert!`s membership.
+- **Closed schemas.** Objects are `additionalProperties: false` except the
+  open ones in `openapi::OPEN`: config sections, the status table, the
+  document itself, tenant declarations. A `#[serde(flatten)]` type's
+  `allOf` is merged into one closed object, so the type it flattens stays
+  closed where it stands alone. This replaces the plan-review design
+  (`unevaluatedProperties` on the composition, its parts left open), which
+  left `TenantSummary`, `Tombstone` and `Draft` open everywhere.
+- **Web page.** Server-rendered, no script, no external asset, served
+  under `default-src 'none'; style-src 'unsafe-inline'; img-src 'none';
+  base-uri 'none'; form-action 'none'; frame-ancestors 'none'`. No Swagger
+  UI or Scalar: a vendored JavaScript bundle to review and keep current,
+  and "try it out" invites pasting admin keys into a page.
+- **Tests** (`src/ops/api/docs_tests.rs`, `tests/api_e2e.rs`):
+
+  | Test | Holds |
+  |---|---|
+  | `the_document_lists_every_route_and_nothing_else` | Operations equal `ROUTES`, with scope, class, action, security per exposure, path parameters, the guard's responses; objects closed unless open; no composition left |
+  | `the_router_serves_exactly_what_the_document_lists` | Every documented method of every documented path is routed, no other method is |
+  | `the_error_reference_is_the_table` | `docs/api.md`'s error table and the document's `code` enum equal `ERROR_CODES` |
+  | `the_document_is_valid_openapi_3_1` | Valid against the vendored OAS 3.1 schema, every schema valid for the OAS dialect and compiling with references resolved, nothing fetched; negative controls |
+  | `Conformance`, on every `Api::call` | Every response every in-process API test gets: a documented status, media type and headers, a body its schema accepts, an error code the operation declares for that status |
+  | `the_conformance_check_refuses_what_the_document_does_not_say` | The checker refuses an unknown field, an undeclared status, code and media type, a missing guard header, an undocumented ETag |
+  | `every_operation_answers_its_documented_successes` | Each documented success status of each operation, from a request made to produce it; readiness's 503 |
+  | `request_bodies_agree_with_their_schemas` | Request bodies through the schema and the API: what one refuses the other refuses, and each body route has one both accept |
+  | `the_docs_are_public_only_with_their_flag` | All four flag combinations: who answers without a key, the document's security, other methods |
+  | `public_docs_are_rate_limited_per_address` | Preauth and the docs bucket each exhausted with the other to spare |
+  | `the_page_is_self_contained_and_covers_the_document`, `the_renderer_shows_every_construct_and_escapes_text` | CSP and headers, no script or external asset, every operation and schema anchored, links land, nested fields linked, no key or secret; each rendered construct; escaping |
+  | `api_docs_prints_what_the_daemon_serves` (e2e) | The CLI prints the library's document and page for each flag set |
+  | `api_tenants_apply_live_without_restart` (e2e) | A live daemon serves what the CLI prints; `/v1/tenants/{id}/tables`, which needs a source, matches its schema |
+
+  The conformance hook found two wrong references on its first run:
+  `invalid_body` was said to cover a body naming another tenant (it is
+  `invalid_id`), and `/v1/tenants/{id}/tables` was an empty open schema
+  (it is a fixed, now closed, shape).
+- **Plan files** renamed to the `plans/` convention (lowercase topic
+  names, no ticket ids): `T-1021-01.md` → `http_api.md`,
+  `T-1021-01-code-r1.md` → `http_api_review_r1.md`, `T-1021-01-code-r2.md`
+  → `http_api_review_r2.md`, `T-1021-01-code-r2-repros.patch` →
+  `http_api_review_r2_repros.patch`. `docs/plans/T-1021-WS-API.md` was
+  never committed, so there was nothing to fold in.

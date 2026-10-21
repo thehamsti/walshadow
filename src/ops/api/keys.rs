@@ -32,7 +32,19 @@ use subtle::ConstantTimeEq;
 
 pub const TOKEN_PREFIX: &str = "wsk_";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
     Read,
@@ -89,7 +101,7 @@ impl std::fmt::Debug for Key {
 }
 
 /// A caller who presented a valid key
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct Principal {
     pub key_id: String,
     pub scopes: BTreeSet<Scope>,
