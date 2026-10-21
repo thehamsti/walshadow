@@ -297,9 +297,13 @@ pub async fn apply_fragment(
         })?;
     }
     let outcome = async {
-        save(&ctx.fragment, &root)
-            .await
-            .map_err(|e| ServiceError::new(500, "internal", format!("{e:#}")))?;
+        // A reload, or an edit that changes nothing, leaves the fragment
+        // alone: never rewritten, never created
+        if root != before {
+            save(&ctx.fragment, &root)
+                .await
+                .map_err(|e| ServiceError::new(500, "internal", format!("{e:#}")))?;
+        }
         let published = tx
             .publish(ReloadCause::Control, PublishOpts::default())
             .await
@@ -958,6 +962,49 @@ mod tests {
             ok_note(&["billing".to_string()]).starts_with("OK config names billing"),
             "ctl prints the note on the OK line"
         );
+    }
+
+    /// `reload`, and an edit that changes nothing, publish without writing
+    /// the control fragment: no empty `50-api.toml` appears, an existing one
+    /// keeps its bytes and mtime
+    #[tokio::test]
+    async fn reload_and_no_op_edits_leave_the_fragment_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let ctx = ctx_at(dir.path());
+        let frag = ctx.fragment.clone();
+        let _h = serve(sock.clone(), ctx.clone()).await.unwrap();
+        assert!(call(&sock, "reload", "").await.starts_with("OK"));
+        assert!(!frag.exists(), "reload created the fragment");
+        assert!(
+            call(&sock, "apply", "[ch]\nhost = \"ch\"\n")
+                .await
+                .starts_with("OK")
+        );
+        let bytes = std::fs::read(&frag).unwrap();
+        let mtime = std::fs::metadata(&frag).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let generation = ctx.reloader.current().generation;
+        assert!(call(&sock, "reload", "").await.starts_with("OK"));
+        // The same value again: published, not rewritten
+        assert!(
+            call(&sock, "apply", "[ch]\nhost = \"ch\"\n")
+                .await
+                .starts_with("OK")
+        );
+        assert_eq!(std::fs::read(&frag).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&frag).unwrap().modified().unwrap(), mtime);
+        assert!(
+            ctx.reloader.current().generation > generation,
+            "still published"
+        );
+        // Unsetting a key that is not there changes nothing either
+        assert!(
+            call(&sock, "unset", "[ch]\nport = 0\n")
+                .await
+                .starts_with("OK")
+        );
+        assert_eq!(std::fs::read(&frag).unwrap(), bytes);
     }
 
     #[tokio::test]
