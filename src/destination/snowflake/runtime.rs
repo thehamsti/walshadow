@@ -67,6 +67,10 @@ pub struct SnowflakeRuntime {
     /// (landing, receipts) tables applied into since the last cleanup
     landed: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
     last_cleanup: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Outbox appliers and the blocking state calls the runtime makes,
+    /// owned so a tenant teardown stops and joins them before another
+    /// tenant takes this destination or state directory
+    writers: crate::ops::writers::WriterSet,
 }
 
 impl std::fmt::Debug for SnowflakeRuntime {
@@ -117,6 +121,7 @@ impl SnowflakeRuntime {
             apply_failed: std::sync::OnceLock::new(),
             landed: Default::default(),
             last_cleanup: Default::default(),
+            writers: crate::ops::writers::WriterSet::new(),
         });
         runtime.preflight().await?;
         runtime.recover_schema_changes().await?;
@@ -551,7 +556,7 @@ impl SnowflakeRuntime {
         for _ in 0..self.config.max_in_flight {
             let runtime = Arc::downgrade(self);
             let rx = rx.clone();
-            tokio::spawn(async move {
+            self.writers.spawn(async move {
                 loop {
                     let Some(id) = rx.lock().await.recv().await else {
                         return;
@@ -585,6 +590,12 @@ impl SnowflakeRuntime {
                 }
             });
         }
+    }
+
+    /// Outbox appliers and blocking state calls, for a teardown to stop and
+    /// join
+    pub fn writers(&self) -> &crate::ops::writers::WriterSet {
+        &self.writers
     }
 
     /// Wait until every outbox batch handed to the appliers has applied: a
@@ -692,7 +703,9 @@ impl SnowflakeRuntime {
         loop {
             let state = self.state.clone();
             let attempt = batch.clone();
-            let result = tokio::task::spawn_blocking(move || state.enqueue(&attempt))
+            let result = self
+                .writers
+                .spawn_blocking(move || state.enqueue(&attempt))
                 .await
                 .context("Snowflake enqueue task")?;
             match result {
@@ -721,16 +734,18 @@ impl SnowflakeRuntime {
             return Ok(());
         }
         let state = self.state.clone();
-        let (manifests, toast) = tokio::task::spawn_blocking(move || -> Result<(usize, u64)> {
-            let manifests = state.gc_applied()?;
-            let toast = state
-                .toast_store()
-                .gc_below(floor)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            Ok((manifests, toast))
-        })
-        .await
-        .context("Snowflake maintenance task")??;
+        let (manifests, toast) = self
+            .writers
+            .spawn_blocking(move || -> Result<(usize, u64)> {
+                let manifests = state.gc_applied()?;
+                let toast = state
+                    .toast_store()
+                    .gc_below(floor)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok((manifests, toast))
+            })
+            .await
+            .context("Snowflake maintenance task")??;
         if manifests > 0 || toast > 0 {
             tracing::debug!(
                 target: "walshadow::snowflake",
@@ -1434,6 +1449,7 @@ mod tests {
             apply_failed: std::sync::OnceLock::new(),
             landed: Default::default(),
             last_cleanup: Default::default(),
+            writers: crate::ops::writers::WriterSet::new(),
         };
         let batch = DurableBatch {
             id: "batch1".into(),
@@ -1462,6 +1478,64 @@ mod tests {
         };
         let plan = TableSqlPlan::new(&schema, "INTERNAL").unwrap();
         (dir, runtime, batch, plan, requests)
+    }
+
+    /// R3-M3: the outbox appliers and the runtime's blocking state writes
+    /// belong to its writer set, and a teardown hands the Snowflake
+    /// database and state directory to another tenant only once every one
+    /// of them has joined. A state write stuck in RocksDB keeps the claim;
+    /// the appliers, parked on the outbox, abort at once
+    #[tokio::test]
+    async fn teardown_waits_for_blocked_outbox() {
+        use crate::tenants::{Reservations, Resource};
+        let (dir, runtime, _batch, _plan, _requests) = fixture(Vec::new()).await;
+        let runtime = Arc::new(runtime);
+        runtime.spawn_appliers();
+        let appliers = runtime.config.max_in_flight;
+        assert!(appliers > 0);
+        assert_eq!(runtime.writers().live_count(), appliers);
+        // A state write that has not returned
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let stuck = runtime.writers().spawn_blocking(move || {
+            let _ = held.recv();
+        });
+        drop(stuck);
+
+        let theirs: std::collections::BTreeSet<Resource> = [
+            Resource::Snowflake("https://test.snowflakecomputing.com".into(), "DB".into()),
+            Resource::StateDir(dir.path().to_path_buf()),
+        ]
+        .into_iter()
+        .collect();
+        let reservations = Reservations::default();
+        reservations.claim("a", theirs.clone()).unwrap();
+        reservations.tearing_down("a");
+
+        // Teardown: the appliers abort, the blocked write outlives the wait
+        let joined = runtime
+            .writers()
+            .abort_and_join(Duration::from_millis(200))
+            .await;
+        assert!(!joined, "a blocking state write still runs");
+        assert_eq!(runtime.writers().live_count(), 1, "only the stuck write");
+        if joined {
+            reservations.release("a");
+        }
+        let conflict = reservations.claim("b", theirs.clone()).unwrap_err();
+        assert_eq!(conflict.holder, "a");
+        assert!(conflict.tearing_down);
+
+        // The write returns; the join completes and the claim moves on
+        release.send(()).unwrap();
+        assert!(
+            runtime
+                .writers()
+                .abort_and_join(Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(runtime.writers().live_count(), 0);
+        reservations.release("a");
+        reservations.claim("b", theirs).unwrap();
     }
 
     #[tokio::test]

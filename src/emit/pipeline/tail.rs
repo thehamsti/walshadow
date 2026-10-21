@@ -54,6 +54,47 @@ impl TailParts {
         self.join().await;
     }
 
+    /// [`join`](Self::join) until `deadline`, then abort every stage still
+    /// running and wait up to `abort_wait` for them to end. Returns
+    /// `(drained, joined)`: whether the cascade finished in time, and
+    /// whether every stage has ended either way
+    pub(super) async fn join_or_abort(
+        self,
+        deadline: tokio::time::Instant,
+        abort_wait: std::time::Duration,
+    ) -> (bool, bool) {
+        let mut stages: Vec<AbortOnDropHandle<()>> = std::iter::once(self.batcher)
+            .chain(self.resolvers)
+            .chain(self.inserters)
+            .chain(std::iter::once(self.collector))
+            .collect();
+        let mut done = 0;
+        for stage in &mut stages {
+            if tokio::time::timeout_at(deadline, &mut *stage)
+                .await
+                .is_err()
+            {
+                break;
+            }
+            done += 1;
+        }
+        if done == stages.len() {
+            return (true, true);
+        }
+        let rest = &mut stages[done..];
+        for stage in rest.iter() {
+            stage.abort();
+        }
+        let joined = tokio::time::timeout(abort_wait, async {
+            for stage in rest.iter_mut() {
+                let _ = (&mut *stage).await;
+            }
+        })
+        .await
+        .is_ok();
+        (false, joined)
+    }
+
     /// Await the drain cascade once every producer handle has dropped
     pub(super) async fn join(self) {
         let _ = self.batcher.await;

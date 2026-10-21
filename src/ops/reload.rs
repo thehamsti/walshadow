@@ -115,6 +115,9 @@ pub struct Reloader {
     tenants: Mutex<BTreeMap<String, TenantSlot>>,
     epoch: Arc<str>,
     tx: watch::Sender<Arc<ConfigRevision>>,
+    /// Exclusive resources of attached and tearing-down tenants, shared by
+    /// the session and the control plane across session restarts
+    reservations: Arc<crate::tenants::Reservations>,
 }
 
 impl Default for Reloader {
@@ -144,7 +147,12 @@ impl Reloader {
             tenants: Mutex::new(BTreeMap::new()),
             epoch,
             tx,
+            reservations: Arc::default(),
         }
+    }
+
+    pub fn reservations(&self) -> &Arc<crate::tenants::Reservations> {
+        &self.reservations
     }
 
     pub fn epoch(&self) -> &Arc<str> {

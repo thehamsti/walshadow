@@ -839,6 +839,9 @@ pub struct CopyBackfiller {
     /// Pending visibility ledger live apply folds commits into; backup passes
     /// add their tables to this same instance
     pending_rows: SharedPendingLedger,
+    /// COPY, resumed-swap and backup passes, owned so a tenant teardown can
+    /// stop and join every pass before another tenant takes the destination
+    writers: crate::ops::writers::WriterSet,
 }
 
 impl CopyBackfiller {
@@ -907,7 +910,13 @@ impl CopyBackfiller {
                 emitter_copy_concurrency.unwrap_or(DEFAULT_COPY_CONCURRENCY),
             ),
             pending_rows,
+            writers: crate::ops::writers::WriterSet::new(),
         })
+    }
+
+    /// Every pass this backfiller runs, for a teardown to stop and join
+    pub fn writers(&self) -> &crate::ops::writers::WriterSet {
+        &self.writers
     }
 
     /// Ledger entries awaiting backfill completion.
@@ -1087,7 +1096,7 @@ impl CopyBackfiller {
         };
         if let Some((s_lsn, staging_uuid, staging_target)) = resume {
             let this = self.clone();
-            tokio::spawn(async move {
+            self.writers.spawn(async move {
                 this.resume_swap(rel, s_lsn, staging_uuid, staging_target)
                     .await
             });
@@ -1111,12 +1120,14 @@ impl CopyBackfiller {
                 }
                 let this = self.clone();
                 let desc = desc.clone();
-                tokio::spawn(async move { this.run(desc, s_lsn).await });
+                self.writers
+                    .spawn(async move { this.run(desc, s_lsn).await });
             }
             InitialLoadMode::BaseBackup | InitialLoadMode::ObjectStore => {
                 if spawn_pass {
                     let this = self.clone();
-                    tokio::spawn(async move { this.run_backup_pass(mode).await });
+                    self.writers
+                        .spawn(async move { this.run_backup_pass(mode).await });
                 }
             }
         }
@@ -1321,6 +1332,7 @@ impl CopyBackfiller {
             oracle: self.oracle.clone(),
             source_major: self.source_major,
             checkpoint,
+            writer: Some(self.writers.token()),
         };
         let outcome = crate::backfill::backup_backfill::run_pass(&ctx, mode, reqs).await?;
         self.hold_pending(&outcome).await;
@@ -1386,6 +1398,7 @@ impl CopyBackfiller {
                 oracle: self.oracle.clone(),
                 source_major: self.source_major,
                 checkpoint,
+                writer: Some(self.writers.token()),
             };
             outcome = crate::backfill::backup_backfill::run_pass(&ctx, mode, &active_reqs).await?;
             BackupCheckpoint::discard(&ctx.scratch_dir).await?;
@@ -2058,7 +2071,9 @@ impl CopyBackfiller {
         let mut catalog = CatalogMap::new();
         catalog.insert(desc.clone());
         let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
-        let drain = tokio::spawn(bootstrap::drain(
+        // Aborted with the pass that awaits it, and counted until it ends
+        let token = self.writers.token();
+        let drain_task = bootstrap::drain(
             tup_rx,
             catalog,
             freeze_routes(
@@ -2077,7 +2092,11 @@ impl CopyBackfiller {
             HashSet::new(),
             false,
             None,
-        ));
+        );
+        let drain = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let _token = token;
+            drain_task.await
+        }));
 
         let copied = crate::ops::stages::COPY
             .measure(copy_rows_into(

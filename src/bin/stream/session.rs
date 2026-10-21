@@ -961,6 +961,24 @@ async fn session_body(
                     .await
                 {
                     Ok(Some((t, sink, from_lsn))) => {
+                        match decl
+                            .resources(&merged, &args.spill_dir)
+                            .map(|r| reloader.reservations().claim(&decl.id, r))
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(c)) => tracing::warn!(
+                                target: "walshadow::tenant",
+                                tenant = %decl.id,
+                                conflict = %c,
+                                "resumed tenant overlaps another's reservation",
+                            ),
+                            Err(e) => tracing::warn!(
+                                target: "walshadow::tenant",
+                                tenant = %decl.id,
+                                error = %format!("{e:#}"),
+                                "could not reserve the resumed tenant's resources",
+                            ),
+                        }
                         for db in &t.db_oids {
                             stream.filter_mut().add_target_db(*db);
                         }
@@ -1394,6 +1412,7 @@ async fn session_body(
                 tenant::catch_up(&tenants, rev, reloader).await;
             }
             let tcfg = tenants_cfg.as_ref().expect("tenants mode");
+            supervisor.reap_teardowns(reloader.reservations()).await;
             // Evict tenants the router gave up on, or that trail too far
             let mut evict = record_sink.decoder_xact.evictions();
             let head = record_sink.decoder_xact.last_record_end();
@@ -1440,48 +1459,80 @@ async fn session_body(
                     .filter(|d| d.desired == walshadow::tenants::Desired::Active)
                 && !tenants.iter().any(|t| t.id == id)
             {
-                let attached = async {
-                    record_sink.decoder_xact.flush().await?;
-                    let p0 = match record_sink.decoder_xact.last_record_end() {
-                        0 => stream.next_lsn().get(),
-                        end => end,
-                    };
-                    tenant::wait_shadow_replay(
-                        &shadow_state,
-                        record_sink.decoder_xact.last_record_start(),
-                        Duration::from_secs(args.catalog_hold_timeout),
-                    )
-                    .await?;
-                    let shadow_sql = open_shadow_sql_client(
-                        &args.shadow_socket_dir,
-                        args.shadow_port,
-                        &args.shadow_user,
-                        &primary_dbname,
-                    )
-                    .await?;
-                    if !tenant::attachment_ready(
-                        feed.sql_client().await?,
-                        &shadow_sql,
-                        &decl.dbname,
-                    )
-                    .await?
-                    {
-                        return Ok(None);
+                // Exclusive resources first: a destination or directory a
+                // tenant still tearing down holds, whatever its id, defers
+                // the attach until that teardown joined every writer. Its
+                // own teardown defers it too, claim or no claim
+                let claim = if supervisor.is_tearing_down(&id) {
+                    Ok(Err(walshadow::tenants::Conflict {
+                        resource: walshadow::tenants::Resource::TenantDir(
+                            walshadow::tenants::tenant_dir(&args.spill_dir, &id),
+                        ),
+                        holder: id.clone(),
+                        tearing_down: true,
+                    }))
+                } else {
+                    decl.resources(&merged, &args.spill_dir)
+                        .map(|r| reloader.reservations().claim(&id, r))
+                };
+                let attached = match claim {
+                    Ok(Err(conflict)) => {
+                        supervisor.wait_for(&id, conflict.to_string());
+                        None
                     }
-                    tenant::publish_tenant_bridges(
-                        &shadow_lifecycle,
-                        tenant::wanted_databases(tcfg),
-                    )
-                    .await?;
-                    let (t, sink) = supervisor
-                        .attach(&shared, args, &merged, tcfg, decl, p0, reloader)
-                        .await?;
-                    anyhow::Ok(Some((t, sink, p0)))
-                }
-                .await;
+                    Err(e) => Some(Err(e)),
+                    Ok(Ok(())) => {
+                        supervisor.stop_waiting(&id);
+                        Some(
+                            async {
+                                record_sink.decoder_xact.flush().await?;
+                                let p0 = match record_sink.decoder_xact.last_record_end() {
+                                    0 => stream.next_lsn().get(),
+                                    end => end,
+                                };
+                                tenant::wait_shadow_replay(
+                                    &shadow_state,
+                                    record_sink.decoder_xact.last_record_start(),
+                                    Duration::from_secs(args.catalog_hold_timeout),
+                                )
+                                .await?;
+                                let shadow_sql = open_shadow_sql_client(
+                                    &args.shadow_socket_dir,
+                                    args.shadow_port,
+                                    &args.shadow_user,
+                                    &primary_dbname,
+                                )
+                                .await?;
+                                if !tenant::attachment_ready(
+                                    feed.sql_client().await?,
+                                    &shadow_sql,
+                                    &decl.dbname,
+                                )
+                                .await?
+                                {
+                                    return Ok(None);
+                                }
+                                tenant::publish_tenant_bridges(
+                                    &shadow_lifecycle,
+                                    tenant::wanted_databases(tcfg),
+                                )
+                                .await?;
+                                let (t, sink) = supervisor
+                                    .attach(&shared, args, &merged, tcfg, decl, p0, reloader)
+                                    .await?;
+                                anyhow::Ok(Some((t, sink, p0)))
+                            }
+                            .await,
+                        )
+                    }
+                };
                 match attached {
-                    Ok(None) => supervisor.retry_attach(&id, Duration::from_secs(1)),
-                    Ok(Some((t, sink, p0))) => {
+                    None => {}
+                    Some(Ok(None)) => {
+                        reloader.reservations().release(&id);
+                        supervisor.retry_attach(&id, Duration::from_secs(1));
+                    }
+                    Some(Ok(Some((t, sink, p0)))) => {
                         for db in &t.db_oids {
                             stream.filter_mut().add_target_db(*db);
                         }
@@ -1495,7 +1546,8 @@ async fn session_body(
                         );
                         tenants.push(t);
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
+                        reloader.reservations().release(&id);
                         tracing::error!(
                             target: "walshadow::tenant",
                             tenant = %id,
@@ -2299,13 +2351,27 @@ async fn session_body(
     let mut drain = Pos::<walshadow::pos::Drain>::new(final_durable.get());
     let mut resume_safe = Pos::<walshadow::pos::ResumeSafe>::new(final_durable.get());
     let mut first_err = None;
+    // Teardowns started before shutdown finish first, bounded
+    supervisor
+        .await_teardowns(
+            reloader.reservations(),
+            tenants_cfg
+                .as_ref()
+                .map_or(Duration::from_secs(30), |t| t.stall_timeout)
+                + tenant::SHUTDOWN_JOIN_WAIT,
+        )
+        .await;
     for t in tenants {
+        let id = t.id.clone();
         let sink = router.detach(&t.id).map(|r| r.sink);
         let tenant_drain = t.xact_buffer.lock().await.stats().drain_lsn;
         match t.shutdown(sink).await {
             Ok(safe) => {
                 drain = drain.min(tenant_drain);
                 resume_safe = resume_safe.min(safe);
+                // Joined: a session restarted in this process may claim
+                // what it held. A failed shutdown keeps its claims
+                reloader.reservations().release(&id);
             }
             Err(e) => {
                 first_err.get_or_insert(e);

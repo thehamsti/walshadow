@@ -381,6 +381,41 @@ impl QueueingRecordSink {
         self.take_pending_error().map_or(Ok(()), Err)
     }
 
+    /// [`close`](Self::close) until `deadline`, then abort the worker and
+    /// wait up to `abort_wait` for it to end. The second value says whether
+    /// the worker has ended, drained or aborted
+    pub async fn close_or_abort(
+        mut self,
+        deadline: tokio::time::Instant,
+        abort_wait: Duration,
+    ) -> (Result<(), SinkError>, bool) {
+        let flushed = tokio::time::timeout_at(deadline, self.flush_buf()).await;
+        self.tx.take();
+        let mut worker = self.worker.take().expect("only close and drop take worker");
+        match tokio::time::timeout_at(deadline, &mut worker).await {
+            Ok(res) => {
+                let res = res
+                    .map_err(|e| SinkError::Other(format!("queueing sink worker: {e}")))
+                    .and_then(|()| match flushed {
+                        Ok(r) => r,
+                        Err(_) => Err(SinkError::Other("queueing sink flush timed out".into())),
+                    })
+                    .and_then(|()| self.take_pending_error().map_or(Ok(()), Err));
+                (res, true)
+            }
+            Err(_) => {
+                worker.abort();
+                let joined = tokio::time::timeout(abort_wait, &mut worker).await.is_ok();
+                (
+                    Err(SinkError::Other(
+                        "queueing sink worker did not drain in time; aborted".into(),
+                    )),
+                    joined,
+                )
+            }
+        }
+    }
+
     fn take_pending_error(&self) -> Option<SinkError> {
         self.err
             .lock()

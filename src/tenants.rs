@@ -381,6 +381,396 @@ impl TenantDecl {
     }
 }
 
+impl TenantDecl {
+    /// What durable state is bound to: the database, destination kind and
+    /// Snowflake fingerprint, ie the inputs of
+    /// [`identity_differs_across`](Self::identity_differs_across). Carries no
+    /// credential
+    pub fn identity_digest(&self, root: &toml::Table) -> Result<String> {
+        let (kind, fingerprint, _) = self.destination_binding(root)?;
+        Ok(digest(&serde_json::json!({
+            "v": 1,
+            "dbname": self.dbname,
+            "destination": kind,
+            "snowflake_fingerprint": fingerprint,
+        })))
+    }
+
+    /// Everything a running tenant was built with that a reload cannot
+    /// change in place: identity, ClickHouse scopes, Snowflake state dir and
+    /// the settings fixed when the tenant opens. A recovery fence records
+    /// the binding an accepted re-bind targets. Carries no credential
+    pub fn binding_digest(&self, root: &toml::Table) -> Result<String> {
+        let (kind, fingerprint, state_dir) = self.destination_binding(root)?;
+        let eff = self.effective_table(root);
+        let cfg = crate::ch_emitter::EmitterConfig::from_table(&eff)
+            .map_err(|e| anyhow::anyhow!("tenant {}: {e}", self.id))?;
+        let scopes: Vec<_> = if kind == "clickhouse" {
+            clickhouse_scopes(&cfg).into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        let cols = &cfg.system_columns;
+        Ok(digest(&serde_json::json!({
+            "v": 1,
+            "dbname": self.dbname,
+            "destination": kind,
+            "snowflake_fingerprint": fingerprint,
+            "snowflake_state_dir": state_dir,
+            "clickhouse_scopes": scopes,
+            "decoder_pool_size": cfg.decoder_pool_size,
+            "inserter_pool_size": cfg.inserter_pool_size,
+            "runtime_config_schema": cfg.runtime_config_schema,
+            "replicate_all": cfg.replicate_all,
+            "soft_delete": cfg.soft_delete,
+            "system_columns": [&cols.lsn, &cols.xid, &cols.commit_ts, &cols.is_deleted, &cols.leaf],
+            "toast_mode": format!("{:?}", cfg.toast.mode),
+        })))
+    }
+
+    fn destination_binding(
+        &self,
+        root: &toml::Table,
+    ) -> Result<(&'static str, Option<String>, Option<String>)> {
+        let dest =
+            crate::destination::config::DestinationConfig::from_table(&self.effective_table(root))
+                .with_context(|| format!("tenant {}: destination", self.id))?;
+        Ok(match dest.snowflake {
+            Some(sf) => (
+                "snowflake",
+                Some(sf.fingerprint()),
+                Some(sf.state.directory.display().to_string()),
+            ),
+            None => ("clickhouse", None, None),
+        })
+    }
+}
+
+fn digest(value: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(value.to_string().as_bytes()))
+}
+
+/// `<tenant-dir>/rebind.toml`: an accepted re-bind of an attached tenant,
+/// written before the config that triggers it. A boot that finds the
+/// config already carrying `target_binding` attaches the tenant afresh
+/// instead of resuming state bound to the old binding; otherwise the
+/// change never landed and the fence is dropped. The fresh attach clears
+/// the tenant directory, and with it the fence. While one is pending a
+/// further re-bind of the same tenant is refused (R3-M1)
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebindFence {
+    pub version: u32,
+    pub request_id: String,
+    pub target_binding: String,
+    /// Seconds since the Unix epoch
+    pub created_at: u64,
+}
+
+pub const REBIND_FENCE: &str = "rebind.toml";
+const FENCE_VERSION: u32 = 1;
+
+impl RebindFence {
+    pub fn new(request_id: &str, target_binding: String) -> Self {
+        Self {
+            version: FENCE_VERSION,
+            request_id: request_id.to_string(),
+            target_binding,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        }
+    }
+
+    pub async fn load(dir: &Path) -> Result<Option<Self>> {
+        let path = dir.join(REBIND_FENCE);
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        let fence: Self =
+            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        ensure!(
+            fence.version == FENCE_VERSION,
+            "{} has unsupported version {}",
+            path.display(),
+            fence.version
+        );
+        Ok(Some(fence))
+    }
+
+    /// Durable before it returns: temp file at 0600, fsync, rename, dir fsync
+    pub async fn store(&self, dir: &Path) -> Result<()> {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .with_context(|| format!("create {}", dir.display()))?;
+        crate::fs::write_private(dir, REBIND_FENCE, toml::to_string(self)?.as_bytes())
+            .await
+            .with_context(|| format!("write {}", dir.join(REBIND_FENCE).display()))
+    }
+
+    pub async fn remove(dir: &Path) -> Result<()> {
+        match tokio::fs::remove_file(dir.join(REBIND_FENCE)).await {
+            Ok(()) => crate::fs::fsync_dir(dir).await.map_err(Into::into),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                Err(e).with_context(|| format!("remove {}", dir.join(REBIND_FENCE).display()))
+            }
+        }
+    }
+}
+
+/// What a boot does with a tenant it finds active on disk
+#[derive(Debug, PartialEq, Eq)]
+pub enum BootResume {
+    /// Resume from the persisted state
+    Resume,
+    /// Resume, after dropping a fence whose re-bind never landed
+    DropFenceAndResume,
+    /// Do not resume: attach afresh, with fresh initial loads
+    Fresh(String),
+}
+
+/// Decide whether `state` may resume under `decl`, the boot's config. The
+/// caller has already checked the phase and database name
+pub fn boot_resume(
+    state: &TenantState,
+    decl: &TenantDecl,
+    root: &toml::Table,
+    fence: Option<&RebindFence>,
+) -> Result<BootResume> {
+    if let Some(identity) = &state.identity
+        && *identity != decl.identity_digest(root)?
+    {
+        return Ok(BootResume::Fresh(
+            "the database or destination identity changed while stopped".into(),
+        ));
+    }
+    Ok(match fence {
+        Some(fence) if fence.target_binding == decl.binding_digest(root)? => {
+            BootResume::Fresh(format!(
+                "re-bind {} was accepted before the restart",
+                fence.request_id
+            ))
+        }
+        Some(_) => BootResume::DropFenceAndResume,
+        None => BootResume::Resume,
+    })
+}
+
+/// Something only one tenant may write at a time
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Resource {
+    /// ClickHouse `(host:port, database)`
+    ClickHouse(String, String),
+    /// Snowflake `(account url, database)`
+    Snowflake(String, String),
+    /// A Snowflake state directory
+    StateDir(PathBuf),
+    /// `<spill-dir>/tenants/<id>`
+    TenantDir(PathBuf),
+}
+
+impl std::fmt::Display for Resource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClickHouse(endpoint, db) => write!(f, "ClickHouse database {db} on {endpoint}"),
+            Self::Snowflake(account, db) => write!(f, "Snowflake database {db} on {account}"),
+            Self::StateDir(dir) => write!(f, "state directory {}", dir.display()),
+            Self::TenantDir(dir) => write!(f, "tenant directory {}", dir.display()),
+        }
+    }
+}
+
+impl TenantDecl {
+    /// What attaching this tenant writes exclusively
+    pub fn resources(
+        &self,
+        root: &toml::Table,
+        spill_dir: &Path,
+    ) -> Result<std::collections::BTreeSet<Resource>> {
+        let mut out = std::collections::BTreeSet::new();
+        out.insert(Resource::TenantDir(tenant_dir(spill_dir, &self.id)));
+        let eff = self.effective_table(root);
+        let dest = crate::destination::config::DestinationConfig::from_table(&eff)
+            .with_context(|| format!("tenant {}: destination", self.id))?;
+        if let Some(sf) = dest.snowflake {
+            out.insert(Resource::Snowflake(
+                sf.account_url.to_ascii_lowercase(),
+                sf.database.to_ascii_uppercase(),
+            ));
+            out.insert(Resource::StateDir(normalize(&sf.state.directory)));
+        } else if eff.contains_key("ch") {
+            let cfg = crate::ch_emitter::EmitterConfig::from_table(&eff)
+                .map_err(|e| anyhow::anyhow!("tenant {}: {e}", self.id))?;
+            out.extend(
+                clickhouse_scopes(&cfg)
+                    .into_iter()
+                    .map(|(endpoint, db)| Resource::ClickHouse(endpoint, db)),
+            );
+        }
+        Ok(out)
+    }
+}
+
+/// Lexical normal form, so `/a/./b/` and `/a/b` are one directory
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Directories nest: one inside another tenant's is that tenant's too
+fn overlaps(a: &Resource, b: &Resource) -> bool {
+    match (a, b) {
+        (
+            Resource::StateDir(x) | Resource::TenantDir(x),
+            Resource::StateDir(y) | Resource::TenantDir(y),
+        ) => x.starts_with(y) || y.starts_with(x),
+        _ => a == b,
+    }
+}
+
+#[derive(Debug)]
+struct Holding {
+    resources: std::collections::BTreeSet<Resource>,
+    tearing_down: bool,
+}
+
+/// Exclusive resources of attached and tearing-down tenants. A tenant
+/// keeps its claim through teardown until every one of its writers has
+/// joined, so no other tenant, whatever its id, attaches to a destination
+/// or directory something may still write. A leaf lock
+#[derive(Debug, Default)]
+pub struct Reservations {
+    held: std::sync::Mutex<BTreeMap<String, Holding>>,
+}
+
+/// A resource another tenant holds
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub resource: Resource,
+    pub holder: String,
+    pub tearing_down: bool,
+}
+
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is held by tenant {}{}",
+            self.resource,
+            self.holder,
+            if self.tearing_down {
+                " until its teardown joins every writer"
+            } else {
+                ""
+            }
+        )
+    }
+}
+
+impl Reservations {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Holding>> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What of `resources` a tenant other than `id` holds
+    pub fn conflicts(
+        &self,
+        id: &str,
+        resources: &std::collections::BTreeSet<Resource>,
+    ) -> Vec<Conflict> {
+        let held = self.lock();
+        let mut out = Vec::new();
+        for (holder, holding) in held.iter().filter(|(h, _)| h.as_str() != id) {
+            for theirs in &holding.resources {
+                if let Some(ours) = resources.iter().find(|r| overlaps(r, theirs)) {
+                    out.push(Conflict {
+                        resource: ours.clone(),
+                        holder: holder.clone(),
+                        tearing_down: holding.tearing_down,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// All or nothing. A tenant still tearing down blocks its own id too:
+    /// a re-attach must not race the old pipeline into the directory it
+    /// clears
+    pub fn claim(
+        &self,
+        id: &str,
+        resources: std::collections::BTreeSet<Resource>,
+    ) -> std::result::Result<(), Conflict> {
+        let mut held = self.lock();
+        if let Some(own) = held.get(id)
+            && own.tearing_down
+        {
+            let resource = own
+                .resources
+                .iter()
+                .find(|r| matches!(r, Resource::TenantDir(_)))
+                .or_else(|| own.resources.iter().next())
+                .cloned()
+                .unwrap_or_else(|| Resource::TenantDir(PathBuf::from(id)));
+            return Err(Conflict {
+                resource,
+                holder: id.to_string(),
+                tearing_down: true,
+            });
+        }
+        for (holder, holding) in held.iter().filter(|(h, _)| h.as_str() != id) {
+            for theirs in &holding.resources {
+                if let Some(ours) = resources.iter().find(|r| overlaps(r, theirs)) {
+                    return Err(Conflict {
+                        resource: ours.clone(),
+                        holder: holder.clone(),
+                        tearing_down: holding.tearing_down,
+                    });
+                }
+            }
+        }
+        held.insert(
+            id.to_string(),
+            Holding {
+                resources,
+                tearing_down: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// The tenant's claim now outlives it until [`release`](Self::release)
+    pub fn tearing_down(&self, id: &str) {
+        if let Some(h) = self.lock().get_mut(id) {
+            h.tearing_down = true;
+        }
+    }
+
+    /// Every writer of `id` has joined
+    pub fn release(&self, id: &str) {
+        self.lock().remove(id);
+    }
+
+    pub fn is_tearing_down(&self, id: &str) -> bool {
+        self.lock().get(id).is_some_and(|h| h.tearing_down)
+    }
+}
+
 /// Lower-case letters, digits, `-` and `_`: used in paths, metric labels and
 /// Snowflake object names
 pub fn validate_id(id: &str) -> Result<()> {
@@ -442,6 +832,16 @@ pub struct TenantState {
     /// resumes; the backfill ledger no-ops finished ones
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub start_tables: Vec<StartTable>,
+    /// [`TenantDecl::identity_digest`] at attach. A boot whose config has
+    /// another identity attaches afresh rather than resume state bound to
+    /// the old one. Absent in state written before it existed, which boot
+    /// accepts and fills in
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// Random id of this attachment, new at every attach: a confirmation
+    /// issued for one attachment cannot act on the next
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -463,6 +863,8 @@ impl TenantState {
             start_lsn: 0,
             reason: None,
             start_tables: Vec::new(),
+            identity: None,
+            incarnation: None,
         }
     }
 
@@ -544,6 +946,162 @@ mod tests {
 
     fn root(text: &str) -> toml::Table {
         toml::from_str(text).unwrap()
+    }
+
+    fn ch_tenant(body: &str) -> toml::Table {
+        root(&format!(
+            "[source]\nhost = 'pg'\ndbname = 'postgres'\n[tenants]\n\
+             [tenant.a]\ndbname = 'app'\n[tenant.a.ch]\nhost = 'ch'\n{body}"
+        ))
+    }
+
+    fn decl_a(r: &toml::Table) -> TenantDecl {
+        TenantsConfig::from_table(r)
+            .unwrap()
+            .unwrap()
+            .get("a")
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn digests_carry_no_credentials_and_track_their_inputs() {
+        let base = ch_tenant("database = 'a'\npassword = 'one'\n");
+        let (identity, binding) = {
+            let d = decl_a(&base);
+            (
+                d.identity_digest(&base).unwrap(),
+                d.binding_digest(&base).unwrap(),
+            )
+        };
+        // A rotated password changes neither
+        let rotated = ch_tenant("database = 'a'\npassword = 'two'\n");
+        let d = decl_a(&rotated);
+        assert_eq!(d.identity_digest(&rotated).unwrap(), identity);
+        assert_eq!(d.binding_digest(&rotated).unwrap(), binding);
+        assert!(!binding.contains("one") && binding.len() == 64);
+        // Another ClickHouse database re-binds, but is the same identity
+        let moved = ch_tenant("database = 'b'\n");
+        let d = decl_a(&moved);
+        assert_eq!(d.identity_digest(&moved).unwrap(), identity);
+        assert_ne!(d.binding_digest(&moved).unwrap(), binding);
+        // So does a setting fixed when the tenant opens
+        let pools = ch_tenant("database = 'a'\ninserter_pool_size = 4\n");
+        assert_ne!(decl_a(&pools).binding_digest(&pools).unwrap(), binding);
+        // Another source database is another identity
+        let other = root(
+            "[source]\nhost = 'pg'\ndbname = 'postgres'\n[tenants]\n\
+             [tenant.a]\ndbname = 'other'\n[tenant.a.ch]\nhost = 'ch'\ndatabase = 'a'\n",
+        );
+        assert_ne!(decl_a(&other).identity_digest(&other).unwrap(), identity);
+    }
+
+    #[tokio::test]
+    async fn fence_round_trips_privately_and_removes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("tenants/a");
+        assert!(RebindFence::load(&tdir).await.unwrap().is_none());
+        let fence = RebindFence::new("req-1", "b".repeat(64));
+        fence.store(&tdir).await.unwrap();
+        assert_eq!(RebindFence::load(&tdir).await.unwrap(), Some(fence));
+        let mode = std::fs::metadata(tdir.join(REBIND_FENCE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        RebindFence::remove(&tdir).await.unwrap();
+        RebindFence::remove(&tdir).await.unwrap();
+        assert!(RebindFence::load(&tdir).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn boot_resumes_only_state_bound_to_the_boot_config() {
+        let a = ch_tenant("database = 'a'\n");
+        let b = ch_tenant("database = 'b'\n");
+        let decl = decl_a(&b);
+        let mut state = TenantState::new("a", "app", 7);
+        state.phase = Phase::Active;
+        // Pre-identity state is accepted
+        assert_eq!(
+            boot_resume(&state, &decl, &b, None).unwrap(),
+            BootResume::Resume
+        );
+        state.identity = Some(decl.identity_digest(&b).unwrap());
+        assert_eq!(
+            boot_resume(&state, &decl, &b, None).unwrap(),
+            BootResume::Resume
+        );
+        // An accepted re-bind to b that landed: attach afresh against b
+        let landed = RebindFence::new("req-b", decl.binding_digest(&b).unwrap());
+        assert!(matches!(
+            boot_resume(&state, &decl, &b, Some(&landed)).unwrap(),
+            BootResume::Fresh(why) if why.contains("req-b")
+        ));
+        // A fence whose change never landed: the config is still a's
+        let decl_on_a = decl_a(&a);
+        assert_eq!(
+            boot_resume(&state, &decl_on_a, &a, Some(&landed)).unwrap(),
+            BootResume::DropFenceAndResume
+        );
+        // Identity changed while stopped
+        state.identity = Some("0".repeat(64));
+        assert!(matches!(
+            boot_resume(&state, &decl, &b, None).unwrap(),
+            BootResume::Fresh(_)
+        ));
+    }
+
+    #[test]
+    fn reservations_hold_through_teardown_across_ids() {
+        let spill = Path::new("/spill");
+        let a = ch_tenant("database = 'a'\n");
+        let resources = decl_a(&a).resources(&a, spill).unwrap();
+        assert!(resources.contains(&Resource::ClickHouse("ch:9000".into(), "a".into())));
+        let r = Reservations::default();
+        r.claim("a", resources.clone()).unwrap();
+        // Tenant b wants a's database
+        let mut theirs = std::collections::BTreeSet::new();
+        theirs.insert(Resource::ClickHouse("ch:9000".into(), "a".into()));
+        theirs.insert(Resource::TenantDir(spill.join("tenants/b")));
+        let err = r.claim("b", theirs.clone()).unwrap_err();
+        assert_eq!(err.holder, "a");
+        assert!(!err.tearing_down);
+        // a tears down: still held, by a, and a may not re-attach either
+        r.tearing_down("a");
+        assert!(r.claim("b", theirs.clone()).unwrap_err().tearing_down);
+        assert!(r.claim("a", resources.clone()).is_err());
+        assert_eq!(r.conflicts("b", &theirs).len(), 1);
+        // Writers joined
+        r.release("a");
+        assert!(r.conflicts("b", &theirs).is_empty());
+        r.claim("b", theirs).unwrap();
+    }
+
+    #[test]
+    fn nested_directories_conflict() {
+        let r = Reservations::default();
+        let mut outer = std::collections::BTreeSet::new();
+        outer.insert(Resource::StateDir(PathBuf::from("/var/lib/sf/a")));
+        r.claim("a", outer).unwrap();
+        let mut inner = std::collections::BTreeSet::new();
+        inner.insert(Resource::StateDir(normalize(Path::new(
+            "/var/lib/sf/./a/nested",
+        ))));
+        assert!(r.claim("b", inner).is_err());
+        let mut sibling = std::collections::BTreeSet::new();
+        sibling.insert(Resource::StateDir(PathBuf::from("/var/lib/sf/b")));
+        r.claim("b", sibling).unwrap();
+    }
+
+    #[test]
+    fn older_state_without_identity_or_incarnation_still_loads() {
+        let text = "version = 1\nid = 'a'\ndbname = 'app'\ndb_oid = 7\nphase = 'active'\n\
+                    attached_lsn = 1\nstart_lsn = 2\n";
+        let state: TenantState = toml::from_str(text).unwrap();
+        assert!(state.identity.is_none() && state.incarnation.is_none());
+        let written = toml::to_string(&state).unwrap();
+        assert!(!written.contains("identity") && !written.contains("incarnation"));
     }
 
     #[test]

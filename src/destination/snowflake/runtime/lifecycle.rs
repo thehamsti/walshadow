@@ -274,6 +274,7 @@ mod tests {
             apply_failed: std::sync::OnceLock::new(),
             landed: Default::default(),
             last_cleanup: Default::default(),
+            writers: crate::ops::writers::WriterSet::new(),
         };
         let mut desc = RelDescriptor {
             ancestors: Vec::new(),

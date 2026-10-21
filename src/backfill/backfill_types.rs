@@ -43,6 +43,9 @@ pub struct PassContext {
     /// Source PG major: picks the backup's pg_multixact offsets width
     pub source_major: u32,
     pub checkpoint: crate::backfill::backup_checkpoint::BackupCheckpoint,
+    /// Counts the pass's nested tasks as live writers of the backfiller that
+    /// runs it, so a teardown joins them too. `None` outside a backfiller
+    pub writer: Option<crate::ops::writers::WriterToken>,
 }
 
 /// Walk-phase counters a resumed pass reports rather than re-deriving from

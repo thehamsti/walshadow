@@ -13,3 +13,4 @@ pub mod retention;
 pub mod stages;
 pub mod tenant_ctl;
 pub mod trace;
+pub mod writers;
