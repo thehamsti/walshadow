@@ -48,6 +48,12 @@ fn tenants_of(root: &Table) -> Result<TenantsConfig> {
 /// Every tenant parses and every tenant's effective config parses: what
 /// the daemon checks at boot, so an accepted change stays restart-safe
 pub fn validate(root: &Table) -> Result<()> {
+    validate_with(root, None)
+}
+
+/// [`validate`], and, with the daemon's spill directory, no Snowflake state
+/// directory among the tenants' spill directories
+pub fn validate_with(root: &Table, spill_dir: Option<&Path>) -> Result<()> {
     crate::tenants::reject_database_sections(root)?;
     let Some(tenants) = TenantsConfig::from_table(root)? else {
         return check_destination(root);
@@ -56,7 +62,8 @@ pub fn validate(root: &Table) -> Result<()> {
         check_destination(&decl.effective_table(root))
             .with_context(|| format!("tenant {}", decl.id))?;
     }
-    ensure_distinct_destinations(root, &tenants)
+    ensure_distinct_destinations(root, &tenants)?;
+    crate::tenants::check_state_dirs(root, &tenants, spill_dir)
 }
 
 /// The destination section and table rules parse, and a Snowflake
@@ -77,7 +84,6 @@ fn check_destination(root: &Table) -> Result<()> {
 /// state locks
 fn ensure_distinct_destinations(root: &Table, tenants: &TenantsConfig) -> Result<()> {
     let mut seen_snowflake = std::collections::BTreeMap::new();
-    let mut seen_state = std::collections::BTreeMap::new();
     let mut seen_ch = std::collections::BTreeMap::new();
     for decl in &tenants.decls {
         let eff = decl.effective_table(root);
@@ -93,13 +99,6 @@ fn ensure_distinct_destinations(root: &Table, tenants: &TenantsConfig) -> Result
                      its own database",
                     decl.id,
                     sf.database,
-                );
-            }
-            if let Some(other) = seen_state.insert(sf.state.directory.clone(), decl.id.clone()) {
-                bail!(
-                    "tenants {other} and {} share Snowflake state directory {}",
-                    decl.id,
-                    sf.state.directory.display()
                 );
             }
         } else if eff.contains_key("ch") {

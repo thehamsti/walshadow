@@ -157,7 +157,7 @@ async fn session_body(
         "source identified",
     );
 
-    walshadow::ops::tenant_ctl::validate(&merged)?;
+    walshadow::ops::tenant_ctl::validate_with(&merged, Some(&args.spill_dir))?;
     let mut tenants_cfg = walshadow::tenants::TenantsConfig::from_table(&merged)
         .context("parse [tenants] / [tenant.*]")?;
     if let Some(tcfg) = &tenants_cfg {
@@ -954,31 +954,21 @@ async fn session_body(
             )
             .await?;
             for decl in active {
-                match supervisor
+                // Claimed before it opens, failing closed: resuming next to
+                // a writer an earlier session left running would share its
+                // destination
+                tenant::claim_resumed(reloader.reservations(), decl, &merged, &args.spill_dir)?;
+                let booted = supervisor
                     .boot_existing(
                         &shared, args, &merged, tcfg, decl, raw_start, aligned, reloader,
                     )
-                    .await
-                {
+                    .await;
+                if !matches!(booted, Ok(Some(_))) {
+                    // A fresh attach claims again, waiting out any conflict
+                    reloader.reservations().release(&decl.id);
+                }
+                match booted {
                     Ok(Some((t, sink, from_lsn))) => {
-                        match decl
-                            .resources(&merged, &args.spill_dir)
-                            .map(|r| reloader.reservations().claim(&decl.id, r))
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(c)) => tracing::warn!(
-                                target: "walshadow::tenant",
-                                tenant = %decl.id,
-                                conflict = %c,
-                                "resumed tenant overlaps another's reservation",
-                            ),
-                            Err(e) => tracing::warn!(
-                                target: "walshadow::tenant",
-                                tenant = %decl.id,
-                                error = %format!("{e:#}"),
-                                "could not reserve the resumed tenant's resources",
-                            ),
-                        }
                         for db in &t.db_oids {
                             stream.filter_mut().add_target_db(*db);
                         }
@@ -998,9 +988,14 @@ async fn session_body(
                             error = %format!("{e:#}"),
                             "tenant failed to open; detaching it, other tenants continue",
                         );
-                        supervisor
-                            .record_detached(&args.spill_dir, decl, format!("open failed: {e:#}"))
-                            .await;
+                        // Never routed, so nothing waits on the record
+                        supervisor.forget(&decl.id);
+                        tenant::persist_detached_logged(
+                            &args.spill_dir,
+                            decl,
+                            format!("open failed: {e:#}"),
+                        )
+                        .await;
                     }
                 }
             }
@@ -1354,10 +1349,11 @@ async fn session_body(
             // A revision (HTTP API, control socket, SIGHUP, SQL registry) may
             // add, remove, detach or re-bind tenants
             if let Some(rev) = &revision {
-                match walshadow::ops::tenant_ctl::validate(&rev.merged).and_then(|()| {
-                    walshadow::tenants::TenantsConfig::from_table(&rev.merged)
-                        .map(|t| ((*rev.merged).clone(), t))
-                }) {
+                match walshadow::ops::tenant_ctl::validate_with(&rev.merged, Some(&args.spill_dir))
+                    .and_then(|()| {
+                        walshadow::tenants::TenantsConfig::from_table(&rev.merged)
+                            .map(|t| ((*rev.merged).clone(), t))
+                    }) {
                     Ok((next_merged, Some(next))) => {
                         let old = tenants_cfg.take().expect("tenants mode");
                         if rev.cause.is_external() {
@@ -1369,13 +1365,14 @@ async fn session_body(
                             &merged,
                             &next_merged,
                             tenants.iter().map(|t| t.id.as_str()),
-                            &rev.force_rebind,
+                            &tenant::pending_rebinds(rev, reloader),
                         );
                         merged = next_merged;
                         tenants_cfg = Some(next);
                         let tcfg = tenants_cfg.as_ref().expect("just set");
+                        let mut still_attached = Vec::new();
                         for (id, reason) in plan.detach {
-                            tenant::detach(
+                            if !tenant::detach(
                                 &id,
                                 reason,
                                 true,
@@ -1388,10 +1385,17 @@ async fn session_body(
                                 &args.spill_dir,
                                 tcfg.get(&id),
                             )
-                            .await;
+                            .await
+                            {
+                                still_attached.push(id);
+                            }
                         }
+                        // A re-bind whose detach could not be recorded keeps
+                        // the old attachment; it is asked again later
                         for id in plan.attach {
-                            supervisor.queue_attach(&id);
+                            if !still_attached.contains(&id) {
+                                supervisor.queue_attach(&id);
+                            }
                         }
                         if let Err(e) = tenant::publish_tenant_bridges(
                             &shadow_lifecycle,
@@ -1560,9 +1564,14 @@ async fn session_body(
                             error = %format!("{e:#}"),
                             "tenant attach failed; it stays detached",
                         );
-                        supervisor
-                            .record_detached(&args.spill_dir, decl, format!("attach failed: {e:#}"))
-                            .await;
+                        // Never routed, so nothing waits on the record
+                        supervisor.forget(&decl.id);
+                        tenant::persist_detached_logged(
+                            &args.spill_dir,
+                            decl,
+                            format!("attach failed: {e:#}"),
+                        )
+                        .await;
                     }
                 }
             }

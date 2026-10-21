@@ -230,6 +230,18 @@ impl Operations {
             .find(|(id, _)| id == request_id)
             .map(|(_, v)| v.clone())
     }
+
+    /// Request ids of `action` operations still running
+    #[cfg(test)]
+    pub fn running(&self, action: &str) -> Vec<String> {
+        self.recent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(_, v)| v["state"] == "running" && v["action"] == action)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
 }
 
 fn outcome_json(out: &Outcome) -> Value {
@@ -258,12 +270,37 @@ struct Ask {
     path: String,
 }
 
-/// Run one tenant mutation off the request
+/// Finish a mutation on its own task: a dropped connection or the request
+/// timeout cancels only the response, never the bookkeeping that follows
+/// an applied change
+async fn owned<F>(ctx: &RequestCtx, fut: F) -> Reply
+where
+    F: std::future::Future<Output = Reply> + Send + 'static,
+{
+    match tokio::spawn(fut).await {
+        Ok(reply) => reply,
+        Err(e) => Err(internal(ctx, e)),
+    }
+}
+
+/// Run one tenant mutation, and its operation record, off the request
 async fn mutate<F>(st: &ApiState, ctx: &RequestCtx, ask: Ask, edit: F) -> Reply
 where
     F: FnOnce(Option<&TenantDecl>) -> ServiceResult<Option<TenantDecl>> + Send + 'static,
 {
     ctx.audit_handled();
+    let (st, task_ctx) = (st.clone(), ctx.clone());
+    owned(
+        ctx,
+        async move { mutate_owned(&st, &task_ctx, ask, edit).await },
+    )
+    .await
+}
+
+async fn mutate_owned<F>(st: &ApiState, ctx: &RequestCtx, ask: Ask, edit: F) -> Reply
+where
+    F: FnOnce(Option<&TenantDecl>) -> ServiceResult<Option<TenantDecl>> + Send + 'static,
+{
     let m = Mutation {
         request_id: ctx.request_id.clone(),
         actor: ctx.actor(),
@@ -279,12 +316,7 @@ where
         &ctx.request_id,
         json!({"request_id": ctx.request_id, "state": "running", "tenant": ask.id, "action": ask.action}),
     );
-    let svc = st.service.clone();
-    let id = ask.id.clone();
-    let res = tokio::spawn(async move { svc.mutate(&id, &m, edit).await })
-        .await
-        .map_err(|e| internal(ctx, e))?;
-    match res {
+    match st.service.mutate(&ask.id, &m, edit).await {
         Ok(out) => {
             if !out.dry_run {
                 st.deletes.invalidate(&ask.id);
@@ -882,13 +914,8 @@ async fn patch_tenant(
         merge_patch(&mut doc, &patch);
         let table = match json_to_toml(&doc) {
             Ok(toml::Value::Table(t)) => t,
-            Ok(_) => {
-                return Err(ServiceError::new(
-                    400,
-                    "invalid_body",
-                    "the patch removed the tenant",
-                ));
-            }
+            // An object patch merged into an object leaves an object
+            Ok(_) => unreachable!("a merge-patched tenant is an object"),
             Err(e) => return Err(ServiceError::new(400, "invalid_body", e)),
         };
         TenantDecl::parse(&tenant, &table)
@@ -1048,6 +1075,12 @@ async fn delete_tenant(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Reply {
+    // The tombstone and the delete stand or fall together, cancelled or not
+    let c = ctx.clone();
+    owned(&c, delete_owned(st, ctx, id, headers)).await
+}
+
+async fn delete_owned(st: ApiState, ctx: RequestCtx, id: String, headers: HeaderMap) -> Reply {
     let token = headers
         .get("x-confirm-delete")
         .and_then(|v| v.to_str().ok())
@@ -1138,6 +1171,17 @@ async fn restore(
     Query(q): Query<MutationQuery>,
     body: Option<Json<StateBody>>,
 ) -> Reply {
+    let c = ctx.clone();
+    owned(&c, restore_owned(st, ctx, id, q, body)).await
+}
+
+async fn restore_owned(
+    st: ApiState,
+    ctx: RequestCtx,
+    id: String,
+    q: MutationQuery,
+    body: Option<Json<StateBody>>,
+) -> Reply {
     if q.dry_run {
         ctx.audit_handled();
     }
@@ -1189,11 +1233,20 @@ async fn config_mutation(
     ctx: &RequestCtx,
     action: &'static str,
     path: &str,
-    edit: impl FnOnce(&mut toml::Table),
+    edit: impl FnOnce(&mut toml::Table) + Send + 'static,
 ) -> Reply {
     ctx.audit_handled();
+    let (st, task_ctx) = (st.clone(), ctx.clone());
     let origin = Some((ctx.request_id.clone(), "POST".to_string(), path.to_string()));
-    let res = crate::control::apply_fragment(&st.ctx, &ctx.actor(), action, origin, edit).await;
+    owned(ctx, async move {
+        let ctx = &task_ctx;
+        let res = crate::control::apply_fragment(&st.ctx, &ctx.actor(), action, origin, edit).await;
+        config_reply(&st, ctx, res)
+    })
+    .await
+}
+
+fn config_reply(st: &ApiState, ctx: &RequestCtx, res: Result<Vec<String>, ServiceError>) -> Reply {
     match res {
         Ok(unfollowed) => {
             let rev = st.ctx.reloader.current();

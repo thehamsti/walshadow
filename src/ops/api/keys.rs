@@ -372,6 +372,24 @@ pub fn generate(id: &str, scopes: &[Scope], expires_at: Option<&str>) -> Result<
 pub(crate) mod tests {
     use super::*;
 
+    /// The store's debug form names its file, never a key or a hash
+    #[test]
+    fn debug_shows_the_file_not_the_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, tokens) = key_file(dir.path(), &[("ops", &[Scope::Admin], None, false)]);
+        let store = KeyStore::open(&path).unwrap();
+        let shown = format!("{store:?}");
+        assert!(
+            shown.contains("KeyStore") && shown.contains("api-keys"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains(&tokens[0]) && !shown.contains("sha256"),
+            "{shown}"
+        );
+        assert_eq!(AuthFailure::Unavailable.label(), "keys_unavailable");
+    }
+
     /// A key file at 0600 holding the stanzas of `keys`, and their tokens
     pub(crate) fn key_file(
         dir: &Path,

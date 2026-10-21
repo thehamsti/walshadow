@@ -379,18 +379,24 @@ impl Tenant {
             let _ = task.await;
         }
         // Passes and appliers end with the session: a session restarted in
-        // the same process must not find the old one's writers still running
-        for backfiller in self.backfillers() {
-            backfiller
-                .writers()
-                .abort_and_join(SHUTDOWN_JOIN_WAIT)
-                .await;
-        }
-        if let Some(runtime) = &self.snowflake {
-            runtime.writers().abort_and_join(SHUTDOWN_JOIN_WAIT).await;
-        }
+        // the same process must not find the old one's writers still running.
+        // One that outlived its wait keeps what the tenant holds reserved
+        let backfills: Vec<_> = self.backfillers().map(|b| b.writers()).collect();
+        let joined = join_writers(
+            &backfills,
+            self.snowflake.as_ref().map(|r| r.writers()),
+            SHUTDOWN_JOIN_WAIT,
+        )
+        .await;
         if let Some(msg) = self.gc_fatal.message() {
             anyhow::bail!("tenant {}: {msg}", self.id);
+        }
+        if !joined {
+            anyhow::bail!(
+                "tenant {}: a writer outlived the shutdown wait; its destination and directories \
+                 stay reserved until the daemon restarts",
+                self.id
+            );
         }
         Ok(resume_safe)
     }
@@ -444,6 +450,11 @@ impl Tenant {
             task.abort();
             out.joined &= tokio::time::timeout(join_wait, task).await.is_ok();
         }
+        // Backfill passes next, for the same reason: they write through the
+        // runtime, so its writers join only once no pass is left to start one
+        for backfiller in self.backfillers() {
+            out.joined &= backfiller.writers().abort_and_join(join_wait).await;
+        }
         if let Some(runtime) = &self.snowflake {
             // Outbox batches apply while the drain lasts; the rest stay
             // durable for the next attachment's recovery
@@ -455,9 +466,6 @@ impl Tenant {
                 out.drained = false;
             }
             out.joined &= runtime.writers().abort_and_join(join_wait).await;
-        }
-        for backfiller in self.backfillers() {
-            out.joined &= backfiller.writers().abort_and_join(join_wait).await;
         }
         // Closing the floor ends the GC tasks between passes
         drop(self.gc_floor.take());
@@ -1227,7 +1235,9 @@ impl Supervisor {
                     "tenant teardown did not drain cleanly",
                 );
             }
-            persist_detached(&spill_dir, &decl, reason).await;
+            // Already recorded before the teardown started; this keeps
+            // the reason current
+            persist_detached_logged(&spill_dir, &decl, reason).await;
             out
         });
         self.tearing_down.insert(id, handle);
@@ -1336,9 +1346,11 @@ impl Supervisor {
                 return Ok(None);
             }
         }
-        if state.identity.is_none() {
-            // State from before identities: accept it, and record this one
-            state.identity = Some(decl.identity_digest(merged)?);
+        if state.identity.is_none() || state.binding.is_none() {
+            // State from before identities or bindings: accept it, and
+            // record what it resumes with
+            state.identity.get_or_insert(decl.identity_digest(merged)?);
+            state.binding.get_or_insert(decl.binding_digest(merged)?);
             state.store(&dir).await?;
         }
         let emitter = shared.tenant_emitter(args, merged, tenants, decl).await?;
@@ -1368,6 +1380,7 @@ impl Supervisor {
         if let Some(r) = &t.config_resolver {
             reloader.set_tenant_resolver(&t.id, Some(r.clone())).await;
         }
+        reloader.settle_rebind(&t.id, state.binding.clone());
         tracing::info!(
             target: "walshadow::tenant",
             tenant = %t.id,
@@ -1422,11 +1435,16 @@ impl Supervisor {
         state.phase = Phase::Priming;
         state.attached_lsn = p0;
         state.identity = Some(decl.identity_digest(merged)?);
+        // What this runtime was built with: a boot that finds the config
+        // asking for another binding attaches afresh, and a revision that
+        // changed it while this one opened leaves the re-bind pending
+        state.binding = Some(decl.binding_digest(merged)?);
         state.incarnation = Some(uuid::Uuid::new_v4().simple().to_string());
         state.store(&dir).await?;
         if let Some(r) = &t.config_resolver {
             reloader.set_tenant_resolver(&t.id, Some(r.clone())).await;
         }
+        reloader.settle_rebind(&t.id, state.binding.clone());
         self.priming.insert(
             decl.id.clone(),
             Priming {
@@ -1493,15 +1511,16 @@ impl Supervisor {
         out
     }
 
-    /// Persist `reason` as the tenant's detached state
+    /// Persist `reason` as the tenant's detached state, then forget it
     pub async fn record_detached(
         &mut self,
         spill_dir: &Path,
         decl: &walshadow::tenants::TenantDecl,
         reason: String,
-    ) {
+    ) -> Result<()> {
+        persist_detached(spill_dir, decl, reason).await?;
         self.forget(&decl.id);
-        persist_detached(spill_dir, decl, reason).await;
+        Ok(())
     }
 }
 
@@ -1510,25 +1529,35 @@ pub(crate) async fn persist_detached(
     spill_dir: &Path,
     decl: &walshadow::tenants::TenantDecl,
     reason: String,
+) -> Result<()> {
+    use walshadow::tenants::{Phase, TenantState, tenant_dir};
+    let dir = tenant_dir(spill_dir, &decl.id);
+    let mut state = TenantState::load(&dir)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| TenantState::new(&decl.id, &decl.dbname, 0));
+    state.phase = Phase::Detached;
+    state.reason = Some(reason);
+    state
+        .store(&dir)
+        .await
+        .with_context(|| format!("tenant {}: persist detached state", decl.id))
+}
+
+/// [`persist_detached`] where nothing waits on it: logged, not returned
+pub(crate) async fn persist_detached_logged(
+    spill_dir: &Path,
+    decl: &walshadow::tenants::TenantDecl,
+    reason: String,
 ) {
-    {
-        use walshadow::tenants::{Phase, TenantState, tenant_dir};
-        let dir = tenant_dir(spill_dir, &decl.id);
-        let mut state = TenantState::load(&dir)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| TenantState::new(&decl.id, &decl.dbname, 0));
-        state.phase = Phase::Detached;
-        state.reason = Some(reason);
-        if let Err(e) = state.store(&dir).await {
-            tracing::error!(
-                target: "walshadow::tenant",
-                tenant = %decl.id,
-                error = %format!("{e:#}"),
-                "could not persist detached state",
-            );
-        }
+    if let Err(e) = persist_detached(spill_dir, decl, reason).await {
+        tracing::error!(
+            target: "walshadow::tenant",
+            tenant = %decl.id,
+            error = %format!("{e:#}"),
+            "could not persist detached state",
+        );
     }
 }
 
@@ -1716,12 +1745,12 @@ pub(crate) async fn detach(
     reloader: &walshadow::control::Reloader,
     spill_dir: &Path,
     decl: Option<&walshadow::tenants::TenantDecl>,
-) {
+) -> bool {
     let Some(at) = tenants.iter().position(|t| t.id == id) else {
         router.detach(id);
         reloader.set_tenant_resolver(id, None).await;
         supervisor.forget(id);
-        return;
+        return true;
     };
     let fallback;
     let decl = match decl {
@@ -1740,10 +1769,23 @@ pub(crate) async fn detach(
     };
     // Detached on disk before the tenant leaves routing and the floor: a
     // crash once the floor moves past its unfinished work must not resume
-    // it from WAL the slot no longer holds
-    supervisor
+    // it from WAL the slot no longer holds. A write that fails detaches
+    // nothing: the tenant keeps its place in the floor, and the detach is
+    // asked again, by the next eviction check, reload or mutation
+    if let Err(e) = supervisor
         .record_detached(spill_dir, decl, format!("detaching: {reason}"))
-        .await;
+        .await
+    {
+        tracing::error!(
+            target: "walshadow::tenant",
+            tenant = %id,
+            reason = %reason,
+            error = %format!("{e:#}"),
+            "tenant not detached: its detached state could not be recorded, so it stays \
+             attached; retry once the spill directory is writable",
+        );
+        return false;
+    }
     let routed = router.detach(id);
     reloader.set_tenant_resolver(id, None).await;
     let t = tenants.remove(at);
@@ -1771,6 +1813,44 @@ pub(crate) async fn detach(
         decl.clone(),
         reason,
     );
+    true
+}
+
+/// Abort and join `producers`, then `consumer`, each bounded by `wait`:
+/// backfill passes write through the Snowflake runtime, so its writers join
+/// only once no pass is left to start another. `true` when all joined
+pub(crate) async fn join_writers(
+    producers: &[&walshadow::ops::writers::WriterSet],
+    consumer: Option<&walshadow::ops::writers::WriterSet>,
+    wait: Duration,
+) -> bool {
+    let mut joined = true;
+    for set in producers {
+        joined &= set.abort_and_join(wait).await;
+    }
+    if let Some(set) = consumer {
+        joined &= set.abort_and_join(wait).await;
+    }
+    joined
+}
+
+/// Claim what a tenant resumed at boot writes, before it opens. A claim
+/// still held, by a teardown of an earlier session in this process that
+/// never joined its writers, refuses the boot: two writers must never share
+/// a destination, and only a daemon restart ends the stuck one
+pub(crate) fn claim_resumed(
+    reservations: &walshadow::tenants::Reservations,
+    decl: &walshadow::tenants::TenantDecl,
+    merged: &toml::Table,
+    spill_dir: &Path,
+) -> Result<()> {
+    let resources = decl.resources(merged, spill_dir)?;
+    reservations.claim(&decl.id, resources).map_err(|c| {
+        anyhow::anyhow!(
+            "tenant {}: {c}; restart the daemon to stop the writer that still holds it",
+            decl.id
+        )
+    })
 }
 
 /// What a reload changes in the tenant set
@@ -1783,6 +1863,18 @@ pub(crate) struct ReconcilePlan {
 /// Diff the old and new declarations against the attached tenants. A
 /// changed database or destination identity detaches and re-attaches: the
 /// tenant's durable state is bound to both
+/// Tenants `rev` re-binds, and every re-bind an earlier revision asked
+/// for that has not happened yet: the session reads only the newest
+/// revision, so one published in between must not drop a re-bind
+pub(crate) fn pending_rebinds(
+    rev: &walshadow::control::ConfigRevision,
+    reloader: &walshadow::control::Reloader,
+) -> std::collections::BTreeSet<String> {
+    let mut ids = reloader.rebinding();
+    ids.extend(rev.force_rebind.iter().cloned());
+    ids
+}
+
 pub(crate) fn reconcile_plan<'a>(
     old: &walshadow::tenants::TenantsConfig,
     next: &walshadow::tenants::TenantsConfig,
@@ -2229,6 +2321,104 @@ mod tests {
             assert_eq!(err.holder, id);
         }
         assert_eq!(supervisor.teardowns().1, ["panicked", "stuck"]);
+    }
+
+    /// H1: a re-bind the newest revision no longer names, because another
+    /// published after it, still detaches and re-attaches the tenant
+    #[tokio::test]
+    async fn reconcile_rebinds_what_an_earlier_revision_asked_for() {
+        let old_root = config();
+        let next_root: toml::Table = toml::to_string(&old_root)
+            .unwrap()
+            .replace("database = \"a\"", "database = \"b\"")
+            .parse()
+            .unwrap();
+        let old = TenantsConfig::from_table(&old_root).unwrap().unwrap();
+        let next = TenantsConfig::from_table(&next_root).unwrap().unwrap();
+        let reloader = walshadow::control::Reloader::default();
+        // The revision after the re-bind names no re-bind of its own
+        let rev = walshadow::control::ConfigRevision {
+            epoch: reloader.epoch().clone(),
+            generation: 9,
+            merged: Arc::new(next_root.clone()),
+            force_rebind: Default::default(),
+            cause: walshadow::control::ReloadCause::Sighup,
+        };
+        let plan = |force: &std::collections::BTreeSet<String>| {
+            reconcile_plan(&old, &next, &old_root, &next_root, ["a"].into_iter(), force)
+        };
+        assert!(
+            plan(&pending_rebinds(&rev, &reloader)).detach.is_empty(),
+            "a ClickHouse database change alone is no identity change"
+        );
+        // The earlier revision's re-bind is still pending in the reloader:
+        // the runtime registered was built for database a
+        reloader.seed(next_root.clone()).await;
+        reloader.settle_rebind("a", Some("built for database a".into()));
+        assert!(reloader.is_rebinding("a"));
+        let rebind = plan(&pending_rebinds(&rev, &reloader));
+        assert_eq!(rebind.detach.len(), 1);
+        assert_eq!(rebind.detach[0].0, "a");
+        assert_eq!(rebind.attach, ["a"]);
+    }
+
+    /// H3: joining backfill passes before the runtime they write through
+    /// leaves no runtime writer behind, and no pass meets a closed runtime
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producers_join_before_the_runtime_they_write_through() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use walshadow::ops::writers::WriterSet;
+        let producers = WriterSet::new();
+        let runtime = Arc::new(WriterSet::new());
+        let (writes, refused) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (rt, w, r) = (runtime.clone(), writes.clone(), refused.clone());
+        // A pass that keeps handing the runtime blocking state writes
+        producers.spawn(async move {
+            loop {
+                let write = rt.spawn_blocking(|| std::thread::sleep(Duration::from_millis(5)));
+                r.fetch_add(usize::from(write.is_err()), Ordering::SeqCst);
+                if let Ok(h) = write {
+                    let _ = h.await;
+                    w.fetch_add(1, Ordering::SeqCst);
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while writes.load(Ordering::SeqCst) < 3 {
+            assert!(Instant::now() < deadline, "the pass never wrote");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(join_writers(&[&producers], Some(&runtime), Duration::from_secs(5)).await);
+        assert_eq!(runtime.live_count(), 0);
+        assert_eq!(
+            refused.load(Ordering::SeqCst),
+            0,
+            "no pass was left to write once the runtime closed"
+        );
+    }
+
+    /// H3: boot refuses to resume a tenant next to a writer an earlier
+    /// session's teardown never joined
+    #[test]
+    fn boot_refuses_to_resume_next_to_a_stuck_writer() {
+        let root = config();
+        let tenants = TenantsConfig::from_table(&root).unwrap().unwrap();
+        let decl = tenants.get("a").unwrap();
+        let spill = Path::new("/spill");
+        let reservations = Reservations::default();
+        reservations
+            .claim(
+                "old",
+                [Resource::ClickHouse("ch:9000".into(), "a".into())].into(),
+            )
+            .unwrap();
+        reservations.tearing_down("old");
+        let err = claim_resumed(&reservations, decl, &root, spill).unwrap_err();
+        assert!(err.to_string().contains("restart the daemon"), "{err}");
+        assert!(err.to_string().contains("old"), "{err}");
+        reservations.release("old");
+        claim_resumed(&reservations, decl, &root, spill).unwrap();
     }
 
     #[tokio::test]

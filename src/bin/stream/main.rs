@@ -187,6 +187,7 @@ async fn run(mut args: Args, crashes: Arc<walshadow::ops::crash::CrashStore>) ->
 
     let metrics = MetricsRegistry::new();
     let reloader = Arc::new(Reloader::new(args.ch_config.clone(), cli_base(&args)));
+    reloader.set_spill_dir(args.spill_dir.clone());
     // Every control-plane mutation, control socket and HTTP API alike
     reloader.set_audit(
         walshadow::ops::audit::AuditLog::open(&api::state_dir(&args), 64 << 20, 10)

@@ -204,6 +204,21 @@ then is stopped. Its destination and directories stay reserved until every
 one of its writers has stopped, so no other tenant attaches to them sooner;
 such a tenant reports `waiting`.
 
+A detach, delete or remove of an attached tenant first records it as
+detached in `<spill-dir>/tenants/<id>/tenant.toml`. If that write fails,
+nothing changes: the tenant stays attached and replicating, the request
+answers `503 detach_not_recorded` with the cause, the audit log records it
+as rejected, and the caller retries once the spill directory is writable.
+
+A re-bind stays pending until the tenant has re-attached with the new
+binding, whatever is published meanwhile. `tenant.toml` records the binding
+each attachment was built with, so a restart that finds the config asking
+for another one attaches the tenant afresh instead of resuming.
+
+Once a mutation starts, it runs to completion, operation record and
+tombstone included, even if the client disconnects or the request times out.
+`GET /v1/operations/{request_id}` reports how it ended.
+
 ## Delete and restore
 
 Deleting takes two requests and keeps everything but the declaration:

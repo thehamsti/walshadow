@@ -46,6 +46,11 @@ impl Drop for WriterToken {
     }
 }
 
+/// A [`WriterSet`] whose owner is tearing down takes no more writers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("its writers are being stopped; no new write starts")]
+pub struct Closed;
+
 #[derive(Default)]
 pub struct WriterSet {
     tasks: Mutex<JoinSet<()>>,
@@ -108,17 +113,24 @@ impl WriterSet {
     }
 
     /// `spawn_blocking` counted as a live writer until the closure returns,
-    /// however its caller ends
-    pub fn spawn_blocking<F, R>(&self, f: F) -> tokio::task::JoinHandle<R>
+    /// however its caller ends. Refused once
+    /// [`abort_and_join`](Self::abort_and_join) started: a writer that slips
+    /// in after the join would outlive it
+    pub fn spawn_blocking<F, R>(&self, f: F) -> Result<tokio::task::JoinHandle<R>, Closed>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        // Counted before the check: a join that starts in between waits for
+        // this one instead of missing it
         let token = self.token();
-        tokio::task::spawn_blocking(move || {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Closed);
+        }
+        Ok(tokio::task::spawn_blocking(move || {
             let _token = token;
             f()
-        })
+        }))
     }
 
     /// Writers still running, blocking descendants included
@@ -155,6 +167,18 @@ impl WriterSet {
 mod tests {
     use super::*;
 
+    /// H3: once a set joined, blocking work is refused rather than left
+    /// running past the join
+    #[tokio::test]
+    async fn a_closed_set_refuses_blocking_writers() {
+        let set = WriterSet::new();
+        let ran = set.spawn_blocking(|| 7).unwrap().await.unwrap();
+        assert_eq!(ran, 7);
+        assert!(set.abort_and_join(Duration::from_secs(5)).await);
+        assert_eq!(set.spawn_blocking(|| 7).unwrap_err(), Closed);
+        assert_eq!(set.live_count(), 0);
+    }
+
     #[tokio::test]
     async fn abort_joins_async_writers_blocked_on_anything() {
         let set = WriterSet::new();
@@ -175,9 +199,11 @@ mod tests {
     async fn a_blocking_descendant_holds_the_join_until_it_returns() {
         let set = WriterSet::new();
         let (release, held) = std::sync::mpsc::channel::<()>();
-        let blocking = set.spawn_blocking(move || {
-            let _ = held.recv();
-        });
+        let blocking = set
+            .spawn_blocking(move || {
+                let _ = held.recv();
+            })
+            .unwrap();
         // Its caller is gone, the closure is not
         drop(blocking);
         assert!(!set.abort_and_join(Duration::from_millis(100)).await);

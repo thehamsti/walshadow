@@ -12,7 +12,7 @@
 //! ([`Reloader::begin`]), so no other reload can publish its candidate first.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::anyhow;
@@ -97,8 +97,9 @@ pub enum PublishError {
 #[derive(Default)]
 struct TenantSlot {
     resolver: Option<Arc<ConfigResolver>>,
-    /// Generation of the revision re-binding this tenant: its resolver is
-    /// skipped until a replacement registers
+    /// Generation of the latest revision re-binding this tenant: its
+    /// resolver is skipped, and the session keeps re-binding it, until a
+    /// runtime built with that revision's binding registers
     rebinding_since: Option<u64>,
 }
 
@@ -121,6 +122,9 @@ pub struct Reloader {
     /// Where every control-plane mutation is recorded, once the daemon set
     /// it up
     audit: std::sync::OnceLock<Arc<crate::ops::audit::AuditLog>>,
+    /// The daemon's spill directory: no tenant's Snowflake state may
+    /// resolve among the tenants' spill directories under it
+    spill_dir: std::sync::OnceLock<PathBuf>,
 }
 
 impl Default for Reloader {
@@ -152,7 +156,16 @@ impl Reloader {
             tx,
             reservations: Arc::default(),
             audit: std::sync::OnceLock::new(),
+            spill_dir: std::sync::OnceLock::new(),
         }
+    }
+
+    pub fn set_spill_dir(&self, dir: PathBuf) {
+        let _ = self.spill_dir.set(dir);
+    }
+
+    pub fn spill_dir(&self) -> Option<&Path> {
+        self.spill_dir.get().map(PathBuf::as_path)
     }
 
     pub fn set_audit(&self, log: Arc<crate::ops::audit::AuditLog>) {
@@ -212,19 +225,44 @@ impl Reloader {
         }
     }
 
-    /// Register or drop a tenant's resolver. Registering a replacement ends
-    /// any re-binding skip; dropping keeps no resolver to skip
+    /// Register or drop a tenant's resolver. Dropping, as a detach does,
+    /// also ends any pending re-bind: the next attachment starts afresh.
+    /// Registering leaves it to [`settle_rebind`](Self::settle_rebind)
     pub async fn set_tenant_resolver(&self, id: &str, r: Option<Arc<ConfigResolver>>) {
         let mut tenants = leaf(&self.tenants);
         match r {
             Some(r) => {
-                let slot = tenants.entry(id.to_string()).or_default();
-                slot.resolver = Some(r);
-                slot.rebinding_since = None;
+                tenants.entry(id.to_string()).or_default().resolver = Some(r);
             }
             None => {
                 tenants.remove(id);
             }
+        }
+    }
+
+    /// A runtime opened with `built`, `id`'s binding digest in the config it
+    /// was built from, now routes. It ends a pending re-bind only when the
+    /// published revision asks for exactly that binding and is no older
+    /// than the re-bind; a runtime opened from an older binding than the
+    /// published one is marked re-binding instead
+    pub fn settle_rebind(&self, id: &str, built: Option<String>) {
+        let rev = self.current();
+        let wanted = crate::tenants::TenantsConfig::from_table(&rev.merged)
+            .ok()
+            .flatten()
+            .and_then(|c| c.get(id).and_then(|d| d.binding_digest(&rev.merged).ok()));
+        let Some(wanted) = wanted else {
+            // Removed or unreadable: the session's reconcile detaches it
+            return;
+        };
+        let current = built.as_deref() == Some(wanted.as_str());
+        let mut tenants = leaf(&self.tenants);
+        let slot = tenants.entry(id.to_string()).or_default();
+        match slot.rebinding_since {
+            Some(since) if current && since <= rev.generation => slot.rebinding_since = None,
+            Some(_) => {}
+            None if !current => slot.rebinding_since = Some(rev.generation),
+            None => {}
         }
     }
 
@@ -233,6 +271,15 @@ impl Reloader {
         leaf(&self.tenants)
             .get(id)
             .is_some_and(|s| s.rebinding_since.is_some())
+    }
+
+    /// Tenants with a re-bind still to happen, whichever revision asked
+    pub fn rebinding(&self) -> BTreeSet<String> {
+        leaf(&self.tenants)
+            .iter()
+            .filter(|(_, s)| s.rebinding_since.is_some())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Take the reload lock. Hold it from a config write until the revision
@@ -303,7 +350,8 @@ impl ReloadTx<'_> {
         };
         crate::tenants::reject_database_sections(&merged).map_err(PublishError::Invalid)?;
         let tenants_cfg = if merged.contains_key("tenants") || merged.contains_key("tenant") {
-            crate::ops::tenant_ctl::validate(&merged).map_err(PublishError::Invalid)?;
+            crate::ops::tenant_ctl::validate_with(&merged, reloader.spill_dir())
+                .map_err(PublishError::Invalid)?;
             crate::tenants::TenantsConfig::from_table(&merged).map_err(PublishError::Invalid)?
         } else {
             None
@@ -371,13 +419,11 @@ impl ReloadTx<'_> {
             }
         }
         {
+            // Pending until a runtime with this binding registers: a later
+            // revision that does not re-bind must not drop it
             let mut tenants = leaf(&reloader.tenants);
             for id in &rebinding {
-                if let Some(slot) = tenants.get_mut(id)
-                    && slot.resolver.is_some()
-                {
-                    slot.rebinding_since.get_or_insert(generation);
-                }
+                tenants.entry(id.clone()).or_default().rebinding_since = Some(generation);
             }
         }
         let revision = Arc::new(ConfigRevision {
@@ -424,6 +470,108 @@ mod tests {
 
     const DOC: &str = "[ch]\nhost = \"ch\"\n[source]\ndbname = \"app\"\n\
          [table.public.orders]\nreplicate = true\n";
+
+    fn tenants_doc(database: &str, lag: u64) -> String {
+        format!(
+            "[source]\nhost = 'pg'\ndbname = 'postgres'\n[tenants]\n[tenant.a]\ndbname = 'a_db'\n\
+             max_lag_bytes = {lag}\n[tenant.a.ch]\nhost = 'ch'\ndatabase = '{database}'\n"
+        )
+    }
+
+    fn binding(doc: &str) -> String {
+        let root: Table = doc.parse().unwrap();
+        crate::tenants::TenantsConfig::from_table(&root)
+            .unwrap()
+            .unwrap()
+            .get("a")
+            .unwrap()
+            .binding_digest(&root)
+            .unwrap()
+    }
+
+    /// H1: the session reads only the newest revision, so a re-bind stays
+    /// pending through later revisions that do not re-bind, until a runtime
+    /// built with the new binding registers. H2: one built with the old
+    /// binding, as an attach opening across the re-bind is, settles nothing
+    #[tokio::test]
+    async fn a_rebind_stays_pending_until_a_runtime_with_its_binding_registers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("c.toml");
+        std::fs::write(&config, tenants_doc("one", 1)).unwrap();
+        let reloader = Reloader::new(Some(config.clone()), Table::new());
+        std::fs::write(&config, tenants_doc("two", 1)).unwrap();
+        reloader
+            .begin()
+            .await
+            .publish(
+                ReloadCause::Control,
+                PublishOpts {
+                    force_rebind: ["a".to_string()].into(),
+                    abort_on: None,
+                },
+            )
+            .await
+            .unwrap();
+        std::fs::write(&config, tenants_doc("two", 2)).unwrap();
+        let rev = reloader
+            .begin()
+            .await
+            .publish(ReloadCause::Sighup, PublishOpts::default())
+            .await
+            .unwrap()
+            .revision;
+        assert!(rev.force_rebind.is_empty());
+        assert_eq!(
+            reloader.rebinding(),
+            ["a".to_string()].into(),
+            "a later revision does not drop the re-bind"
+        );
+        reloader.settle_rebind("a", Some(binding(&tenants_doc("one", 1))));
+        assert!(
+            reloader.is_rebinding("a"),
+            "the stale runtime settles nothing"
+        );
+        reloader.settle_rebind("a", Some(binding(&tenants_doc("two", 2))));
+        assert!(!reloader.is_rebinding("a"), "its replacement does");
+        // A detach ends it too: the next attachment starts afresh
+        reloader.settle_rebind("a", Some(binding(&tenants_doc("one", 1))));
+        assert!(
+            reloader.is_rebinding("a"),
+            "marked: built for another binding"
+        );
+        reloader.set_tenant_resolver("a", None).await;
+        assert!(reloader.rebinding().is_empty());
+        // A tenant gone from the config is the reconcile's to detach
+        std::fs::write(
+            &config,
+            "[source]\nhost = 'pg'\ndbname = 'postgres'\n[tenants]\n",
+        )
+        .unwrap();
+        reloader
+            .begin()
+            .await
+            .publish(ReloadCause::Sighup, PublishOpts::default())
+            .await
+            .unwrap();
+        reloader.settle_rebind("a", Some(binding(&tenants_doc("one", 1))));
+        assert!(!reloader.is_rebinding("a"));
+        // A changed identity re-binds without any mutation asking
+        std::fs::write(&config, tenants_doc("one", 1)).unwrap();
+        reloader
+            .begin()
+            .await
+            .publish(ReloadCause::Sighup, PublishOpts::default())
+            .await
+            .unwrap();
+        std::fs::write(&config, tenants_doc("one", 1).replace("a_db", "other_db")).unwrap();
+        reloader
+            .begin()
+            .await
+            .publish(ReloadCause::Sighup, PublishOpts::default())
+            .await
+            .unwrap();
+        assert!(reloader.is_rebinding("a"), "the database changed");
+    }
 
     #[tokio::test]
     async fn every_reload_publishes_one_revision_after_resolvers_apply() {

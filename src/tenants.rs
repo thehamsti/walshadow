@@ -43,7 +43,7 @@ pub const TENANT_SECTIONS: &[&str] = &[
     "toast",
 ];
 
-const STATE_FILE: &str = "tenant.toml";
+pub const STATE_FILE: &str = "tenant.toml";
 const STATE_VERSION: u32 = 1;
 
 /// What the operator wants a tenant to be
@@ -578,6 +578,15 @@ pub fn boot_resume(
             "the database or destination identity changed while stopped".into(),
         ));
     }
+    // A re-bind the state never saw, fenced or not: one accepted while the
+    // runtime was still opening writes no fence
+    if let Some(binding) = &state.binding
+        && *binding != decl.binding_digest(root)?
+    {
+        return Ok(BootResume::Fresh(
+            "the tenant's destination binding differs from the one its state was built with".into(),
+        ));
+    }
     Ok(match fence {
         Some(fence) if fence.target_binding == decl.binding_digest(root)? => {
             BootResume::Fresh(format!(
@@ -622,7 +631,9 @@ impl TenantDecl {
         spill_dir: &Path,
     ) -> Result<std::collections::BTreeSet<Resource>> {
         let mut out = std::collections::BTreeSet::new();
-        out.insert(Resource::TenantDir(tenant_dir(spill_dir, &self.id)));
+        out.insert(Resource::TenantDir(canonical(&tenant_dir(
+            spill_dir, &self.id,
+        ))));
         let eff = self.effective_table(root);
         let dest = crate::destination::config::DestinationConfig::from_table(&eff)
             .with_context(|| format!("tenant {}: destination", self.id))?;
@@ -631,7 +642,7 @@ impl TenantDecl {
                 sf.account_url.to_ascii_lowercase(),
                 sf.database.to_ascii_uppercase(),
             ));
-            out.insert(Resource::StateDir(normalize(&sf.state.directory)));
+            out.insert(Resource::StateDir(canonical(&sf.state.directory)));
         } else if eff.contains_key("ch") {
             let cfg = crate::ch_emitter::EmitterConfig::from_table(&eff)
                 .map_err(|e| anyhow::anyhow!("tenant {}: {e}", self.id))?;
@@ -643,6 +654,73 @@ impl TenantDecl {
         }
         Ok(out)
     }
+}
+
+/// `path` with every symlink in the part that exists resolved, and the
+/// rest in lexical normal form: two spellings of one directory, symlinks
+/// included, compare equal, so neither nesting nor aliasing hides overlap
+pub fn canonical(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(mut real) = std::fs::canonicalize(&existing) {
+            real.extend(rest.iter().rev());
+            return normalize(&real);
+        }
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name.to_os_string());
+                existing = parent.to_path_buf();
+            }
+            _ => return normalize(path),
+        }
+    }
+}
+
+/// Every tenant's Snowflake state directory, resolved through its
+/// symlinks, is its own: not equal to, inside or around another tenant's,
+/// nor any tenant's spill directory under `<spill-dir>/tenants`, its own
+/// included, since attaching afresh clears that. Checked wherever a config
+/// is validated: at boot, on every published revision, on every mutation
+pub fn check_state_dirs(
+    root: &toml::Table,
+    tenants: &TenantsConfig,
+    spill_dir: Option<&Path>,
+) -> Result<()> {
+    let mut dirs = Vec::new();
+    for decl in &tenants.decls {
+        let eff = decl.effective_table(root);
+        let dest = crate::destination::config::DestinationConfig::from_table(&eff)
+            .with_context(|| format!("tenant {}: destination", decl.id))?;
+        if let Some(sf) = dest.snowflake {
+            let real = canonical(&sf.state.directory);
+            dirs.push((decl.id.clone(), sf.state.directory, real));
+        }
+    }
+    let spill = spill_dir.map(|s| canonical(&s.join("tenants")));
+    for (i, (id, dir, real)) in dirs.iter().enumerate() {
+        for (other, _, theirs) in &dirs[i + 1..] {
+            ensure!(
+                !(real.starts_with(theirs) || theirs.starts_with(real)),
+                "tenants {id} and {other} share Snowflake state directory {} (it resolves to \
+                 {}, which overlaps {}); give each tenant its own",
+                dir.display(),
+                real.display(),
+                theirs.display()
+            );
+        }
+        if let Some(spill) = &spill {
+            ensure!(
+                !(real.starts_with(spill) || spill.starts_with(real)),
+                "tenant {id}: Snowflake state directory {} resolves to {}, overlapping the \
+                 tenants' spill directories under {}, which attaching clears; keep it outside",
+                dir.display(),
+                real.display(),
+                spill.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Lexical normal form, so `/a/./b/` and `/a/b` are one directory
@@ -1154,6 +1232,12 @@ pub struct TenantState {
     /// accepts and fills in
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
+    /// [`TenantDecl::binding_digest`] the runtime was built with. A boot
+    /// whose config asks for another binding attaches afresh, whether or
+    /// not a recovery fence survived. Absent in state written before it
+    /// existed, which boot accepts and fills in
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<String>,
     /// Random id of this attachment, new at every attach: a confirmation
     /// issued for one attachment cannot act on the next
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1180,6 +1264,7 @@ impl TenantState {
             reason: None,
             start_tables: Vec::new(),
             identity: None,
+            binding: None,
             incarnation: None,
         }
     }
@@ -1622,6 +1707,51 @@ name = 'DB.INTERNAL.LOAD_STAGE'
             boot_resume(&state, &decl, &b, None).unwrap(),
             BootResume::Fresh(_)
         ));
+    }
+
+    /// H2: a re-bind accepted while the runtime was still opening writes
+    /// no fence; the binding recorded at attach still keeps boot from
+    /// resuming state built for the old destination
+    #[test]
+    fn boot_attaches_afresh_when_the_state_was_built_for_another_binding() {
+        let a = ch_tenant("database = 'a'\n");
+        let b = ch_tenant("database = 'b'\n");
+        let mut state = TenantState::new("a", "app", 7);
+        state.phase = Phase::Active;
+        state.identity = Some(decl_a(&a).identity_digest(&a).unwrap());
+        state.binding = Some(decl_a(&a).binding_digest(&a).unwrap());
+        // Same identity, so only the binding tells them apart
+        assert_eq!(
+            state.identity,
+            Some(decl_a(&b).identity_digest(&b).unwrap())
+        );
+        assert!(matches!(
+            boot_resume(&state, &decl_a(&b), &b, None).unwrap(),
+            BootResume::Fresh(why) if why.contains("binding")
+        ));
+        assert_eq!(
+            boot_resume(&state, &decl_a(&a), &a, None).unwrap(),
+            BootResume::Resume
+        );
+        // Pre-binding state is accepted, like pre-identity state
+        state.binding = None;
+        assert_eq!(
+            boot_resume(&state, &decl_a(&b), &b, None).unwrap(),
+            BootResume::Resume
+        );
+    }
+
+    /// H7: symlinks resolve, what does not exist yet stays lexical, and a
+    /// path no prefix of which resolves keeps its lexical form
+    #[test]
+    fn canonical_paths_follow_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(real.join("state")).unwrap();
+        std::os::unix::fs::symlink(real.join("state"), real.join("link")).unwrap();
+        assert_eq!(canonical(&real.join("link/./sub")), real.join("state/sub"));
+        assert_eq!(canonical(&real.join("link/../state")), real.join("state"));
+        assert_eq!(canonical(Path::new("./missing/..")), PathBuf::new());
     }
 
     #[test]

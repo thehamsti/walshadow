@@ -95,6 +95,22 @@ impl TailParts {
         (false, joined)
     }
 
+    /// Abort every stage and wait for each to end: a stage blocked in a
+    /// synchronous call ends only once that call returns
+    async fn abort_and_wait(self) {
+        let stages: Vec<AbortOnDropHandle<()>> = std::iter::once(self.batcher)
+            .chain(self.resolvers)
+            .chain(self.inserters)
+            .chain(std::iter::once(self.collector))
+            .collect();
+        for stage in &stages {
+            stage.abort();
+        }
+        for stage in stages {
+            let _ = stage.await;
+        }
+    }
+
     /// Await the drain cascade once every producer handle has dropped
     pub(super) async fn join(self) {
         let _ = self.batcher.await;
@@ -164,10 +180,32 @@ async fn flush_and_prove(
 pub struct OwnedTail {
     pub msg_tx: mpsc::Sender<BatcherMsg>,
     pub ack: AckHandle,
-    parts: TailParts,
+    /// Taken by [`finish`](Self::finish) and [`quiesce`](Self::quiesce);
+    /// still here on drop when the leg was abandoned mid-way
+    parts: Option<TailParts>,
     fatal: Fatal,
     /// Prefix for the errors this leg reports
     context: &'static str,
+    /// Counts the stages as live writers of the leg's owner until they end,
+    /// however the leg ends
+    writer: Option<crate::ops::writers::WriterToken>,
+}
+
+impl Drop for OwnedTail {
+    /// A leg dropped mid-way, as an aborted backfill pass drops it: its
+    /// stages stop, and whoever counts them waits until they have
+    fn drop(&mut self) {
+        let Some(parts) = self.parts.take() else {
+            return;
+        };
+        let writer = self.writer.take();
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                parts.abort_and_wait().await;
+                drop(writer);
+            });
+        }
+    }
 }
 
 impl OwnedTail {
@@ -178,9 +216,10 @@ impl OwnedTail {
         Self {
             msg_tx,
             ack,
-            parts,
+            parts: Some(parts),
             fatal,
             context: "test",
+            writer: None,
         }
     }
 
@@ -207,10 +246,36 @@ impl OwnedTail {
         Ok(Self {
             msg_tx,
             ack,
-            parts,
+            parts: Some(parts),
             fatal,
             context,
+            writer: None,
         })
+    }
+
+    /// Count the stages as live writers of `token`'s set until they end, so
+    /// a teardown that joins the set waits for them too
+    pub fn counted(mut self, token: Option<crate::ops::writers::WriterToken>) -> Self {
+        self.writer = token;
+        self
+    }
+
+    /// Parts and producer handles, leaving `self` to drop as a no-op: the
+    /// originals go with it, so the cascade can close
+    fn take(
+        mut self,
+    ) -> (
+        TailParts,
+        mpsc::Sender<BatcherMsg>,
+        AckHandle,
+        Fatal,
+        Option<crate::ops::writers::WriterToken>,
+    ) {
+        let parts = self.parts.take().expect("a tail's parts are taken once");
+        let handles = (self.msg_tx.clone(), self.ack.clone(), self.fatal.clone());
+        let writer = self.writer.take();
+        drop(self);
+        (parts, handles.0, handles.1, handles.2, writer)
     }
 
     /// [`Self::finish`] without closing the tail: what licenses recording
@@ -223,10 +288,12 @@ impl OwnedTail {
 
     /// Seal batches and prove every seq below `through` durable
     pub async fn finish(self, through: u64) -> Result<(), String> {
-        self.parts
-            .finish(self.msg_tx, self.ack, through, &self.fatal)
+        let context = self.context;
+        let (parts, msg_tx, ack, fatal, _writer) = self.take();
+        parts
+            .finish(msg_tx, ack, through, &fatal)
             .await
-            .map_err(|m| format!("{}: {m}", self.context))
+            .map_err(|m| format!("{context}: {m}"))
     }
 
     /// Failed-leg teardown: dropping the last producer handles closes the
@@ -234,7 +301,8 @@ impl OwnedTail {
     /// down. Bounded by the inserters' retry policy (a CH outage trips their
     /// fatal, not a hang)
     pub async fn quiesce(self) {
-        self.parts.close(self.msg_tx, self.ack).await;
+        let (parts, msg_tx, ack, _fatal, _writer) = self.take();
+        parts.close(msg_tx, ack).await;
     }
 }
 
@@ -870,6 +938,46 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H3: an abandoned leg's stages count as their owner's writers until
+    /// they end, so a teardown joining the owner waits for a stage stuck in
+    /// a synchronous call instead of reporting joined while it still runs
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_counted_tail_holds_its_owners_join_until_its_stages_end() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let set = crate::ops::writers::WriterSet::new();
+        let fatal = Fatal::new();
+        let (msg_tx, ack, mut parts) = spawn_null(Arc::new(Monotone::default()), fatal.clone());
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started) = oneshot::channel::<()>();
+        let ended = Arc::new(AtomicBool::new(false));
+        let flag = ended.clone();
+        // A stage blocked where an abort cannot reach it
+        parts.batcher = AbortOnDropHandle::new(tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _ = held.recv();
+            flag.store(true, Ordering::SeqCst);
+        }));
+        started.await.unwrap();
+        let tail = OwnedTail {
+            msg_tx,
+            ack,
+            parts: Some(parts),
+            fatal,
+            context: "test",
+            writer: None,
+        }
+        .counted(Some(set.token()));
+        drop(tail);
+        assert!(
+            !set.abort_and_join(Duration::from_millis(200)).await,
+            "the stuck stage still counts"
+        );
+        release.send(()).unwrap();
+        assert!(set.abort_and_join(Duration::from_secs(5)).await);
+        assert!(ended.load(Ordering::SeqCst));
+        assert_eq!(set.live_count(), 0);
+    }
 
     #[tokio::test]
     async fn dropped_tail_closes_workers_with_live_producers() {

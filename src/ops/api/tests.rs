@@ -1354,6 +1354,25 @@ async fn expired_delete_and_invalid_restore_leave_the_tenant_unchanged() {
             .await;
         let (s, _, out) = api.get("/v1/tenants-deleted/a", &api.admin).await;
         assert_eq!((s, out["teardown"].clone()), (StatusCode::OK, json!(want)));
+        // Health says the same: draining is fine, a stuck writer degrades
+        let (_, _, health) = api.get("/v1/health", &api.read).await;
+        let tenants = health["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "tenants")
+            .unwrap()
+            .clone();
+        let (status, detail) = if want == "stuck" {
+            ("degraded", "teardown left a writer running for a")
+        } else {
+            ("ok", "tearing down a")
+        };
+        assert_eq!(tenants["status"], status, "{tenants}");
+        assert!(
+            tenants["detail"].as_str().unwrap().contains(detail),
+            "{tenants}"
+        );
     }
 }
 
@@ -1881,4 +1900,230 @@ async fn rollback_conflict_and_storage_failure_audit_their_actual_outcomes() {
         (StatusCode::INTERNAL_SERVER_ERROR, json!("internal"))
     );
     assert!(!out.to_string().contains("hidden"));
+}
+
+/// H6: a request dropped while its mutation waits still finishes it: the
+/// change applies, the operation record says so, and a delete keeps the
+/// tombstone that makes it restorable
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_request_still_finishes_its_mutation() {
+    let api = Api::new(false, generous()).await;
+    api.attach_on_disk("a").await;
+    let etag = api.etag("a").await;
+    let (_, _, intent) = api
+        .call(
+            "POST",
+            "/v1/tenants/a/delete-intent",
+            Some(&api.admin),
+            &[],
+            None,
+        )
+        .await;
+    let token = intent["confirm_token"].as_str().unwrap().to_string();
+    // The mutation waits on the reload lock while its request goes away
+    let held = api.state.ctx.reloader.begin().await;
+    let mut req = Request::builder()
+        .method("DELETE")
+        .uri("/v1/tenants/a")
+        .header("authorization", format!("Bearer {}", api.admin))
+        .header("if-match", etag.as_str())
+        .header("x-confirm-delete", token.as_str())
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 5], 4000))));
+    let router = api.router.clone();
+    let request = tokio::spawn(async move { router.oneshot(req).await });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let op = loop {
+        if let Some(id) = api.state.ops.running("tenant.delete").pop() {
+            break id;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the delete never started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    drop(held);
+    loop {
+        if api.state.ops.get(&op).unwrap()["state"] == "applied" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dropped delete was left running: {:?}",
+            api.state.ops.get(&op)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(api.frag("a").is_empty(), "the tenant is gone");
+    assert!(
+        api.state.deletes.latest("a").is_some(),
+        "and restorable from its tombstone"
+    );
+    let results: Vec<_> = api
+        .audit()
+        .into_iter()
+        .filter(|r| r.draft.request_id == op && r.draft.phase == "result")
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].draft.outcome, "applied");
+}
+
+/// H4: a detach whose detached state cannot be recorded changes nothing.
+/// The tenant stays attached and its config untouched; the API answers 503
+/// and the socket an error, each audited as rejected. Once the spill
+/// directory is writable again, the caller's retry detaches it
+#[tokio::test]
+async fn an_unrecordable_detach_changes_nothing() {
+    let api = Api::new(false, generous()).await;
+    api.attach_on_disk("a").await;
+    let dir = tenant_dir(&api.dir.path().join("spill"), "a");
+    // The state write goes through `tenant.toml.tmp`; a directory there
+    // makes it fail
+    std::fs::create_dir(dir.join("tenant.toml.tmp")).unwrap();
+    let before = api.frag("a");
+    let generation = api.state.ctx.reloader.current().generation;
+    let etag = api.etag("a").await;
+    let (s, _, out) = api
+        .call(
+            "POST",
+            "/v1/tenants/a/detach",
+            Some(&api.admin),
+            &[("if-match", &etag)],
+            None,
+        )
+        .await;
+    assert_eq!(
+        (s, out["error"]["code"].clone()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!("detach_not_recorded")
+        )
+    );
+    assert!(
+        out["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stays attached"),
+        "{out}"
+    );
+    let body: toml::Table = "id = 'a'\nstate = 'detached'\n".parse().unwrap();
+    let err = crate::ops::tenant_ctl::set_state(
+        &api.state.ctx,
+        &body,
+        &crate::ops::audit::Actor::unix(Some(42)),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("detach_not_recorded"), "{err}");
+    let (s, _, out) = api
+        .call(
+            "POST",
+            "/v1/tenants/a/delete-intent",
+            Some(&api.admin),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let token = out["confirm_token"].as_str().unwrap().to_string();
+    let (s, _, out) = api
+        .call(
+            "DELETE",
+            "/v1/tenants/a",
+            Some(&api.admin),
+            &[("if-match", &etag), ("x-confirm-delete", &token)],
+            None,
+        )
+        .await;
+    assert_eq!(
+        (s, out["error"]["code"].clone()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!("detach_not_recorded")
+        )
+    );
+    assert!(
+        api.state.deletes.latest("a").is_none(),
+        "a delete that did not happen leaves no tombstone"
+    );
+    assert_eq!(api.frag("a"), before, "config untouched");
+    assert_eq!(
+        TenantState::load(&dir).await.unwrap().unwrap().phase,
+        Phase::Active,
+        "still attached"
+    );
+    assert_eq!(
+        api.state.ctx.reloader.current().generation,
+        generation,
+        "nothing published"
+    );
+    let results: Vec<_> = api
+        .audit()
+        .into_iter()
+        .filter(|r| r.draft.phase == "result" && r.draft.error.is_some())
+        .collect();
+    assert_eq!(results.len(), 3, "{results:?}");
+    assert!(results.iter().all(|r| r.draft.outcome == "rejected"));
+    assert!(results.iter().all(|r| {
+        r.draft
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("detach_not_recorded")
+            || r.draft
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("could not record the detach")
+    }));
+    // Writable again: the retry detaches
+    std::fs::remove_dir(dir.join("tenant.toml.tmp")).unwrap();
+    let (s, _, out) = api
+        .call(
+            "POST",
+            "/v1/tenants/a/detach",
+            Some(&api.admin),
+            &[("if-match", &etag)],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{out}");
+    let state = TenantState::load(&dir).await.unwrap().unwrap();
+    assert_eq!(state.phase, Phase::Detached);
+    assert!(
+        state
+            .reason
+            .unwrap()
+            .starts_with("requested by tenant.detach"),
+        "recorded before the config changed"
+    );
+}
+
+/// `ctl tenant remove` of a tenant that exists removes its declaration and
+/// audits it like the API does
+#[tokio::test]
+async fn the_socket_removes_an_existing_tenant() {
+    let api = Api::new(false, generous()).await;
+    let body: toml::Table = "id = 'a'\n".parse().unwrap();
+    crate::ops::tenant_ctl::remove(
+        &api.state.ctx,
+        &body,
+        &crate::ops::audit::Actor::unix(Some(42)),
+    )
+    .await
+    .unwrap();
+    assert!(api.frag("a").is_empty());
+    let applied: Vec<_> = api
+        .audit()
+        .into_iter()
+        .filter(|r| r.draft.action == "tenant.remove" && r.draft.phase == "result")
+        .collect();
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].draft.outcome, "applied");
+    assert_eq!(applied[0].draft.actor.kind, "unix");
 }

@@ -2092,6 +2092,7 @@ impl CopyBackfiller {
         range: BlockRange,
     ) -> anyhow::Result<u64> {
         // Dedicated tail: own CH connection, own seq space, own fatal.
+        // Counted with the pass, so a teardown waits for its stages too
         let tail = OwnedTail::spawn(
             self.dest.clone(),
             1,
@@ -2102,7 +2103,8 @@ impl CopyBackfiller {
             "backfill",
         )
         .await
-        .map_err(anyhow::Error::msg)?;
+        .map_err(anyhow::Error::msg)?
+        .counted(Some(self.writers.token()));
 
         let mut catalog = CatalogMap::new();
         catalog.insert(desc.clone());

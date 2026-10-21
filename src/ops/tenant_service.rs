@@ -211,7 +211,9 @@ impl TenantService {
         if let Some(log) = self.ctx.reloader.audit() {
             let (outcome, error) = match &res {
                 Ok(_) => ("applied", None),
-                Err(e) if !audit.attempted => ("rejected", Some(e.to_string())),
+                Err(e) if !audit.attempted || e.code == "detach_not_recorded" => {
+                    ("rejected", Some(e.to_string()))
+                }
                 Err(e) if e.code == "apply_refused" => ("rolled_back", Some(e.to_string())),
                 Err(e) if e.code == "conflict_after_failed_apply" => {
                     ("conflict", Some(e.to_string()))
@@ -317,7 +319,7 @@ impl TenantService {
         if let Some(next) = &next {
             crate::ch_emitter::merge_tables(&mut preview, next.to_fragment());
         }
-        crate::ops::tenant_ctl::validate(&preview)
+        crate::ops::tenant_ctl::validate_with(&preview, self.ctx.spill_dir.as_deref())
             .map_err(|e| ServiceError::new(422, "invalid_config", format!("{e:#}")))?;
         let change = match (&current, &next) {
             (_, None) => Change::Live,
@@ -425,11 +427,33 @@ impl TenantService {
             }
             _ => None,
         };
+        // H4: detached on disk before any config changes, so a tenant that
+        // leaves the floor never resumes from WAL the slot no longer holds.
+        // A write that fails changes nothing; the tenant stays attached and
+        // the caller retries
+        let detaching = attached && next.as_ref().is_none_or(|d| d.desired == Desired::Detached);
+        let was = match (&dir, detaching) {
+            (Some(dir), true) => match record_detaching(dir, m).await {
+                Ok(was) => Some((dir.clone(), was)),
+                Err(e) => {
+                    if let Some(dir) = &fence {
+                        let _ = RebindFence::remove(dir).await;
+                    }
+                    return Err(e);
+                }
+            },
+            _ => None,
+        };
         let written = match self.persist(&tx, &root, &stored, id, next.as_ref()).await {
             Ok(written) => written,
             Err(e) => {
-                if let Some(dir) = &fence {
-                    let _ = RebindFence::remove(dir).await;
+                // A change that stands although persisting failed keeps
+                // the fence that protects it
+                if e.code != "conflict_after_failed_apply" {
+                    if let Some(dir) = &fence {
+                        let _ = RebindFence::remove(dir).await;
+                    }
+                    undo_detaching(&was).await;
                 }
                 return Err(e);
             }
@@ -454,8 +478,13 @@ impl TenantService {
             }
             Err(refused) => {
                 let restored = self.restore(&tx, &root, &stored, &written, id).await;
-                if let Some(dir) = &fence {
-                    let _ = RebindFence::remove(dir).await;
+                // Only a rollback that put the old config back retires the
+                // fence and the detach record; whatever stands keeps them
+                if restored.is_ok() {
+                    if let Some(dir) = &fence {
+                        let _ = RebindFence::remove(dir).await;
+                    }
+                    undo_detaching(&was).await;
                 }
                 if let Err(e) = tx.publish(cause, PublishOpts::default()).await {
                     tracing::warn!(
@@ -672,9 +701,28 @@ impl TenantService {
                 let wanted = next.map(row_of);
                 self.swap_row(schema, id, row.as_ref(), wanted.as_ref())
                     .await?;
-                mirror_registry(tx, &self.ctx.ch_config, root, schema)
-                    .await
-                    .map_err(ServiceError::internal)?;
+                if let Err(e) = mirror_registry(tx, &self.ctx.ch_config, root, schema).await {
+                    // The row committed: put it back, or the poller would
+                    // publish the accepted change later without its fence
+                    return Err(
+                        match self
+                            .swap_row(schema, id, wanted.as_ref(), row.as_ref())
+                            .await
+                        {
+                            Ok(()) => ServiceError::internal(format!(
+                                "write the registry mirror, so the row was put back: {e:#}"
+                            )),
+                            Err(_) => ServiceError::new(
+                                409,
+                                "conflict_after_failed_apply",
+                                format!(
+                                    "the registry row committed but its mirror failed ({e:#}), \
+                                     and the row changed again before it could be put back"
+                                ),
+                            ),
+                        },
+                    );
+                }
                 Ok(Written::Row(wanted))
             }
         }
@@ -817,6 +865,47 @@ struct AuditState {
 enum Written {
     Fragment(Option<Vec<u8>>),
     Row(Option<(String, String, String)>),
+}
+
+/// Mark an attached tenant detached for `m`, returning the state it had.
+/// The session replaces the reason with its own once it stopped routing
+async fn record_detaching(dir: &Path, m: &Mutation) -> ServiceResult<TenantState> {
+    let refused = |e: anyhow::Error| {
+        ServiceError::new(
+            503,
+            "detach_not_recorded",
+            format!(
+                "could not record the detach in {}, so nothing changed and the tenant stays \
+                 attached; retry: {e:#}",
+                dir.join(crate::tenants::STATE_FILE).display()
+            ),
+        )
+    };
+    let was = TenantState::load(dir)
+        .await
+        .map_err(refused)?
+        .ok_or_else(|| refused(anyhow::anyhow!("the tenant has no state")))?;
+    let mut detached = was.clone();
+    detached.phase = Phase::Detached;
+    detached.reason = Some(format!("requested by {} {}", m.action, m.request_id));
+    detached.store(dir).await.map_err(refused)?;
+    Ok(was)
+}
+
+/// Put back the state [`record_detaching`] replaced, after the detach
+/// itself was rolled back
+async fn undo_detaching(was: &Option<(PathBuf, TenantState)>) {
+    if let Some((dir, state)) = was
+        && let Err(e) = state.store(dir).await
+    {
+        tracing::error!(
+            target: "walshadow::control",
+            tenant = %state.id,
+            error = %format!("{e:#}"),
+            "could not restore the tenant's state after a rolled-back detach; it attaches \
+             afresh at the next boot",
+        );
+    }
 }
 
 fn changed_since() -> ServiceError {
@@ -1375,11 +1464,20 @@ name = "{database}.INTERNAL.LOAD_STAGE"
         assert!(err.contains("only `paused` stays cluster-wide"), "{err}");
     }
 
-    #[tokio::test]
-    async fn sql_registry_cas_and_rollback_preserve_external_edits() {
+    /// A local PostgreSQL, stopped on drop
+    struct LocalPg(crate::shadow::Shadow);
+
+    impl Drop for LocalPg {
+        fn drop(&mut self) {
+            let _ = self.0.stop();
+        }
+    }
+
+    /// A fixture whose registry is `walshadow.tenant` on a local PostgreSQL,
+    /// with its socket directory and port. `None` without `initdb`, which
+    /// only CI's `WALSHADOW_REQUIRE_TOOLS` turns into a failure
+    async fn sql_fixture() -> Option<(Fixture, LocalPg, PathBuf, u16)> {
         use crate::shadow::{Shadow, ShadowConfig};
-        // Needs a local PostgreSQL, like the e2e suites: skipped without
-        // one unless CI demands every tool
         let initdb = std::process::Command::new("initdb")
             .arg("--version")
             .output()
@@ -1389,13 +1487,7 @@ name = "{database}.INTERNAL.LOAD_STAGE"
                 std::env::var_os("WALSHADOW_REQUIRE_TOOLS").is_none(),
                 "WALSHADOW_REQUIRE_TOOLS is set but initdb is not on PATH"
             );
-            return;
-        }
-        struct LocalPg(Shadow);
-        impl Drop for LocalPg {
-            fn drop(&mut self) {
-                let _ = self.0.stop();
-            }
+            return None;
         }
         let f = Fixture::new(&[]).await;
         let pgdir = f.dir.path().join("pg");
@@ -1407,13 +1499,21 @@ name = "{database}.INTERNAL.LOAD_STAGE"
         let mut cfg = ShadowConfig::new(pgdir, f.dir.path().join("filtered"));
         cfg.socket_dir = socket.clone();
         cfg.port = port;
-        let source = LocalPg(Shadow::new(cfg));
-        source.0.initdb().unwrap();
-        source.0.write_base_conf().unwrap();
-        source.0.start().unwrap();
+        let pg = LocalPg(Shadow::new(cfg));
+        pg.0.initdb().unwrap();
+        pg.0.write_base_conf().unwrap();
+        pg.0.start().unwrap();
         std::fs::write(&f.svc.ctx.ch_config, format!(
             "[source]\nhost = '{}'\nport = {port}\nuser = 'postgres'\ndbname = 'postgres'\nsslmode = 'disable'\n[tenants]\nregistry = 'sql'\nregistry_schema = 'walshadow'\n", socket.display()
         )).unwrap();
+        Some((f, pg, socket, port))
+    }
+
+    #[tokio::test]
+    async fn sql_registry_cas_and_rollback_preserve_external_edits() {
+        let Some((f, _pg, socket, port)) = sql_fixture().await else {
+            return;
+        };
         let created = f
             .put("a", &ch_body("a", "a", ""), &Mutation::new("sql-create"))
             .await
@@ -1515,6 +1615,54 @@ name = "{database}.INTERNAL.LOAD_STAGE"
         f.svc.swap_row("walshadow", "a", None, None).await.unwrap();
     }
 
+    /// H5: a committed registry row whose mirror cannot be written is put
+    /// back before the fence goes, so the poller can never publish the
+    /// accepted re-bind later without the fence that protects it
+    #[tokio::test]
+    async fn a_failed_registry_mirror_puts_the_committed_row_back() {
+        let Some((f, _pg, ..)) = sql_fixture().await else {
+            return;
+        };
+        f.put("a", &ch_body("a", "a", ""), &Mutation::new("sql-create"))
+            .await
+            .unwrap();
+        let original = f.svc.registry_row("walshadow", "a").await.unwrap();
+        f.attach("a").await;
+        f.register("a").await;
+        // The mirror's temp path is a directory, so writing the mirror fails
+        // while the config, which reads only `.toml` fragments, still loads
+        let mirror = crate::ops::tenant_ctl::registry_mirror_path(&f.svc.ctx.ch_config);
+        std::fs::create_dir(mirror.with_extension("tmp")).unwrap();
+        let generation = f.svc.ctx.reloader.current().generation;
+        let err = f
+            .put(
+                "a",
+                &ch_body("a", "b", ""),
+                &acked(Mutation::new("sql-rebind")),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!((err.status, err.code), (500, "internal"));
+        assert!(err.message.contains("row was put back"), "{}", err.message);
+        assert_eq!(
+            f.svc.registry_row("walshadow", "a").await.unwrap(),
+            original,
+            "the re-bind never stands without its fence"
+        );
+        assert!(
+            RebindFence::load(&f.tenant_dir("a"))
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing changed, so nothing is fenced"
+        );
+        assert_eq!(
+            f.svc.ctx.reloader.current().generation,
+            generation,
+            "nothing published"
+        );
+    }
+
     #[tokio::test]
     async fn storage_failures_leave_config_and_fence_unchanged() {
         let f = Fixture::new(&[("a", ch_body("a", "a", ""))]).await;
@@ -1558,6 +1706,102 @@ name = "{database}.INTERNAL.LOAD_STAGE"
         );
     }
 
+    /// H7: Snowflake state directories compare by where they resolve. A
+    /// symlink into another tenant's state, or into any tenant's spill
+    /// directory (an attach clears those), is refused on every mutation,
+    /// at publish, and by the reservations an attach claims
+    #[tokio::test]
+    async fn state_directories_are_compared_through_their_symlinks() {
+        let state_a = tempfile::tempdir().unwrap();
+        let f = Fixture::new(&[("a", snowflake_body("a", "A_DB", state_a.path()))]).await;
+        let spill = f.svc.ctx.spill_dir.clone().unwrap();
+        f.svc.ctx.reloader.set_spill_dir(spill.clone());
+        let links = tempfile::tempdir().unwrap();
+        // Into tenant a's state
+        let into_a = links.path().join("into-a");
+        std::os::unix::fs::symlink(state_a.path(), &into_a).unwrap();
+        let err = f
+            .put(
+                "b",
+                &snowflake_body("b", "B_DB", &into_a.join("b")),
+                &Mutation::new("alias-a"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!((err.status, err.code), (422, "invalid_config"));
+        assert!(
+            err.message.contains("share Snowflake state directory"),
+            "{}",
+            err.message
+        );
+        // Into a tenant's spill directory, its own included
+        let own = spill.join("tenants/b");
+        std::fs::create_dir_all(&own).unwrap();
+        let into_spill = links.path().join("into-spill");
+        std::os::unix::fs::symlink(&own, &into_spill).unwrap();
+        let err = f
+            .put(
+                "b",
+                &snowflake_body("b", "B_DB", &into_spill.join("state")),
+                &Mutation::new("alias-spill"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!((err.status, err.code), (422, "invalid_config"));
+        assert!(err.message.contains("spill directories"), "{}", err.message);
+        assert!(
+            !tenant_fragment_path(&f.svc.ctx.ch_config, "b").exists(),
+            "nothing persisted"
+        );
+        // A directory of its own is fine
+        let state_b = tempfile::tempdir().unwrap();
+        f.put(
+            "b",
+            &snowflake_body("b", "B_DB", state_b.path()),
+            &Mutation::new("own"),
+        )
+        .await
+        .unwrap();
+        // At load: a hand-written fragment aliasing a's state never publishes
+        std::fs::write(
+            tenant_fragment_path(&f.svc.ctx.ch_config, "c"),
+            snowflake_body("c", "C_DB", &into_a.join("c")),
+        )
+        .unwrap();
+        let err = f
+            .svc
+            .ctx
+            .reloader
+            .begin()
+            .await
+            .publish(ReloadCause::Sighup, PublishOpts::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PublishError::Invalid(e) if format!("{e:#}").contains("share")),
+            "{err}"
+        );
+        std::fs::remove_file(tenant_fragment_path(&f.svc.ctx.ch_config, "c")).unwrap();
+        // And an attach's claim sees the alias as a's directory
+        let root = f.root().await;
+        let tenants = TenantsConfig::from_table(&root).unwrap().unwrap();
+        let reservations = crate::tenants::Reservations::default();
+        reservations
+            .claim(
+                "a",
+                tenants.get("a").unwrap().resources(&root, &spill).unwrap(),
+            )
+            .unwrap();
+        let text: Table = snowflake_body("b", "B_DB", &into_a.join("b"))
+            .parse()
+            .unwrap();
+        let aliased = TenantDecl::parse("b", text["tenant"]["b"].as_table().unwrap()).unwrap();
+        let conflict = reservations
+            .claim("b", aliased.resources(&root, &spill).unwrap())
+            .unwrap_err();
+        assert_eq!(conflict.holder, "a");
+    }
+
     #[tokio::test]
     async fn fresh_snowflake_state_cannot_overlap_a_tearing_down_tenant() {
         let f = Fixture::new(&[("a", snowflake_body("a", "A_DB", Path::new("/old")))]).await;
@@ -1584,6 +1828,35 @@ name = "{database}.INTERNAL.LOAD_STAGE"
             f.decl(&snowflake_body("a", "A_DB", Path::new("/old")), "a")
         );
     }
+    /// What callers read back: refusal text, re-bind reasons, the registry
+    /// row a detached tenant stores, and fragment deletes that are already
+    /// done or cannot happen
+    #[tokio::test]
+    async fn refusals_rows_and_fragment_deletes_read_as_expected() {
+        let invalid = PublishError::Invalid(anyhow::anyhow!("no [source] dbname"));
+        assert_eq!(refusal(&invalid), "no [source] dbname");
+        assert_eq!(rebind_reasons(&Change::Live), "");
+        assert_eq!(
+            rebind_reasons(&Change::FreshAttach),
+            "the tenant becomes active"
+        );
+        let f = Fixture::new(&[]).await;
+        let mut decl = f.decl(&ch_body("a", "a", ""), "a");
+        decl.desired = Desired::Detached;
+        let (dbname, spec, state) = row_of(&decl);
+        assert_eq!((dbname.as_str(), state.as_str()), ("a_db", "detached"));
+        assert!(!spec.contains("dbname") && !spec.contains("state"));
+        let gone = f.dir.path().join("gone.toml");
+        write_fragment(&gone, None).await.unwrap();
+        let busy = f.dir.path().join("busy.toml");
+        std::fs::create_dir(&busy).unwrap();
+        std::fs::write(busy.join("inside"), "x").unwrap();
+        assert_eq!(
+            write_fragment(&busy, None).await.unwrap_err().code,
+            "internal"
+        );
+    }
+
     #[test]
     fn service_errors_scrub_credentials_before_operations_store_them() {
         let err = ServiceError::new(

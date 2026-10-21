@@ -90,7 +90,11 @@ lock is ever shared. The daemon and `ctl` refuse a config where two tenants:
 - write one Snowflake database (account and database), whatever their
   `internal_schema`: public views are named per database and schema, not per
   internal schema
-- share a Snowflake state directory
+- share a Snowflake state directory, or nest one inside another's. State
+  directories compare by where they resolve, symlinks followed, and none may
+  resolve among the tenants' spill directories under `<spill-dir>/tenants`,
+  its own included, since attaching afresh clears those. This is checked at
+  boot, on every reload and on every `ctl` or API change
 - reach one ClickHouse database on one host and port, through `[ch]
   database`, a namespace or table `target_database`, a named instance or a
   tee. Two tenants left at the default database collide, so give each its own

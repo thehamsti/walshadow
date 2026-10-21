@@ -706,6 +706,7 @@ impl SnowflakeRuntime {
             let result = self
                 .writers
                 .spawn_blocking(move || state.enqueue(&attempt))
+                .context("Snowflake enqueue")?
                 .await
                 .context("Snowflake enqueue task")?;
             match result {
@@ -744,6 +745,7 @@ impl SnowflakeRuntime {
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 Ok((manifests, toast))
             })
+            .context("Snowflake maintenance")?
             .await
             .context("Snowflake maintenance task")??;
         if manifests > 0 || toast > 0 {
@@ -1496,9 +1498,12 @@ mod tests {
         assert_eq!(runtime.writers().live_count(), appliers);
         // A state write that has not returned
         let (release, held) = std::sync::mpsc::channel::<()>();
-        let stuck = runtime.writers().spawn_blocking(move || {
-            let _ = held.recv();
-        });
+        let stuck = runtime
+            .writers()
+            .spawn_blocking(move || {
+                let _ = held.recv();
+            })
+            .unwrap();
         drop(stuck);
 
         let theirs: std::collections::BTreeSet<Resource> = [

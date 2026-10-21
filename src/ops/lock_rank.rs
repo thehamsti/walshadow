@@ -169,6 +169,24 @@ mod tests {
         let _d = RankToken::enter(MAPPING_WRITE, "mapping");
     }
 
+    /// A default mutex ranks last: it nests under every ranked lock, and
+    /// leaving a rank never entered changes nothing. Spawned: ranks are
+    /// tracked per task
+    #[tokio::test]
+    async fn a_default_mutex_ranks_below_everything() {
+        tokio::spawn(async {
+            let unranked = RankedMutex::<u32>::default();
+            let mutation = RankedMutex::new(MUTATION, "mutation", ());
+            let _m = mutation.lock().await;
+            let _r = RankToken::enter(MAPPING_WRITE, "mapping");
+            assert_eq!(*unranked.lock().await, 0);
+            #[cfg(debug_assertions)]
+            held::exit(tokio::task::id(), RESOLVER);
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn released_ranks_can_be_taken_again() {
         let reload = RankedMutex::new(RELOAD, "reload", ());

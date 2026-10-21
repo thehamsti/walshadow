@@ -331,7 +331,9 @@ async fn walk_and_ship(
         "backup_backfill",
     )
     .await
-    .map_err(anyhow::Error::msg)?;
+    .map_err(anyhow::Error::msg)?
+    // Counted with the pass, so a teardown waits for its stages too
+    .counted(ctx.writer.clone());
 
     let result: Result<_> = async {
         let mut checkpoint = ctx.checkpoint.clone();
