@@ -430,7 +430,14 @@ impl Renderer {
         if let Some(d) = field.get("default") {
             parts.push(format!("Default: <code>{}</code>", esc(&display(d))));
         }
-        for (key, label) in [("minimum", "min"), ("maximum", "max"), ("format", "format")] {
+        for (key, label) in [
+            ("minimum", "min"),
+            ("maximum", "max"),
+            ("minLength", "min length"),
+            ("maxLength", "max length"),
+            ("pattern", "pattern"),
+            ("format", "format"),
+        ] {
             if let Some(v) = field.get(key) {
                 parts.push(format!("{label} <code>{}</code>", esc(&display(v))));
             }

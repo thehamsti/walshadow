@@ -277,6 +277,12 @@ fn operation(r: &Route, c: &mut Components, error_ref: &Value, exposure: Exposur
     let mut responses = Map::new();
     for reply in d.replies {
         let mut headers = guard_headers();
+        if reply.media == Media::Html {
+            headers.insert(
+                "Content-Security-Policy".into(),
+                header(super::docs_html::CONTENT_SECURITY_POLICY),
+            );
+        }
         if reply.etag {
             headers.insert(
                 "ETag".into(),
@@ -313,6 +319,10 @@ fn operation(r: &Route, c: &mut Components, error_ref: &Value, exposure: Exposur
                 headers.insert(
                     "Retry-After".into(),
                     header("Seconds to wait before retrying"),
+                );
+                headers.insert(
+                    "RateLimit-Reset".into(),
+                    header("Seconds until a token is available, the same as `Retry-After`"),
                 );
             }
             _ => {}

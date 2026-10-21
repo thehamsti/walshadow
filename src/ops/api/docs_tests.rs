@@ -428,6 +428,17 @@ fn the_document_lists_every_route_and_nothing_else() {
                 "{what}"
             );
             let responses = op["responses"].as_object().unwrap();
+            assert!(
+                responses["429"]["headers"].get("RateLimit-Reset").is_some(),
+                "{what}"
+            );
+            assert_eq!(
+                op["responses"]["200"]["headers"]
+                    .get("Content-Security-Policy")
+                    .is_some(),
+                r.path == "/v1/docs",
+                "{what}"
+            );
             for s in ["408", "413", "429", "500", "503"] {
                 assert!(responses.contains_key(s), "{what}: no {s}");
             }
@@ -1097,7 +1108,7 @@ async fn the_docs_are_public_only_with_their_flag() {
 
 /// Public docs stay behind the per-IP limits: preauth, and their own
 /// bucket at the read rate, each exhausted with the other to spare
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn public_docs_are_rate_limited_per_address() {
     let tight = Rate::new(0.01, 2.0);
     let docs = Exposure {
@@ -1317,7 +1328,10 @@ fn the_renderer_shows_every_construct_and_escapes_text() {
                 "Either": {"oneOf": [{"$ref": "#/components/schemas/Leaf"}, {"type": "null"}]},
                 "Open": {
                     "type": "object",
-                    "properties": {"k": {"type": "string", "default": "d"}},
+                    "properties": {"k": {
+                        "type": "string", "default": "d", "pattern": "^[a-z<&]+$",
+                        "minLength": 1, "maxLength": 63,
+                    }},
                     "additionalProperties": true,
                 },
                 "Any": {"type": "object", "additionalProperties": true},
@@ -1396,6 +1410,7 @@ fn the_renderer_shows_every_construct_and_escapes_text() {
         "Other keys are allowed.",
         "An object; any keys.",
         "Default: <code>d</code>",
+        "min length <code>1</code>. max length <code>63</code>. pattern <code>^[a-z&lt;&amp;]+$</code>",
         "<p><strong>408</strong> Late</p>",
         // Schemas
         "<h3 id=\"schema-Kind\">Kind</h3><p>Values: <code>a</code>, <code>b&lt;c&gt;</code></p>",
