@@ -171,9 +171,25 @@ impl TenantsConfig {
             return Ok(None);
         }
         for section in TENANT_SECTIONS {
+            // Pause is cluster-wide: `ctl pause` writes a top-level
+            // `[stream] paused`, the one stream key tenants leave to the
+            // cluster
+            if *section == "stream"
+                && root
+                    .get("stream")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|t| t.keys().all(|k| k == "paused"))
+            {
+                continue;
+            }
             ensure!(
                 !root.contains_key(*section),
-                "[{section}] belongs inside a [tenant.<id>] table once tenants are configured"
+                "[{section}] belongs inside a [tenant.<id>] table once tenants are configured{}",
+                if *section == "stream" {
+                    "; only `paused` stays cluster-wide"
+                } else {
+                    ""
+                }
             );
         }
         #[derive(Deserialize, Default)]
@@ -771,6 +787,291 @@ impl Reservations {
     }
 }
 
+/// How a change to one tenant reaches a running daemon
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// Nothing changes
+    None,
+    /// Applies to the running tenant through its resolver, or takes effect
+    /// at its next attach
+    Live,
+    /// A detached tenant becomes active: it attaches afresh, with fresh
+    /// initial loads
+    FreshAttach,
+    /// Detach, then attach afresh with fresh initial loads: what the
+    /// running tenant was built with changes
+    Rebind {
+        reasons: Vec<String>,
+        /// The edit moves the Snowflake state directory here, which must be
+        /// absent or empty: a fresh runtime cannot reopen state bound to
+        /// another fingerprint
+        fresh_state_dir: Option<PathBuf>,
+    },
+    /// Refused while the daemon runs
+    Rejected(Vec<String>),
+}
+
+impl Change {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Live => "live",
+            Self::FreshAttach => "fresh_attach",
+            Self::Rebind { .. } => "rebind",
+            Self::Rejected(_) => "rejected",
+        }
+    }
+
+    /// Starts a fresh attachment of an existing tenant, so the caller must
+    /// acknowledge the resync
+    pub fn resyncs(&self) -> bool {
+        matches!(self, Self::FreshAttach | Self::Rebind { .. })
+    }
+}
+
+/// Class of one changed setting, by its dotted path inside `[tenant.<id>]`
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Rule {
+    Live,
+    /// Live unless the ClickHouse scope set moves, which the scope check
+    /// catches
+    Scoped,
+    /// Snowflake fingerprint: re-binds only with a fresh state directory
+    Fingerprint,
+    StateDir,
+    Rebind,
+    Rejected,
+}
+
+fn rule_for(path: &[&str]) -> (Rule, &'static str) {
+    use Rule::*;
+    match path {
+        ["dbname"] => (Rebind, "dbname"),
+        ["max_lag_bytes"] | ["initial_load"] | ["state"] => (Live, ""),
+        ["destination", ..] => (
+            Rejected,
+            "changing the destination kind needs a daemon restart and separate durable state",
+        ),
+        ["table", ..] | ["namespace", ..] => (Scoped, ""),
+        ["ch", "host" | "port" | "database"] => (Scoped, ""),
+        ["ch", "instances", _, "host" | "port" | "database"] | ["ch", "instances", _] => {
+            (Scoped, "")
+        }
+        [
+            "ch",
+            "instances",
+            _,
+            "user" | "password" | "secure" | "tls_server_name" | "compression",
+        ] => (Live, ""),
+        [
+            "ch",
+            "user"
+            | "password"
+            | "secure"
+            | "tls_server_name"
+            | "compression"
+            | "row_budget"
+            | "byte_budget"
+            | "drain_batch_rows"
+            | "drain_batch_bytes"
+            | "plan_disk_max"
+            | "flush_timeout_ms"
+            | "retry_max_attempts"
+            | "retry_initial_backoff_ms"
+            | "retry_max_backoff_ms"
+            | "drop_table_strategy"
+            | "detach_strategy",
+        ] => (Live, ""),
+        [
+            "ch",
+            "decoder_pool_size" | "inserter_pool_size" | "soft_delete",
+        ] => (Rebind, "a setting fixed when the tenant opens"),
+        ["ch", "decoder_batch_size" | "decoder_queue_capacity"] => (
+            Rejected,
+            "decoder batch and queue sizes are session-wide and need a daemon restart",
+        ),
+        [
+            "snowflake",
+            "role"
+            | "warehouse"
+            | "user"
+            | "statement_timeout_secs"
+            | "batch_rows"
+            | "batch_bytes"
+            | "flush_interval_ms",
+        ]
+        | ["snowflake", "auth", ..] => (Live, ""),
+        ["snowflake", "account_url" | "database" | "internal_schema"]
+        | ["snowflake", "stage", ..]
+        | ["snowflake", "schema_mapping", ..] => (Fingerprint, ""),
+        ["snowflake", "state", "directory"] => (StateDir, ""),
+        [
+            "snowflake",
+            "channels_per_table"
+            | "max_in_flight"
+            | "merge_interval_ms"
+            | "metadata_concurrency"
+            | "merge_concurrency"
+            | "ack_after",
+        ]
+        | ["snowflake", "state", "max_bytes"] => (
+            Rejected,
+            "Snowflake channel, pool, merge-interval, state and ack_after settings need a daemon restart",
+        ),
+        [
+            "stream",
+            "skip_attribution" | "auto_create_name_all" | "paused",
+        ] => (Live, ""),
+        ["stream", "replicate_all"] => (Rebind, "replicate_all is fixed when the tenant opens"),
+        ["runtime_config", "schema"] => (
+            Rebind,
+            "the runtime-config schema is fixed when the tenant opens",
+        ),
+        ["system_columns", ..] => (
+            Rebind,
+            "system column names are fixed when the tenant opens",
+        ),
+        ["toast", "mode"] => (Rebind, "the TOAST mode is fixed when the tenant opens"),
+        _ => (Rejected, ""),
+    }
+}
+
+/// Dotted paths of every leaf that differs between `a` and `b`
+fn changed_paths(a: &toml::Table, b: &toml::Table) -> Vec<Vec<String>> {
+    fn table<'v>(v: Option<&'v toml::Value>, empty: &'v toml::Table) -> Option<&'v toml::Table> {
+        match v {
+            Some(toml::Value::Table(t)) => Some(t),
+            None => Some(empty),
+            Some(_) => None,
+        }
+    }
+    fn walk(
+        prefix: &mut Vec<String>,
+        a: Option<&toml::Value>,
+        b: Option<&toml::Value>,
+        out: &mut Vec<Vec<String>>,
+    ) {
+        // A table added or removed whole changes each of its leaves
+        let empty = toml::Table::new();
+        match (table(a, &empty), table(b, &empty)) {
+            (Some(x), Some(y))
+                if a.is_some_and(toml::Value::is_table) || b.is_some_and(toml::Value::is_table) =>
+            {
+                let keys: std::collections::BTreeSet<&String> = x.keys().chain(y.keys()).collect();
+                for k in keys {
+                    prefix.push(k.clone());
+                    walk(prefix, x.get(k), y.get(k), out);
+                    prefix.pop();
+                }
+            }
+            _ if a == b => {}
+            _ => out.push(prefix.clone()),
+        }
+    }
+    let mut out = Vec::new();
+    let (a, b) = (toml::Value::Table(a.clone()), toml::Value::Table(b.clone()));
+    walk(&mut Vec::new(), Some(&a), Some(&b), &mut out);
+    out
+}
+
+/// Classify replacing tenant `old` with `new`, the whole config going from
+/// `old_root` to `new_root`. Fails closed: a changed setting no rule names
+/// is refused. `None` for `old` is a new tenant
+pub fn classify_change(
+    old: Option<&TenantDecl>,
+    new: &TenantDecl,
+    old_root: &toml::Table,
+    new_root: &toml::Table,
+) -> Result<Change> {
+    let Some(old) = old else {
+        return Ok(Change::Live);
+    };
+    let (a, b) = (old.to_fragment(), new.to_fragment());
+    let body = |t: &toml::Table, id: &str| -> toml::Table {
+        t.get("tenant")
+            .and_then(|t| t.get(id))
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let (a, b) = (body(&a, &old.id), body(&b, &new.id));
+    let paths = changed_paths(&a, &b);
+    let mut rejected = Vec::new();
+    let mut rebind = Vec::new();
+    let mut fingerprint = false;
+    let mut state_dir = false;
+    for path in &paths {
+        let parts: Vec<&str> = path.iter().map(String::as_str).collect();
+        let (rule, why) = rule_for(&parts);
+        let dotted = path.join(".");
+        match rule {
+            Rule::Live | Rule::Scoped => {}
+            Rule::Fingerprint => fingerprint = true,
+            Rule::StateDir => state_dir = true,
+            Rule::Rebind => rebind.push(if why.is_empty() {
+                dotted
+            } else {
+                format!("{dotted}: {why}")
+            }),
+            Rule::Rejected if why.is_empty() => rejected.push(format!(
+                "{dotted}: unclassified setting, refused while the daemon runs"
+            )),
+            Rule::Rejected => rejected.push(format!("{dotted}: {why}")),
+        }
+    }
+    let mut fresh_state_dir = None;
+    if fingerprint {
+        let dir = crate::destination::config::DestinationConfig::from_table(
+            &new.effective_table(new_root),
+        )
+        .ok()
+        .and_then(|d| d.snowflake)
+        .map(|sf| sf.state.directory);
+        match (state_dir, dir) {
+            (true, Some(dir)) => {
+                rebind.push(
+                    "Snowflake account, database, internal schema, stage or schema mapping, with a fresh state directory"
+                        .into(),
+                );
+                fresh_state_dir = Some(dir);
+            }
+            _ => rejected.push(
+                "the Snowflake account, database, internal schema, stage or schema mapping is bound to its \
+                 state directory: move snowflake.state.directory to a fresh, empty path in the same edit"
+                    .into(),
+            ),
+        }
+    } else if state_dir {
+        rejected.push("snowflake.state.directory alone needs a daemon restart".into());
+    }
+    // A ClickHouse route the tenant reaches differently re-binds: its
+    // reservations are fixed at attach
+    let scopes = |d: &TenantDecl, root: &toml::Table| -> Option<ChScopes> {
+        let eff = d.effective_table(root);
+        eff.contains_key("ch")
+            .then(|| crate::ch_emitter::EmitterConfig::from_table(&eff).ok())
+            .flatten()
+            .map(|cfg| clickhouse_scopes(&cfg))
+    };
+    if scopes(old, old_root) != scopes(new, new_root) {
+        rebind.push("the ClickHouse databases the tenant reaches".into());
+    }
+    if !rejected.is_empty() {
+        return Ok(Change::Rejected(rejected));
+    }
+    let was_active = old.desired == Desired::Active;
+    let is_active = new.desired == Desired::Active;
+    Ok(match (was_active, is_active) {
+        (true, true) if !rebind.is_empty() => Change::Rebind {
+            reasons: rebind,
+            fresh_state_dir,
+        },
+        (false, true) => Change::FreshAttach,
+        _ if paths.is_empty() => Change::None,
+        _ => Change::Live,
+    })
+}
+
 /// Lower-case letters, digits, `-` and `_`: used in paths, metric labels and
 /// Snowflake object names
 pub fn validate_id(id: &str) -> Result<()> {
@@ -994,6 +1295,105 @@ mod tests {
              [tenant.a]\ndbname = 'other'\n[tenant.a.ch]\nhost = 'ch'\ndatabase = 'a'\n",
         );
         assert_ne!(decl_a(&other).identity_digest(&other).unwrap(), identity);
+    }
+
+    /// One row per class of the capability matrix (plan §9.4), and the
+    /// fail-closed fallback
+    #[test]
+    fn classify_change_follows_the_capability_matrix() {
+        let tenant = |top: &str, ch: &str, rest: &str| -> toml::Table {
+            root(&format!(
+                "[source]\nhost = 'pg'\ndbname = 'postgres'\n[tenants]\n\
+                 [tenant.a]\ndbname = 'app'\n{top}[tenant.a.ch]\nhost = 'ch'\ndatabase = 'a'\n{ch}{rest}"
+            ))
+        };
+        let base = tenant("", "", "");
+        let class = |next: &toml::Table| {
+            classify_change(Some(&decl_a(&base)), &decl_a(next), &base, next)
+                .unwrap()
+                .label()
+        };
+        let cases = [
+            (tenant("", "", ""), "none"),
+            (tenant("max_lag_bytes = 9\n", "", ""), "live"),
+            (tenant("initial_load = 'none'\n", "", ""), "live"),
+            (
+                tenant("", "password = 'x'\nretry_max_attempts = 3\n", ""),
+                "live",
+            ),
+            (
+                tenant("", "", "[tenant.a.table.public.t]\nreplicate = true\n"),
+                "live",
+            ),
+            (
+                tenant("", "", "[tenant.a.stream]\nskip_attribution = true\n"),
+                "live",
+            ),
+            (tenant("", "inserter_pool_size = 4\n", ""), "rebind"),
+            (tenant("", "soft_delete = true\n", ""), "rebind"),
+            (
+                tenant("", "", "[tenant.a.stream]\nreplicate_all = true\n"),
+                "rebind",
+            ),
+            (
+                tenant("", "", "[tenant.a.runtime_config]\nschema = 'cfg'\n"),
+                "rebind",
+            ),
+            (
+                tenant(
+                    "",
+                    "",
+                    "[tenant.a.namespace.public]\ntarget_database = 'elsewhere'\n",
+                ),
+                "rebind",
+            ),
+            (
+                root(
+                    "[source]\nhost = 'pg'\ndbname = 'postgres'\n[tenants]\n\
+                     [tenant.a]\ndbname = 'app'\n[tenant.a.ch]\nhost = 'ch2'\ndatabase = 'a'\n",
+                ),
+                "rebind",
+            ),
+            (tenant("", "decoder_queue_capacity = 10\n", ""), "rejected"),
+            (tenant("", "made_up = 1\n", ""), "rejected"),
+            (
+                tenant("", "", "[tenant.a.toast]\nconnections = 2\n"),
+                "rejected",
+            ),
+            (
+                tenant("", "", "[tenant.a.destination]\nkind = 'clickhouse'\n"),
+                "rejected",
+            ),
+        ];
+        for (next, want) in &cases {
+            assert_eq!(class(next), *want, "{}", toml::to_string(next).unwrap());
+        }
+        // A dbname change is an identity re-bind
+        let moved = root(
+            "[source]\nhost = 'pg'\ndbname = 'postgres'\n[tenants]\n\
+             [tenant.a]\ndbname = 'app2'\n[tenant.a.ch]\nhost = 'ch'\ndatabase = 'a'\n",
+        );
+        assert_eq!(class(&moved), "rebind");
+        // Detached to active attaches afresh; active to detached is live
+        let detached = tenant("state = 'detached'\n", "", "");
+        assert_eq!(class(&detached), "live");
+        let back =
+            classify_change(Some(&decl_a(&detached)), &decl_a(&base), &detached, &base).unwrap();
+        assert_eq!(back, Change::FreshAttach);
+        assert!(back.resyncs());
+        // A re-bind of a tenant staying detached waits for its next attach
+        let both = tenant("state = 'detached'\n", "inserter_pool_size = 4\n", "");
+        assert_eq!(
+            classify_change(Some(&decl_a(&detached)), &decl_a(&both), &detached, &both)
+                .unwrap()
+                .label(),
+            "live"
+        );
+        // A new tenant
+        assert_eq!(
+            classify_change(None, &decl_a(&base), &base, &base).unwrap(),
+            Change::Live
+        );
     }
 
     #[tokio::test]
