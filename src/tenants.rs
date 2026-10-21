@@ -1393,8 +1393,14 @@ mod tests {
         let d = decl_a(&moved);
         assert_eq!(d.identity_digest(&moved).unwrap(), identity);
         assert_ne!(d.binding_digest(&moved).unwrap(), binding);
-        // So does a setting fixed when the tenant opens
-        let pools = ch_tenant("database = 'a'\ninserter_pool_size = 4\n");
+        // So does a setting fixed when the tenant opens. The pool's default
+        // tracks vCPUs: spelling the default out builds the same tenant, so
+        // the change must be to a size this machine does not default to
+        let default = crate::ch_emitter::default_inserter_pool();
+        let spelled = ch_tenant(&format!("database = 'a'\ninserter_pool_size = {default}\n"));
+        assert_eq!(decl_a(&spelled).binding_digest(&spelled).unwrap(), binding);
+        let other = if default == 3 { 4 } else { 3 };
+        let pools = ch_tenant(&format!("database = 'a'\ninserter_pool_size = {other}\n"));
         assert_ne!(decl_a(&pools).binding_digest(&pools).unwrap(), binding);
         // Another source database is another identity
         let other = root(

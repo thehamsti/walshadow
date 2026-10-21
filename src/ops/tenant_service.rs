@@ -818,7 +818,10 @@ impl TenantService {
                 changed_since()
             }
         };
+        // Every refusal rolls back before it returns: the row lock goes
+        // now, not whenever the dropped transaction's ROLLBACK is sent
         if current.as_ref() != from {
+            let _ = txn.rollback().await;
             return Err(conflict());
         }
         let touched = match (from, to) {
@@ -843,9 +846,20 @@ impl TenantService {
                     &[&id, d0, s0, st0, dbname, spec, state],
                 )
                 .await,
-        }
-        .map_err(|e| ServiceError::new(422, "invalid_config", format!("registry write: {e}")))?;
+        };
+        let touched = match touched {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = txn.rollback().await;
+                return Err(ServiceError::new(
+                    422,
+                    "invalid_config",
+                    format!("registry write: {e}"),
+                ));
+            }
+        };
         if touched != 1 && !(from.is_none() && to.is_none()) {
+            let _ = txn.rollback().await;
             return Err(conflict());
         }
         txn.commit().await.map_err(ServiceError::internal)?;
@@ -1509,6 +1523,57 @@ name = "{database}.INTERNAL.LOAD_STAGE"
         Some((f, pg, socket, port))
     }
 
+    /// One `psql -c` against the fixture's PostgreSQL, run where it is
+    /// called: blocking, as a reload hook runs
+    fn psql(socket: &Path, port: u16, sql: &str) -> std::process::Output {
+        std::process::Command::new("psql")
+            .args(["-h", socket.to_str().unwrap(), "-p", &port.to_string()])
+            .args([
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-X",
+                "-v",
+                "ON_ERROR_STOP=1",
+            ])
+            .args(["-c", sql])
+            .output()
+            .unwrap()
+    }
+
+    /// A compare-and-swap that finds the row changed rolls back before it
+    /// returns. A caller that blocks right after, as a reload hook may on a
+    /// runtime the dropped transaction's ROLLBACK would need, must not wait
+    /// on its row lock. Single-threaded and with no await in between, so
+    /// the lock would still be held without the explicit rollback
+    #[tokio::test]
+    async fn a_refused_registry_swap_releases_its_row_lock_before_returning() {
+        let Some((f, _pg, socket, port)) = sql_fixture().await else {
+            return;
+        };
+        f.put("a", &ch_body("a", "a", ""), &Mutation::new("sql-create"))
+            .await
+            .unwrap();
+        let wrong = ("different".into(), "".into(), "active".into());
+        let err = f
+            .svc
+            .swap_row("walshadow", "a", Some(&wrong), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "precondition_failed");
+        let out = psql(
+            &socket,
+            port,
+            "SET lock_timeout = '2s'; UPDATE walshadow.tenant SET spec = spec WHERE id = 'a'",
+        );
+        assert!(
+            out.status.success(),
+            "the refused swap still held the row lock: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[tokio::test]
     async fn sql_registry_cas_and_rollback_preserve_external_edits() {
         let Some((f, _pg, socket, port)) = sql_fixture().await else {
@@ -1555,27 +1620,22 @@ name = "{database}.INTERNAL.LOAD_STAGE"
             None,
             "mirror restored too"
         );
-        let socket_arg = socket.to_str().unwrap().to_string();
+        // The external edit runs blocking inside the hook, on the test's one
+        // runtime thread; a lock the service left behind fails it in 5 s
+        // instead of deadlocking
+        let hook_socket = socket.clone();
         resolver.refuse_reloads(Some(Arc::new(move || {
-            let out = std::process::Command::new("psql")
-                .args([
-                    "-h",
-                    &socket_arg,
-                    "-p",
-                    &port.to_string(),
-                    "-U",
-                    "postgres",
-                    "-d",
-                    "postgres",
-                    "-X",
-                    "-v",
-                    "ON_ERROR_STOP=1",
-                    "-c",
-                    "UPDATE walshadow.tenant SET spec = 'max_lag_bytes = 7' WHERE id = 'a'",
-                ])
-                .output()
-                .unwrap();
-            assert!(out.status.success());
+            let out = psql(
+                &hook_socket,
+                port,
+                "SET lock_timeout = '5s'; \
+                 UPDATE walshadow.tenant SET spec = 'max_lag_bytes = 7' WHERE id = 'a'",
+            );
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         })));
         let err = f
             .put("a", &body, &Mutation::new("sql-conflict"))
