@@ -1973,6 +1973,72 @@ async fn a_dropped_request_still_finishes_its_mutation() {
     assert_eq!(results[0].draft.outcome, "applied");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_config_requests_finish_their_operation_records() {
+    let api = Api::new(false, generous()).await;
+    for (path, action) in [
+        ("/v1/stream/pause", "stream.pause"),
+        ("/v1/stream/resume", "stream.resume"),
+        ("/v1/reload", "config.reload"),
+    ] {
+        let held = api.state.ctx.reloader.begin().await;
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", format!("Bearer {}", api.admin))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 5], 4000))));
+        let router = api.router.clone();
+        let request = tokio::spawn(async move { router.oneshot(req).await });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let op = loop {
+            if let Some(id) = api.state.ops.running(action).pop() {
+                break id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{action} has no operation"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        drop(held);
+        loop {
+            let (_, _, operation) = api.get(&format!("/v1/operations/{op}"), &api.admin).await;
+            if operation["state"] == "applied" {
+                assert_eq!(operation["action"], action);
+                assert_eq!(
+                    operation["generation"],
+                    api.state.ctx.reloader.current().generation
+                );
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{operation}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let results: Vec<_> = api
+            .audit()
+            .into_iter()
+            .filter(|r| r.draft.request_id == op && r.draft.phase == "result")
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].draft.outcome, "applied");
+    }
+
+    std::fs::create_dir(api.state.ctx.fragment.with_extension("toml.tmp")).unwrap();
+    let (status, headers, _) = api
+        .call("POST", "/v1/stream/pause", Some(&api.admin), &[], None)
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let id = headers["x-request-id"].to_str().unwrap();
+    let (_, _, operation) = api.get(&format!("/v1/operations/{id}"), &api.admin).await;
+    assert_eq!(operation["state"], "rejected");
+    assert_eq!(operation["error"]["code"], "internal");
+}
+
 /// H4: a detach whose detached state cannot be recorded changes nothing.
 /// The tenant stays attached and its config untouched; the API answers 503
 /// and the socket an error, each audited as rejected. Once the spill

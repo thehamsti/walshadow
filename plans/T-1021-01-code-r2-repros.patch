@@ -1,0 +1,110 @@
+diff --git a/src/bin/stream/tenant.rs b/src/bin/stream/tenant.rs
+index e32161e..d8ba879 100644
+--- a/src/bin/stream/tenant.rs
++++ b/src/bin/stream/tenant.rs
+@@ -2421,6 +2421,22 @@ mod tests {
+         claim_resumed(&reservations, decl, &root, spill).unwrap();
+     }
+ 
++    #[test]
++    #[ignore = "HOLD: shutdown retains an unmarked claim that the same id can replace"]
++    fn boot_must_refuse_its_own_unjoined_shutdown_claim() {
++        let root = config();
++        let tenants = TenantsConfig::from_table(&root).unwrap().unwrap();
++        let decl = tenants.get("a").unwrap();
++        let reservations = Reservations::default();
++        let spill = Path::new("/spill");
++        // Session shutdown retains this claim on an error, without marking it tearing down.
++        claim_resumed(&reservations, decl, &root, spill).unwrap();
++        assert!(
++            claim_resumed(&reservations, decl, &root, spill).is_err(),
++            "boot must not open a second runtime beside its own unjoined writer"
++        );
++    }
++
+     #[tokio::test]
+     async fn waiting_tenants_and_external_changes_are_visible() {
+         let root = config();
+diff --git a/src/emit/pipeline/tail.rs b/src/emit/pipeline/tail.rs
+index 58a66a4..ae7fe02 100644
+--- a/src/emit/pipeline/tail.rs
++++ b/src/emit/pipeline/tail.rs
+@@ -939,6 +939,59 @@ where
+ mod tests {
+     use super::*;
+ 
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    #[ignore = "HOLD: cancellation during finish/quiesce releases live stages"]
++    async fn cancelled_tail_completion_must_keep_its_stages_counted() {
++        let mut joined_while_blocked = Vec::new();
++        for finish in [true, false] {
++            let set = crate::ops::writers::WriterSet::new();
++            let fatal = Fatal::new();
++            let (_, ack, mut parts) = spawn_null(Arc::new(Monotone::default()), fatal.clone());
++            let (msg_tx, msg_rx) = mpsc::channel(16);
++            let (release, held) = std::sync::mpsc::channel::<()>();
++            let (started_tx, started) = oneshot::channel();
++            parts.batcher = AbortOnDropHandle::new(tokio::spawn(async move {
++                let _rx = msg_rx;
++                let _ = started_tx.send(());
++                let _ = held.recv();
++            }));
++            started.await.unwrap();
++            let tail = OwnedTail {
++                msg_tx,
++                ack,
++                parts: Some(parts),
++                fatal,
++                context: "review",
++                writer: None,
++            }
++            .counted(Some(set.token()));
++            let (poll_tx, polled) = oneshot::channel();
++            let completion = tokio::spawn(async move {
++                let mut completion = Box::pin(async move {
++                    if finish {
++                        let _ = tail.finish(0).await;
++                    } else {
++                        tail.quiesce().await;
++                    }
++                });
++                assert!(futures::poll!(&mut completion).is_pending());
++                let _ = poll_tx.send(());
++                completion.await;
++            });
++            polled.await.unwrap();
++            completion.abort();
++            assert!(completion.await.unwrap_err().is_cancelled());
++            let joined = set.abort_and_join(Duration::from_millis(100)).await;
++            release.send(()).unwrap();
++            joined_while_blocked.push((finish, joined));
++            assert!(set.abort_and_join(Duration::from_secs(5)).await);
++        }
++        assert!(
++            joined_while_blocked.iter().all(|(_, joined)| !joined),
++            "completion cancelled with a blocked stage, but its writer set reported joined: {joined_while_blocked:?}"
++        );
++    }
++
+     /// H3: an abandoned leg's stages count as their owner's writers until
+     /// they end, so a teardown joining the owner waits for a stage stuck in
+     /// a synchronous call instead of reporting joined while it still runs
+diff --git a/src/tenants.rs b/src/tenants.rs
+index e00ffad..6cb7697 100644
+--- a/src/tenants.rs
++++ b/src/tenants.rs
+@@ -1754,6 +1754,14 @@ name = 'DB.INTERNAL.LOAD_STAGE'
+         assert_eq!(canonical(Path::new("./missing/..")), PathBuf::new());
+     }
+ 
++    #[test]
++    #[ignore = "HOLD: a nonexistent relative state dir does not resolve against cwd"]
++    fn missing_relative_state_paths_must_compare_with_absolute_paths() {
++        let dir = tempfile::tempdir().unwrap();
++        std::env::set_current_dir(dir.path()).unwrap();
++        assert_eq!(canonical(Path::new("state")), dir.path().join("state"));
++    }
++
+     #[test]
+     fn reservations_hold_through_teardown_across_ids() {
+         let spill = Path::new("/spill");

@@ -1240,28 +1240,48 @@ async fn config_mutation(
     let origin = Some((ctx.request_id.clone(), "POST".to_string(), path.to_string()));
     owned(ctx, async move {
         let ctx = &task_ctx;
+        st.ops.set(
+            &ctx.request_id,
+            json!({"request_id": ctx.request_id, "state": "running", "action": action}),
+        );
         let res = crate::control::apply_fragment(&st.ctx, &ctx.actor(), action, origin, edit).await;
-        config_reply(&st, ctx, res)
+        config_reply(&st, ctx, action, res)
     })
     .await
 }
 
-fn config_reply(st: &ApiState, ctx: &RequestCtx, res: Result<Vec<String>, ServiceError>) -> Reply {
+fn config_reply(
+    st: &ApiState,
+    ctx: &RequestCtx,
+    action: &str,
+    res: Result<Vec<String>, ServiceError>,
+) -> Reply {
     match res {
         Ok(unfollowed) => {
             let rev = st.ctx.reloader.current();
-            Ok((
-                StatusCode::ACCEPTED,
-                Json(json!({
-                    "request_id": ctx.request_id,
-                    "epoch": rev.epoch.to_string(),
-                    "generation": rev.generation,
-                    "unfollowed_databases": unfollowed,
-                })),
-            )
-                .into_response())
+            let body = json!({
+                "request_id": ctx.request_id,
+                "action": action,
+                "state": "applied",
+                "epoch": rev.epoch.to_string(),
+                "generation": rev.generation,
+                "unfollowed_databases": unfollowed,
+            });
+            st.ops.set(&ctx.request_id, body.clone());
+            Ok((StatusCode::ACCEPTED, Json(body)).into_response())
         }
-        Err(e) => Err(service(ctx, e)),
+        Err(e) => {
+            st.ops.set(
+                &ctx.request_id,
+                json!({
+                    "request_id": ctx.request_id,
+                    "state": "rejected",
+                    "action": action,
+                    "error": {"code": e.code, "message": e.message},
+                }),
+            );
+            Err(service(ctx, e))
+        }
     }
 }
 
