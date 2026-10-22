@@ -1,0 +1,1284 @@
+# Authenticated HTTP API for health, metrics, crash reports, jobs and tenant control
+
+Tickets: T-1021-01 (the API), T-1021-06 (built-in API docs, plan file names).
+
+Status: **implemented on branch `t3/walshadow/t1021-ws-api-20261021-0846`,
+in review.** Sol plan reviews r1–r3 returned CHANGES_REQUESTED. The requester
+ruled (10/21 9:37 AM MT) that r3's fixes are binding requirements R3-M1,
+R3-M2, R3-M3 and R3-m1 (§9.9). Product decisions §18a–l were **approved as
+recommended** on 10/21. Base: `main` @ `225b45e`. Operator docs:
+[docs/api.md](../docs/api.md). Remove this plan once the PR merges.
+
+Requester goal (John, 10/21 8:45 AM MT, verbatim): "help me add an authenticated
+API that reports metrics, health checks, crash points, as well as full
+visibility into jobs/status of tenants, as well as full control over adding new
+tenants, removing tenants, editing tenants etc. the API should allow for full
+control externally."
+
+## 1. Summary
+
+Add an opt-in HTTPS API (`--api-bind`) inside `walshadow-stream`, built on
+axum 0.8. axum is a new dependency; its stack (hyper 1, hyper-util, tower 0.5,
+tower-http 0.6) already resolves transitively in `Cargo.lock`. Every route
+needs a bearer API key. Keys are hashed and carry `read` or `admin` scope.
+They're loaded from a key file outside the repo and reloaded live, failing
+closed. Requests are rate-limited per key and per client IP. Every
+authenticated mutation request is audited, write-ahead for those that run.
+Tenant deletes are two-step soft deletes that can be restored, and never
+delete destination data, replication state or any directory.
+
+Tenant mutations go through one `TenantService` shared with the control
+socket. It applies changes to running replication without a restart:
+
+- **One serialized reload pipeline.** The service holds the reload lock from
+  before persistence until the immutable `ConfigRevision` is published or
+  rolled back. The session reconciles exactly the published revision and never
+  re-reads disk.
+- **Fail-closed capability matrix.** Every tenant setting is live, rebind
+  (detach plus fresh attach, needs `acknowledge_resync`) or rejected (needs a
+  daemon restart). Unknown keys are rejected.
+- **Durable recovery fences.** These cover pending rebinds and detaching
+  tenants, so a crash at any step resumes safely.
+- **Background teardown.** Detach drains off the shared WAL pump, and teardown
+  keeps exclusive destination reservations across tenant ids until every
+  writer is joined.
+- **HMAC ETags**, so they leak nothing about inline secrets.
+
+The control socket, `ctl`, the PeerDB shim wire protocol and `--metrics-bind`
+keep working. The behavior changes are listed in §18c.
+
+## 2. How it works today (codebase map)
+
+| Area | Where | What it does today |
+|---|---|---|
+| Process wiring | `src/bin/stream/main.rs:157` `run()` | Binds the metrics listener and the control socket, then loops `run_session`. The binary is Linux-only. |
+| Metrics HTTP | `src/ops/metrics.rs:1119` `serve`, `:1159` `handle_client` | A hand-rolled HTTP/1.0 responder: any path returns OpenMetrics text. No auth. Docker binds it on `0.0.0.0:9484`. |
+| Metrics model | `MetricsRegistry` (`Arc<RwLock<MetricsSnapshot>>`) | Written by the session every iteration (min 50 ms, idle tick 250 ms). Per-tenant `TenantMetrics` (`metrics.rs:921`). |
+| Control plane | `src/ops/control.rs:218` `serve`, `:260` `dispatch` | Unix socket with 0600 permissions, TOML verbs. `apply`/`unset` hold `frag_lock` across the reload (`:291`, `:319`). Nothing is audited. |
+| Reload | `control.rs:91` `Reloader::reload` | Sets the reconcile flag **first**, then runs each resolver's `reload()`, and each one re-reads disk (`config.rs:1165-1170`). SIGHUP (`src/bin/stream/runtime_cfg.rs:17`), the SQL registry poller (`src/bin/stream/tenant.rs:1669`) and the resolver-wiring sweep (`control.rs:51`) call it with no lock. Activation calls `resolver.reload()` directly, bypassing `Reloader` (`tenant.rs:1347`). |
+| Reconcile | `src/bin/stream/session.rs:1318-1430` | `take_reconcile()` re-reads the merged config from disk **again**, then `reconcile_plan` (`tenant.rs:1502`), then each detach is awaited inline in the WAL loop (`session.rs:1344`). |
+| Tenant verbs | `src/ops/tenant_ctl.rs` `put:174`, `remove:227`, `set_state:255`, `write_validated:299`, `mirror_registry:328` | Config registry writes `60-tenant-<id>.toml` under `frag_lock`. SQL registry does an unconditional upsert with no lock, then rewrites the mirror via a fixed `.tmp` name (`:359`). Reload errors arrive after persistence. |
+| Tenant model | `src/tenants.rs` | `TenantDecl`. `identity_differs_across:362` is true only for a dbname or Snowflake fingerprint change. `TenantState:424` (`tenant.toml`, no `deny_unknown_fields`). `tenant_dir:400` is keyed by id. |
+| Boot resume | `tenant.rs:1059-1075` `boot_existing` | Resumes when `phase == Active` and dbname matches. It doesn't check the destination or construction binding. |
+| Attach/detach | `tenant.rs` `attach:1122`, `detach:1424`, `shutdown:351`, `abandon:384` | Attaching clears `<spill>/tenants/<id>/` (`:1133`). Graceful detach awaits `shutdown(self)`, which closes the sink, joins the pipeline, then GC tasks, then aborts Snowflake maintenance, for up to `stall_timeout` (default 300 s, `tenants.rs:223`). `Detached` is persisted only afterwards (`record_detached`, `:1229-1250`). |
+| Resolver live checks | `src/destination/snowflake/runtime.rs:135-150` `update_settings`; `config.rs:1219`; `config.rs:532` `reserve_destinations` | Refuses: a Snowflake fingerprint change; channel, pool, merge, state or `ack_after` changes; destination-kind changes; ClickHouse routes outside the scopes reserved at attach. |
+| Construction-time settings | `tenant.rs:653` (runtime-config schema), `:705`, `:766-782` (tenant `[ch]` decoder/inserter pools), `:183-184` (decoder batch/queue from `SessionShared`) | Fixed when the tenant or session is built, not reloaded. |
+| Snowflake state | `runtime.rs:91` `SnowflakeRuntime::open`, `state.rs:185` | Opening a state dir whose stored `{source_system_id, destination_fingerprint}` identity differs fails with an ownership-identity mismatch. |
+| Jobs | `src/backfill/copy_backfill.rs:206-252` | Per-relation ledger plus `active`/`queued`. Only counts are exported. |
+| Errors | `src/ops/log_events.rs` `LogEventLayer` | Counts by level and target only. |
+| Crashes | none | No panic hook or exit record. `src/crash_test.rs` is test-only. |
+| Tests | `tests/multi_tenant_e2e.rs`, `tests/control_plane_e2e.rs`; Snowflake fake HTTP in `src/destination/snowflake/http_tests.rs` | Real binary, local `initdb` Postgres and a local `clickhouse`. CI runs on Ubuntu across PG 16 to 19 with `WALSHADOW_REQUIRE_TOOLS=1`. |
+
+These facts shape the design:
+
+- **There's no per-tenant slot or publication.** All tenants share one
+  physical slot, and its floor is the minimum over attached tenants.
+- **Tenants have no true pause**, only `active` and `detached`. Re-attaching
+  always means a fresh initial load. Cluster `ctl pause` is **confirmed broken
+  in tenants mode** (G1).
+- **The coverage gate** is `MAX_MISSED_LINES: 7200` merged, with about 7046
+  missed at the last calibration, and no file may sit at 0% (R1).
+
+## 3. Architecture
+
+```
+            HTTPS (rustls)                       same tokio runtime
+client ──► api listener ──► layers ───────────► handlers ──► ApiBackend (trait; daemon impl + test fake)
+                            │ request-id                      ├─ MetricsRegistry (read)
+                            │ body 1 MiB, timeouts            ├─ ErrorRing, CrashStore (read)
+                            │ concurrency cap                 ├─ AuditLog (leaf lock)
+                            │ catch-panic → 500               └─ TenantService
+                            │ pre-auth IP limiter                 │ [L1 mutation_lock]
+                            │ authN, per-key limiter              │ [L2 reload_lock, held persist → publish/rollback]
+                            └ authZ (route table)                 ▼
+unix ctl ─► control.rs (tenant-*, apply, unset) ─► same L1 → L2   Reloader: read M once → resolvers.reload_from(M)
+SIGHUP / SQL registry poller / wiring sweep ─────► L2 only           (monotonic; rebinding tenants skipped)
+                                                                   → publish ConfigRevision{epoch, gen, M, force_rebind, cause}
+                                                                  │ tokio watch (no lock)
+                                                                  ▼
+            session loop (takes neither L1 nor L2): reconcile(rev.M) → catch-up sweep of registered resolvers
+              → detach: persist Detached, then floor exclusion, then background teardown
+              → attach: waits for teardown and reservations
+              → publish reconciled (epoch, gen)
+```
+
+New lib module `src/ops/api/`:
+
+- `mod.rs`, `routes.rs`, `auth.rs`, `keys.rs`, `rate_limit.rs`, `audit.rs`
+- `tenants.rs`, `service.rs` (`TenantService`, classifier)
+- `health.rs`, `crash.rs`, `error_ring.rs`, `json.rs` (TOML↔JSON, API
+  redaction), `etag.rs`
+
+Replication-side changes:
+
+- `Reloader` (`control.rs`), `ConfigResolver::reload_from` (`config.rs`)
+- session reconcile (`session.rs`)
+- `tenant.rs` detach and teardown, `reconcile_plan`, `boot_existing`,
+  activation
+- `TenantState` optional fields (`tenants.rs`), `Backfiller::jobs()`
+
+The API server starts in `run()` next to the control socket and outlives
+session restarts.
+
+## 4. HTTP framework and dependencies
+
+**Recommendation: axum 0.8, a new dependency (not in `Cargo.lock` today).** Its
+stack is already present transitively: hyper 1, hyper-util, tower 0.5 and
+tower-http 0.6, via reqwest and tonic. Rejected:
+
+- a hand-rolled hyper server, or extending `metrics.rs`'s raw responder: too
+  much security-sensitive parsing of our own
+- actix-web: its own runtime model
+- warp: maintenance has slowed
+- poem or salvo: no advantage
+
+TLS: `tokio-rustls` (already direct) hands `TlsStream`s to
+`hyper_util::server::conn::auto::Builder`, using the rustls crypto provider the
+graph already enables.
+
+**Direct dependencies to add.** axum is new to the lockfile; the rest already
+resolve transitively, except where noted:
+
+| Crate | Version | Features |
+|---|---|---|
+| `axum` | 0.8 (**new**) | `default-features = false`, features `tokio`, `http1`, `http2`, `json`, `query` |
+| `hyper` | 1 | `server`, `http1`, `http2` |
+| `hyper-util` | 0.1 | `server-auto`, `tokio` |
+| `tower` | 0.5 | `limit`, `util`, `timeout` |
+| `tower-http` | 0.6 | `limit`, `timeout`, `catch-panic`, `set-header`, `request-id`, `trace` |
+| `subtle` | 2 | constant-time compare |
+| `getrandom` | 0.3 | key, token and incarnation generation |
+| `hmac` | 0.12 | ETag HMAC; pairs with the existing `sha2` 0.10 |
+| `time` | 0.3 | `formatting`, `parsing` (RFC 3339) |
+
+Phase 2 pins versions to what `Cargo.lock` already resolves wherever possible.
+axum's own new transitive crates (`axum-core`, `matchit` and similar) are
+listed in the PR.
+
+## 5. Endpoints
+
+All paths are under `/v1`, with JSON bodies except `/v1/metrics`
+(OpenMetrics). Errors use one envelope:
+`{"error":{"code":"…","message":"…","request_id":"…"}}`. Every response carries
+`X-Request-Id`, `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+Classes: **R** read, **X** expensive read, **M** mutation.
+
+| Method | Path | Scope | Class | Purpose |
+|---|---|---|---|---|
+| GET | `/livez` | **none, only with `--api-public-livez`** (§18e) | IP | Constant `200 ok`. Without the flag it returns 401. |
+| GET | `/v1/whoami` | read | R | Key id, scopes, expiry. |
+| GET | `/v1/health/live` | read | R | The process and HTTP runtime respond. |
+| GET | `/v1/health/ready` | read | R | 200 or 503 from the checks in §11. |
+| GET | `/v1/health` | read | R | Each check: status, observed_at, detail. |
+| GET | `/v1/status` | read | R | `ctl status` as JSON, plus `epoch`, `published_generation` and `reconciled_generation`. |
+| GET | `/v1/metrics` | read | R | Same body as `--metrics-bind`. |
+| GET | `/v1/errors` | read | R | Recent WARN and ERROR events (§12). |
+| GET | `/v1/crashes`, `/v1/crashes/{id}` | read | R | Panic, fatal-exit and unclean-exit records (§12). |
+| GET | `/v1/jobs` | read | R | Loads, backfills, priming, teardowns, bootstrap (§13). |
+| GET | `/v1/tenants` | read | R | Every tenant: desired, phase (incl. `detaching` and `waiting`), reason, lag, LSNs, counters, destination summary, `etag`, `last_changed_generation`. |
+| GET | `/v1/tenants/{id}` | read | R | The above plus the redacted spec and persisted state. |
+| GET | `/v1/tenants/{id}/jobs`, `/v1/tenants/{id}/errors` | read | R | That tenant's jobs; errors plus eviction and detach reasons. |
+| GET | `/v1/tenants/{id}/tables` | read | X | Source catalog listing with selection. |
+| GET | `/v1/config` | admin | R | Effective merged config, redacted by the API redactor (§16). |
+| GET | `/v1/audit` | admin | R | Audit records with `chain_ok`. |
+| GET | `/v1/operations/{request_id}` | admin | R | Mutation outcome (`running`, `applied`, `rejected`, `rolled_back`, `conflict`, `failed`) plus generation. In memory, last 1000. |
+| POST | `/v1/tenants` | admin | M | Create; supports `dry_run`. 409 if the id exists. |
+| PUT | `/v1/tenants/{id}` | admin | M | Replace. Requires `If-Match`. Supports `dry_run`. |
+| PATCH | `/v1/tenants/{id}` | admin | M | JSON Merge Patch. Requires `If-Match`. Supports `dry_run`. |
+| POST | `/v1/tenants/{id}/detach` | admin | M | `desired=detached`. Requires `If-Match` and `{reason}`. |
+| POST | `/v1/tenants/{id}/attach` | admin | M | `desired=active`. Requires `If-Match` and `acknowledge_resync`. |
+| POST | `/v1/tenants/{id}/delete-intent` | admin | M | Impact preview and confirm token (§10). |
+| DELETE | `/v1/tenants/{id}` | admin | M | Soft delete. Requires `X-Confirm-Delete` and `If-Match`. |
+| GET | `/v1/tenants-deleted`, `/v1/tenants-deleted/{id}` | admin | R | Tombstones and teardown progress. |
+| POST | `/v1/tenants-deleted/{id}/restore` | admin | M | Re-declare `detached`, or `active` with `acknowledge_resync`. |
+| POST | `/v1/stream/pause`, `/v1/stream/resume` | admin | M | Cluster pause. In tenants mode it depends on §18l and returns 409 without that fix. |
+| POST | `/v1/reload` | admin | M | Same as `ctl reload`. |
+
+A mutation returns `202` with `{request_id, epoch, generation, classification,
+etag}`:
+
+- 202 means persisted, resolvers applied and revision published, all under
+  one reload-lock hold.
+- Attach and detach outcomes come later. The client polls until
+  `reconciled_generation >= generation` in the same `epoch`, then reads
+  `status.phase`.
+- `dry_run` returns `200` and persists nothing.
+
+**Excluded from phase 2** (§18f): raw `apply`/`unset`, source and destination
+endpoint swaps, and runtime-config rows.
+
+## 6. Authentication and authorization
+
+**Recommended mechanism (§18a): hashed API keys with scopes.**
+
+- Token: `wsk_<key_id>_<64 hex>`, where the secret is 32 bytes from
+  `getrandom`. The key file stores `sha256` of the secret bytes, never the
+  token. Comparison uses `subtle::ConstantTimeEq`, and an unknown id compares
+  against a dummy value.
+- Key file: `--api-keys-file` (env `WALSHADOW_API_KEYS_FILE`), never in the
+  repo:
+
+  ```toml
+  [[key]]
+  id = "ops-ci"                         # [a-z0-9-]{1,32}; the audit actor
+  scopes = ["admin"]                    # "read" | "admin"; admin implies read
+  sha256 = "<64 hex>"
+  expires_at = "2027-01-01T00:00:00Z"   # optional
+  disabled = false                      # optional
+  ```
+
+  Startup is refused if the file is group- or world-readable, unparsable, or
+  has duplicate ids. It reloads on SIGHUP or when the mtime changes (checked
+  every 5 s). **A failed reload fails closed:** every key is rejected until the
+  file is fixed. The failure shows in the `api_keys` health check, a metric and
+  the log. Replication is unaffected.
+- `walshadow-stream api-key new --id … --scope … [--expires …]` prints the
+  token once on stdout and the stanza on stderr. It writes no files.
+- Requests:
+  - Only `Authorization: Bearer` is accepted. Query tokens are rejected, and
+    auth headers are never logged.
+  - Missing, malformed, unknown, wrong, expired or disabled keys get **401**
+    with `WWW-Authenticate: Bearer realm="walshadow"`. The reason goes to a
+    metric only.
+  - A valid key without the route's scope gets **403**.
+- AuthZ: the static `ROUTES` table builds the router and drives the middleware.
+  A guard test asserts the registered routes equal `ROUTES`.
+- Transport:
+  - `--api-tls-cert` and `--api-tls-key`.
+  - A non-loopback bind without TLS is refused at startup unless
+    `--api-allow-plaintext` is set.
+  - Certificates reload on SIGHUP.
+- No cookies and no CORS. `X-Forwarded-For` is honored only from
+  `--api-trusted-proxies`.
+- Room left for later: an `Authenticator` trait for mTLS or OIDC, and
+  `Principal` carries an optional tenant filter (§18g).
+
+## 7. Rate limiting and resource limits
+
+- An in-process token bucket with an injectable clock, tested with
+  `tokio::time::pause`.
+- A 429 carries `Retry-After` and `RateLimit-*` headers.
+
+  | Bucket | Key | Default |
+  |---|---|---|
+  | pre-auth | client IP | 50 req/s, burst 100 |
+  | auth-failure | client IP | 10 per minute, burst 10. Once empty, that IP gets 429 before auth. |
+  | R | key id | 20 req/s, burst 40 |
+  | X | key id | 1 req/s, burst 3 |
+  | M | key id | 1 req/s, burst 5 |
+  | M (global) | process | L1 `mutation_lock` gives one mutation at a time across the API and socket. A 30 s queue wait returns 503. |
+
+- Overridable with `--api-rate-limit`. Maps are capped at 10k entries.
+- Transport limits:
+  - body at most 1 MiB
+  - read timeout 30 s; mutations have no request-side cancellation (§9.2)
+  - at most 64 in-flight requests and 256 connections
+  - header-read timeout 10 s
+  - `CatchPanicLayer`
+- API metrics:
+  - `walshadow_api_requests_total{route,method,status}`
+  - `walshadow_api_auth_failures_total{reason}`
+  - `walshadow_api_rate_limited_total{class}`
+  - `walshadow_api_audit_write_failures_total`
+
+## 8. Audit log
+
+- Location: `--api-state-dir` (default `<spill-dir>/api`, dir 0700),
+  `audit/audit.jsonl` at 0600. It rotates at 64 MiB and keeps 10 files. Each
+  record is also emitted on the `walshadow::audit` tracing target.
+- **One wrapper around every authenticated mutation request** (API routes and
+  socket mutation verbs) guarantees exactly one audit outcome per request:
+  - **Rejected before anything runs:** schema or validation errors, a
+    `rejected` class, a missing acknowledgement, a missing ETag (428), a
+    mismatched ETag (412), token errors, or 409 conflicts found before
+    persistence. These write one `result` record with `outcome:"rejected"` and
+    the error, and no `attempt` record, because nothing was attempted.
+  - **Run:** write-ahead.
+    1. Append an `attempt` record and fsync. If that fails, return 503 and
+       change nothing.
+    2. Mutate.
+    3. Append a `result` record (`applied`, `rolled_back`, `conflict` or
+       `failed`) and fsync.
+
+    If step 3 fails, the metric counts it. At the next start, an `attempt`
+    with no `result` becomes `outcome:"unknown"`, and a torn last line is
+    truncated.
+  - **403 on a mutation route** by an authenticated principal: one `denied`
+    record.
+  - **Unauthenticated (401) or rate-limited (429):** metrics and rate-limited
+    logs only, so attackers can't flood the audit disk.
+  - **`dry_run`: not audited** (it mutates nothing). Logged at `walshadow::api`
+    info.
+- Record v1:
+
+  ```json
+  {"v":1,"seq":1042,"ts":"2026-10-21T15:04:05.123Z","request_id":"…","phase":"attempt|result",
+   "actor":{"kind":"api_key|unix|external","id":"ops-ci","ip":"10.0.0.5","uid":null,"source":null},
+   "action":"tenant.create|tenant.update|tenant.patch|tenant.detach|tenant.attach|tenant.delete_intent|tenant.delete|tenant.restore|stream.pause|stream.resume|config.reload|config.apply|config.unset|tenant_set.external_change",
+   "target":{"tenant":"acme"},"request":{"method":"PATCH","path":"/v1/tenants/acme"},
+   "before":{…redacted…},"after":{…redacted…},"classification":"live|rebind|rejected",
+   "outcome":"applied|rejected|rolled_back|conflict|failed|denied|unknown","error":"…",
+   "epoch":"…","generation":57,"prev_hash":"sha256:…","hash":"sha256:…"}
+  ```
+
+- Hash chain: `hash = sha256(prev_hash || canonical record)`.
+- Socket actor: `{"kind":"unix","uid":…}` via `UnixStream::peer_cred`.
+- External changes (SIGHUP after a hand edit, a direct SQL registry row) are
+  recorded as `tenant_set.external_change` from the reconcile diff.
+  `ReloadCause` keeps them from being recorded twice.
+- `before`/`after` pass the API redactor (§16). A changed secret shows as
+  `"***(changed)"`, and no hash of a secret is ever recorded.
+
+## 9. Tenant mutations and live apply
+
+### 9.1 Lock order (all locks)
+
+| Rank | Lock | Held by | Covers |
+|---|---|---|---|
+| L1 | `TenantService::mutation_lock` (tokio mutex) | API mutations; socket `tenant-*`, `apply`, `unset`, `reload` | Whole mutation, steps 1–9 of §9.3 |
+| L2 | `Reloader::reload_lock` (tokio mutex) | Everything L1 holds, plus SIGHUP, the SQL registry poller, the resolver-wiring sweep, restore and delete | Every fragment write, every SQL registry write, every mirror rewrite, resolver application and revision publication |
+| leaf | `ConfigResolver` inner mutex, audit writer, delete-token map, key store, rate-limit maps, `Reservations` (std mutex), `Reloader.tenants` map | Short critical sections | Never held while acquiring L1 or L2. Never held across another leaf, except the audit writer across its own fsync. |
+
+- Locks are acquired only in the order L1 → L2 → leaf. Skipping outer ranks is
+  allowed: SIGHUP and the poller take only L2.
+- **`frag_lock` is retired** (subsumed by L2: every fragment writer holds L2).
+  The proposed r2 `registry_lock` is dropped for the same reason. Socket
+  `apply`/`unset` are refactored from "frag_lock across reload" to
+  L1 → L2 → write → apply → publish.
+- **The session loop takes neither L1 nor L2.** It reads revisions from the
+  watch channel and uses only leaf locks, so a slow mutation (including a
+  10 s Postgres statement) can never park the WAL pump.
+- Test builds wrap the locks in a `Ranked` guard backed by a task-local
+  rank stack. Acquiring a lock of equal or lower rank while holding a higher
+  one panics. Every service and e2e test runs with it.
+
+### 9.2 One reload pipeline and revisions
+
+`Reloader::apply_and_publish(&mut ReloadTx, cause)` requires the caller to
+hold L2 (the `ReloadTx` guard proves it):
+
+1. Read the merged config **once** (`M`) and validate it statically.
+2. Call `ConfigResolver::reload_from(&M, generation)` on the cluster resolver
+   and each registered tenant resolver. It's a refactor of `reload()`
+   (`config.rs:1165`) with the same logic and no disk read.
+   - **Monotonic:** a resolver records `applied_generation`, ignores older
+     revisions, and re-applies the same generation idempotently.
+   - **Tenants marked rebinding are skipped**, so the old runtime never sees
+     settings it would refuse (`runtime.rs:135`). A tenant is marked from the
+     revision that rebinds it until its replacement resolver registers with a
+     built generation at or above that revision.
+3. Publish `ConfigRevision { epoch, generation: g + 1, merged: Arc<Table>,
+   force_rebind, cause }` on a `tokio::sync::watch`. **Exception:** if the
+   cause is a `TenantService` mutation and the target tenant's resolver failed,
+   nothing is published and the error goes back to the caller, which still
+   holds L2 (§9.3, step 7).
+
+External causes (SIGHUP, poller, wiring sweep) keep today's semantics: a
+failing tenant resolver keeps its last snapshot, and the revision is still
+published.
+
+On the session side, `take_reconcile()` and its disk read are replaced:
+
+- On `revision_rx.has_changed()` the session reconciles exactly `rev.merged`
+  (`reconcile_plan` honors `force_rebind` as it does identity changes).
+- Then it runs a **catch-up sweep**: every registered resolver with
+  `applied_generation < rev.generation` that isn't rebinding gets
+  `reload_from(&rev.merged)`.
+- Only then does it publish `reconciled = (epoch, generation)`. So
+  "reconciled" never covers a stale resolver.
+- **Activation** (`tenant.rs:1347`) stops calling `resolver.reload()`. It sets
+  the activation and calls `reload_from(&latest_rev.merged)`, which is
+  monotonic and reads no disk.
+
+**Resolver registration of already-accepted revisions** (r2 new 3):
+
+- Every tenant runtime records `built_from = (epoch, generation)` of the
+  revision its config came from.
+- After `open_tenant` returns and the resolver registers, the session compares
+  `built_from` with the latest revision. If the tenant's declaration changed
+  in between:
+  - Live diff: `reload_from(latest)` before routing starts.
+  - Rebind diff: discard the fresh tenant (nothing was delivered yet) through
+    teardown, and requeue the attach.
+- Because publication happens after resolver application in the Reloader, the
+  next reconcile sweep catches a resolver that registered between the
+  Reloader's iteration and its publish.
+
+**Epoch**: a random id per process, and generation restarts per epoch. At boot
+the session reconciles from disk, subject to the boot fences in §9.6.
+
+### 9.3 Mutation flow (`TenantService`)
+
+Shared by the API and the socket's `tenant-*` verbs. **L1, then L2, held for
+all of steps 1–9.**
+
+1. **Load authoritative state.**
+   - Config registry: the fragment bytes.
+   - SQL registry: the row, read in a transaction with `SELECT … FOR UPDATE`
+     on `<schema>.tenant` (DDL `tenants.rs` `registry_ddl`, non-null
+     `dbname`/`spec`/`state`), not the mirror.
+
+   Compute the ETag (§9.5) and check `If-Match` (428 or 412).
+2. **Build** the next declaration (PUT, or a merge patch for PATCH).
+   `validate_id` runs before any path is built.
+3. **Validate** with `tenant_ctl::validate` on the would-be merged config.
+   Check **reservations** (§9.7) against tenants being torn down.
+4. **Classify** with the matrix (§9.4) and enforce acknowledgement (§9.8).
+   `rejected` returns 409 with the offending keys. A dry run stops here.
+5. **Audit** the `attempt` (§8).
+6. **Persist conditionally.**
+   - **Rebind fence first**, when the class is Rebind on an attached tenant
+     (§9.6).
+   - Config registry: re-read the fragment under L2 and compare it to step 1,
+     then write it. Write mode and atomicity stay as they are today; see §17
+     G3/G4, which are out of scope.
+   - SQL registry, in the same transaction:
+     - update: `UPDATE … WHERE id = $1 AND dbname = $2 AND spec = $3 AND
+       state = $4`; 0 rows gives 412.
+     - create: `INSERT … ON CONFLICT DO NOTHING`; 0 rows gives 409.
+     - delete: `DELETE … WHERE <same>`.
+     - Commit, then rewrite the mirror, still under L2.
+7. **Apply and publish** with `cause = TenantService { request_id, tenant,
+   force_rebind }`. If not published (the target resolver refused), still
+   under L2:
+   - **Conditional rollback**: restore the previous content only if the stored
+     content still equals this candidate. Under L2 that holds unless someone
+     edited the file by hand or wrote straight to SQL; otherwise return 409
+     `conflict_after_failed_apply` and restore nothing.
+   - Remove the rebind fence written in step 6.
+   - Call `apply_and_publish` again with external semantics.
+   - Audit `rolled_back` or `conflict` and return 422 or 409.
+8. **Audit** the `result`.
+9. **Release L2, then L1**, and respond 202.
+
+Because L2 is held from step 6 to step 7, SIGHUP, the poller or another
+mutation can't publish the candidate before the API decides on it (r2, r1 #1).
+
+**Cancellation:** steps 5–9 run in a `tokio::spawn`ed task. A dropped
+connection or timeout never cancels a mutation midway. Steps are bounded (PG
+`statement_timeout` 10 s). The outcome is always audited and readable at
+`/v1/operations/{request_id}`.
+
+Mutations get 409 `tenants_not_configured` in the single-database layout, and
+409 `managed_outside_api` for tenants declared outside
+`60-tenant-<id>.toml`.
+
+### 9.4 Capability matrix (fail closed)
+
+One classifier, `tenants::classify_change(old, new, old_root, new_root) ->
+Change { Live | Rebind(reasons) | Rejected(reasons) }`, used by the service and
+reconcile:
+
+- It diffs the old and new effective tenant tables into changed leaf paths.
+- Each path matches the ordered rules below.
+- **Any changed path no rule names is `Rejected("unclassified setting")`**.
+  Adding a setting therefore means adding a row and a test.
+- The rules are factored from where they live today:
+  `update_settings`'s two `ensure!`s, `config.rs:1219`,
+  `identity_differs_across` and `clickhouse_scopes`. The resolver calls the
+  same functions.
+
+| Tenant-scoped setting | Class | Evidence / note |
+|---|---|---|
+| `dbname` | Rebind | `identity_differs_across` |
+| Snowflake fingerprint (account, database, internal schema, stage, schema mapping) **together with** `[snowflake.state] directory` moved to a fresh path | Rebind | `runtime.rs:135`. The fresh path must not exist, or be an empty dir, and must not equal, contain or sit inside any other declared or tearing-down tenant's state dir (§9.7). The old dir is retained, never deleted. |
+| Snowflake fingerprint **without** a fresh state dir | Rejected | Reopening the same dir fails the identity check (`state.rs:185`, `runtime.rs:91`). The error tells the operator to move `state.directory` in the same edit. |
+| Snowflake role, warehouse, user, auth file paths, `statement_timeout_secs`, batch/flush sizes | Live | `update_settings` → `http.update_config` |
+| Snowflake channels, `max_in_flight`, merge and metadata concurrency, `merge_interval_ms`, `ack_after`; `state.directory` or `max_bytes` alone | Rejected | `runtime.rs:141-150`, `docs/tenants.md` |
+| destination kind | Rejected | `config.rs:1219` |
+| ClickHouse scope set, `clickhouse_scopes(cfg)` (`host:port` plus databases from `[ch]`, instances, namespace and table `target_database`, tees) | Rebind | reservations fixed at attach (`config.rs:532`) |
+| ClickHouse user, password, TLS, batch, flush, retry, compression (scopes unchanged) | Live | `docs/configuration.md` live list |
+| tenant `[ch] decoder_pool_size`, `inserter_pool_size` | Rebind | built per tenant in `open_tenant` (`tenant.rs:705`, `:766-782`) |
+| tenant `[ch] decoder_batch_size`, `decoder_queue_capacity` | Rejected (daemon restart) | taken from `SessionShared` (`tenant.rs:183-184`), not from the tenant at open |
+| table, namespace and column rules, `order_by`/`primary_key`/`partition_by` | Live | live list |
+| `[runtime_config]` schema | Rebind | fixed at construction (`tenant.rs:653`) |
+| `[stream] replicate_all`, `[system_columns]` names, `[toast]` mode, soft-delete mode | Rebind, **or Rejected if phase 2 finds a session-scoped input** | `docs/configuration.md` "require restart". Phase 2 traces each into `open_tenant` versus `SessionShared`, and the matrix test pins whichever class the code supports. |
+| `max_lag_bytes` | Live | `session.rs:1387-1391` |
+| `initial_load` | Live, used at the next attach | `TenantDecl` |
+| `desired` active → detached | Live (detach) | `reconcile_plan` |
+| `desired` detached → active | Fresh attach, needs acknowledgement | `tenant.rs:1540`, `:1133` |
+
+How Rebind is carried out:
+
+- The service writes the fence (§9.6) and puts the id in `force_rebind`.
+- `reconcile_plan` detaches, then queues an attach. The attach waits for
+  teardown and reservations (§9.7).
+- The Reloader skips the old resolver.
+- `open_tenant` builds a new runtime.
+
+Every row is tested through the real service and resolver boundary. ClickHouse
+runs in-process. Snowflake uses the fake HTTP server pattern
+(`src/destination/snowflake/http_tests.rs`) and actually reopens
+`SnowflakeRuntime::open`/`StateStore::open` in tempdirs, proving both the
+Rejected path (same dir) and the Rebind path (fresh dir).
+
+### 9.5 ETag
+
+`etag = "r-" + hex(HMAC-SHA256(etag_key, canonical declaration))[..32]`:
+
+- The key is 32 random bytes in `<api-state-dir>/etag.key` (0600), created
+  once.
+- SQL registry: the HMAC is over the authoritative row.
+- A secret-only change still changes the ETag, and there's no public hash to
+  test guesses against.
+
+### 9.6 Durable recovery fences
+
+Three crash windows must resume safely:
+
+**(a) Rebind accepted, crash before reconcile.**
+
+- Before persisting a Rebind-class change of an attached tenant, the service
+  writes `<spill>/tenants/<id>/rebind.toml` (`{v:1, request_id,
+  target_binding, created_at}`, a new API-owned file, atomic and 0600).
+- `target_binding` is a SHA-256 over **non-secret** binding fields:
+  - dbname and destination kind
+  - sorted ClickHouse scopes
+  - Snowflake fingerprint and state dir
+  - every Rebind-class construction setting in §9.4
+
+  Credentials are never included.
+- `boot_existing` gains a check. If `rebind.toml` exists and the current
+  config's binding equals `target_binding`, the change landed, so it **does not
+  resume**: the tenant attaches fresh. If the binding differs, the change
+  never landed or was rolled back, so it deletes the fence and resumes
+  normally.
+- At runtime the fence goes away with the fresh attach itself, which clears
+  the tenant dir (`tenant.rs:1133`), or with an explicit removal on rollback.
+
+**(b) Identity changed while the daemon was down.**
+
+- `TenantState` gains an optional `identity` field: a digest of dbname,
+  destination kind and Snowflake fingerprint, i.e. today's
+  `identity_differs_across` inputs. It's set at attach.
+- `boot_existing` resumes only if it matches. A mismatch means a fresh attach,
+  which is the same thing runtime reconcile already does for identity changes.
+- A missing field (a pre-upgrade file) is computed from the current config,
+  stored, and accepted.
+- No version bump. `TenantState` doesn't deny unknown fields, so older binaries
+  ignore the field. ClickHouse scope and construction changes made by **hand**
+  keep today's restart semantics (they apply at restart without a resync).
+  Only API- or socket-acknowledged Rebinds are fenced by (a).
+
+**(c) Floor exclusion before the drain finishes.**
+
+- Detach persists `phase = Detached` (reason `detaching: <reason>`) to
+  `tenant.toml` with fsync **before** removing the tenant from the floor
+  aggregate and from routing. That's a small synchronous write on the session
+  loop, as `record_detached` does today.
+- So a crash after the floor advances past the tenant's unfinished work boots
+  it as detached: no resume from WAL the slot may have recycled. If it's still
+  declared active, it attaches fresh.
+- After the drain, `record_detached` rewrites the final reason.
+
+### 9.7 Detach without stalling the pump; teardown ownership; reservations
+
+**Inline in the session (fast):**
+
+1. persist `Detached` (§9.6c)
+2. `router.detach` and `filter.remove_target_db`
+3. unregister the resolver
+4. drop the tenant from the floor aggregate
+
+**Background teardown task:**
+
+- First take every writer handle out of the tenant: pipeline tasks, GC tasks
+  (`gc_tasks`), Snowflake maintenance, bridge connections. `Tenant` is split
+  into a drain half and a `TenantWriters` half, and `PipelineHandle` gains
+  `abort_and_join`.
+- Run the drain (`sink.close`, `pipeline.join`, GC join) bounded by
+  `stall_timeout`.
+- On timeout, **abort every writer and join each one**, bounded again.
+- **The attach guard and the reservations are released only after every
+  writer has joined.** If a writer (for example a `spawn_blocking` RocksDB
+  call) outlives the second bound, the guard and reservations stay held. The
+  tenant shows `detaching (stuck)`, the `tenants` health check reports
+  `degraded`, and only a daemon restart frees it. Fail-safe, never early
+  release.
+- If `Tenant` can't be made `Send + 'static`, the drain runs on the session's
+  own task set, with the same join-before-release rule.
+
+**Reservations** (r2 new 2): a leaf-locked `Reservations` registry holds
+exclusive resources for **attached and tearing-down** tenants:
+
+- ClickHouse scopes (`host:port`, database)
+- Snowflake `(account_url, database)`
+- the canonical Snowflake state dir
+- the tenant dir
+
+Reservations are released per tenant only after its writers have joined:
+
+- `TenantService` (step 3) flags a declaration that claims a resource held by
+  a **different** id that's tearing down. The change is still accepted (it's
+  valid config), with `202` and `status.phase = "waiting"`.
+- The session's attach queue **defers** any attach whose resources are held,
+  whatever the id, and retries when teardown releases them.
+- A same-id attach also waits for its own teardown.
+
+Daemon shutdown awaits outstanding teardowns, bounded. `ctl tenant
+detach`/`remove` now return before the drain finishes (§18c).
+
+### 9.8 Acknowledgement enforcement
+
+`TenantService` requires `"acknowledge_resync": true` for every change that
+starts a fresh attachment of an existing tenant, whatever the route:
+
+- `detached` → `active` (attach, PUT, PATCH, restore-as-active)
+- any Rebind
+
+Create doesn't need it. On the socket:
+
+- An `acknowledge_resync = true` body key, and `ctl tenant update`/`attach`
+  gain `--acknowledge-resync`.
+- The socket auto-acknowledges what `ctl` rebinds today, for compatibility:
+  dbname changes and `ctl tenant attach`.
+- Snowflake fingerprint changes now also need the fresh state dir (§9.4).
+  Without it they're Rejected up front instead of failing at re-attach (G11).
+- It requires the flag for the newly recognized Rebind rows.
+
+### 9.9 Binding requirements from Sol r3 (requester ruling 10/21 9:37 AM MT)
+
+These are **binding** for phase 2. Each has its own regression test, and the
+Sol code pass verifies each by name.
+
+| Id | Requirement | Test |
+|---|---|---|
+| **R3-M1** | While a tenant's recovery fence (`rebind.toml`, §9.6a) is pending, any further Rebind of **the same id** is rejected with 409 `rebind_pending`, from both the API and the socket. A fence is pending from the moment it's written until the fresh attach clears the tenant dir, or a rollback removes it. Live edits stay allowed. This is the simple option: it never replaces a fence, so the boot check can't drop an earlier accepted rebind. | `rebind_fence_survives_crash_during_second_rebind`: accept an A→B rebind (fence B written, config B persisted, not reconciled); a second B→C request returns 409 and leaves fence B and config B untouched; simulated crash plus `boot_existing` attaches fresh against B, never resumes A's state. A variant with a crash injected between a would-be second fence write and persist proves the 409 comes first. Both start as the in-memory model Sol used in r3 and are kept as regression tests. |
+| **R3-M2** | Activation is tracked **separately from the config generation**. `ConfigResolver` holds `activation_seq`, bumped by `set_activation`, and records `(applied_generation, applied_activation_seq)`. `reload_from(rev)` targets `max(rev, applied)` and never regresses the base. It recomputes whenever the target generation is newer **or** `activation_seq != applied_activation_seq`. A dirty activation re-parses from the applied revision's stored merged table, because `Activation::apply` is destructive on the base. | `activation_survives_publish_gap`: the resolver applies N+1 before its publication; activation runs with the latest published N; the resolved snapshot must show the activated scope on N+1's base; the later sweep with N+1 is a no-op that leaves scope correct. Starts as Sol's r3 in-memory model and is kept as a regression test. |
+| **R3-M3** | `TenantWriters` owns cancel and join handles for **every** writer: pipeline stages, GC, Snowflake maintenance, **COPY passes, resumed-swap passes and backup passes** spawned by `CopyBackfiller` (today detached `tokio::spawn` at `src/backfill/copy_backfill.rs:1090,1114,1119`), and **Snowflake outbox appliers** (`src/destination/snowflake/runtime.rs:545-588`). Both components spawn into an owned task set with a `CancellationToken`, including the `spawn_blocking` calls they await, and expose `abort_and_join(deadline) -> bool`. Teardown releases the attach guard and reservations only when every set reports joined. | `teardown_waits_for_blocked_backfill` and `teardown_waits_for_blocked_outbox`: a COPY pass, or an outbox applier, blocked on a gate; teardown times out the drain, aborts, and keeps the reservation; a different tenant claiming that destination stays `waiting` until the gate opens and the writer joins; then it attaches. |
+| **R3-m1** | Nested resolver locks. **Chosen: remove one nesting and give the rest subranks.** (1) The **activation** mutex is no longer taken under `inner`: `reload_from` snapshots `(activation, activation_seq)` before locking `inner` (also needed for R3-M2). (2) **Snowflake HTTP** config locks (`src/destination/snowflake/http.rs:149-160`, std `RwLock`/`Mutex` plus a `try_lock`) stay nested as subrank **R31**: std, never held across `.await`, acquire nothing; documented leaf. (3) **Mapping write** (`src/mapping.rs:515-516`, async `RwLock`) stays nested as subrank **R32**: taken only under resolver `inner` (R30) or alone, and its holders never take R30 or above. The test-build rank checker covers L1 (R10), L2 (R20), resolver `inner` (R30) and mapping write (R32). | Rank-checker unit tests: inversions panic (R30 under R32, R20 under R30); every service and e2e test runs with the checker on. |
+
+## 10. Safe delete
+
+**Recommended (§18b): confirm token plus soft delete with restore. The API
+never deletes destination data, replication state or any directory.**
+
+1. `POST /v1/tenants/{id}/delete-intent` (admin, audited) returns:
+   - `impact`: phase, lag, destination summary, `ack_after`. With `outbox`, a
+     warning that the Snowflake state directory may hold rows applied nowhere
+     else (G6).
+   - `confirm_token`: 32 random bytes, single-use, in memory, expiring in
+     5 minutes. It's bound to `(id, ETag, key id, epoch, issued generation,
+     incarnation)`.
+     - `incarnation` is a new optional `TenantState` field: a random id
+       written at each attach, serde-defaulted. It's `none` for a tenant that
+       was never attached or a pre-upgrade file.
+     - Any change to that id invalidates all its pending tokens: a
+       `TenantService` mutation from the API or socket, or an external change
+       seen in reconcile.
+2. `DELETE /v1/tenants/{id}` with `X-Confirm-Delete` and `If-Match`:
+   - no token: 428
+   - unknown, used, invalidated or mismatched token: 409
+   - expired token: 410
+   - success:
+     - tombstone `<api-state-dir>/deleted/<id>-<ts>.toml` (0600, holding the
+       full declaration and `deleted_at`, `deleted_by`, `request_id`,
+       `incarnation`)
+     - conditional removal (§9.3) and publish
+     - detach (§9.7). Its reservations are held until its writers join.
+3. Restore within `--api-deleted-retention` (default 30 days), as `detached`,
+   or `active` with `acknowledge_resync`. An id already in use gets 409.
+4. Expiry deletes **only the tombstone file**. There's no automatic pruning of
+   `<spill>/tenants/<id>/` or any Snowflake state path. Reclaiming disk is a
+   documented manual step, done only when the id isn't declared.
+
+| Resource | On delete |
+|---|---|
+| Replication slot | None per tenant. The shared slot's floor stops waiting for it once it's excluded. |
+| Publications | None (physical WAL). |
+| ClickHouse databases and tables | **Retained.** |
+| Snowflake objects and stage files | **Retained.** |
+| Snowflake state dir | **Retained**, never touched. |
+| `<spill>/tenants/<id>/` | **Retained.** Cleared only by a later attach of that id (existing behavior). |
+| Shadow bridge pool | Stopped by the existing `publish_tenant_bridges`. |
+
+## 11. Health, readiness and liveness
+
+Following [runtime_config.md](runtime_config.md), the checks keep liveness,
+freshness, source receipt, shadow replay and destination ack apart. They also
+keep idle, paused, blocked, recovering and unavailable distinct.
+
+- `MetricsRegistry` records `published_at`. The session publishes
+  `session_state` and `last_ack_advance_at`.
+
+  | Check | Rule |
+  |---|---|
+  | `snapshot` | Age above 5 s is `unknown`, and the other checks turn `unknown` with it, keeping their last value. |
+  | `session` | Not streaming is `degraded`; past `--api-ready-grace` it's `failing`. |
+  | `source` | Swap blocked is `blocked`; no receipt progress while the source has new WAL is `degraded`. |
+  | `shadow_replay` | Lag over threshold is `degraded`. |
+  | `destination` | ack stalled for more than 300 s while backlog exists is `failing`. |
+  | `crossing` | Blocked is `blocked`. |
+  | `paused` | `paused`. |
+  | `tenants` | Evicted, or `detaching (stuck)`, is `degraded`. |
+  | `reconcile` | Published ahead of reconciled for more than 60 s is `degraded`. |
+  | `api_keys` | Reload failure is `failing`. |
+
+- `/v1/health/ready` returns 503 when any check is `failing` or `unknown`, or
+  while the session isn't streaming yet.
+- `/v1/health/live` returns 200 whenever the handler runs.
+
+## 12. Crash points and error reporting
+
+The recommended reading, to confirm under §18h:
+
+- **Panic hook** (chained, best-effort, fsync):
+  `<api-state-dir>/crashes/panic-<ts>-<pid>.json` with ts, pid, version,
+  thread, message, location and backtrace (at most 64 KiB). This also covers
+  tokio-task panics.
+- **Fatal exit**: `exit-<ts>-<pid>.json` with the `{e:#}` chain.
+- **Unclean exit**: a `running.json` marker. If it's left behind with no exit
+  record, the daemon records `unclean_exit`.
+- **Per tenant**: eviction and detach reasons from `tenant.toml`, `fatal()`
+  messages, stuck teardowns.
+- **Blocked states**: `crossing_blocked_on`, `source_swap_blocked_on`,
+  `promotion_blocked_on`.
+- **Error ring**: the last 1000 WARN and ERROR events (ts, level, target,
+  message, and the fields `tenant`, `database`, `error`, `reason`, each at most
+  2 KiB).
+- Retention: the newest 100 crash records or 10 MiB. All strings pass the API
+  redactor.
+- `crash_test.rs` stays test-only.
+
+## 13. Jobs and tenant status
+
+- `Backfiller::jobs()` (read-only) reports per relation: `{namespace, name,
+  mode, state, s_lsn, copy_cursor_block?, fallback_from?, last_error?,
+  updated_at}`. `last_error` and `updated_at` live in memory only, so the
+  ledger format doesn't change.
+- The session publishes jobs into a non-rendered `MetricsSnapshot` field.
+  Priming, teardown (with writer-join progress) and bootstrap appear as job
+  kinds.
+- `TenantMetrics` gains `reason`, `backfills_pending`, `attached_lsn`,
+  `start_lsn`, `incarnation` and phases `detaching` and `waiting`.
+- Tenant status: `desired` versus `phase` (`pending`, `waiting`, `priming`,
+  `active`, `detaching`, `detached`), plus `stale`.
+
+## 14. Data model and migrations
+
+- **No database migrations.** Nothing new is written to source Postgres,
+  shadow or ClickHouse. The SQL registry table and DDL are unchanged; only the
+  write statements become conditional.
+- **Additive, optional `TenantState` fields:** `identity` and `incarnation`.
+  They're serde-defaulted and skipped when `None`, with no version bump:
+  older files load, and older binaries ignore them (no `deny_unknown_fields`).
+  Ledger, manifests and config fragment formats are unchanged.
+- **New API-owned files**, written atomically at 0600 (dir 0700):
+
+  | Path | Format | Lifecycle |
+  |---|---|---|
+  | `<api-state-dir>/audit/audit.jsonl[.N]` | JSONL v1 | Rotated |
+  | `<api-state-dir>/deleted/<id>-<ts>.toml` | `[tenant.<id>]` plus `[_tombstone]` | File removed at expiry |
+  | `<api-state-dir>/crashes/*.json` | JSON v1 | Newest 100 or 10 MiB |
+  | `<api-state-dir>/running.json` | JSON | Created at start, removed on clean exit |
+  | `<api-state-dir>/etag.key` | 32 bytes | Created once |
+  | `<spill>/tenants/<id>/rebind.toml` | TOML v1 | Removed by the fresh attach (dir clear) or by rollback |
+
+- **Operator-owned input:** the key file (TOML v1) and TLS PEMs, read only.
+- Readers reject unknown versions. Startup handles missing directories and a
+  torn last audit line.
+
+## 15. Configuration surface
+
+CLI flags with env equivalents, deliberately not TOML: the API can write the
+merged TOML.
+
+| Flag | Env | Default |
+|---|---|---|
+| `--api-bind` | `WALSHADOW_API_BIND` | off |
+| `--api-keys-file` | `WALSHADOW_API_KEYS_FILE` | required with `--api-bind` |
+| `--api-tls-cert`, `--api-tls-key` | `WALSHADOW_API_TLS_CERT`, `_KEY` | required off-loopback |
+| `--api-allow-plaintext` | `WALSHADOW_API_ALLOW_PLAINTEXT` | false |
+| `--api-state-dir` | `WALSHADOW_API_STATE_DIR` | `<spill-dir>/api` |
+| `--api-public-livez` | `WALSHADOW_API_PUBLIC_LIVEZ` | false |
+| `--api-trusted-proxies` | `WALSHADOW_API_TRUSTED_PROXIES` | none |
+| `--api-rate-limit`, `--api-deleted-retention`, `--api-ready-grace` | — | §7, 30d, 10m |
+
+- Also new: `ctl … --acknowledge-resync`, the `api-key new` subcommand, and the
+  `acknowledge_resync` socket body key.
+- Docs:
+  - new `docs/api.md`, covering the capability matrix, delete flow, health
+    semantics and manual disk reclaim
+  - links from `README.md` and `docs/README.md`
+  - sections in `docs/configuration.md` and `docs/tenants.md`
+  - a note in `docs/operations.md` recommending `--metrics-bind` on loopback or
+    token scraping
+  - a docker compose example mounting the key file as a secret
+
+## 16. Secrets
+
+- **None in code or the repo.** Test keys, certs and the ETag key are generated
+  at test runtime.
+- **API redactor** (`src/ops/api/json.rs`), **used only on API output and new
+  API files**: `GET /v1/tenants*`, `GET /v1/config`, audit `before`/`after`,
+  and crash and error records. At any depth, keys matching `password`,
+  `secret`, `secret_key`, `access_key`, `token`, `api_key`, `passphrase` or
+  `private_key` (not `*_file` paths) become `"***"`. It doesn't change
+  `control::masked`, `ctl show` or `ctl tenant show` (G3 is out of scope, §17).
+- **ETags** are keyed HMACs. **Binding digests** cover only non-secret fields.
+  No hash of a secret is ever exposed.
+- **Inline ClickHouse passwords in tenant specs** are accepted (§18i) and never
+  returned or logged by the API. Tombstones are 0600. How tenant fragments and
+  the registry mirror are written on disk is unchanged here (G4 is out of
+  scope).
+- The key file and TLS key get the permission check, and key material has a
+  hand-written `Debug`/`Display` that prints `***`.
+
+## 17. Pre-existing gaps this work touches
+
+| # | Gap | Plan |
+|---|---|---|
+| G1 | **Confirmed:** `ctl pause`/`resume` fail validation in tenants mode. | §18l. |
+| G2 | Persist first, then report a failed live apply. | §9.2, §9.3: the revision isn't published, then a conditional rollback under L2. |
+| G3 | `ctl show` prints `[backup] secret_key`/`access_key` unmasked. | **Out of scope for T-1021-01** (requester ruling 10/21 9:24): the security track (Codex), relayed separately. Not fixed here, and not a blocker. The new API's own output is redacted (§16). |
+| G4 | Tenant fragment writes are non-atomic with umask permissions, and may hold inline passwords. | **Out of scope for T-1021-01**, same ruling. The service keeps today's write mechanism, and its CAS re-reads under L2. A torn write on crash stays a pre-existing risk tracked there. |
+| G5 | SQL registry: no lock, unconditional upsert, fixed mirror temp name. | Every registry and mirror write holds L2, so the temp name can't collide, and the writes are CAS (§9.3). |
+| G6 | Under `ack_after="outbox"`, teardown doesn't await `SnowflakeRuntime::quiesce()`. | Never deleted by the API, impact warning, quiesce follow-up. |
+| G7 | The reconcile flag is set before resolvers run. | §9.2. |
+| G8 | Resolvers and the session re-read disk; SIGHUP and the poller are unserialized; activation bypasses `Reloader`. | §9.1, §9.2. |
+| G9 | Graceful detach blocks the WAL loop for up to `stall_timeout`. | §9.7. |
+| G10 | ClickHouse scope and construction-time settings aren't treated as rebinds. | §9.4. |
+| G11 | A Snowflake fingerprint re-attach probably fails today, because `StateStore::open` rejects the identity (`state.rs:185`). | Phase 2 verifies with `ctl` first. The matrix rejects it unless the state dir moves to a fresh path in the same edit (§9.4). |
+
+## 18. Product decisions
+
+**Decided 10/21 9:27 AM MT.** John, quoted by AlfieW and relayed by the
+requester: "Approve all walshadow API recommendations (a through l), and (h)
+crash points means what the plan says". Every item below is therefore
+**approved as recommended**:
+
+| # | Decision | Approved option |
+|---|---|---|
+| a | Auth mechanism | Hashed API keys with `read`/`admin` scopes, fail-closed reload, TLS off-loopback |
+| b | Delete | Two-step confirm token plus soft delete, 30-day restore. No destination purge, no automatic state or directory deletion. |
+| c | Breaking changes | None to config or deploy. The listed `ctl` behavior changes are accepted. |
+| d | Pause/resume | `detach`/`attach` under those names, plus cluster pause. No per-tenant pause. |
+| e | Liveness | Authenticated by default. Opt-in `--api-public-livez` exposes only a constant `GET /livez`. |
+| f | Control beyond tenants | Tenant lifecycle, pause/resume, reload and reads. No raw apply/unset, endpoint swaps or runtime-config rows. |
+| g | Tenant-scoped keys | Deferred |
+| h | Crash points | Panic, fatal-exit and unclean-exit records, eviction and detach reasons, blocked states, the recent-error ring. **No crash injection.** |
+| i | Inline secrets in specs | Accepted, redacted in all API output |
+| j | Integration harness | The local Postgres and ClickHouse harness, natively in CI and in a local Linux docker container on macOS |
+| k | Audit sink | Local JSONL with a hash chain, mirrored to tracing |
+| l | G1 cluster pause in tenants mode | Fixed narrowly in this ticket |
+
+The options and alternatives as originally weighed:
+
+**(a) Auth mechanism.** Recommended: **hashed API keys with `read` and
+`admin` scopes**: a 0600 key file, live reload, expiry, fail-closed reload, TLS
+off-loopback. Alternatives: mTLS (PKI burden, could be added later) or
+OIDC/JWT (IdP dependency, a phase 3 candidate).
+
+**(b) Hard versus soft delete.** Recommended: **two-step confirm token plus
+soft delete** with a 30-day restore. No destination purge and no automatic
+deletion of state or directories. Slots and publications are a non-issue (none
+per tenant), and ClickHouse and Snowflake data and state are always retained.
+Alternatives: immediate hard delete, or a purge endpoint (not recommended).
+
+**(c) Breaking or behavior changes.** Recommended: **no breaking change to
+config or deploy.** The API is opt-in, and `--metrics-bind` and the socket wire
+protocol are unchanged. Behavior changes, which also affect `ctl`:
+
+1. a tenant change whose live apply fails is rolled back, or reported as a
+   conflict, rather than left persisted
+2. socket mutations are audited
+3. `ctl tenant detach`/`remove` return before the background drain finishes
+4. ClickHouse scope and construction-time changes through `ctl` need
+   `--acknowledge-resync`
+5. a Snowflake fingerprint change through `ctl` is rejected unless the state
+   dir moves in the same edit, instead of failing at re-attach (G11)
+6. a tenant whose identity changed while the daemon was down attaches fresh at
+   boot instead of resuming (§9.6b)
+7. `frag_lock` is replaced internally by the reload lock (no visible effect).
+
+New direct deps (§4) and the `api-key` subcommand. Alternative, which is
+breaking: auth on `--metrics-bind`, best as a separate announced change.
+
+**(d) Tenant pause and resume.** Recommended: **`detach` and `attach` under
+those names** (attach needs `acknowledge_resync`), plus cluster pause.
+Alternative: a true per-tenant pause, as a separate ticket.
+
+**(e) Unauthenticated liveness.** Recommended: **off by default**. An opt-in
+`--api-public-livez` exposes only `GET /livez`, a constant `ok`, per-IP
+rate-limited, for orchestrator probes that can't present a secret. Alternative:
+always authenticated, with an exec probe.
+
+**(f) Control beyond tenants.** Recommended: tenant lifecycle, pause/resume,
+reload and reads. Exclude raw `apply`/`unset`, endpoint swaps and
+runtime-config rows. Alternative: everything `ctl` can do.
+
+**(g) Tenant-scoped keys.** Recommended: **defer**.
+
+**(h) Meaning of "crash points".** Recommended: crash, exit and unclean-exit
+records, eviction and detach reasons, blocked states and the error ring. Not
+test crash injection. Please confirm.
+
+**(i) Inline secrets in tenant specs.** Recommended: **accept** (parity with
+`ctl`). Redacted in all API output, never in ETags or audit records. On-disk
+handling of tenant fragments is out of scope here (G4). Alternative: reject
+inline `password` on API writes and add `[ch] password_file`.
+
+**(j) "Local containers" harness.** Recommended: the existing local-process
+harness (`initdb` plus local `clickhouse`), natively in CI and in a Linux
+docker container on macOS. Alternative: testcontainers-rs.
+
+**(k) Audit sink.** Recommended: local JSONL with a hash chain, mirrored to
+tracing. Alternatives: the admin Postgres DB (not recommended) or syslog/OTLP.
+
+**(l) G1 cluster pause in tenants mode.** Recommended: **fix narrowly**: a
+top-level `[stream]` holding only `paused` is allowed in tenants mode.
+Alternative: return 409 and file a follow-up.
+
+## 19. Acceptance criteria and how each is tested
+
+Test kinds:
+
+- **In-proc:** the axum router via `tower::ServiceExt::oneshot`, a fake
+  `ApiBackend`, paused tokio time.
+- **Service:** the real `TenantService`, `Reloader` and `ConfigResolver` with
+  the lock-rank checker on. Tempdir fragments, local Postgres for the SQL
+  registry, and the Snowflake fake HTTP server with real `StateStore`
+  tempdirs.
+- **e2e:** the real binary against local Postgres and ClickHouse, in
+  `tests/api_e2e.rs` (`#![cfg(target_os = "linux")]`, required under
+  `WALSHADOW_REQUIRE_TOOLS=1`).
+
+| # | Acceptance | Design | Tests |
+|---|---|---|---|
+| 1 | 401 unauthenticated, 403 wrong scope, on every endpoint | `ROUTES` table (§6) | In-proc, table-driven over every route and every 401 cause: no header, wrong scheme, malformed, unknown, wrong secret, expired, disabled, fail-closed after a bad reload. Read key on admin routes gives 403. Guard test: router equals `ROUTES`. e2e over TLS: one read and one admin route; a plaintext non-loopback bind is refused. |
+| 2 | Read covers metrics, health detail, crash/error reports, jobs and tenant status. Admin covers mutations. Liveness justified | §5, §18e | In-proc scope matrix. `/livez` gives 401 without the flag; with it, exactly `ok` while the rest still give 401. |
+| 3 | Every mutation audited (who, what, when, before/after) | §8 wrapper | In-proc, per mutation route: attempt/result with actor, action, ts, redacted before/after, outcome, epoch and generation. **Early rejections** (validation, rejected class, missing ack, 428, 412, token errors) give exactly one `rejected` result. 403 gives `denied`. Dry run writes nothing. Unwritable audit dir gives 503 with config unchanged. Chain verifies and detects tampering. A planted password never appears. Socket verbs audited with a unix actor. Service: SIGHUP and a direct SQL row give `external_change`. |
+| 4 | Rate limiting | §7 | In-proc, paused time: burst+1 gives 429 with `Retry-After`; refill; per-key isolation; mutation class stricter; auth-failure flood gives 429 before auth; maps stay bounded. e2e: one 429. |
+| 5 | Safe delete | §10 | In-proc: 428, 409, 410 cases; changed ETag gives 409; tombstone 0600; restore; restore onto a live id gives 409; dry run inert. **delete → restore → expiry** keeps `<spill>/tenants/<id>/`. **delete → identical re-create** rejects the old token (new incarnation). Expiry removes only the tombstone. e2e: deleted tenant gone, ClickHouse data kept, others streaming, floor stops waiting. |
+| 6 | Live without restart, or documented why not; integration test | §9; Rejected rows return 409 because the daemon refuses them live (§9.4) | See the service and e2e tests below. |
+| 7 | No secrets in the repo; config documented | §15, §16 | Runtime-generated keys, certs and ETag key. Pre-PR `git grep` for `wsk_`, PEM headers and 64-hex `sha256 =` outside placeholders. `docs/api.md` plus the doc updates. |
+| 8 | CI green; output in the PR | — | Exactly CI's commands: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --lib --bins`, `cargo nextest run --workspace --all-targets --locked`, plus `cargo llvm-cov nextest --workspace --all-targets --locked` with `cargo llvm-cov report --summary-only`. Local Linux container for one PG major; CI for 16 to 19, ceiling 7200, no 0% file. Check the existing clippy finding first (R10). |
+
+Acceptance 6 tests, **service** level:
+
+- **Lock order:** the rank checker is on for every test, and a test asserts an
+  inversion panics.
+- **Persist-before-publish:** with an API mutation paused between persist
+  (step 6) and apply (step 7), SIGHUP and a poller tick block on L2 and
+  publish nothing. A failing target resolver produces no revision, a
+  conditional rollback and the fence removed. A hand edit during the window
+  gives `conflict_after_failed_apply`.
+- **Revisions:** the session-side consumer never sees a rejected candidate.
+  `reload_from` is monotonic (an older revision is ignored). Activation
+  consumes the latest revision and reads no disk.
+- **Registration:** `open_tenant` blocked while a Live edit publishes N+1
+  means the resolver catches up before routing and `reconciled` isn't
+  published early. A Rebind edit published during the blocked open means the
+  fresh tenant is discarded and requeued, and the old resolver stays skipped.
+- **Fences:**
+  - kill after a 202 and before reconcile: boot attaches fresh, and the old
+    state isn't resumed
+  - kill after the fence but before config persistence: boot clears the fence
+    and resumes
+  - kill after `Detached` is persisted and before the drain: boot doesn't
+    resume
+  - identity changed offline: boot attaches fresh
+  - pre-upgrade `tenant.toml` without `identity`: accepted
+- **Teardown and reservations:**
+  - fake writer tasks that ignore abort (`spawn_blocking`) keep the attach
+    guard and reservations held, with `detaching (stuck)` shown
+  - tenant B claiming A's ClickHouse database or Snowflake state dir while A
+    tears down is accepted, shows `waiting`, and attaches only after A's
+    writers join
+- **SQL registry on local PG:** external row change between ETag and write
+  gives 412; competing poller and service mirror writes stay consistent;
+  rollback after a concurrent update gives conflict with nothing restored.
+- **Capability matrix:** every row, plus an unknown key giving Rejected. For
+  Snowflake, a fingerprint change with the same dir gives Rejected (and
+  `StateStore::open` really refuses it in a tempdir); with a fresh dir it's a
+  Rebind that reopens successfully; a fresh dir nested in another tenant's
+  dir gives 409.
+- **Acknowledgement:** PUT and PATCH detached→active and every Rebind give 409
+  without ack and are accepted with it. Request cancellation still completes
+  and audits.
+
+Acceptance 6 tests, **e2e**:
+
+- **`api_tenants_apply_live_without_restart`:** tenants a and b stream rows
+  throughout. Via the API:
+  - create c, and its rows land
+  - PATCH a to add a table (live)
+  - PATCH a's ClickHouse database without ack gives 409; with ack it
+    re-attaches
+  - detach b, and the floor stops waiting
+  - attach b with ack, and it resyncs
+  - delete c
+
+  Same PID throughout, no "restarting the session" line, a and b counts keep
+  rising.
+- **`api_detach_slow_destination_does_not_stall_pump`:** one tenant's
+  ClickHouse sits behind an in-test freezable TCP proxy, with
+  `stall_timeout_secs = 20`. Freeze, then detach:
+  - another tenant's rows land within 10 s
+  - the frozen tenant's teardown aborts and joins after the limit
+  - an immediate re-attach waits for the join and then succeeds
+  - a daemon restart after the timeout boots cleanly, with the tenant not
+    resumed from stale state and no "owned by" or lock errors from leftover
+    writers
+
+## 20. Implementation sequence (phase 2, after the requester's decisions)
+
+One PR, in reviewable commits. The replication-core changes come first, so
+`multi_tenant_e2e`, `control_plane_e2e` and `runtime_config_e2e` check them
+before API code depends on them.
+
+1. Lock ranks, `reload_lock`, `ReloadTx`, `reload_from` (monotonic),
+   `ConfigRevision` watch, session revision consumption, catch-up sweep,
+   activation via revision, `built_from` registration check, epoch and
+   generation, `ReloadCause`. Retire `frag_lock`. Serialize SIGHUP, the poller
+   and the sweep (G2, G5, G7, G8).
+2. Durable fences: persist `Detached` before floor exclusion, the `identity`
+   and `incarnation` fields, the `rebind.toml` boot check.
+3. Background teardown with the writer split, join-before-release, and
+   `Reservations` with deferred attach (G9), plus the stall e2e.
+4. `classify_change` (fail closed), `force_rebind`, rebind skip, Snowflake
+   fresh-state-dir rule (verify G11 first), matrix tests (G10). G1 fix if
+   approved.
+5. API skeleton, routes, TLS, `ApiBackend`, keys, `api-key new`, auth and scope
+   tests.
+6. Rate limiter and resource limits.
+7. Read endpoints, health, jobs, API redactor.
+8. Error ring and crash store.
+9. Audit wrapper, chain, rotation, recovery, socket and external auditing.
+10. `TenantService`: ETag, CAS persistence under L1 → L2, rollback,
+    cancellation-safe tasks, `/v1/operations`, acknowledgement. Socket verbs
+    routed through it.
+11. Safe delete.
+12. `tests/api_e2e.rs`, docs, PR with outputs.
+
+## 21. Risks
+
+| # | Risk | Mitigation |
+|---|---|---|
+| R1 | Coverage ceiling: about 150 lines of slack | In-proc and service tests reach the error paths. Never raise the ceiling. |
+| R2 | The binary is Linux-only | Local Linux docker container. CI is authoritative. |
+| R3 | Steps 1–4 change the replication core: reload, reconcile, boot, teardown | They land first. The existing e2e suites, plus the new interleaving, fence and stall tests, check them. Behavior changes are in §18c. |
+| R4 | Holding L2 across a 10 s Postgres statement delays SIGHUP and poller reloads | Bounded. The session takes no L1 or L2, so the pump is never blocked. Documented. |
+| R5 | The API shares the pipeline's tokio runtime | Caps, limits, a single mutation lane, `spawn_blocking` for audit fsync. |
+| R6 | Direct SQL edits bypass API audit | Recorded as `external_change`; documented. |
+| R7 | A fail-closed key reload locks out the API | Replication unaffected; health check says why. |
+| R8 | Snowflake outbox rows remain on delete (G6) | Never deleted; warning; follow-up. |
+| R9 | A writer that won't join keeps a tenant `detaching (stuck)` until restart | Fail-safe by design. Health shows it. |
+| R10 | Sol r2 saw default-feature clippy fail on `main` (`nonminimal_bool` at `src/destination/snowflake/runtime/pending.rs:163`) with its local toolchain | Phase 2 checks CI's stable clippy first. If it flags this too, it's a pre-existing fix to call out separately in the PR. |
+| R11 | Large diff (about 5k lines with tests) | Ordered commits. Layer-local tests. |
+
+## 22. Data safety (binding for phase 2, verbatim from the requester)
+
+- Never touch any institution or global admin DB, or any real Postgres or
+  ClickHouse (no writes, no replication slots, no publications, no pgext
+  installs) without John's explicit approval relayed by K16 EM.
+- Without that approval, never: terraform/HCL apply or destroy, deploy anything
+  from deploy/ or docker to real infra, any cloud write, DNS/IAM/secrets
+  changes, workflow_dispatch or repository_dispatch runs, releases, tags or
+  crate publishing.
+- Fine and encouraged: cargo build/test/clippy/fmt, benches, local docker or
+  testcontainer Postgres and ClickHouse, terraform fmt/validate/plan. Put test
+  and bench output in the PR body.
+- Also: never read credential files (~/.aws, .env, keychains and so on), never
+  run env-dumping commands (env, printenv, set, export -p, ps with args,
+  /proc/*/environ), and never print tokens or keys.
+
+All phase-2 tests use only local tempdir Postgres and ClickHouse instances
+started by the harness, plus an in-process Snowflake fake. Nothing here writes
+to a real database, slot or publication.
+
+## 23. Changelog
+
+- **r1 → r2:**
+  - single reload pipeline and `ConfigRevision`
+  - SQL CAS writes; poller and SIGHUP serialized
+  - capability matrix
+  - HMAC ETag
+  - no state pruning, plus token invalidation
+  - background teardown
+  - acknowledgement on every route
+  - direct deps and CI commands
+- **r2 → r3**, each r2 finding folded into its section:
+
+  | r2 finding | Section |
+  |---|---|
+  | r1 #1 partial | §9.3, L2 held from persist to publish or rollback; §9.2, activation via revision |
+  | r1 #2 partial | §9.1, lock order for all locks; `frag_lock`/`registry_lock` subsumed by L2; socket `apply`/`unset` refactor; rank checker |
+  | r1 #3 partial | §9.4, `[ch]` pool and batch/queue rows; fail-closed unknown keys |
+  | r1 #6 partial | §9.7, writer split, abort+join, release only after join, stuck state |
+  | new 1 | §9.6, rebind fence, `identity` boot check, `Detached` persisted before floor exclusion |
+  | new 2 | §9.7, cross-id `Reservations`, deferred attach, `waiting` phase |
+  | new 3 | §9.2, `built_from`, monotonic `reload_from`, catch-up sweep before `reconciled` |
+  | new 4 | §9.4, Snowflake fingerprint Rebind only with a fresh state dir, otherwise Rejected; G11 |
+  | new 5 | §1, §4, axum is a new lockfile entry |
+  | new 6 | §8, audit wrapper for early rejections; dry-run policy |
+
+  Requester ruling (10/21 9:24 AM MT): G3 and G4 secret-exposure fixes
+  removed from this ticket (§16, §17, §18c, §18i). The plan moved from
+  `docs/plans/` to `plans/` per repo convention.
+- **Decisions (10/21 9:27 AM MT):** §18a–l approved as recommended; (h)
+  confirmed as written.
+- **Sol r3 (scoped): `VERDICT: CHANGES_REQUESTED`.** Resolved: (6) Snowflake
+  fingerprint vs `StateStore::open`, (7) `[ch]` matrix rows and fail-closed
+  keys, (8) axum lockfile, (9) rejected-mutation auditing. Open at r3, and
+  made **binding requirements R3-M1, R3-M2, R3-M3 and R3-m1 in §9.9** by the
+  requester ruling of 10/21 9:37 AM MT:
+
+  | Sev | Finding | Sol's suggested fix |
+  |---|---|---|
+  | MAJOR | §9.6: there's one `rebind.toml` per tenant, deleted on a boot mismatch. An accepted A→B rebind followed by a crash midway through B→C resumes A's state against B. | Refuse or queue another same-id Rebind while a fence is pending, or keep pending intents durably across replacement and rollback. Crash test for that sequence. |
+  | MAJOR | §9.2: monotonic `reload_from` can drop an activation. `set_activation` only stores the layer (`src/config.rs:510`). Activation between the Reloader applying N+1 and publishing it reloads with N, which is ignored, and the sweep then skips the resolver. | Track a dirty activation independently of config generation, so it always forces a recompute. Test that interleaving. |
+  | MAJOR | §9.7: the teardown writer set misses detached backfill tasks (`src/backfill/copy_backfill.rs:1090`) and the Snowflake outbox appliers (`src/destination/snowflake/runtime.rs:544`), which can write after teardown "joins". | Owned cancel/join handles for backfill passes and appliers, including their blocking descendants, in `TenantWriters`. Blocked-backfill and blocked-outbox tests. |
+  | MINOR | §9.1: the hierarchy omits locks nested under the resolver mutex (activation, Snowflake HTTP, mapping write lock; `src/config.rs:869-871,1169,1202,1224`, `src/destination/snowflake/http.rs:149-160`, `src/mapping.rs:515-516`). | Explicit sub-ranks or a refactor that removes the nesting. Rank checker on them. |
+
+- **Implementation notes (phase 2):**
+  - In-process API tests drive the real `TenantService`, `Reloader`, audit
+    log and key store over temp configs instead of a fake `ApiBackend`
+    trait: no trait was needed, and the tests exercise the real paths.
+  - The audit log and crash store live under `<spill-dir>/api` (or
+    `--api-state-dir`) whether or not `--api-bind` is set, so control-socket
+    mutations are audited and crash points recorded either way (§18c).
+  - The jobs view refreshes every 2 s, not every publish: it walks each
+    tenant's backfill ledger.
+  - Teardown always aborts and joins initial-load passes (re-attaching
+    reloads them anyway); only the pipeline drain waits out
+    `stall_timeout_secs`.
+  - G1 is fixed by letting a top-level `[stream]` hold only `paused` with
+    tenants, and by pointing the pump at the cluster resolver in tenants
+    mode: the first tenant's resolver, which it watched before, goes stale
+    once that tenant detaches or re-binds.
+  - Attaching a tenant still opens its destination inside the session loop,
+    as before this ticket. A destination that hangs during attach stalls
+    the pump until it answers; out of scope here, worth a follow-up.
+
+- **Code pass r1 (Sol, `t1021-01-code-r1`):** R3-M1, R3-M2 and R3-m1 pass;
+  R3-M3 failed (H3). Ten bounded findings were fixed in the pass; the round's
+  report is `plans/http_api_review_r1.md`. Seven core findings were held, and
+  the requester ruling of 10/21 1:22 PM MT had each fixed with its own
+  regression test:
+
+  | # | Fix | Regression test |
+  |---|---|---|
+  | H1 | A re-bind stays pending in the reloader through later revisions; reconcile re-binds every pending one, not just the newest revision's | `a_rebind_stays_pending_until_a_runtime_with_its_binding_registers`, `reconcile_rebinds_what_an_earlier_revision_asked_for` |
+  | H2 | Registration settles a pending re-bind only with the binding the published revision asks for; `tenant.toml` records the binding at attach, and boot attaches afresh on a mismatch, fenced or not | same reloader test, `boot_attaches_afresh_when_the_state_was_built_for_another_binding` |
+  | H3 | Backfill passes join before the Snowflake runtime they write through; a closed `WriterSet` refuses blocking work; abandoned backfill tails count until their stages end; shutdown fails closed when a writer outlives its wait; boot claims a resumed tenant before opening it and refuses a conflict | `producers_join_before_the_runtime_they_write_through`, `a_closed_set_refuses_blocking_writers`, `an_abandoned_counted_tail_holds_its_owners_join_until_its_stages_end`, `boot_refuses_to_resume_next_to_a_stuck_writer` |
+  | H4 | Fail closed: the service records an attached tenant as detached before any config changes; a failed write answers `503 detach_not_recorded` (socket: an error), audited as rejected, and leaves the tenant attached. In the session, a failed record aborts the detach, leaving the tenant in the floor; the next eviction check, reload or mutation asks again. No retry loop | `an_unrecordable_detach_changes_nothing` |
+  | H5 | A committed SQL-registry row whose mirror fails is put back before the fence goes; a fence stays whenever a rollback did not happen | `a_failed_registry_mirror_puts_the_committed_row_back` |
+  | H6 | Every mutation handler runs, bookkeeping included, on its own task: a dropped request or timeout cancels only the response | `a_dropped_request_still_finishes_its_mutation` |
+  | H7 | Snowflake state directories compare canonically (symlinks resolved) in reservations and validation; one resolving into, around or onto another tenant's, or among `<spill-dir>/tenants`, is refused at boot, on every publish and on every mutation | `state_directories_are_compared_through_their_symlinks` |
+
+  H7 reads "outside that tenant's own root" as: walshadow has no per-tenant
+  root setting, and adding a mandatory one would break existing configs
+  (§18c), so a tenant's own root is where its configured state directory
+  resolves, which must not be, contain or sit inside any directory the
+  daemon assigns another tenant or clears on attach.
+
+- **Code pass r2 (Sol, `t1021-01-code-r2`):** H1, H4, H5, H6 pass; F11
+  (operation records for pause/resume/reload) fixed in the pass. Four core
+  findings were held; the requester ruling of 10/21 2:47 PM MT had each
+  fixed with its own regression test, then a third round scoped to them:
+
+  | # | Fix | Regression test |
+  |---|---|---|
+  | C1 | A tail's stages and the writer hold that counts them live in one guard; `finish` and `quiesce` drive the stages by reference, so a completion that fails or is cancelled mid-await, or a leg dropped mid-way, aborts the stages and keeps the hold until every one has exited | `a_cancelled_completion_keeps_its_blocked_stages_counted`, `a_blocked_clickhouse_insert_holds_the_join_until_its_stage_exits` (an INSERT blocked on a stalling fake ClickHouse) |
+  | C2 | A session shutdown that left a writer running keeps its claim marked tearing down, so not even the same id claims it again before a daemon restart | `a_failed_shutdown_claim_refuses_a_same_id_reopen` |
+  | C3 | Snowflake state directories are made absolute when the config loads, and `canonical` makes any path absolute before resolving it; one that cannot be made absolute is refused | `relative_and_absolute_state_directories_are_one_directory` |
+  | C4 | A runtime opened, at boot or attach, for a binding a revision replaced while it opened is never routed: it is torn down off the loop holding its claim, and the tenant attaches afresh once it has joined | `a_rebind_during_resume_never_routes_the_old_runtime` (e2e: a re-bind accepted while the resume of the tenant blocks on its frozen destination) |
+
+  C4's reproducer failed on the code before the fix by routing the stale
+  runtime and then detaching it. It found no WAL rows in the old database:
+  the session reconciles revisions at the top of every loop iteration,
+  before it reads WAL, so the stale runtime was detached before a record
+  reached it. The fence makes that independent of loop order.
+
+- **Code pass r3 (Sol, `t1021-01-code-r3`, scoped to C1–C4):** C1, C2
+  and C3 pass. C4's fence passes; the round held only on the ruling's
+  reproduction wording, and the requester ruling of 10/21 3:19 PM MT
+  accepted "stale runtime routed, then detached" as C4's pre-fix
+  reproduction (on that code no WAL reached the old database, because the
+  session applies config revisions at the top of its loop). Per the same
+  ruling, C1's fix was reverted locally to the pre-fix `tail.rs` with the
+  new tests kept: both C1 tests failed there
+  (`a_cancelled_completion_keeps_its_blocked_stages_counted`: "finish=true:
+  joined while a stage was still blocked";
+  `a_blocked_clickhouse_insert_holds_the_join_until_its_stage_exits`: the
+  writer count fell to 0 while the insert's stage was still going away),
+  and both passed with the fix restored. The blocked-insert test checks
+  the count at a point the stage is held alive, with no timing waits.
+
+- **Coverage measure.** CI's gate counts `DA:` lines in the merged lcov.
+  Main's merged lcov misses 7,052 and its PG18 lcov (artifact
+  `coverage-pg18`, run 39618611443) 7,076. Two local PG18 runs of this
+  branch at `aac306f` missed 7,101 and 7,087, projecting 7,077 and 7,063
+  merged, under the 7,200 ceiling. Earlier projections in this work used
+  the llvm-cov report's TOTAL "Missed Lines", a different count that mixes
+  bases with the DA-based 7,052 and overstates (7,185–7,200 for the same
+  two runs). Run-to-run variation was about 20 DA lines, in
+  `catalog/shadow.rs`.
+
+## 24. Built-in API docs (T-1021-06)
+
+Requester (John, 10/21 4:06 PM MT): an endpoint with built-in API docs, a
+web view and a JSON export, following best practices. None existed: no
+OpenAPI document, docs route or UI on `main` or this branch, only
+`docs/api.md`.
+
+- **Routes.** `GET /v1/openapi.json` (OpenAPI 3.1) and `GET /v1/docs` (a
+  web page rendered from that document), scope `read`, rate class `read`.
+  `--api-public-docs` (off by default) opens exactly those two `GET`s
+  without a key; they stay behind the per-IP preauth limiter and draw on
+  their own per-IP bucket at the read rate (`public_read`). The served
+  document's `security` follows the flags. `walshadow-stream api-docs
+  --format json|html [--public-docs] [--public-livez]` prints either
+  without a daemon: the same JSON document (pretty-printed by the CLI),
+  and byte for byte the HTML a daemon with the same flags serves.
+- **Sources.**
+  - Paths, methods, scopes, rate classes and audit actions come from
+    `ROUTES`, which also builds the router and drives the guard.
+  - Every `Route` carries a required `doc: RouteDoc` (`route_docs.rs`):
+    operation id, parameters, request body, replies and the route's own
+    errors.
+  - Schemas come from `utoipa` `ToSchema` on the types handlers serialize,
+    and on mirrors in `schema.rs` of the bodies built with `json!`.
+  - Error codes come from `ERROR_CODES` (`errors.rs`); every error
+    producer `debug_assert!`s membership.
+- **Closed schemas.** Objects are `additionalProperties: false` except the
+  open ones in `openapi::OPEN`: config sections, the status table, the
+  document itself, tenant declarations. A `#[serde(flatten)]` type's
+  `allOf` is merged into one closed object, so the type it flattens stays
+  closed where it stands alone. This replaces the plan-review design
+  (`unevaluatedProperties` on the composition, its parts left open), which
+  left `TenantSummary`, `Tombstone` and `Draft` open everywhere.
+- **Web page.** Server-rendered, no script, no external asset, served
+  under `default-src 'none'; style-src 'unsafe-inline'; img-src 'none';
+  base-uri 'none'; form-action 'none'; frame-ancestors 'none'`. No Swagger
+  UI or Scalar: a vendored JavaScript bundle to review and keep current,
+  and "try it out" invites pasting admin keys into a page.
+- **Tests** (`src/ops/api/docs_tests.rs`, `tests/api_e2e.rs`):
+
+  | Test | Holds |
+  |---|---|
+  | `the_document_lists_every_route_and_nothing_else` | Operations equal `ROUTES`, with scope, class, action, security per exposure, path parameters, the guard's responses; objects closed unless open; no composition left |
+  | `the_router_serves_exactly_what_the_document_lists` | Every documented method of every documented path is routed, no other method is |
+  | `the_error_reference_is_the_table` | `docs/api.md`'s error table and the document's `code` enum equal `ERROR_CODES` |
+  | `the_document_is_valid_openapi_3_1` | Valid against the vendored OAS 3.1 schema, every schema valid for the OAS dialect and compiling with references resolved, nothing fetched; negative controls |
+  | `Conformance`, on every `Api::call` | Every response every in-process API test gets: a documented status, media type and headers, a body its schema accepts, an error code the operation declares for that status |
+  | `the_conformance_check_refuses_what_the_document_does_not_say` | The checker refuses an unknown field, an undeclared status, code and media type, a missing guard header, an undocumented ETag |
+  | `every_operation_answers_its_documented_successes` | Each documented success status of each operation, from a request made to produce it; readiness's 503 |
+  | `request_bodies_agree_with_their_schemas` | Request bodies through the schema and the API: what one refuses the other refuses, and each body route has one both accept |
+  | `the_docs_are_public_only_with_their_flag` | All four flag combinations: who answers without a key, the document's security, other methods |
+  | `public_docs_are_rate_limited_per_address` | Preauth and the docs bucket each exhausted with the other to spare |
+  | `the_page_is_self_contained_and_covers_the_document`, `the_renderer_shows_every_construct_and_escapes_text` | CSP and headers, no script or external asset, every operation and schema anchored, links land, nested fields linked, no key or secret; each rendered construct; escaping |
+  | `api_docs_prints_what_the_daemon_serves` (e2e) | The CLI prints the library's document and page for each flag set |
+  | `api_tenants_apply_live_without_restart` (e2e) | A live daemon serves what the CLI prints; `/v1/tenants/{id}/tables`, which needs a source, matches its schema |
+
+  The conformance hook found two wrong references on its first run:
+  `invalid_body` was said to cover a body naming another tenant (it is
+  `invalid_id`), and `/v1/tenants/{id}/tables` was an empty open schema
+  (it is a fixed, now closed, shape).
+- **Plan files** renamed to the `plans/` convention (lowercase topic
+  names, no ticket ids): `T-1021-01.md` → `http_api.md`,
+  `T-1021-01-code-r1.md` → `http_api_review_r1.md`, `T-1021-01-code-r2.md`
+  → `http_api_review_r2.md`, `T-1021-01-code-r2-repros.patch` →
+  `http_api_review_r2_repros.patch`. `docs/plans/T-1021-WS-API.md` was
+  never committed, so there was nothing to fold in.

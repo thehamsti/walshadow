@@ -78,6 +78,11 @@ Choose thresholds from workload's normal lag and retained-WAL budget
 Grafana reads walshadow metrics only. It does not connect to source or
 ClickHouse
 
+`--metrics-bind` needs no credentials. Bind it to loopback or a private
+network, or scrape the [HTTP API](api.md)'s `/v1/metrics` with an API key
+instead. The API also answers `/v1/health/ready`, `/v1/crashes` (why earlier
+processes stopped, SIGKILL and OOM included) and `/v1/errors`
+
 ## Pause and resume
 
 ```bash
@@ -91,7 +96,9 @@ keeps producing WAL, so replication slot or archive usage can grow throughout
 pause. Keep maintenance window bounded and verify available storage before
 pausing a busy source
 
-Pause persists in config and survives restart
+Pause persists in config and survives restart. With tenants, pause stays
+cluster-wide: `ctl pause` writes a top-level `[stream] paused`, the one
+`[stream]` key tenants leave to the cluster
 
 ## Reload config
 

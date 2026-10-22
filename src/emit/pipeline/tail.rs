@@ -48,10 +48,93 @@ pub struct TailParts {
 impl TailParts {
     /// Drop the spawn-returned producer handles, then await the drain
     /// cascade. Hangs while any clone handed to a producer stays alive
-    pub async fn close(self, msg_tx: mpsc::Sender<BatcherMsg>, ack: AckHandle) {
+    pub async fn close(mut self, msg_tx: mpsc::Sender<BatcherMsg>, ack: AckHandle) {
+        self.close_mut(msg_tx, ack).await;
+    }
+
+    /// [`close`](Self::close) without giving the stages up: a caller whose
+    /// await is cancelled still holds whichever have not ended
+    async fn close_mut(&mut self, msg_tx: mpsc::Sender<BatcherMsg>, ack: AckHandle) {
         drop(msg_tx);
         drop(ack);
-        self.join().await;
+        let _ = (&mut self.batcher).await;
+        for h in &mut self.resolvers {
+            let _ = h.await;
+        }
+        for h in &mut self.inserters {
+            let _ = h.await;
+        }
+        let _ = (&mut self.collector).await;
+    }
+
+    fn stages(&self) -> impl Iterator<Item = &AbortOnDropHandle<()>> {
+        std::iter::once(&self.batcher)
+            .chain(&self.resolvers)
+            .chain(&self.inserters)
+            .chain(std::iter::once(&self.collector))
+    }
+
+    fn all_ended(&self) -> bool {
+        self.stages().all(AbortOnDropHandle::is_finished)
+    }
+
+    /// [`join`](Self::join) until `deadline`, then abort every stage still
+    /// running and wait up to `abort_wait` for them to end. Returns
+    /// `(drained, joined)`: whether the cascade finished in time, and
+    /// whether every stage has ended either way
+    pub(super) async fn join_or_abort(
+        self,
+        deadline: tokio::time::Instant,
+        abort_wait: std::time::Duration,
+    ) -> (bool, bool) {
+        let mut stages: Vec<AbortOnDropHandle<()>> = std::iter::once(self.batcher)
+            .chain(self.resolvers)
+            .chain(self.inserters)
+            .chain(std::iter::once(self.collector))
+            .collect();
+        let mut done = 0;
+        for stage in &mut stages {
+            if tokio::time::timeout_at(deadline, &mut *stage)
+                .await
+                .is_err()
+            {
+                break;
+            }
+            done += 1;
+        }
+        if done == stages.len() {
+            return (true, true);
+        }
+        let rest = &mut stages[done..];
+        for stage in rest.iter() {
+            stage.abort();
+        }
+        let joined = tokio::time::timeout(abort_wait, async {
+            for stage in rest.iter_mut() {
+                let _ = (&mut *stage).await;
+            }
+        })
+        .await
+        .is_ok();
+        (false, joined)
+    }
+
+    /// Abort every stage and wait for each to end: a stage blocked in a
+    /// synchronous call ends only once that call returns. One already
+    /// awaited to its end is not polled again
+    async fn abort_and_wait(self) {
+        for stage in self.stages() {
+            stage.abort();
+        }
+        let stages = std::iter::once(self.batcher)
+            .chain(self.resolvers)
+            .chain(self.inserters)
+            .chain(std::iter::once(self.collector));
+        for stage in stages {
+            if !stage.is_finished() {
+                let _ = stage.await;
+            }
+        }
     }
 
     /// Await the drain cascade once every producer handle has dropped
@@ -71,14 +154,24 @@ impl TailParts {
     /// handles so the drop-before-join ordering can't be gotten wrong; `fatal`
     /// short-circuits a CH outage instead of hanging.
     pub async fn finish(
-        self,
+        mut self,
+        msg_tx: mpsc::Sender<BatcherMsg>,
+        ack: AckHandle,
+        through: u64,
+        fatal: &Fatal,
+    ) -> Result<(), String> {
+        self.finish_mut(msg_tx, ack, through, fatal).await
+    }
+
+    async fn finish_mut(
+        &mut self,
         msg_tx: mpsc::Sender<BatcherMsg>,
         ack: AckHandle,
         through: u64,
         fatal: &Fatal,
     ) -> Result<(), String> {
         flush_and_prove(&msg_tx, &ack, through, fatal).await?;
-        self.close(msg_tx, ack).await;
+        self.close_mut(msg_tx, ack).await;
         if let Some(msg) = fatal.message() {
             return Err(msg);
         }
@@ -123,10 +216,46 @@ async fn flush_and_prove(
 pub struct OwnedTail {
     pub msg_tx: mpsc::Sender<BatcherMsg>,
     pub ack: AckHandle,
-    parts: TailParts,
+    stages: Stages,
     fatal: Fatal,
     /// Prefix for the errors this leg reports
     context: &'static str,
+}
+
+/// A leg's stages, and the hold that counts them as live writers of the
+/// leg's owner. The hold goes only once every stage has exited, however the
+/// leg ends: finished, failed, abandoned, or its completion cancelled
+/// mid-await. One dropped with stages still running aborts them and keeps
+/// the hold until each has ended
+struct Stages {
+    parts: Option<TailParts>,
+    writer: Option<crate::ops::writers::WriterToken>,
+}
+
+impl Stages {
+    fn parts(&mut self) -> &mut TailParts {
+        self.parts
+            .as_mut()
+            .expect("a tail's stages stay until it drops")
+    }
+}
+
+impl Drop for Stages {
+    fn drop(&mut self) {
+        let Some(parts) = self.parts.take() else {
+            return;
+        };
+        let writer = self.writer.take();
+        if parts.all_ended() {
+            return;
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                parts.abort_and_wait().await;
+                drop(writer);
+            });
+        }
+    }
 }
 
 impl OwnedTail {
@@ -137,7 +266,10 @@ impl OwnedTail {
         Self {
             msg_tx,
             ack,
-            parts,
+            stages: Stages {
+                parts: Some(parts),
+                writer: None,
+            },
             fatal,
             context: "test",
         }
@@ -166,10 +298,20 @@ impl OwnedTail {
         Ok(Self {
             msg_tx,
             ack,
-            parts,
+            stages: Stages {
+                parts: Some(parts),
+                writer: None,
+            },
             fatal,
             context,
         })
+    }
+
+    /// Count the stages as live writers of `token`'s set until every one
+    /// has exited, so a teardown that joins the set waits for them too
+    pub fn counted(mut self, token: Option<crate::ops::writers::WriterToken>) -> Self {
+        self.stages.writer = token;
+        self
     }
 
     /// [`Self::finish`] without closing the tail: what licenses recording
@@ -182,10 +324,20 @@ impl OwnedTail {
 
     /// Seal batches and prove every seq below `through` durable
     pub async fn finish(self, through: u64) -> Result<(), String> {
-        self.parts
-            .finish(self.msg_tx, self.ack, through, &self.fatal)
+        let Self {
+            msg_tx,
+            ack,
+            mut stages,
+            fatal,
+            context,
+        } = self;
+        // `stages` keeps the hold until every stage ended: here when the
+        // tail finished, or reaped when this failed or was cancelled
+        stages
+            .parts()
+            .finish_mut(msg_tx, ack, through, &fatal)
             .await
-            .map_err(|m| format!("{}: {m}", self.context))
+            .map_err(|m| format!("{context}: {m}"))
     }
 
     /// Failed-leg teardown: dropping the last producer handles closes the
@@ -193,7 +345,13 @@ impl OwnedTail {
     /// down. Bounded by the inserters' retry policy (a CH outage trips their
     /// fatal, not a hang)
     pub async fn quiesce(self) {
-        self.parts.close(self.msg_tx, self.ack).await;
+        let Self {
+            msg_tx,
+            ack,
+            mut stages,
+            ..
+        } = self;
+        stages.parts().close_mut(msg_tx, ack).await;
     }
 }
 
@@ -829,6 +987,162 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A leg over `parts`, counted as a writer of `token`'s set
+    fn counted(
+        msg_tx: mpsc::Sender<BatcherMsg>,
+        ack: AckHandle,
+        parts: TailParts,
+        fatal: Fatal,
+        token: crate::ops::writers::WriterToken,
+    ) -> OwnedTail {
+        OwnedTail {
+            msg_tx,
+            ack,
+            stages: Stages {
+                parts: Some(parts),
+                writer: None,
+            },
+            fatal,
+            context: "test",
+        }
+        .counted(Some(token))
+    }
+
+    /// C1: a leg's completion cancelled mid-await, its stage blocked in a
+    /// synchronous call, never lets its owner's join report the stage gone
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_completion_keeps_its_blocked_stages_counted() {
+        for finish in [true, false] {
+            let set = crate::ops::writers::WriterSet::new();
+            let fatal = Fatal::new();
+            let (_, ack, mut parts) = spawn_null(Arc::new(Monotone::default()), fatal.clone());
+            let (msg_tx, msg_rx) = mpsc::channel(16);
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let (started_tx, started) = oneshot::channel();
+            parts.batcher = AbortOnDropHandle::new(tokio::spawn(async move {
+                let _rx = msg_rx;
+                let _ = started_tx.send(());
+                let _ = held.recv();
+            }));
+            started.await.unwrap();
+            let tail = counted(msg_tx, ack, parts, fatal, set.token());
+            let (polled_tx, polled) = oneshot::channel();
+            let completion = tokio::spawn(async move {
+                let mut completion = Box::pin(async move {
+                    if finish {
+                        let _ = tail.finish(0).await;
+                    } else {
+                        tail.quiesce().await;
+                    }
+                });
+                assert!(futures::poll!(&mut completion).is_pending());
+                let _ = polled_tx.send(());
+                completion.await;
+            });
+            polled.await.unwrap();
+            completion.abort();
+            assert!(completion.await.unwrap_err().is_cancelled());
+            assert!(
+                !set.abort_and_join(Duration::from_millis(200)).await,
+                "finish={finish}: joined while a stage was still blocked"
+            );
+            release.send(()).unwrap();
+            assert!(set.abort_and_join(Duration::from_secs(5)).await);
+        }
+    }
+
+    /// C1: a leg whose ClickHouse insert is blocked, its completion
+    /// cancelled, keeps its owner's writer count until that stage has gone
+    /// away. The stage cannot finish going away until the test releases it,
+    /// so the count is checked at a point the stage is known to be alive
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blocked_clickhouse_insert_holds_the_join_until_its_stage_exits() {
+        /// Blocks the stage's teardown until released, or until the test
+        /// panics and drops the sender
+        struct Parked(std::sync::mpsc::Receiver<()>);
+        impl Drop for Parked {
+            fn drop(&mut self) {
+                let _ = self.0.recv();
+            }
+        }
+        let (config, closed) = crate::ch::test_support::stalled_server().await;
+        let set = crate::ops::writers::WriterSet::new();
+        let fatal = Fatal::new();
+        let (msg_tx, ack, mut parts) = spawn_null(Arc::new(Monotone::default()), fatal.clone());
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (sent_tx, sent) = oneshot::channel();
+        // An inserter stage waiting on its INSERT's answer, which never comes
+        parts
+            .inserters
+            .push(AbortOnDropHandle::new(tokio::spawn(async move {
+                let _parked = Parked(held);
+                let mut client = crate::ch::connect_client(&config).await.unwrap();
+                client
+                    .send_query("INSERT INTO t (x) VALUES", None)
+                    .await
+                    .unwrap();
+                let _ = sent_tx.send(());
+                let _ = client.recv_event().await;
+            })));
+        sent.await.unwrap();
+        let tail = counted(msg_tx, ack, parts, fatal, set.token());
+        // Its completion is pending on the insert when it is cancelled
+        let (polled_tx, polled) = oneshot::channel();
+        let completion = tokio::spawn(async move {
+            let mut quiesce = Box::pin(tail.quiesce());
+            assert!(futures::poll!(&mut quiesce).is_pending());
+            let _ = polled_tx.send(());
+            quiesce.await;
+        });
+        polled.await.unwrap();
+        completion.abort();
+        assert!(completion.await.unwrap_err().is_cancelled());
+        // The insert's stage is still going away: the hold stays
+        assert_eq!(
+            set.live_count(),
+            1,
+            "the cancelled completion released its hold before the insert's stage exited"
+        );
+        release.send(()).unwrap();
+        assert!(set.abort_and_join(Duration::from_secs(5)).await);
+        assert_eq!(set.live_count(), 0);
+        closed
+            .await
+            .expect("the blocked insert's connection closed");
+    }
+
+    /// H3: an abandoned leg's stages count as their owner's writers until
+    /// they end, so a teardown joining the owner waits for a stage stuck in
+    /// a synchronous call instead of reporting joined while it still runs
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_counted_tail_holds_its_owners_join_until_its_stages_end() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let set = crate::ops::writers::WriterSet::new();
+        let fatal = Fatal::new();
+        let (msg_tx, ack, mut parts) = spawn_null(Arc::new(Monotone::default()), fatal.clone());
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started) = oneshot::channel::<()>();
+        let ended = Arc::new(AtomicBool::new(false));
+        let flag = ended.clone();
+        // A stage blocked where an abort cannot reach it
+        parts.batcher = AbortOnDropHandle::new(tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _ = held.recv();
+            flag.store(true, Ordering::SeqCst);
+        }));
+        started.await.unwrap();
+        let tail = counted(msg_tx, ack, parts, fatal, set.token());
+        drop(tail);
+        assert!(
+            !set.abort_and_join(Duration::from_millis(200)).await,
+            "the stuck stage still counts"
+        );
+        release.send(()).unwrap();
+        assert!(set.abort_and_join(Duration::from_secs(5)).await);
+        assert!(ended.load(Ordering::SeqCst));
+        assert_eq!(set.live_count(), 0);
+    }
 
     #[tokio::test]
     async fn dropped_tail_closes_workers_with_live_producers() {

@@ -325,6 +325,15 @@ impl BoundaryHoldSink {
     pub async fn close(self) -> Result<(), SinkError> {
         self.inner.close().await
     }
+
+    /// [`QueueingRecordSink::close_or_abort`] on the inner sink
+    pub async fn close_or_abort(
+        self,
+        deadline: tokio::time::Instant,
+        abort_wait: std::time::Duration,
+    ) -> (Result<(), SinkError>, bool) {
+        self.inner.close_or_abort(deadline, abort_wait).await
+    }
 }
 
 impl RecordSink for BoundaryHoldSink {

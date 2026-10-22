@@ -1,0 +1,228 @@
+# HTTP API code review, round 1
+
+Ticket: T-1021-01. Plan: [http_api.md](http_api.md).
+
+Client request: `t1021-01-code-r1`. Reviewer: Sol.
+
+Checkout: `t3/walshadow/t1021-ws-api-20261021-0846`, HEAD `e9a231e`.
+Review base: `225b45e`. All changes are uncommitted. No policy ceiling,
+branch, commit, PR, deployment, or real database was changed.
+
+**Verdict: HOLD.** Bounded fixes and coverage tests are applied, but the
+core defects below need another implementation pass. They were left for
+the parent because the brief prohibits redesigning new major core defects.
+
+## Binding requirements
+
+| Requirement | Verdict | Evidence |
+|---|---|---|
+| R3-M1 | PASS after fix | `src/ops/tenant_service.rs:341`, `src/ops/tenant_service.rs:1133`, `src/ops/api/tests.rs:1196`. `TenantService::mutate_inner` checks a pending fence before acknowledgement and persistence, even when persisted state is already `Detached`. The existing `rebind_fence_survives_crash_during_second_rebind` regression is retained. `pending_rebind_is_refused_by_api_and_socket_after_detach` adds both transports, active/detached state, acknowledged/unacknowledged requests, unchanged fence bytes and unchanged config. |
+| R3-M2 | PASS | `src/config.rs:1255`, `src/config.rs:3113`. `ConfigResolver::activation_snapshot`, `reload_from`, `Applied`, and `apply_locked` keep activation sequence independent of generation, reparse the applied merged table on a dirty activation, and retain the newer generation. `activation_survives_publish_gap` is retained. |
+| R3-M3 | FAIL | `src/bin/stream/tenant.rs:354`, `src/bin/stream/tenant.rs:457`, `tests/api_e2e.rs:988`, `src/destination/snowflake/runtime.rs:1489`. The named COPY and outbox tests pass, but their scope does not prove all writer ownership. `Tenant::shutdown` discards unsuccessful writer joins; `Tenant::teardown` joins Snowflake runtime writers before stopping backfill producers. Backfill `OwnedTail` stages are abort-on-drop handles outside the backfiller's writer count. See H3. |
+| R3-m1 | PASS after documentation fix | `src/ops/lock_rank.rs:14`, `src/destination/snowflake/http.rs:149`, `src/mapping.rs:513`, `src/ops/lock_rank.rs:198`. Activation snapshots precede `inner`; R10/R20/R30/R32 are checked, including mapping writes. Snowflake HTTP settings/cache locks are now explicitly documented as R31 leaves. `inversions_panic` exercises R30-under-R32, R20-under-R30 and equal-rank inversions. |
+
+The original named r3 fence and activation regressions remain in the tree;
+no existing regression test was removed.
+
+## Findings
+
+| ID | Severity | Evidence | Scenario and disposition |
+|---|---|---|---|
+| H1 | HOLD (MAJOR) | `src/ops/reload.rs:387`, `src/bin/stream/session.rs:1349`, `src/bin/stream/tenant.rs:1808` | A Rebind publication contains `force_rebind={a}`, then a Live edit or reload publishes before the session reads its watch. The second revision replaces the first and contains only its own empty force set. Reconcile compares identity, which does not cover CH scopes/pools/system columns. It leaves the old runtime attached while `rebinding_since` keeps its resolver skipped. An acknowledged Rebind can therefore never happen. Not fixed: reload/reconcile design. |
+| H2 | HOLD (MAJOR) | `src/bin/stream/tenant.rs:1420`, `src/bin/stream/tenant.rs:1626`, `src/ops/reload.rs:223` | `open_tenant` may be awaiting a destination while a mutation publishes. The opened runtime has no `built_from` revision, registers unconditionally (clearing the rebind skip), and is routed without comparing its declaration with the accepted revision. For a CH Rebind accepted before `tenant.toml` exists, no fence is written; the stale open is registered and routed without the required revision check. Activation also persists Active before checking the latest resolver revision. A crash in that window can resume old state against the new CH binding. Not fixed: registration/revision model. |
+| H3 | HOLD (MAJOR) | `src/bin/stream/tenant.rs:354`, `src/bin/stream/tenant.rs:457`, `src/bin/stream/session.rs:2411`, `src/ops/writers.rs:112`, `src/emit/pipeline/tail.rs:164` | Normal shutdown ignores `abort_and_join(false)` and returns success, allowing its caller to release reservations. Background teardown joins runtime writers before aborting backfill producers; a producer can start another runtime `spawn_blocking` after that join, because `spawn_blocking` accepts work after close. Backfill tail stages are aborted on drop but not included in its join count. These paths can report joined while a destination/state writer remains. Not fixed: teardown ownership. |
+| H4 | HOLD (MAJOR) | `src/bin/stream/tenant.rs:1509`, `src/bin/stream/tenant.rs:1524`, `src/bin/stream/tenant.rs:1745` | `persist_detached` logs a failed durable write and returns success. Detach then removes routing/floor participation anyway. On a lag eviction, the declaration remains active; after the floor advances and a crash, disk still says Active and boot can resume from WAL no longer retained. Not fixed: durable detach fence. |
+| H5 | HOLD (MAJOR) | `src/ops/tenant_service.rs:673`, `src/ops/tenant_service.rs:675`, `src/ops/tenant_service.rs:432` | SQL persistence commits the authoritative row, then rewrites the mirror. A mirror error returns before a `Written::Row` exists, so the caller treats persistence as failed and removes its rebind fence without restoring the committed row. A later successful mirror/boot can expose the accepted CH binding without its recovery fence. Not fixed: persistence/recovery protocol. This is distinct from the excluded fragment permissions/atomicity issues. |
+| H6 | HOLD (MAJOR) | `src/ops/api/handlers.rs:284`, `src/ops/api/handlers.rs:1187`, `src/ops/api/mod.rs:494` | Only the tenant service call is spawned. Operation completion, token invalidation, restore/tombstone bookkeeping remain in the request future, so request cancellation can leave an applied operation marked running. Pause/resume/reload call `apply_fragment` directly and can be cancelled after their attempt/config write but before publication/result. The global request timeout cancels the inner future. Not fixed: complete mutation ownership/cancellation boundary. |
+| H7 | HOLD (MAJOR) | `src/tenants.rs:649`, `src/tenants.rs:634`, `src/bin/stream/tenant.rs:1402` | Reservations normalize paths lexically, not canonically. A Snowflake state path reached through a symlink can alias a directory inside another tenant's spill directory while the resources appear disjoint. Attaching that other tenant clears its tenant directory, potentially unlinking the first tenant's active durable Snowflake state. RocksDB's same-directory lock does not protect a parent directory from deletion by a ClickHouse tenant. Not fixed: resource reservation model. |
+| F1 | minor | `src/ops/tenant_service.rs:341`, `src/ops/api/tests.rs:1196` | The second-Rebind check previously applied only while persisted state was not Detached and ran after acknowledgement rejection. Fixed: a pending fence is checked throughout its lifetime, before acknowledgement, for both transports. |
+| F2 | MAJOR | `src/ops/api/mod.rs:341`, `src/ops/tenant_ctl.rs:192` | Invalid bodies, missing ETags, invalid restore/token requests, and socket tenant argument errors could return before the service audit path. Fixed: authenticated handler rejections get one rejected result; service-handled requests are marked to avoid duplicates; socket tenant parsing failures are audited. |
+| F3 | MAJOR | `src/ops/redact.rs:64`, `src/ops/audit.rs:268`, `src/ops/tenant_service.rs:41` | Audit after-values did not walk arrays, and secret-named object values were left unmasked. Error strings could also enter audit/operation/API output before scrubbing. Fixed: recursive pair redaction, whole secret-field masking, and scrubbing at error storage/output boundaries. |
+| F4 | minor | `src/ops/control.rs:251`, `src/ops/api/handlers.rs:1195` | Config mutations generated a new audit request id rather than using the response id. Fixed: propagate the HTTP id; assertions require exactly the correlated attempt/result pair. |
+| F5 | minor | `src/ops/tenant_service.rs:766` | A concurrent SQL create conflict returned 412 rather than the planned 409 exists. Fixed: distinguish create conflicts from changed-since update/delete conflicts; the local SQL test checks both. |
+| F6 | minor | `docs/api.md:255`, `plans/INDEX.md:48`, `src/ops/reload.rs:5` | The crash list documentation promised backtraces although list responses omit them, and the plan index still claimed decisions were pending. Corrected. |
+| F7 | MAJOR | `src/ops/api/metrics.rs:21` | Arbitrary unauthenticated extension HTTP methods created unbounded metric-label entries. Fixed: standard methods keep their labels; extension methods share `OTHER`, asserted under method churn. |
+| F8 | minor | `src/ops/api/mod.rs:328`, `src/ops/api/tests.rs:1632` | Axum raw JSON/query/media-type errors escaped the documented JSON envelope, and oversized unauthenticated requests reached the body-limit layer before auth. Fixed: normalize framework rejections and authenticate before applying the body limit; raw malformed/missing-type/oversized request tests assert envelopes, auth priority and audit counts. |
+| F9 | minor | `src/ops/tenant_service.rs:201`, `src/ops/api/tests.rs:1727` | Rejected dry runs were audited despite the no-audit dry-run policy. Fixed for parsed dry-run requests, with invalid body/class/not-found cases proving no audit or config changes. |
+| F10 | minor | `tests/bootstrap_object_store_crash_ch.rs:192`, `tests/control_plane_e2e.rs:751` | The first full run exposed two timing assumptions: a kill can leave a resumable extraction checkpoint, and a loaded pump need not observe SIGHUP within one second. Fixed tests choose the expected recovery path from durable state and wait for a new observable pause frontier, retaining row parity/frozen-row assertions. |
+
+A related H3 failure path is `src/bin/stream/session.rs:969`: boot resume
+opens the tenant before claiming resources, warns on a conflicting claim,
+and still routes it. Retaining a failed teardown's reservation therefore
+also needs a fail-closed boot/resume path.
+
+## Tests added
+
+All tests assert behavior, using local temp files/processes and the existing
+Snowflake fake HTTP fixture. No coverage exclusion was introduced.
+
+| File | Test | Assertions |
+|---|---|---|
+| `src/ops/api/routes.rs` | `constructors_match_the_scope_and_audit_contract` | Runtime route construction matches declared method/path/scope/class/action for all routes. |
+| `src/ops/api/tests.rs` | `invalid_mutation_bodies_are_rejected_once_and_audited` | Invalid objects, ids, nulls, removed required fields and missing ETags reject without writes and with exactly one audit result. |
+| `src/ops/api/tests.rs` | `pending_rebind_is_refused_by_api_and_socket_after_detach` | Both transports reject the second Rebind before any fence/config replacement, throughout teardown and without a second ack. |
+| `src/ops/api/tests.rs` | `expired_delete_and_invalid_restore_leave_the_tenant_unchanged` | Expired confirmation gives 410, unknown restore gives 404, bad desired gives 400, and stuck/draining teardown views remain visible. |
+| `src/ops/api/tests.rs` | `single_layout_and_missing_audit_have_explicit_responses` | Single-layout tenant response is empty and explicit; missing audit returns 503. |
+| `src/ops/api/tests.rs` | `trusted_proxy_preauth_and_busy_limits_are_enforced` | XFF is honored only for trusted peers; malformed XFF falls back; capacity exhaustion gives 503, preauth exhaustion 429, query tokens 401. |
+| `src/ops/api/tests.rs` | `config_and_socket_failures_are_audited_without_unwanted_writes` | Socket validation/not-found errors audit, invalid config never persists, resolver refusal surfaces, and audit failure prevents pause writes. |
+| `src/ops/api/tests.rs` | `snowflake_views_show_retained_outbox_and_teardown_jobs` | Snowflake destination summary, retained-outbox delete warning, stuck jobs and readiness failure. |
+| `tests/api_e2e.rs` | `sql_registry_api_updates_compare_authoritative_rows_and_delete_safely` | Real daemon create/PATCH persists SQL, an external row change defeats stale If-Match with 412, poller audits it, DELETE removes only the row and retains CH data, PID is unchanged. |
+| `src/ops/tenant_service.rs` | `sql_registry_cas_and_rollback_preserve_external_edits` | Real local PG: create 409, stale CAS 412, rollback restores row/mirror, concurrent edit survives rollback conflict, uniqueness rejection and conditional delete. |
+| `src/ops/tenant_service.rs` | `storage_failures_leave_config_and_fence_unchanged` | Mismatched tenant ids and malformed fragments reject; a hand edit before CAS survives and the failed candidate's fence is removed. |
+| `src/ops/tenant_service.rs` | `fresh_snowflake_state_cannot_overlap_a_tearing_down_tenant` | A fresh path enclosing a held state directory is refused; original declaration remains. |
+| `src/ops/tenant_service.rs` | `service_errors_scrub_credentials_before_operations_store_them` | Error messages retain useful URL context while masking password/URL credentials. |
+| `src/tenants.rs` | `capability_matrix_covers_snowflake_and_instance_settings` | Reject Snowflake channel/pool/merge/ack/state settings; CH instance credential edits stay Live; system column changes Rebind; resource normalization/display/reservation lifetime. |
+| `src/tenants.rs` | `unreadable_and_unknown_fences_are_errors` | Directory/read/remove failures and unsupported fence versions surface. |
+| `src/bin/stream/tenant.rs` | `teardown_results_release_only_joined_claims` | Joined teardowns release claims; unjoined and panicked teardowns remain stuck and block replacement. |
+| `src/bin/stream/tenant.rs` | `waiting_tenants_and_external_changes_are_visible` | Waiting phase is visible; SIGHUP changes audit before/after; unchanged and internally audited revisions add no external audit. |
+| `src/destination/snowflake/runtime.rs` | `durable_enqueue_and_maintenance_keep_unapplied_batches` | Duplicate enqueue is idempotent; maintenance preserves unapplied durable data; writer count returns to zero. |
+| `src/ops/writers.rs` | `cancellation_and_debug_follow_the_writer_lifecycle` | Cancel token, live count, closed state and join result follow a held writer token. |
+| `src/source/queueing_record_sink.rs` | `close_or_abort_cancels_a_worker_that_cannot_drain` | A blocked worker times out, aborts, joins and reports the actionable drain error. |
+| `src/ops/audit.rs` | `reopening_an_empty_active_file_continues_the_rotated_chain` | Reopen continues the rotated sequence/hash and scrubs error credentials. |
+| `src/ops/crash.rs` | `backtraces_are_bounded_at_a_utf8_boundary` | Short, ASCII-long and multibyte-long backtraces preserve valid bounded strings. |
+| `src/ops/error_ring.rs` | `overflow_keeps_only_the_newest_and_truncates_utf8` | Capacity evicts oldest events and field truncation respects UTF-8. |
+| `src/ops/redact.rs` | `audit_pairs_redact_secrets_inside_arrays` | Arrays and secret-named objects mask values and retain changed/unchanged markers; date/URL forms remain useful. |
+| `src/fs.rs` | `private_writes_replace_stale_temps_and_refuse_directory_temps` | Private writers replace stale files, refuse directory temps and preserve the existing durable value. |
+| `src/ops/api/metrics.rs` | `extension_methods_share_one_metric_label` | HTTP extension-method churn creates one bounded metric label. |
+| `src/ops/api/tests.rs` | `raw_request_rejections_use_the_error_envelope_and_authenticate_first` | Malformed JSON, invalid queries, missing content types and oversized bodies have the error envelope; unauthenticated oversized requests receive 401; rejected authenticated mutations audit once. |
+| `src/ops/api/tests.rs` | `rejected_dry_runs_never_append_audit_records` | Invalid dry-run requests change neither config nor audit state. |
+| `src/ops/api/tests.rs` | `rollback_conflict_and_storage_failure_audit_their_actual_outcomes` | Real API/service refusals audit rolled-back/conflict/failed distinctly, preserve external edits and existing files, and scrub invalid-config errors. |
+
+The existing `every_mutation_is_audited` test additionally checks HTTP audit
+request-id correlation. The API harness gains a SQL-registry option.
+
+## Validation and coverage
+
+**Final full PG18 result: 1963 passed, 0 failed, 9 skipped.** The nextest
+test phase took 332.563 s (build/report time is additional).
+
+| Metric | Final result |
+|---|---:|
+| Local PG18 missed lines | **8062** |
+| Projected merged missed, `7052 + (8062 - 7978)` | **7136** |
+| Requested target | **<= 7140: met** |
+| Unchanged CI ceiling | 7200 |
+| Added instrumented lines | 7497 |
+| Added missed lines | 141 |
+| Added-line coverage | **98.1%** |
+| New tests | **29**, all passed |
+| Exclusions | **none** |
+
+The projection uses the requester's main/PG18 calibration; no merged
+PG16/17/18/19 CI run was dispatched or claimed. The final local missed total
+is 323 lower than the supplied 8385 baseline.
+
+The final gating set passed **51/51**:
+
+- `api_e2e`: 4 passed.
+- `control_plane_e2e`: 32 passed.
+- `multi_tenant_e2e`: 2 passed.
+- `runtime_config_e2e`: 13 passed.
+
+Final formatting, clippy (workspace/all-targets, warnings denied) and
+rustdoc (lib/bins, warnings denied) all exited 0. `git diff --check` passed.
+The two regenerated tracked fixture files were restored after both full
+runs. HEAD remains `e9a231e`; all 27 authored paths remain uncommitted.
+No run container remains. The final cargo target was 56991324 KiB
+(about 54.4 GiB); the stop conditions were not reached.
+
+Evidence:
+
+- `coverage/llvm-test.log`: final full test results, including the named r3 regressions.
+- `coverage/cov-summary.txt` and `coverage/lcov.info`: final reports.
+- `/tmp/t1021-dev/sol-missed-final.txt`: regenerated final missed-added inventory and projection.
+- `coverage/sol-clippy.log`, `coverage/sol-fmt.log`, `coverage/sol-doc.log`: final checks.
+- `coverage/sol-first-llvm-test.log`, `coverage/sol-first-cov-summary.txt`: first full run retained for comparison.
+
+First full measurement: 1959 run, 1957 passed, 2 failed, 9 skipped. The two failed tests are described in F10 and were corrected afterward. Local PG18 missed = 8037; projected merged = 7111; added lines = 7449 instrumented, 149 missed, 98.0% covered. The final full run supersedes this earlier measurement.
+
+Targeted runs:
+
+- 39 passed, 0 failed (API/redaction).
+- 203 passed, 0 failed (ops, tenants, supervision, runtime enqueue, private writes).
+- 63 passed, 0 failed, including all 4 API e2es (one slow).
+- 58 passed, 0 failed after final edge-case changes, including both corrected integration tests.
+
+All cargo commands use `NAME=t1021-run-sol JOBS=8 /tmp/t1021-dev/run.sh`
+and `CARGO_PROFILE_DEV_DEBUG=line-tables-only`. Tests use only
+`cargo llvm-cov nextest`; no plain cargo test/nextest/build was run.
+
+Coverage exclusions: **none**. `MAX_MISSED_LINES=7200` is unchanged.
+
+## Files changed
+
+- `docs/api.md`
+- `plans/INDEX.md`
+- `plans/http_api_review_r1.md`
+- `src/bin/stream/tenant.rs`
+- `src/destination/snowflake/http.rs`
+- `src/destination/snowflake/runtime.rs`
+- `src/fs.rs`
+- `src/ops/api/handlers.rs`
+- `src/ops/api/metrics.rs`
+- `src/ops/api/mod.rs`
+- `src/ops/api/routes.rs`
+- `src/ops/api/tests.rs`
+- `src/ops/audit.rs`
+- `src/ops/control.rs`
+- `src/ops/crash.rs`
+- `src/ops/error_ring.rs`
+- `src/ops/lock_rank.rs`
+- `src/ops/redact.rs`
+- `src/ops/reload.rs`
+- `src/ops/tenant_ctl.rs`
+- `src/ops/tenant_service.rs`
+- `src/ops/writers.rs`
+- `src/source/queueing_record_sink.rs`
+- `src/tenants.rs`
+- `tests/api_e2e.rs`
+- `tests/bootstrap_object_store_crash_ch.rs`
+- `tests/control_plane_e2e.rs`
+
+## Commands
+
+Every cargo command runs inside the prescribed wrapper with
+`NAME=t1021-run-sol JOBS=8` and
+`export CARGO_PROFILE_DEV_DEBUG=line-tables-only`. Local integration runs
+also set `WALSHADOW_USE_LOCAL=1`.
+
+The initial strict rustdoc check failed on one unresolved and two redundant
+intra-doc links in the API/reload modules. Those links were corrected;
+subsequent strict checks, including the final check, passed.
+
+Final checks:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --lib --bins
+```
+
+Each full run uses the prescribed fixture captures, then:
+
+```text
+cargo llvm-cov clean --workspace
+cargo llvm-cov nextest --workspace --all-targets --locked --no-report --no-fail-fast
+cargo llvm-cov report --summary-only
+cargo llvm-cov report --lcov --output-path coverage/lcov.info
+```
+
+Fixtures are restored afterward with the explicitly permitted
+`git checkout -- fixtures/wal`. Projection and missed-line inventory use:
+
+```text
+python3 -I /tmp/t1021-dev/added_cov.py --list
+```
+
+Clippy typechecks all Rust workspace targets; the full instrumented run
+also compiles every target. This is a Rust workspace, so Bun/oxlint/oxfmt
+and TypeScript checks do not apply.
+
+Targeted instrumented commands (all passed):
+
+```text
+cargo llvm-cov nextest --no-report --lib -E 'test(ops::api) | test(ops::redact)'
+cargo llvm-cov nextest --no-report --lib --bins -E 'test(ops::) | test(tenants::) | test(tenant::tests) | test(close_or_abort) | test(durable_enqueue_and_maintenance) | test(private_writes)'
+cargo llvm-cov nextest --no-report --lib --bins --test api_e2e -E 'test(ops::api) | test(ops::redact) | test(tenant_service) | binary(api_e2e) | test(tenant::tests)'
+cargo llvm-cov nextest --no-report --lib --test bootstrap_object_store_crash_ch --test control_plane_e2e -E 'test(ops::api) | test(ops::tenant_service) | test(killed_object_store_bootstrap_finishes_after_restart) | test(pause_resume_via_ctl_and_sighup_no_restart)'
+```

@@ -331,7 +331,9 @@ async fn walk_and_ship(
         "backup_backfill",
     )
     .await
-    .map_err(anyhow::Error::msg)?;
+    .map_err(anyhow::Error::msg)?
+    // Counted with the pass, so a teardown waits for its stages too
+    .counted(ctx.writer.clone());
 
     let result: Result<_> = async {
         let mut checkpoint = ctx.checkpoint.clone();
@@ -599,36 +601,44 @@ async fn run_walk(
     // data_dir is never written: PageWalkSink only Taps/Skips
     let data_dir = ctx.scratch_dir.join("void");
     tokio::fs::create_dir_all(&data_dir).await.ok();
-    let gate = tokio::spawn(gate_task(
-        walk_rx,
-        gated_tx,
-        filter.clone(),
-        patch,
-        walk_ok_rx,
-        gate_spool,
-        PendingSpool::new(pending_spool_path, filter.clone()),
-        barrier.clone(),
-    ));
-    let drain = tokio::spawn(bootstrap::drain(
-        gated_rx,
-        filter.clone(),
-        freeze_routes(
-            &ctx.mapping.snapshot().await,
-            ctx.config_rx
-                .as_ref()
-                .map(|rx| rx.borrow().clone())
-                .as_deref(),
-            &ctx.dest.current().row_policy(),
+    // Aborted with the pass that awaits them, and counted as the
+    // backfiller's writers until they end
+    let gate = spawn_owned(
+        ctx.writer.clone(),
+        gate_task(
+            walk_rx,
+            gated_tx,
+            filter.clone(),
+            patch,
+            walk_ok_rx,
+            gate_spool,
+            PendingSpool::new(pending_spool_path, filter.clone()),
+            barrier.clone(),
         ),
-        tail.msg_tx.clone(),
-        tail.ack.clone(),
-        ctx.stats.clone(),
-        resolver.clone(),
-        bootstrap::Deferral::Handback(toast_spool),
-        HashSet::new(),
-        ctx.dest.current().snowflake.is_some(),
-        barrier.clone(),
-    ));
+    );
+    let drain = spawn_owned(
+        ctx.writer.clone(),
+        bootstrap::drain(
+            gated_rx,
+            filter.clone(),
+            freeze_routes(
+                &ctx.mapping.snapshot().await,
+                ctx.config_rx
+                    .as_ref()
+                    .map(|rx| rx.borrow().clone())
+                    .as_deref(),
+                &ctx.dest.current().row_policy(),
+            ),
+            tail.msg_tx.clone(),
+            tail.ack.clone(),
+            ctx.stats.clone(),
+            resolver.clone(),
+            bootstrap::Deferral::Handback(toast_spool),
+            HashSet::new(),
+            ctx.dest.current().snowflake.is_some(),
+            barrier.clone(),
+        ),
+    );
 
     // Success signal before the joins: gate resolves deferred tuples only
     // against a complete pg_xact accum; a failed source drops the sender
@@ -1108,6 +1118,22 @@ impl RecordSink for PrescanSink {
         self.observe(record);
         Box::pin(std::future::ready(Ok(())))
     }
+}
+
+/// Spawn a child of a backup pass: aborted when the pass drops it, and
+/// holding `writer` until its future ends
+fn spawn_owned<F>(
+    writer: Option<crate::ops::writers::WriterToken>,
+    fut: F,
+) -> tokio_util::task::AbortOnDropHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let _writer = writer;
+        fut.await
+    }))
 }
 
 #[cfg(test)]

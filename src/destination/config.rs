@@ -211,12 +211,21 @@ impl DestinationConfig {
                     !root.contains_key("ch"),
                     "[ch] cannot be combined with the Snowflake destination"
                 );
-                let config: SnowflakeConfig = root
+                let mut config: SnowflakeConfig = root
                     .get("snowflake")
                     .context("Snowflake destination requires [snowflake]")?
                     .clone()
                     .try_into()?;
                 config.validate()?;
+                // Absolute from here on, so every comparison between state
+                // directories, and every reservation, sees one spelling
+                config.state.directory = std::path::absolute(&config.state.directory)
+                    .with_context(|| {
+                        format!(
+                            "snowflake.state.directory {}: cannot make it absolute",
+                            config.state.directory.display()
+                        )
+                    })?;
                 Ok(Self {
                     kind: selection.kind,
                     snowflake: Some(config),

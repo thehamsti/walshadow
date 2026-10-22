@@ -165,6 +165,31 @@ impl PipelineHandle {
             None => Ok(()),
         }
     }
+
+    /// [`join`](Self::join) until `deadline`, then abort the stages still
+    /// running and wait up to `abort_wait` for them to end
+    pub async fn join_or_abort(
+        self,
+        deadline: tokio::time::Instant,
+        abort_wait: std::time::Duration,
+    ) -> PipelineStop {
+        let (drained, joined) = self.tail.join_or_abort(deadline, abort_wait).await;
+        PipelineStop {
+            drained,
+            joined,
+            fatal: self.fatal.message(),
+        }
+    }
+}
+
+/// How a [`PipelineHandle::join_or_abort`] ended
+#[derive(Debug)]
+pub struct PipelineStop {
+    /// Every stage drained before the deadline
+    pub drained: bool,
+    /// Every stage has ended, drained or aborted
+    pub joined: bool,
+    pub fatal: Option<String>,
 }
 
 impl PipelineConfig {

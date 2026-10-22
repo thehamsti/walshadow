@@ -87,3 +87,38 @@ pub(crate) async fn retry_server(
     });
     (config, server)
 }
+
+/// A server that completes the handshake, takes the query that follows and
+/// never answers it: an insert sent to it blocks until the client goes
+/// away. `closed` fires once the client's connection has
+pub(crate) async fn stalled_server() -> (EmitterConfig, tokio::sync::oneshot::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = EmitterConfig {
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            compression: CompressionChoice::None,
+            ..Default::default()
+        },
+        ..EmitterConfig::default()
+    };
+    let (closed_tx, closed) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut hello = [0; 1024];
+        assert!(stream.read(&mut hello).await.unwrap() > 0);
+        // The same hello, quota addendum and ping as `retry_server`
+        stream
+            .write_all(&[
+                0, 0, 1, 0, 0xbe, 0xa9, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ])
+            .await
+            .unwrap();
+        assert_eq!(stream.read_u16().await.unwrap(), 0x0004);
+        stream.write_all(&[4]).await.unwrap();
+        let mut query = [0; 4096];
+        while stream.read(&mut query).await.is_ok_and(|n| n > 0) {}
+        let _ = closed_tx.send(());
+    });
+    (config, closed)
+}

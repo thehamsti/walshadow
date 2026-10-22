@@ -508,11 +508,21 @@ impl MappingCell {
             .then_some(guard)
     }
 
+    /// Write side ranks [`MAPPING_WRITE`](crate::ops::lock_rank::MAPPING_WRITE):
+    /// taken alone or under a resolver, and its holders take nothing ranked
     pub async fn mutate<R>(&self, f: impl FnOnce(&mut MappingSnapshot) -> R) -> R {
+        let _rank = crate::ops::lock_rank::RankToken::enter(
+            crate::ops::lock_rank::MAPPING_WRITE,
+            "mapping.write",
+        );
         f(&mut *self.inner.write().await)
     }
 
     pub async fn publish(&self, tables: MappingSnapshot) {
+        let _rank = crate::ops::lock_rank::RankToken::enter(
+            crate::ops::lock_rank::MAPPING_WRITE,
+            "mapping.write",
+        );
         *self.inner.write().await = tables;
     }
 }

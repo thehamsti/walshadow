@@ -26,6 +26,7 @@ PostgreSQL major version
 - [Destination tables](docs/destination-tables.md)
 - [Schema changes](docs/schema-changes.md)
 - [Operations](docs/operations.md)
+- [HTTP API](docs/api.md), authenticated health, metrics, crash reports, jobs and tenant control
 - [Planned source switchover](docs/failover.md)
 - [Current limitations](docs/limitations.md)
 

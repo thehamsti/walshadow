@@ -93,9 +93,80 @@ pub async fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()
     fsync_dir(dir).await
 }
 
+/// Blocking [`fsync_dir`], for code already off the runtime
+pub fn sync_dir_blocking(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Blocking [`write_private`], for code already off the runtime (or with
+/// none, like a panic hook)
+pub fn write_private_blocking(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp_path = dir.join(format!("{name}.tmp"));
+    match std::fs::remove_file(&tmp_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp_path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp_path, dir.join(name))?;
+    sync_dir_blocking(dir)
+}
+
+/// [`write_atomic`] for files only the daemon may read: the temp file is
+/// created 0600 before any byte lands in it, and an existing temp is
+/// replaced rather than reused with its old mode
+pub async fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let tmp_path = dir.join(format!("{name}.tmp"));
+    match tokio::fs::remove_file(&tmp_path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp_path)
+        .await?;
+    f.write_all(bytes).await?;
+    f.sync_all().await?;
+    drop(f);
+    tokio::fs::rename(&tmp_path, dir.join(name)).await?;
+    fsync_dir(dir).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn write_private_is_owner_only_and_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A stale temp with wide permissions is replaced, not reused
+        std::fs::write(dir.path().join("k.tmp"), b"stale").unwrap();
+        std::fs::set_permissions(
+            dir.path().join("k.tmp"),
+            std::fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        write_private(dir.path(), "k", b"one").await.unwrap();
+        write_private(dir.path(), "k", b"two").await.unwrap();
+        let path = dir.path().join("k");
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(!dir.path().join("k.tmp").exists());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn write_atomic_replaces_and_cleans_tmp() {
@@ -139,5 +210,17 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+    #[tokio::test]
+    async fn private_writes_replace_stale_temps_and_refuse_directory_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("key.tmp"), b"stale").unwrap();
+        write_private_blocking(dir.path(), "key", b"fresh").unwrap();
+        assert_eq!(std::fs::read(dir.path().join("key")).unwrap(), b"fresh");
+        std::fs::create_dir(dir.path().join("blocked.tmp")).unwrap();
+        assert!(write_private_blocking(dir.path(), "blocked", b"no").is_err());
+        assert!(write_private(dir.path(), "blocked", b"no").await.is_err());
+        assert!(!dir.path().join("blocked").exists());
+        assert_eq!(std::fs::read(dir.path().join("key")).unwrap(), b"fresh");
     }
 }

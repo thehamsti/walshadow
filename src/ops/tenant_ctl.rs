@@ -19,10 +19,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use toml::{Table, Value};
 
-use crate::control::{SharedCtx, ok, ok_toml};
-use crate::tenants::{
-    Registry, TenantDecl, TenantsConfig, decls_from_rows, registry_ddl, validate_id,
-};
+use crate::control::{ReloadTx, SharedCtx, ok, ok_toml};
+use crate::ops::audit::Actor;
+use crate::ops::tenant_service::{Mutation, ServiceError, TenantService};
+use crate::tenants::{TenantDecl, TenantsConfig, decls_from_rows, registry_ddl, validate_id};
 
 /// Fragment the config registry keeps for tenant `id`
 pub fn tenant_fragment_path(config: &Path, id: &str) -> PathBuf {
@@ -48,6 +48,12 @@ fn tenants_of(root: &Table) -> Result<TenantsConfig> {
 /// Every tenant parses and every tenant's effective config parses: what
 /// the daemon checks at boot, so an accepted change stays restart-safe
 pub fn validate(root: &Table) -> Result<()> {
+    validate_with(root, None)
+}
+
+/// [`validate`], and, with the daemon's spill directory, no Snowflake state
+/// directory among the tenants' spill directories
+pub fn validate_with(root: &Table, spill_dir: Option<&Path>) -> Result<()> {
     crate::tenants::reject_database_sections(root)?;
     let Some(tenants) = TenantsConfig::from_table(root)? else {
         return check_destination(root);
@@ -56,7 +62,8 @@ pub fn validate(root: &Table) -> Result<()> {
         check_destination(&decl.effective_table(root))
             .with_context(|| format!("tenant {}", decl.id))?;
     }
-    ensure_distinct_destinations(root, &tenants)
+    ensure_distinct_destinations(root, &tenants)?;
+    crate::tenants::check_state_dirs(root, &tenants, spill_dir)
 }
 
 /// The destination section and table rules parse, and a Snowflake
@@ -77,7 +84,6 @@ fn check_destination(root: &Table) -> Result<()> {
 /// state locks
 fn ensure_distinct_destinations(root: &Table, tenants: &TenantsConfig) -> Result<()> {
     let mut seen_snowflake = std::collections::BTreeMap::new();
-    let mut seen_state = std::collections::BTreeMap::new();
     let mut seen_ch = std::collections::BTreeMap::new();
     for decl in &tenants.decls {
         let eff = decl.effective_table(root);
@@ -93,13 +99,6 @@ fn ensure_distinct_destinations(root: &Table, tenants: &TenantsConfig) -> Result
                      its own database",
                     decl.id,
                     sf.database,
-                );
-            }
-            if let Some(other) = seen_state.insert(sf.state.directory.clone(), decl.id.clone()) {
-                bail!(
-                    "tenants {other} and {} share Snowflake state directory {}",
-                    decl.id,
-                    sf.state.directory.display()
                 );
             }
         } else if eff.contains_key("ch") {
@@ -171,161 +170,127 @@ pub async fn show(ctx: &SharedCtx, body: &Table) -> Result<String> {
     Ok(ok_toml(&crate::control::masked(decl.to_fragment())))
 }
 
-pub async fn put(ctx: &SharedCtx, body: &Table) -> Result<String> {
-    let (id, tenant_body) = single_tenant(body)?;
-    let decl = TenantDecl::parse(&id, &tenant_body)?;
-    let root = merged(ctx).await?;
-    let tenants = tenants_of(&root)?;
-    match tenants.registry {
-        Registry::Config => {
-            let path = tenant_fragment_path(&ctx.ch_config, &id);
-            write_validated(ctx, &path, Some(decl.to_fragment())).await?
+/// Socket mutations go through [`TenantService`], with `ctl`'s
+/// compatibility: identity re-binds and attaches need no acknowledgement
+fn socket_mutation(body: &Table, actor: &Actor, action: &str) -> Mutation {
+    let mut m = Mutation::new(uuid::Uuid::new_v4().simple().to_string());
+    m.actor = actor.clone();
+    m.action = action.into();
+    m.legacy_ack = true;
+    m.acknowledge_resync = body
+        .get("acknowledge_resync")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    m
+}
+
+fn socket_err(e: ServiceError) -> anyhow::Error {
+    anyhow!("{} ({})", e.message, e.code)
+}
+
+async fn parsed<T>(ctx: &SharedCtx, actor: &Actor, action: &str, result: Result<T>) -> Result<T> {
+    if let Err(e) = &result
+        && let Some(log) = ctx.reloader.audit()
+    {
+        let draft = crate::ops::audit::Draft {
+            request_id: uuid::Uuid::new_v4().simple().to_string(),
+            phase: "result".into(),
+            actor: actor.clone(),
+            action: action.into(),
+            outcome: "rejected".into(),
+            error: Some(format!("{e:#}")),
+            ..Default::default()
+        };
+        if let Err(e) = log.append(draft).await {
+            tracing::error!(target: "walshadow::audit", error = %e, "could not audit a rejected socket mutation");
         }
-        Registry::Sql { schema, .. } => {
-            let mut spec = decl.to_fragment();
-            let spec = spec
-                .get_mut("tenant")
-                .and_then(|t| t.get_mut(&id))
-                .and_then(Value::as_table_mut)
-                .map(std::mem::take)
-                .unwrap_or_default();
-            let mut spec = spec;
-            spec.remove("dbname");
-            let state = match spec
-                .remove("state")
-                .and_then(|v| v.as_str().map(str::to_owned))
-            {
-                Some(s) => s,
-                None => "active".into(),
+    }
+    result
+}
+
+pub async fn put(ctx: &SharedCtx, body: &Table, actor: &Actor) -> Result<String> {
+    let (id, decl) = parsed(
+        ctx,
+        actor,
+        "tenant.put",
+        (|| {
+            let (id, tenant_body) = single_tenant(body)?;
+            let decl = TenantDecl::parse(&id, &tenant_body)?;
+            Ok((id, decl))
+        })(),
+    )
+    .await?;
+    TenantService::new(ctx.clone(), None)
+        .mutate(&id, &socket_mutation(body, actor, "tenant.put"), |_| {
+            Ok(Some(decl))
+        })
+        .await
+        .map_err(socket_err)?;
+    Ok(ok())
+}
+
+pub async fn remove(ctx: &SharedCtx, body: &Table, actor: &Actor) -> Result<String> {
+    let id = parsed(ctx, actor, "tenant.remove", id_of(body)).await?;
+    TenantService::new(ctx.clone(), None)
+        .mutate(
+            &id,
+            &socket_mutation(body, actor, "tenant.remove"),
+            |current| match current {
+                Some(_) => Ok(None),
+                None => Err(ServiceError::new(404, "not_found", "no such tenant")),
+            },
+        )
+        .await
+        .map_err(socket_err)?;
+    Ok(ok())
+}
+
+pub async fn set_state(ctx: &SharedCtx, body: &Table, actor: &Actor) -> Result<String> {
+    let (id, desired) = parsed(
+        ctx,
+        actor,
+        "tenant.state",
+        (|| {
+            let id = id_of(body)?;
+            let state = body
+                .get("state")
+                .and_then(Value::as_str)
+                .context("state = \"active\" or \"detached\" required")?;
+            let desired = match state {
+                "active" => crate::tenants::Desired::Active,
+                "detached" => crate::tenants::Desired::Detached,
+                _ => bail!("state must be active or detached"),
             };
-            // Validate the would-be merged config before the row lands
-            let mut preview = root.clone();
-            crate::ch_emitter::merge_tables(&mut preview, decl.to_fragment());
-            validate(&preview)?;
-            let client = crate::control::pg_connect(&root, None).await?;
-            client.batch_execute(&registry_ddl(&schema)).await?;
-            let s = crate::pg::quote_ident(&schema);
-            client
-                .execute(
-                    &format!(
-                        "INSERT INTO {s}.tenant (id, dbname, spec, state, updated_at) \
-                         VALUES ($1, $2, $3, $4, now()) \
-                         ON CONFLICT (id) DO UPDATE SET dbname = EXCLUDED.dbname, \
-                         spec = EXCLUDED.spec, state = EXCLUDED.state, updated_at = now()"
-                    ),
-                    &[&id, &decl.dbname, &toml::to_string(&spec)?, &state],
-                )
-                .await
-                .context("upsert registry row")?;
-            mirror_registry(&ctx.ch_config, &root, &schema).await?;
-        }
-    }
-    ctx.reloader.reload().await?;
-    Ok(ok())
-}
-
-pub async fn remove(ctx: &SharedCtx, body: &Table) -> Result<String> {
-    let id = id_of(body)?;
-    let root = merged(ctx).await?;
-    let tenants = tenants_of(&root)?;
-    ensure!(tenants.get(&id).is_some(), "no tenant {id}");
-    match tenants.registry {
-        Registry::Config => {
-            let path = tenant_fragment_path(&ctx.ch_config, &id);
-            ensure!(
-                tokio::fs::try_exists(&path).await.unwrap_or(false),
-                "tenant {id} is declared outside {}; edit the operator config to remove it",
-                path.display()
-            );
-            write_validated(ctx, &path, None).await?
-        }
-        Registry::Sql { schema, .. } => {
-            let client = crate::control::pg_connect(&root, None).await?;
-            let s = crate::pg::quote_ident(&schema);
-            client
-                .execute(&format!("DELETE FROM {s}.tenant WHERE id = $1"), &[&id])
-                .await?;
-            mirror_registry(&ctx.ch_config, &root, &schema).await?;
-        }
-    }
-    ctx.reloader.reload().await?;
-    Ok(ok())
-}
-
-pub async fn set_state(ctx: &SharedCtx, body: &Table) -> Result<String> {
-    let id = id_of(body)?;
-    let state = body
-        .get("state")
-        .and_then(Value::as_str)
-        .context("state = \"active\" or \"detached\" required")?;
-    ensure!(
-        matches!(state, "active" | "detached"),
-        "state must be active or detached"
-    );
-    let root = merged(ctx).await?;
-    let tenants = tenants_of(&root)?;
-    let decl = tenants
-        .get(&id)
-        .with_context(|| format!("no tenant {id}"))?;
-    let mut next = decl.clone();
-    next.desired = if state == "active" {
-        crate::tenants::Desired::Active
-    } else {
-        crate::tenants::Desired::Detached
+            Ok((id, desired))
+        })(),
+    )
+    .await?;
+    let action = match desired {
+        crate::tenants::Desired::Active => "tenant.attach",
+        crate::tenants::Desired::Detached => "tenant.detach",
     };
-    match tenants.registry {
-        Registry::Config => {
-            let path = tenant_fragment_path(&ctx.ch_config, &id);
-            write_validated(ctx, &path, Some(next.to_fragment())).await?
-        }
-        Registry::Sql { schema, .. } => {
-            let client = crate::control::pg_connect(&root, None).await?;
-            let s = crate::pg::quote_ident(&schema);
-            client
-                .execute(
-                    &format!("UPDATE {s}.tenant SET state = $2, updated_at = now() WHERE id = $1"),
-                    &[&id, &state],
-                )
-                .await?;
-            mirror_registry(&ctx.ch_config, &root, &schema).await?;
-        }
-    }
-    ctx.reloader.reload().await?;
+    TenantService::new(ctx.clone(), None)
+        .mutate(&id, &socket_mutation(body, actor, action), |current| {
+            let mut next = current
+                .cloned()
+                .ok_or_else(|| ServiceError::new(404, "not_found", "no such tenant"))?;
+            next.desired = desired;
+            Ok(Some(next))
+        })
+        .await
+        .map_err(socket_err)?;
     Ok(ok())
-}
-
-/// Write or delete `path`, keeping the change only if the merged config
-/// still validates
-async fn write_validated(ctx: &SharedCtx, path: &Path, fragment: Option<Table>) -> Result<()> {
-    let _guard = ctx.frag_lock.lock().await;
-    let prev = tokio::fs::read(path).await.ok();
-    match &fragment {
-        Some(f) => {
-            if let Some(dir) = path.parent() {
-                tokio::fs::create_dir_all(dir).await?;
-            }
-            tokio::fs::write(path, toml::to_string(f)?).await?;
-        }
-        None => {
-            let _ = tokio::fs::remove_file(path).await;
-        }
-    }
-    let check = async { validate(&merged(ctx).await?) }.await;
-    if let Err(e) = check {
-        match prev {
-            Some(bytes) => tokio::fs::write(path, bytes).await?,
-            None => {
-                let _ = tokio::fs::remove_file(path).await;
-            }
-        }
-        return Err(e).context("rejected: merged config invalid");
-    }
-    Ok(())
 }
 
 /// Rewrite the registry mirror from the rows; returns whether it changed.
-/// The daemon polls this, so rows edited straight in SQL also take effect
-pub async fn mirror_registry(config: &Path, root: &Table, schema: &str) -> Result<bool> {
+/// The daemon polls this, so rows edited straight in SQL also take effect.
+/// `_tx` proves the reload lock is held: every mirror writer serializes on it
+pub async fn mirror_registry(
+    _tx: &ReloadTx<'_>,
+    config: &Path,
+    root: &Table,
+    schema: &str,
+) -> Result<bool> {
     let client = crate::control::pg_connect(root, None).await?;
     client.batch_execute(&registry_ddl(schema)).await?;
     let s = crate::pg::quote_ident(schema);

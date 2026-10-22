@@ -1048,6 +1048,7 @@ mod tests {
             apply_failed: std::sync::OnceLock::new(),
             landed: Default::default(),
             last_cleanup: Default::default(),
+            writers: crate::ops::writers::WriterSet::new(),
         };
         let old = schema(vec![(1, "id")]);
         let record = SchemaChangeRecord {
@@ -1135,6 +1136,7 @@ mod tests {
             apply_failed: std::sync::OnceLock::new(),
             landed: Default::default(),
             last_cleanup: Default::default(),
+            writers: crate::ops::writers::WriterSet::new(),
         };
         runtime
             .drop_relation_at(7, &RelName::new("PUBLIC", "T"), 100)

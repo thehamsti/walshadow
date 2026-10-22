@@ -188,6 +188,18 @@ async fn killed_object_store_bootstrap_finishes_after_restart() {
         Some(backup_name.as_str()),
         "the first attempt must pin what it resolved, so the retry reloads it",
     );
+    // The kill can land after the extraction checkpoint but before bootstrap completes.
+    let recovery = if walshadow::bootstrap_marker::resumable_extraction(
+        &daemon.shadow_data_dir,
+        mid_flight.backup_name.as_deref(),
+    )
+    .expect("read the interrupted extraction checkpoint")
+    .is_some()
+    {
+        "resuming an incomplete bootstrap past extraction"
+    } else {
+        "discarding an incomplete bootstrap"
+    };
 
     let second = daemon
         .spawn_mode(
@@ -228,8 +240,8 @@ async fn killed_object_store_bootstrap_finishes_after_restart() {
         }
         let log = daemon.stderr();
         anyhow::ensure!(
-            log.contains("discarding an incomplete bootstrap"),
-            "restart did not re-extract; it took some other path:\n{log}",
+            log.contains(recovery),
+            "restart did not follow its durable checkpoint ({recovery}):\n{log}",
         );
         Ok(())
     })();

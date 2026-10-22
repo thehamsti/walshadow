@@ -128,6 +128,12 @@ async fn session_body(
             .with_context(|| format!("load config {}", p.display()))?,
         None => cli_base(args),
     };
+    // The revision this session boots from. The tenant reconcile follows
+    // every later revision the Reloader publishes, in order, and never
+    // re-reads the files itself
+    let mut revisions = reloader.subscribe();
+    reloader.seed(merged.clone()).await;
+    revisions.borrow_and_update();
     // Applied source endpoint. Boot resolves it file-over-CLI; a later reload
     // republishes it on the config watch and the pump swaps its feed.
     let mut source_conn =
@@ -151,7 +157,7 @@ async fn session_body(
         "source identified",
     );
 
-    walshadow::ops::tenant_ctl::validate(&merged)?;
+    walshadow::ops::tenant_ctl::validate_with(&merged, Some(&args.spill_dir))?;
     let mut tenants_cfg = walshadow::tenants::TenantsConfig::from_table(&merged)
         .context("parse [tenants] / [tenant.*]")?;
     if let Some(tcfg) = &tenants_cfg {
@@ -948,12 +954,31 @@ async fn session_body(
             )
             .await?;
             for decl in active {
-                match supervisor
+                // Claimed before it opens, failing closed: resuming next to
+                // a writer an earlier session left running would share its
+                // destination
+                tenant::claim_resumed(reloader.reservations(), decl, &merged, &args.spill_dir)?;
+                let booted = supervisor
                     .boot_existing(
                         &shared, args, &merged, tcfg, decl, raw_start, aligned, reloader,
                     )
-                    .await
-                {
+                    .await;
+                if !matches!(booted, Ok(Some(_))) {
+                    // A fresh attach claims again, waiting out any conflict
+                    reloader.reservations().release(&decl.id);
+                }
+                match booted {
+                    Ok(Some((t, sink, _))) if reloader.is_rebinding(&decl.id) => {
+                        tenant::discard_superseded(
+                            &mut supervisor,
+                            reloader,
+                            t,
+                            sink,
+                            decl,
+                            &args.spill_dir,
+                        )
+                        .await;
+                    }
                     Ok(Some((t, sink, from_lsn))) => {
                         for db in &t.db_oids {
                             stream.filter_mut().add_target_db(*db);
@@ -974,9 +999,14 @@ async fn session_body(
                             error = %format!("{e:#}"),
                             "tenant failed to open; detaching it, other tenants continue",
                         );
-                        supervisor
-                            .record_detached(&args.spill_dir, decl, format!("open failed: {e:#}"))
-                            .await;
+                        // Never routed, so nothing waits on the record
+                        supervisor.forget(&decl.id);
+                        tenant::persist_detached_logged(
+                            &args.spill_dir,
+                            decl,
+                            format!("open failed: {e:#}"),
+                        )
+                        .await;
                     }
                 }
             }
@@ -1134,6 +1164,8 @@ async fn session_body(
     // Streaming publish cadence; idle ticks and segment advances always publish
     const PUBLISH_MIN_INTERVAL: Duration = Duration::from_millis(50);
     let mut last_publish = Instant::now();
+    // Initial-load views refresh less often than the rest of a publish
+    let mut last_jobs: Option<Instant> = None;
     // Inflight-stall watchdog: xacts_active > 0 with stalled
     // `emitter_ack_lsn` dumps the parked xids holding the slot. One-shot
     // per stall, re-arms when ack advances.
@@ -1143,11 +1175,12 @@ async fn session_body(
     // Pump reads `paused` and the source endpoint live off the resolver watch;
     // when paused it idles (stops consuming source WAL) without tearing
     // anything down, and a moved `[source]` swaps the feed in place.
-    // Pause and the source endpoint are cluster-wide, so the primary's
-    // resolver is the one the pump watches
-    let pump_config_rx = config_resolver
+    // Pause and the source endpoint are cluster-wide: with tenants the
+    // cluster resolver, which no detach or re-bind drops, else the
+    // primary's
+    let pump_config_rx = cluster_resolver
         .as_ref()
-        .or(cluster_resolver.as_ref())
+        .or(config_resolver.as_ref())
         .map(|r| r.subscribe());
     let mut swap = SourceSwap::default();
     // Frontier frozen when the pump observes a pause, so a promotion decision
@@ -1315,34 +1348,42 @@ async fn session_body(
                 }
             }
         }
-        // Tenant lifecycle, between chunks where no record is mid-flight
+        // Config revisions, between chunks where no record is mid-flight.
+        // Every resolver already applied the revision before it published;
+        // the session acts on exactly that merged config
+        let revision = revisions
+            .has_changed()
+            .unwrap_or(false)
+            .then(|| revisions.borrow_and_update().clone());
+        // Tenant lifecycle
         if tenants_cfg.is_some() {
-            // A reload (control socket, SIGHUP) may add, remove, detach or
-            // re-bind tenants; tenant resolvers already took their own knobs
-            if reloader.take_reconcile()
-                && let Some(path) = args.ch_config.as_deref()
-            {
-                match walshadow::ch_emitter::load_effective(path, cli_base(args))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-                    .and_then(|m| {
-                        walshadow::ops::tenant_ctl::validate(&m)?;
-                        walshadow::tenants::TenantsConfig::from_table(&m).map(|t| (m, t))
+            // A revision (HTTP API, control socket, SIGHUP, SQL registry) may
+            // add, remove, detach or re-bind tenants
+            if let Some(rev) = &revision {
+                match walshadow::ops::tenant_ctl::validate_with(&rev.merged, Some(&args.spill_dir))
+                    .and_then(|()| {
+                        walshadow::tenants::TenantsConfig::from_table(&rev.merged)
+                            .map(|t| ((*rev.merged).clone(), t))
                     }) {
                     Ok((next_merged, Some(next))) => {
                         let old = tenants_cfg.take().expect("tenants mode");
+                        if rev.cause.is_external() {
+                            tenant::audit_external(reloader, rev, &old, &next);
+                        }
                         let plan = tenant::reconcile_plan(
                             &old,
                             &next,
                             &merged,
                             &next_merged,
                             tenants.iter().map(|t| t.id.as_str()),
+                            &tenant::pending_rebinds(rev, reloader),
                         );
                         merged = next_merged;
                         tenants_cfg = Some(next);
                         let tcfg = tenants_cfg.as_ref().expect("just set");
+                        let mut still_attached = Vec::new();
                         for (id, reason) in plan.detach {
-                            tenant::detach(
+                            if !tenant::detach(
                                 &id,
                                 reason,
                                 true,
@@ -1355,10 +1396,17 @@ async fn session_body(
                                 &args.spill_dir,
                                 tcfg.get(&id),
                             )
-                            .await;
+                            .await
+                            {
+                                still_attached.push(id);
+                            }
                         }
+                        // A re-bind whose detach could not be recorded keeps
+                        // the old attachment; it is asked again later
                         for id in plan.attach {
-                            supervisor.queue_attach(&id);
+                            if !still_attached.contains(&id) {
+                                supervisor.queue_attach(&id);
+                            }
                         }
                         if let Err(e) = tenant::publish_tenant_bridges(
                             &shadow_lifecycle,
@@ -1379,8 +1427,13 @@ async fn session_body(
                         "tenant reconcile skipped: config does not parse",
                     ),
                 }
+                // Resolvers registered after the reload iterated them, or
+                // attached from an older revision, catch up before this
+                // revision counts as reconciled
+                tenant::catch_up(&tenants, rev, reloader).await;
             }
             let tcfg = tenants_cfg.as_ref().expect("tenants mode");
+            supervisor.reap_teardowns(reloader.reservations()).await;
             // Evict tenants the router gave up on, or that trail too far
             let mut evict = record_sink.decoder_xact.evictions();
             let head = record_sink.decoder_xact.last_record_end();
@@ -1427,48 +1480,91 @@ async fn session_body(
                     .filter(|d| d.desired == walshadow::tenants::Desired::Active)
                 && !tenants.iter().any(|t| t.id == id)
             {
-                let attached = async {
-                    record_sink.decoder_xact.flush().await?;
-                    let p0 = match record_sink.decoder_xact.last_record_end() {
-                        0 => stream.next_lsn().get(),
-                        end => end,
-                    };
-                    tenant::wait_shadow_replay(
-                        &shadow_state,
-                        record_sink.decoder_xact.last_record_start(),
-                        Duration::from_secs(args.catalog_hold_timeout),
-                    )
-                    .await?;
-                    let shadow_sql = open_shadow_sql_client(
-                        &args.shadow_socket_dir,
-                        args.shadow_port,
-                        &args.shadow_user,
-                        &primary_dbname,
-                    )
-                    .await?;
-                    if !tenant::attachment_ready(
-                        feed.sql_client().await?,
-                        &shadow_sql,
-                        &decl.dbname,
-                    )
-                    .await?
-                    {
-                        return Ok(None);
+                // Exclusive resources first: a destination or directory a
+                // tenant still tearing down holds, whatever its id, defers
+                // the attach until that teardown joined every writer. Its
+                // own teardown defers it too, claim or no claim
+                let claim = if supervisor.is_tearing_down(&id) {
+                    Ok(Err(walshadow::tenants::Conflict {
+                        resource: walshadow::tenants::Resource::TenantDir(
+                            walshadow::tenants::tenant_dir(&args.spill_dir, &id),
+                        ),
+                        holder: id.clone(),
+                        tearing_down: true,
+                    }))
+                } else {
+                    decl.resources(&merged, &args.spill_dir)
+                        .map(|r| reloader.reservations().claim(&id, r))
+                };
+                let attached = match claim {
+                    Ok(Err(conflict)) => {
+                        supervisor.wait_for(&id, conflict.to_string());
+                        None
                     }
-                    tenant::publish_tenant_bridges(
-                        &shadow_lifecycle,
-                        tenant::wanted_databases(tcfg),
-                    )
-                    .await?;
-                    let (t, sink) = supervisor
-                        .attach(&shared, args, &merged, tcfg, decl, p0, reloader)
-                        .await?;
-                    anyhow::Ok(Some((t, sink, p0)))
-                }
-                .await;
+                    Err(e) => Some(Err(e)),
+                    Ok(Ok(())) => {
+                        supervisor.stop_waiting(&id);
+                        Some(
+                            async {
+                                record_sink.decoder_xact.flush().await?;
+                                let p0 = match record_sink.decoder_xact.last_record_end() {
+                                    0 => stream.next_lsn().get(),
+                                    end => end,
+                                };
+                                tenant::wait_shadow_replay(
+                                    &shadow_state,
+                                    record_sink.decoder_xact.last_record_start(),
+                                    Duration::from_secs(args.catalog_hold_timeout),
+                                )
+                                .await?;
+                                let shadow_sql = open_shadow_sql_client(
+                                    &args.shadow_socket_dir,
+                                    args.shadow_port,
+                                    &args.shadow_user,
+                                    &primary_dbname,
+                                )
+                                .await?;
+                                if !tenant::attachment_ready(
+                                    feed.sql_client().await?,
+                                    &shadow_sql,
+                                    &decl.dbname,
+                                )
+                                .await?
+                                {
+                                    return Ok(None);
+                                }
+                                tenant::publish_tenant_bridges(
+                                    &shadow_lifecycle,
+                                    tenant::wanted_databases(tcfg),
+                                )
+                                .await?;
+                                let (t, sink) = supervisor
+                                    .attach(&shared, args, &merged, tcfg, decl, p0, reloader)
+                                    .await?;
+                                anyhow::Ok(Some((t, sink, p0)))
+                            }
+                            .await,
+                        )
+                    }
+                };
                 match attached {
-                    Ok(None) => supervisor.retry_attach(&id, Duration::from_secs(1)),
-                    Ok(Some((t, sink, p0))) => {
+                    None => {}
+                    Some(Ok(None)) => {
+                        reloader.reservations().release(&id);
+                        supervisor.retry_attach(&id, Duration::from_secs(1));
+                    }
+                    Some(Ok(Some((t, sink, _)))) if reloader.is_rebinding(&id) => {
+                        tenant::discard_superseded(
+                            &mut supervisor,
+                            reloader,
+                            t,
+                            sink,
+                            decl,
+                            &args.spill_dir,
+                        )
+                        .await;
+                    }
+                    Some(Ok(Some((t, sink, p0)))) => {
                         for db in &t.db_oids {
                             stream.filter_mut().add_target_db(*db);
                         }
@@ -1482,16 +1578,22 @@ async fn session_body(
                         );
                         tenants.push(t);
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
+                        reloader.reservations().release(&id);
                         tracing::error!(
                             target: "walshadow::tenant",
                             tenant = %id,
                             error = %format!("{e:#}"),
                             "tenant attach failed; it stays detached",
                         );
-                        supervisor
-                            .record_detached(&args.spill_dir, decl, format!("attach failed: {e:#}"))
-                            .await;
+                        // Never routed, so nothing waits on the record
+                        supervisor.forget(&decl.id);
+                        tenant::persist_detached_logged(
+                            &args.spill_dir,
+                            decl,
+                            format!("attach failed: {e:#}"),
+                        )
+                        .await;
                     }
                 }
             }
@@ -1504,7 +1606,7 @@ async fn session_body(
                 let Some(decl) = tcfg.get(&id) else {
                     continue;
                 };
-                if let Err(e) = tenant::activate(t, args, &merged, decl, start).await {
+                if let Err(e) = tenant::activate(t, args, &merged, decl, start, reloader).await {
                     tracing::error!(
                         target: "walshadow::tenant",
                         tenant = %id,
@@ -1516,6 +1618,19 @@ async fn session_body(
                         .mark_evicted(&id, format!("activation failed: {e:#}"));
                 }
             }
+        }
+        if let Some(rev) = &revision {
+            if tenants_cfg.is_none() {
+                tenant::catch_up(&tenants, rev, reloader).await;
+            }
+            let epoch = rev.epoch.to_string();
+            let generation = rev.generation;
+            metrics
+                .update(|snap| {
+                    snap.config_epoch = epoch;
+                    snap.reconciled_generation = generation;
+                })
+                .await;
         }
         // `durable` (fsynced) lags `dispatched`; advertise it as flush/cursor.
         let dispatched = stream.dispatched_lsn();
@@ -2152,9 +2267,40 @@ async fn session_body(
         )
         .await;
         if let Some(tcfg) = &tenants_cfg {
-            let view =
-                tenant::metrics_view(&tenants, tcfg, &supervisor, &record_sink.decoder_xact).await;
-            metrics.update(|snap| snap.tenants = view).await;
+            // Initial loads are a ledger walk per tenant: every 2 s, not
+            // every publish
+            let with_jobs = last_jobs.is_none_or(|at| at.elapsed() >= Duration::from_secs(2));
+            if with_jobs {
+                last_jobs = Some(Instant::now());
+            }
+            let mut view = tenant::metrics_view(
+                &tenants,
+                tcfg,
+                &supervisor,
+                &record_sink.decoder_xact,
+                with_jobs,
+            )
+            .await;
+            let (running, stuck) = supervisor.teardowns();
+            metrics
+                .update(|snap| {
+                    if !with_jobs {
+                        for t in &mut view {
+                            if let Some(old) = snap.tenants.iter().find(|o| o.id == t.id) {
+                                t.jobs.clone_from(&old.jobs);
+                            }
+                        }
+                    }
+                    snap.tenants = view;
+                    snap.tearing_down = running;
+                    snap.stuck_teardowns = stuck;
+                    snap.session_state = "streaming";
+                })
+                .await;
+        } else {
+            metrics
+                .update(|snap| snap.session_state = "streaming")
+                .await;
         }
         if advanced {
             let new_segs = (now_dispatched - prev_dispatched) / WAL_SEG_SIZE;
@@ -2273,10 +2419,23 @@ async fn session_body(
     let mut drain = Pos::<walshadow::pos::Drain>::new(final_durable.get());
     let mut resume_safe = Pos::<walshadow::pos::ResumeSafe>::new(final_durable.get());
     let mut first_err = None;
+    // Teardowns started before shutdown finish first, bounded
+    supervisor
+        .await_teardowns(
+            reloader.reservations(),
+            tenants_cfg
+                .as_ref()
+                .map_or(Duration::from_secs(30), |t| t.stall_timeout)
+                + tenant::SHUTDOWN_JOIN_WAIT,
+        )
+        .await;
     for t in tenants {
+        let id = t.id.clone();
         let sink = router.detach(&t.id).map(|r| r.sink);
         let tenant_drain = t.xact_buffer.lock().await.stats().drain_lsn;
-        match t.shutdown(sink).await {
+        let shut = t.shutdown(sink).await;
+        tenant::settle_shutdown(reloader.reservations(), &id, shut.is_ok());
+        match shut {
             Ok(safe) => {
                 drain = drain.min(tenant_drain);
                 resume_safe = resume_safe.min(safe);

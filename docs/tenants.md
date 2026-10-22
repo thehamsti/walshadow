@@ -90,7 +90,13 @@ lock is ever shared. The daemon and `ctl` refuse a config where two tenants:
 - write one Snowflake database (account and database), whatever their
   `internal_schema`: public views are named per database and schema, not per
   internal schema
-- share a Snowflake state directory
+- share a Snowflake state directory, or nest one inside another's. A
+  relative state directory is taken from the daemon's working directory and
+  made absolute when the config loads. State directories compare by where
+  they resolve, symlinks followed, and none may
+  resolve among the tenants' spill directories under `<spill-dir>/tenants`,
+  its own included, since attaching afresh clears those. This is checked at
+  boot, on every reload and on every `ctl` or API change
 - reach one ClickHouse database on one host and port, through `[ch]
   database`, a namespace or table `target_database`, a named instance or a
   tee. Two tenants left at the default database collide, so give each its own
@@ -129,6 +135,20 @@ A spec holds the tenant's sections without the `tenant.<id>.` prefix
 (`[snowflake]`, `[stream]`, `[table.public.orders]`, …); `--spec -` reads
 stdin. Every change is validated against the whole merged config before it
 lands, then reloaded; SIGHUP after editing fragments by hand does the same.
+The [HTTP API](api.md) manages tenants the same way, with ETags, dry runs,
+an audit log and a two-step delete.
+
+A change that attaches a tenant afresh, with fresh initial loads, says so
+before it lands. `ctl tenant update` re-binds on a changed `dbname` as before;
+a change to which ClickHouse databases a tenant reaches, or to a setting
+fixed when it opens (`ch` pool sizes, `soft_delete`, `replicate_all`, the
+runtime-config schema, system columns, TOAST mode), needs
+`--acknowledge-resync`, and the tenant then re-attaches. A Snowflake account,
+database, schema, stage or mapping change needs a fresh, empty
+`snowflake.state.directory` in the same edit: the state store refuses a
+second identity. A setting the daemon cannot change while running is refused
+up front, and a change the tenant's resolver refuses is rolled back rather
+than left on disk.
 
 | Change | Effect |
 |---|---|
@@ -137,8 +157,15 @@ lands, then reloaded; SIGHUP after editing fragments by hand does the same.
 | Snowflake role, warehouse, user, credential files, statement timeout | Applies live |
 | `dbname`, or Snowflake account, database, internal schema, stage, schema mapping | Detaches and re-attaches with fresh initial loads: durable state is bound to them |
 | Snowflake channels, pools, merge interval, state, `ack_after` | Rejected until restart |
-| `state = "detached"` / `ctl tenant detach` | Stops routing, stops holding WAL, keeps the destination |
+| `state = "detached"` / `ctl tenant detach` | Stops routing, stops holding WAL, keeps the destination; the pipeline drains in the background |
 | Removal | Same as detach, and forgets the tenant |
+
+Detaching never holds up the other tenants: routing and WAL retention stop
+at once, and the tenant's pipeline drains in the background for up to
+`stall_timeout_secs`, then stops. Its destinations and directories stay
+reserved until every one of its writers, initial loads included, has
+stopped; a tenant that needs them meanwhile waits. A crash during the drain
+boots the tenant detached, never from WAL the slot no longer holds.
 
 ### SQL registry
 

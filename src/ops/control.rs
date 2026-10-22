@@ -12,7 +12,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
 use tokio_postgres::Client;
 use toml::{Table, Value};
 
@@ -25,108 +24,9 @@ use crate::metrics::MetricsRegistry;
 use crate::schema::RelName;
 use crate::source_feed::open_sql_client;
 
-/// Holds the running session's resolvers so the control socket + SIGHUP can
-/// trigger a live `reload()`. The daemon streams one session; there is no
-/// start/stop/restart lifecycle — pause is a config flag applied by reload.
-///
-/// With tenants, the session resolver carries cluster-wide knobs (pause, the
-/// source endpoint) and each tenant has its own. Every reload also flags the
-/// session to reconcile its tenant set against the new config
-#[derive(Default)]
-pub struct Reloader {
-    /// One per followed database: a reload republishes each database's own
-    /// scope of the same document
-    resolvers: Mutex<Vec<Arc<crate::config::ConfigResolver>>>,
-    tenants: Mutex<std::collections::BTreeMap<String, Arc<crate::config::ConfigResolver>>>,
-    reconcile: std::sync::atomic::AtomicBool,
-}
-
-impl Reloader {
-    pub async fn set_resolvers(&self, r: Vec<Arc<crate::config::ConfigResolver>>) {
-        *self.resolvers.lock().await = r.clone();
-        // Control socket serves before the session wires a resolver;
-        // apply/reload in that window persist fragments but republish
-        // nothing (reload() below no-ops while empty). Sweep once at wiring
-        // so file state and published config converge
-        for r in &r {
-            if let Err(e) = r.reload().await {
-                tracing::warn!(
-                    target: "walshadow::control",
-                    error = %e,
-                    "config sweep at resolver wiring failed",
-                );
-            }
-        }
-    }
-
-    /// Register or drop a tenant's resolver
-    pub async fn set_tenant_resolver(
-        &self,
-        id: &str,
-        r: Option<Arc<crate::config::ConfigResolver>>,
-    ) {
-        let mut tenants = self.tenants.lock().await;
-        match r {
-            Some(r) => {
-                tenants.insert(id.to_string(), r);
-            }
-            None => {
-                tenants.remove(id);
-            }
-        }
-    }
-
-    /// Whether a reload happened since the last call
-    pub fn take_reconcile(&self) -> bool {
-        self.reconcile
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-    }
-
-    /// Live reconfigure: re-read the merged config + republish. No restart.
-    /// Return databases the config now names that this process does not
-    /// follow: shadow registers its bridge workers at startup, so they need a
-    /// restart rather than a reload. A tenant whose reload fails keeps its
-    /// last snapshot; the first error is reported after every tenant had its
-    /// turn
-    pub async fn reload(&self) -> anyhow::Result<Vec<String>> {
-        self.reconcile
-            .store(true, std::sync::atomic::Ordering::Release);
-        let resolvers = self.resolvers.lock().await.clone();
-        for r in &resolvers {
-            r.reload()
-                .await
-                .map_err(|e| anyhow::anyhow!("reload: {e}"))?;
-        }
-        let mut first_err = None;
-        let tenants: Vec<_> = self
-            .tenants
-            .lock()
-            .await
-            .iter()
-            .map(|(id, r)| (id.clone(), r.clone()))
-            .collect();
-        for (id, r) in tenants {
-            if let Err(e) = r.reload().await {
-                tracing::warn!(
-                    target: "walshadow::control",
-                    tenant = %id,
-                    error = %e,
-                    "tenant reload failed; its last config stays in effect",
-                );
-                first_err.get_or_insert(anyhow::anyhow!("reload tenant {id}: {e}"));
-            }
-        }
-        if let Some(e) = first_err {
-            return Err(e);
-        }
-        let Some(first) = resolvers.first() else {
-            return Ok(Vec::new());
-        };
-        let mut unfollowed = first.configured_databases().await;
-        unfollowed.retain(|db| !resolvers.iter().any(|r| r.dbname() == db));
-        Ok(unfollowed)
-    }
-}
+pub use crate::ops::reload::{
+    ConfigRevision, PublishError, PublishOpts, Published, ReloadCause, ReloadTx, Reloader,
+};
 
 // ---------------------------------------------------------------------------
 // Shared context handed to the socket handlers
@@ -145,8 +45,21 @@ pub struct SharedCtx {
     pub cli_base: Table,
     pub metrics: MetricsRegistry,
     pub reloader: Arc<Reloader>,
-    /// Prevents concurrent fragment updates from overwriting each other
-    pub frag_lock: Arc<Mutex<()>>,
+    /// One control-plane mutation at a time, socket and HTTP API alike.
+    /// Ranks above the reload lock, which every config write also holds
+    pub mutation_lock: Arc<crate::ops::lock_rank::RankedMutex<()>>,
+    /// Daemon `--spill-dir`: tenant directories, their recovery fences.
+    /// `None` where no daemon runs
+    pub spill_dir: Option<PathBuf>,
+}
+
+/// The mutation lock a [`SharedCtx`] holds
+pub fn mutation_lock() -> Arc<crate::ops::lock_rank::RankedMutex<()>> {
+    Arc::new(crate::ops::lock_rank::RankedMutex::new(
+        crate::ops::lock_rank::MUTATION,
+        "mutation",
+        (),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -250,22 +163,27 @@ async fn handle_conn(mut stream: UnixStream, ctx: &SharedCtx) -> std::io::Result
     // EOF framing allows newlines in TOML values
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
-    let resp = dispatch(&buf, ctx).await;
+    // Who is on the other end, for the audit log
+    let actor = crate::ops::audit::Actor::unix(stream.peer_cred().ok().map(|c| c.uid()));
+    let resp = dispatch(&buf, ctx, &actor).await;
     stream.write_all(resp.as_bytes()).await?;
     stream.flush().await?;
     let _ = stream.shutdown().await;
     Ok(())
 }
 
-async fn dispatch(buf: &[u8], ctx: &SharedCtx) -> String {
+async fn dispatch(buf: &[u8], ctx: &SharedCtx, actor: &crate::ops::audit::Actor) -> String {
     let req = match Request::parse(buf) {
         Ok(r) => r,
         Err(e) => return err(format!("{e:#}")),
     };
     let res: Result<String> = match req.verb {
-        "apply" => apply(ctx, &req).await,
-        "unset" => unset(ctx, &req).await,
-        "reload" => ctx.reloader.reload().await.map(|dbs| ok_note(&dbs)),
+        "apply" => apply(ctx, &req, actor).await,
+        "unset" => unset(ctx, &req, actor).await,
+        "reload" => reload_audited(ctx, actor, None)
+            .await
+            .map(|dbs| ok_note(&dbs))
+            .map_err(|e| anyhow::anyhow!("{e}")),
         "show" => config_show(ctx).await,
         "status" => stream_status(ctx).await,
         "tables" => tables_list(ctx, &req).await,
@@ -273,9 +191,9 @@ async fn dispatch(buf: &[u8], ctx: &SharedCtx) -> String {
         "columns" => columns_list(ctx, &req).await,
         "tenants" => crate::ops::tenant_ctl::list(ctx).await,
         "tenant-show" => crate::ops::tenant_ctl::show(ctx, &req.config).await,
-        "tenant-put" => crate::ops::tenant_ctl::put(ctx, &req.config).await,
-        "tenant-remove" => crate::ops::tenant_ctl::remove(ctx, &req.config).await,
-        "tenant-state" => crate::ops::tenant_ctl::set_state(ctx, &req.config).await,
+        "tenant-put" => crate::ops::tenant_ctl::put(ctx, &req.config, actor).await,
+        "tenant-remove" => crate::ops::tenant_ctl::remove(ctx, &req.config, actor).await,
+        "tenant-state" => crate::ops::tenant_ctl::set_state(ctx, &req.config, actor).await,
         other => Err(anyhow::anyhow!("unknown command {other}")),
     };
     res.unwrap_or_else(|e| err(format!("{e:#}")))
@@ -284,22 +202,149 @@ async fn dispatch(buf: &[u8], ctx: &SharedCtx) -> String {
 // ---- handlers -------------------------------------------------------------
 
 /// Keeps invalid fragments from breaking reloads or later starts
-async fn apply(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
+async fn apply(
+    ctx: &SharedCtx,
+    req: &Request<'_>,
+    actor: &crate::ops::audit::Actor,
+) -> Result<String> {
     if req.config.is_empty() {
         bail!("empty apply (send a TOML fragment as the body)");
     }
-    let _guard = ctx.frag_lock.lock().await;
-    let mut root = load(&ctx.fragment).await?;
-    crate::ch_emitter::merge_tables(&mut root, req.config.clone());
-    commit(ctx, &ctx.fragment, &root).await
+    let config = req.config.clone();
+    let unfollowed = apply_fragment(ctx, actor, "config.apply", None, move |root| {
+        crate::ch_emitter::merge_tables(root, config);
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(ok_note(&unfollowed))
 }
 
 /// Removes named keys without touching operator-owned base config
-async fn unset(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
-    let _guard = ctx.frag_lock.lock().await;
-    let mut root = load(&ctx.fragment).await?;
-    apply_mask(&mut root, &req.config);
-    commit(ctx, &ctx.fragment, &root).await
+async fn unset(
+    ctx: &SharedCtx,
+    req: &Request<'_>,
+    actor: &crate::ops::audit::Actor,
+) -> Result<String> {
+    let mask = req.config.clone();
+    let unfollowed = apply_fragment(ctx, actor, "config.unset", None, move |root| {
+        apply_mask(root, &mask);
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(ok_note(&unfollowed))
+}
+
+/// Request id, HTTP method and path of a mutation, when it came over HTTP
+pub type Origin = Option<(String, String, String)>;
+
+/// Edit the control fragment and publish, under the mutation lock and then
+/// the reload lock, audited like a tenant mutation: rejected before it ran,
+/// or an attempt before the write and a result after
+pub async fn apply_fragment(
+    ctx: &SharedCtx,
+    actor: &crate::ops::audit::Actor,
+    action: &str,
+    origin: Origin,
+    edit: impl FnOnce(&mut Table),
+) -> std::result::Result<Vec<String>, crate::ops::tenant_service::ServiceError> {
+    use crate::ops::tenant_service::ServiceError;
+    let request_id = origin
+        .as_ref()
+        .map(|o| o.0.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    let _mutation = ctx.mutation_lock.lock().await;
+    let mut tx = ctx.reloader.begin().await;
+    let before = load(&ctx.fragment)
+        .await
+        .map_err(|e| ServiceError::new(500, "internal", format!("{e:#}")))?;
+    let mut root = before.clone();
+    edit(&mut root);
+    let (b, a) = crate::ops::redact::redact_pair(Some(&before), Some(&root));
+    let draft = |phase: &str| crate::ops::audit::Draft {
+        request_id: request_id.clone(),
+        phase: phase.into(),
+        actor: actor.clone(),
+        action: action.into(),
+        method: origin.as_ref().map(|o| o.1.clone()),
+        path: origin.as_ref().map(|o| o.2.clone()),
+        before: b.clone(),
+        after: a.clone(),
+        ..Default::default()
+    };
+    let audit = ctx.reloader.audit().cloned();
+    let record = |mut d: crate::ops::audit::Draft, outcome: &str, error: Option<String>| {
+        d.outcome = outcome.into();
+        d.error = error;
+        d
+    };
+    if let Err(e) = validate(ctx, &ctx.fragment, &root).await {
+        let e = ServiceError::new(
+            422,
+            "invalid_config",
+            format!("rejected: merged config invalid: {e:#}"),
+        );
+        if let Some(log) = &audit {
+            let _ = log
+                .append(record(draft("result"), "rejected", Some(e.to_string())))
+                .await;
+        }
+        return Err(e);
+    }
+    if let Some(log) = &audit {
+        log.append(draft("attempt")).await.map_err(|e| {
+            ServiceError::new(
+                503,
+                "audit_unavailable",
+                format!("the audit log refused the attempt, so nothing changed: {e:#}"),
+            )
+        })?;
+    }
+    let outcome = async {
+        // A reload, or an edit that changes nothing, leaves the fragment
+        // alone: never rewritten, never created
+        if root != before {
+            save(&ctx.fragment, &root)
+                .await
+                .map_err(|e| ServiceError::new(500, "internal", format!("{e:#}")))?;
+        }
+        let published = tx
+            .publish(ReloadCause::Control, PublishOpts::default())
+            .await
+            .map_err(|e| ServiceError::new(422, "apply_refused", format!("reload: {e}")))?;
+        if let Some((id, e)) = published.tenant_errors.first() {
+            return Err(ServiceError::new(
+                422,
+                "apply_refused",
+                format!("reload tenant {id}: {e}"),
+            ));
+        }
+        Ok((published.unfollowed, published.revision))
+    }
+    .await;
+    if let Some(log) = &audit {
+        let d = match &outcome {
+            Ok((_, rev)) => {
+                let mut d = record(draft("result"), "applied", None);
+                d.epoch = Some(rev.epoch.to_string());
+                d.generation = Some(rev.generation);
+                d
+            }
+            Err(e) => record(draft("result"), "failed", Some(e.to_string())),
+        };
+        if let Err(e) = log.append(d).await {
+            tracing::error!(target: "walshadow::audit", error = %format!("{e:#}"), "could not record a config mutation's outcome");
+        }
+    }
+    outcome.map(|(unfollowed, _)| unfollowed)
+}
+
+/// `reload`, audited
+pub async fn reload_audited(
+    ctx: &SharedCtx,
+    actor: &crate::ops::audit::Actor,
+    origin: Origin,
+) -> std::result::Result<Vec<String>, crate::ops::tenant_service::ServiceError> {
+    apply_fragment(ctx, actor, "config.reload", origin, |_| {}).await
 }
 
 fn apply_mask(root: &mut Table, mask: &Table) {
@@ -314,19 +359,8 @@ fn apply_mask(root: &mut Table, mask: &Table) {
     }
 }
 
-/// Persist `root` as fragment `frag` only once merged config accepts it, so
-/// file never holds a rejected fragment, not even briefly
-async fn commit(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<String> {
-    validate(ctx, frag, root)
-        .await
-        .context("rejected: merged config invalid")?;
-    save(frag, root).await?;
-    let unfollowed = ctx.reloader.reload().await?;
-    Ok(ok_note(&unfollowed))
-}
-
 /// Matches startup validation so accepted fragments remain restart-safe
-async fn validate(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<()> {
+pub(crate) async fn validate(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<()> {
     let mut merged = ctx.cli_base.clone();
     crate::ch_emitter::merge_tables(
         &mut merged,
@@ -364,6 +398,23 @@ pub fn fragment_path(ch_config: &Path, name: &str) -> Result<PathBuf> {
 
 async fn get_config(ctx: &SharedCtx) -> Result<Table> {
     Ok(crate::ch_emitter::load_effective(&ctx.ch_config, ctx.cli_base.clone()).await?)
+}
+
+/// `ctl --tenant <id> tables`, as a table
+pub async fn tenant_tables(ctx: &SharedCtx, tenant: &str) -> Result<Table> {
+    let mut config = Table::new();
+    config.insert("tenant".into(), tenant.into());
+    let req = Request {
+        verb: "tables",
+        config,
+    };
+    let text = tables_list(ctx, &req).await?;
+    Ok(text.strip_prefix("OK\n").unwrap_or(&text).parse()?)
+}
+
+/// The merged config, every secret masked by the API's redactor
+pub async fn config_redacted(ctx: &SharedCtx) -> Result<serde_json::Value> {
+    Ok(crate::ops::redact::redact_toml(&get_config(ctx).await?))
 }
 
 async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
@@ -548,6 +599,11 @@ fn status_tables(
 }
 
 async fn stream_status(ctx: &SharedCtx) -> Result<String> {
+    Ok(ok_toml(&status_table(ctx).await?))
+}
+
+/// What `ctl status` prints, as a table
+pub async fn status_table(ctx: &SharedCtx) -> Result<Table> {
     let root = get_config(ctx).await?;
     let paused = root
         .get("stream")
@@ -699,7 +755,7 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
     ] {
         out.insert(key.into(), format_pg_lsn(lsn).to_string().into());
     }
-    Ok(ok_toml(&out))
+    Ok(out)
 }
 
 async fn config_show(ctx: &SharedCtx) -> Result<String> {
@@ -867,7 +923,8 @@ mod tests {
             cli_base: Table::new(),
             metrics: MetricsRegistry::new(),
             reloader: Arc::new(Reloader::default()),
-            frag_lock: Arc::new(Mutex::new(())),
+            mutation_lock: mutation_lock(),
+            spill_dir: None,
         }
     }
 
@@ -908,6 +965,49 @@ mod tests {
             ok_note(&["billing".to_string()]).starts_with("OK config names billing"),
             "ctl prints the note on the OK line"
         );
+    }
+
+    /// `reload`, and an edit that changes nothing, publish without writing
+    /// the control fragment: no empty `50-api.toml` appears, an existing one
+    /// keeps its bytes and mtime
+    #[tokio::test]
+    async fn reload_and_no_op_edits_leave_the_fragment_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let ctx = ctx_at(dir.path());
+        let frag = ctx.fragment.clone();
+        let _h = serve(sock.clone(), ctx.clone()).await.unwrap();
+        assert!(call(&sock, "reload", "").await.starts_with("OK"));
+        assert!(!frag.exists(), "reload created the fragment");
+        assert!(
+            call(&sock, "apply", "[ch]\nhost = \"ch\"\n")
+                .await
+                .starts_with("OK")
+        );
+        let bytes = std::fs::read(&frag).unwrap();
+        let mtime = std::fs::metadata(&frag).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let generation = ctx.reloader.current().generation;
+        assert!(call(&sock, "reload", "").await.starts_with("OK"));
+        // The same value again: published, not rewritten
+        assert!(
+            call(&sock, "apply", "[ch]\nhost = \"ch\"\n")
+                .await
+                .starts_with("OK")
+        );
+        assert_eq!(std::fs::read(&frag).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&frag).unwrap().modified().unwrap(), mtime);
+        assert!(
+            ctx.reloader.current().generation > generation,
+            "still published"
+        );
+        // Unsetting a key that is not there changes nothing either
+        assert!(
+            call(&sock, "unset", "[ch]\nport = 0\n")
+                .await
+                .starts_with("OK")
+        );
+        assert_eq!(std::fs::read(&frag).unwrap(), bytes);
     }
 
     #[tokio::test]

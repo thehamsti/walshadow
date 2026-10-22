@@ -153,15 +153,23 @@ enum TenantCommand {
         spec: Option<PathBuf>,
         #[arg(long, value_enum)]
         initial_load: Option<InitialLoad>,
+        /// Accept a re-attach with fresh initial loads, when replacing a
+        /// tenant changes what it was built with
+        #[arg(long)]
+        acknowledge_resync: bool,
     },
     /// Replace a tenant's spec. Credentials, role, warehouse and table rules
-    /// apply live; a new database or destination identity re-attaches it
+    /// apply live; a new database or destination identity re-attaches it.
+    /// Other changes that re-attach it need `--acknowledge-resync`
     Update {
         id: String,
         #[arg(long)]
         dbname: Option<String>,
         #[arg(long)]
         spec: Option<PathBuf>,
+        /// Accept a re-attach with fresh initial loads
+        #[arg(long)]
+        acknowledge_resync: bool,
     },
     /// Stop and forget a tenant; its destination data stays
     Remove { id: String },
@@ -287,15 +295,24 @@ impl TenantCommand {
                 dbname,
                 spec,
                 initial_load,
+                acknowledge_resync,
             } => {
                 let mut body = read_spec(spec.as_deref())?;
                 body.insert("dbname".into(), dbname.into());
                 if let Some(mode) = initial_load {
                     body.insert("initial_load".into(), mode.as_str().into());
                 }
-                Ok(sugar("tenant-put", tenant_block(&id, body)))
+                Ok(sugar(
+                    "tenant-put",
+                    acked(tenant_block(&id, body), acknowledge_resync),
+                ))
             }
-            Self::Update { id, dbname, spec } => {
+            Self::Update {
+                id,
+                dbname,
+                spec,
+                acknowledge_resync,
+            } => {
                 let mut body = read_spec(spec.as_deref())?;
                 match dbname {
                     Some(db) => {
@@ -306,10 +323,21 @@ impl TenantCommand {
                     ),
                     None => {}
                 }
-                Ok(sugar("tenant-put", tenant_block(&id, body)))
+                Ok(sugar(
+                    "tenant-put",
+                    acked(tenant_block(&id, body), acknowledge_resync),
+                ))
             }
         }
     }
+}
+
+/// A `tenant-put` body, with the acknowledgement of a resync when given
+fn acked(mut body: Table, acknowledge_resync: bool) -> Table {
+    if acknowledge_resync {
+        body.insert("acknowledge_resync".into(), true.into());
+    }
+    body
 }
 
 /// A spec is the tenant's sections as TOML, from a file or stdin (`-`)
@@ -586,6 +614,47 @@ mod tests {
     fn dotted_name_is_not_split_into_a_pair() {
         let error = err(&["add", "public.users"]);
         assert!(error.contains("<TABLE>"), "{error}");
+    }
+
+    #[test]
+    fn tenant_update_carries_the_resync_acknowledgement() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.toml");
+        std::fs::write(&spec, "[ch]\nhost = 'ch'\n").unwrap();
+        let spec = spec.to_str().unwrap();
+        let plain = cmd(&["tenant", "update", "a", "--dbname", "a_db", "--spec", spec]);
+        assert_eq!(plain.verb, "tenant-put");
+        assert!(!plain.body.contains_key("acknowledge_resync"));
+        let acked = cmd(&[
+            "tenant",
+            "update",
+            "a",
+            "--dbname",
+            "a_db",
+            "--spec",
+            spec,
+            "--acknowledge-resync",
+        ]);
+        assert_eq!(
+            acked
+                .body
+                .get("acknowledge_resync")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(acked.body["tenant"]["a"]["ch"].is_table());
+        let add = cmd(&[
+            "tenant",
+            "add",
+            "a",
+            "--dbname",
+            "a_db",
+            "--acknowledge-resync",
+        ]);
+        assert_eq!(
+            add.body.get("acknowledge_resync").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]

@@ -287,6 +287,27 @@ impl Harness {
         Ok(toml::from_str(&text)?)
     }
 
+    /// Wait until `tenant.toml` gives `reason`: the session writes its own
+    /// once it stopped routing, over the record a detach request leaves
+    async fn wait_reason(&self, id: &str, reason: &str, timeout: Duration) -> Result<toml::Table> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(state) = self.state(id)
+                && state.get("reason").and_then(|v| v.as_str()) == Some(reason)
+            {
+                return Ok(state);
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "tenant {id} never gave reason {reason:?}: {:?}\n{}",
+                    self.state(id).ok(),
+                    tail(&self.stderr())
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     async fn wait_phase(&self, id: &str, phase: &str, timeout: Duration) -> Result<toml::Table> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -468,10 +489,12 @@ async fn tenants_share_one_slot_attach_live_detach_and_resume() {
 
     // Detach b through ctl: it stops receiving and stops holding WAL
     h.ctl(&["tenant", "detach", "b"], "").unwrap();
-    let detached = h.wait_phase("b", "detached", t).await.unwrap();
+    // Recorded detached before the config changed; the session's reason
+    // replaces the request's once it stopped routing
+    let detached = h.wait_reason("b", "detached by operator", t).await.unwrap();
     assert_eq!(
-        detached.get("reason").and_then(|v| v.as_str()),
-        Some("detached by operator")
+        detached.get("phase").and_then(|v| v.as_str()),
+        Some("detached")
     );
     b.batch_execute("INSERT INTO app.orders VALUES (61, 'app_b-after-detach')")
         .await
