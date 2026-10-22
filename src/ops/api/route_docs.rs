@@ -648,3 +648,37 @@ pub const RELOAD: RouteDoc = RouteDoc {
     replies: CONFIG_OUTCOME,
     errors: CONFIG_MUTATION_ERRORS,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The helpers the docs are built with, run at run time: in the docs
+    /// themselves they only ever run in const evaluation
+    #[test]
+    fn the_helpers_build_the_replies_and_parameters_the_docs_use() {
+        let reply = ok("x", component::<schema::Live>);
+        assert_eq!(
+            (
+                reply.status,
+                reply.media,
+                reply.schema.is_some(),
+                reply.etag
+            ),
+            (200, Media::Json, true, false)
+        );
+        assert_eq!(reply.status, HEALTH_LIVE.replies[0].status);
+        let page = text(200, "y", Media::Html);
+        assert_eq!(
+            (page.status, page.media, page.schema.is_none(), page.etag),
+            (200, Media::Html, true, false)
+        );
+        assert_eq!(page.media, DOCS.replies[0].media);
+        let param = query("limit", Kind::Integer, "z");
+        assert_eq!(
+            (param.at, param.required, param.kind),
+            (In::Query, false, Kind::Integer)
+        );
+        assert_eq!(param.name, ERRORS.params[4].name);
+    }
+}
