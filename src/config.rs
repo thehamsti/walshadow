@@ -2033,7 +2033,7 @@ mod tests {
         assert!(Arc::ptr_eq(&prior, &rx.borrow()));
         assert_eq!(resolver.rejections(), 1);
         assert_eq!(
-            mapping.snapshot().await[&desc.rel_name].target.database,
+            mapping.snapshot()[&desc.rel_name].target.database,
             "default"
         );
         resolver
@@ -2132,7 +2132,7 @@ mod tests {
         );
         assert!(!t.columns.is_empty(), "columns derived from descriptor");
         // Fenced routing map written for the decode pool.
-        assert!(mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(mapping.with(|m| m.contains_key(&rel)));
         assert_eq!(resolver.opt_in_total(), 1);
     }
 
@@ -2296,7 +2296,7 @@ mod tests {
             !rx.borrow_and_update().tables.contains_key(&rel),
             "opt-out drops the mapping"
         );
-        assert!(!mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(!mapping.with(|m| m.contains_key(&rel)));
         assert_eq!(resolver.opt_out_total(), 1);
         assert!(resolver.is_excluded(&rel_desc("public", "events")).await);
 
@@ -2336,17 +2336,17 @@ mod tests {
             .await;
         assert!(rx.changed().await.is_ok());
         assert!(rx.borrow_and_update().tables.contains_key(&rel));
-        assert!(mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(mapping.with(|m| m.contains_key(&rel)));
         // Unrelated overlay apply full-swaps handle, derived mapping must survive
         resolver
             .apply_config_event(ConfigEvent::GlobalCleared)
             .await;
         assert!(rx.changed().await.is_ok());
         assert!(rx.borrow_and_update().tables.contains_key(&rel));
-        assert!(mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(mapping.with(|m| m.contains_key(&rel)));
         // Source DROP TABLE under strategy=Drop forgets it everywhere
         resolver.forget_derived_mapping(&rel).await;
-        assert!(!mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(!mapping.with(|m| m.contains_key(&rel)));
         assert!(rx.changed().await.is_ok());
         assert!(!rx.borrow_and_update().tables.contains_key(&rel));
     }
@@ -2386,13 +2386,13 @@ mod tests {
                 },
             )
             .await;
-        assert!(!mapping.with(|m| m.contains_key(&old)).await);
-        assert!(mapping.with(|m| m.contains_key(&new)).await);
+        assert!(!mapping.with(|m| m.contains_key(&old)));
+        assert!(mapping.with(|m| m.contains_key(&new)));
         resolver
             .apply_config_event(ConfigEvent::GlobalCleared)
             .await;
-        assert!(!mapping.with(|m| m.contains_key(&old)).await);
-        assert!(mapping.with(|m| m.contains_key(&new)).await);
+        assert!(!mapping.with(|m| m.contains_key(&old)));
+        assert!(mapping.with(|m| m.contains_key(&new)));
     }
 
     #[tokio::test]
@@ -2420,11 +2420,11 @@ mod tests {
         resolver
             .materialize_opt_in(&rel_desc("public", "events"), None, None)
             .await;
-        assert!(mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(mapping.with(|m| m.contains_key(&rel)));
         // Source DROP under strategy=Drop: mapping forgotten, opt-in row
         // re-parked so the next CREATE re-materialises it
         resolver.forget_derived_mapping(&rel).await;
-        assert!(!mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(!mapping.with(|m| m.contains_key(&rel)));
         assert_eq!(resolver.pending_decl_count(), 1);
         let row = resolver.take_pending_decl(&rel).await.expect("re-parked");
         assert_eq!(row.replicate, Some(true));
@@ -2475,15 +2475,12 @@ mod tests {
             m.get(&RelName::new("public", "events"))
                 .is_some_and(|t| t.columns.iter().any(|c| c.src_attnum == 2))
         };
-        assert!(
-            mapping.with(|m| has_note(m)).await,
-            "fold reaches the handle"
-        );
+        assert!(mapping.with(|m| has_note(m)), "fold reaches the handle");
         resolver
             .apply_config_event(ConfigEvent::GlobalCleared)
             .await;
         assert!(
-            mapping.with(|m| has_note(m)).await,
+            mapping.with(|m| has_note(m)),
             "fold survives the republish full-swap"
         );
     }

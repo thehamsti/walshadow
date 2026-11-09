@@ -360,6 +360,8 @@ pub struct ToastSettings {
     pub connections: Option<NonZeroUsize>,
     #[serde(default)]
     pub mode: ToastMode,
+    /// Start speculative TOAST reads before planning
+    pub read_ahead: Option<bool>,
 }
 
 pub(crate) const DEFAULT_INLINE_VALUE_MAX: usize = 1 << 30;
@@ -2547,6 +2549,7 @@ fn encode_value(
         ColumnValue::Float4(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
         ColumnValue::Float8(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
         ColumnValue::Oid(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        ColumnValue::Oid8(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
         ColumnValue::Date(i32::MIN | i32::MAX)
         | ColumnValue::Timestamp(i64::MIN | i64::MAX)
         | ColumnValue::TimestampTz(i64::MIN | i64::MAX) => Err(unsupported(
@@ -2597,6 +2600,15 @@ fn encode_value(
             }
         }
         ColumnValue::Inet(v) => buf.append_string_bytes(v.to_text().as_bytes()),
+        ColumnValue::MacAddr(b) => {
+            buf.append_string_bytes(crate::decode::codecs::macaddr_to_text(b).as_bytes())
+        }
+        ColumnValue::MacAddr8(b) => {
+            buf.append_string_bytes(crate::decode::codecs::macaddr8_to_text(b).as_bytes())
+        }
+        ColumnValue::Tid { block, offset } => {
+            buf.append_string_bytes(crate::decode::codecs::tid_to_text(*block, *offset).as_bytes())
+        }
         ColumnValue::Interval(v) => buf.append_string_bytes(v.to_text().as_bytes()),
         ColumnValue::Bytea(b) => buf.append_string_bytes(b),
         ColumnValue::ExternalToast(_) => Err(unsupported(
@@ -2678,6 +2690,10 @@ crate::atomic_stats! {
         /// Store fetch round trips; a batch covers many values
         pub toast_value_fetch_batches,
         pub toast_value_fetch_nanos,
+        /// Store reads started ahead of planning, off the serial path
+        pub toast_values_read_ahead,
+        /// Planning blocked on reads started ahead of it
+        pub toast_value_wait_nanos,
         /// Toasted values NULL/default-filled because no store could rebuild
         /// them (disabled mode). Surfaced, never silent
         pub toast_values_filled_default,
@@ -2688,6 +2704,12 @@ crate::atomic_stats! {
         /// Oversized values replaced under `inline_value_overflow = "null"`
         pub toast_values_filled_oversize,
         pub toast_fetch_miss,
+        pub bootstrap_replay_covered_rows,
+        pub gate_emitted,
+        pub gate_gated,
+        pub gate_deferred,
+        pub gate_chunks_gated,
+        pub gate_multixact_emitted,
         /// Chunk rows mirrored from a restored TOAST page image, repairing
         /// backup page copies read mid-write
         pub toast_image_rows_mirrored,
@@ -3639,6 +3661,8 @@ mod tests {
     fn quote_ident_escapes_backticks() {
         assert_eq!(quote_ident("foo"), "`foo`");
         assert_eq!(quote_ident("a`b"), "`a``b`");
+        assert_eq!(quote_ident("a\\b"), "`a\\\\b`");
+        assert_eq!(quote_ident("a\\"), "`a\\\\`");
     }
 
     #[test]

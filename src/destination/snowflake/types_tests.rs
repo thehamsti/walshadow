@@ -224,3 +224,92 @@ fn key_encoding_obeys_numeric_and_blank_padded_equality() {
     d.attributes[0].type_oid = INTERVALOID;
     assert!(TableSchema::from_descriptor(&d, "PUBLIC", "T", &[]).is_err());
 }
+
+fn text_column(oid: u32) -> SnowflakeColumn {
+    SnowflakeColumn {
+        attnum: 1,
+        source_name: "c".into(),
+        name: "C".into(),
+        type_oid: oid,
+        data_type: type_for(oid, -1),
+        not_null: false,
+    }
+}
+
+/// System types the heap decoder now reads natively still land as the
+/// `VARCHAR` text PostgreSQL prints for them
+#[test]
+fn natively_decoded_system_types_render_typoutput_text() {
+    let text = |oid, v: ColumnValue| match convert(&v, &text_column(oid)).unwrap() {
+        SnowflakeValue::Text(s) => s,
+        other => panic!("oid {oid}: {other:?}"),
+    };
+    assert_eq!(text(XIDOID, ColumnValue::Oid(4_000_000_000)), "4000000000");
+    assert_eq!(text(CIDOID, ColumnValue::Oid(7)), "7");
+    assert_eq!(
+        text(XID8OID, ColumnValue::Oid8(u64::MAX)),
+        u64::MAX.to_string()
+    );
+    assert_eq!(
+        text(
+            MACADDROID,
+            ColumnValue::MacAddr([0x08, 0, 0x2b, 1, 2, 0xab])
+        ),
+        "08:00:2b:01:02:ab"
+    );
+    assert_eq!(
+        text(
+            MACADDR8OID,
+            ColumnValue::MacAddr8([0x08, 0, 0x2b, 0xff, 0xfe, 1, 2, 3])
+        ),
+        "08:00:2b:ff:fe:01:02:03"
+    );
+    assert_eq!(
+        text(
+            TIDOID,
+            ColumnValue::Tid {
+                block: 5,
+                offset: 3
+            }
+        ),
+        "(5,3)"
+    );
+    // Its text varies by server version: the oracle renders it
+    assert!(convert(&ColumnValue::Oid8(1), &text_column(PG_LSNOID)).is_err());
+}
+
+/// `money` and `pg_lsn` go back to the oracle as the on-disk datum, so the
+/// warehouse keeps the source's own typoutput rather than a local guess
+#[test]
+fn source_dependent_values_defer_to_the_oracle() {
+    let mut d = desc();
+    d.attributes = vec![
+        attr(1, "id", INT8OID, true),
+        attr(2, "m", MONEYOID, false),
+        attr(3, "l", PG_LSNOID, false),
+        attr(4, "n", INT8OID, false),
+    ];
+    let mut columns = vec![
+        Some(ColumnValue::Int8(1)),
+        Some(ColumnValue::Int8(-123_456)),
+        Some(ColumnValue::Oid8(0x16_B374_D848)),
+        Some(ColumnValue::Int8(9)),
+    ];
+    defer_source_rendered(&d, &mut columns);
+    assert_eq!(columns[0], Some(ColumnValue::Int8(1)));
+    assert_eq!(
+        columns[1],
+        Some(ColumnValue::PgPending {
+            type_oid: MONEYOID,
+            raw: (-123_456i64).to_le_bytes().to_vec(),
+        })
+    );
+    assert_eq!(
+        columns[2],
+        Some(ColumnValue::PgPending {
+            type_oid: PG_LSNOID,
+            raw: 0x16_B374_D848u64.to_le_bytes().to_vec(),
+        })
+    );
+    assert_eq!(columns[3], Some(ColumnValue::Int8(9)));
+}

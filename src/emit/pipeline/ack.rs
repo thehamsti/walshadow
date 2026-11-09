@@ -8,11 +8,13 @@
 //! One commit may span several seqs. Only the final seq publishes its
 //! `commit_lsn`, earlier slices gate contiguity via [`Publish::Partial`]
 //!
-//! [`SeqAlloc::open`] is the only registration path. An allocator and its
-//! seqs send only to the collector that made them, and [`OpenSeq::place`]
-//! consumes its seq. Types do not stop two allocators overlapping or a seq
-//! dropping unplaced: collector fails on a repeat registration, and an
-//! unplaced seq pins the frontier where [`AckSnapshot::stall_reason`] names it
+//! Use [`SeqAlloc::open`] to register sequences and [`SeqAlloc::place`] to
+//! report their row counts. Each allocator sends events to its original
+//! collector. Keep sequence numbers unique and place each sequence through
+//! its original allocator. Rust does not enforce these rules or require
+//! placement. Collector rejects duplicate registrations. Dropping a sequence
+//! before placement blocks acknowledgments; [`AckSnapshot::stall_reason`]
+//! explains why progress stopped
 //!
 //! [`AckHandle::acked`] takes the [`EndOfStream`] proof, so only a drained
 //! INSERT acks
@@ -28,6 +30,7 @@ use crate::ch::EndOfStream;
 use crate::crash_test;
 use crate::emit::pipeline::Fatal;
 use crate::pos::{AckFrontier, EmitterAck, Gate, GateClosed, Monotone, Pos};
+use crate::record::SinkError;
 
 #[derive(Debug)]
 pub enum AckEvent {
@@ -368,7 +371,7 @@ impl AckHandle {
         SeqAlloc {
             tx: self.tx.clone(),
             next: first,
-            held: None,
+            buffered_events: None,
         }
     }
 }
@@ -387,22 +390,21 @@ pub enum Publish {
 pub struct SeqAlloc {
     tx: mpsc::UnboundedSender<AckEvent>,
     next: u64,
-    /// Events awaiting [`Self::send_registered`] / [`Self::send_placed`];
-    /// `None` sends each as it happens
-    held: Option<Held>,
+    /// Events awaiting [`BufferedRowSender::flush_pending`]; `None` sends each as it happens
+    buffered_events: Option<BufferedSeqEvents>,
 }
 
 #[derive(Debug, Default)]
-struct Held {
+struct BufferedSeqEvents {
     registered: Vec<AckEvent>,
     placed: Vec<AckEvent>,
 }
 
 impl SeqAlloc {
-    /// Hold registrations and placements for bulk sends, so a run of small
+    /// Buffer registrations and placements for bulk sends, so a run of small
     /// commits wakes the collector once rather than twice per seq
-    pub fn held(mut self) -> Self {
-        self.held = Some(Held::default());
+    pub fn buffer_events(mut self) -> Self {
+        self.buffered_events = Some(BufferedSeqEvents::default());
         self
     }
 
@@ -419,15 +421,12 @@ impl SeqAlloc {
             commit_lsn,
             publish: publish == Publish::Commit,
         };
-        if let Some(held) = &mut self.held {
-            held.registered.push(ev);
+        if let Some(buffered_events) = &mut self.buffered_events {
+            buffered_events.registered.push(ev);
         } else {
             let _ = self.tx.send(ev);
         }
-        OpenSeq {
-            tx: self.tx.clone(),
-            seq,
-        }
+        OpenSeq(seq)
     }
 
     /// Ordering marker carrying no rows
@@ -436,57 +435,63 @@ impl SeqAlloc {
         self.place(seq, 0);
     }
 
-    /// [`OpenSeq::place`], held while this allocator holds
-    pub fn place(&mut self, seq: OpenSeq, rows: u64) {
-        let Some(held) = &mut self.held else {
-            return seq.place(rows);
-        };
-        held.placed.push(AckEvent::Placed { seq: seq.seq, rows });
-    }
-
-    /// Held registrations must reach the collector before their rows reach
-    /// the batcher, else an insert ack can beat its seq's registration
-    pub fn send_registered(&mut self) {
-        if let Some(held) = &mut self.held
-            && !held.registered.is_empty()
-        {
-            let _ = self
-                .tx
-                .send(AckEvent::Batch(std::mem::take(&mut held.registered)));
+    /// Send all rows of `seq` to batcher channel before reporting row count
+    pub fn place(&mut self, OpenSeq(seq): OpenSeq, rows: u64) {
+        let ev = AckEvent::Placed { seq, rows };
+        if let Some(buffered_events) = &mut self.buffered_events {
+            buffered_events.placed.push(ev);
+        } else {
+            let _ = self.tx.send(ev);
         }
     }
 
-    /// Held placements go once their rows are on the batcher channel
-    pub fn send_placed(&mut self) {
-        if let Some(held) = &mut self.held
-            && !held.placed.is_empty()
+    fn send_registered(&mut self) {
+        if let Some(buffered_events) = &mut self.buffered_events
+            && !buffered_events.registered.is_empty()
+        {
+            let _ = self.tx.send(AckEvent::Batch(std::mem::take(
+                &mut buffered_events.registered,
+            )));
+        }
+    }
+
+    fn send_placed(&mut self) {
+        if let Some(buffered_events) = &mut self.buffered_events
+            && !buffered_events.placed.is_empty()
         {
             let _ = self
                 .tx
-                .send(AckEvent::Batch(std::mem::take(&mut held.placed)));
+                .send(AckEvent::Batch(std::mem::take(&mut buffered_events.placed)));
         }
+    }
+}
+
+/// Stage rows alongside buffered sequence events
+pub(crate) trait BufferedRowSender {
+    fn seqs(&mut self) -> &mut SeqAlloc;
+
+    /// Put staged rows on the batcher channel
+    async fn send_rows(&mut self) -> Result<(), SinkError>;
+
+    /// Registrations reach the collector before their rows reach the
+    /// batcher, else an insert ack can beat its registration. Placements
+    /// follow once rows are on the channel
+    async fn flush_pending(&mut self) -> Result<(), SinkError> {
+        self.seqs().send_registered();
+        self.send_rows().await?;
+        self.seqs().send_placed();
+        Ok(())
     }
 }
 
 /// Registered seq awaiting its row count
 #[must_use = "an unplaced seq pins the ack frontier"]
 #[derive(Debug)]
-pub struct OpenSeq {
-    tx: mpsc::UnboundedSender<AckEvent>,
-    seq: u64,
-}
+pub struct OpenSeq(u64);
 
 impl OpenSeq {
     pub const fn seq(&self) -> u64 {
-        self.seq
-    }
-
-    /// Every row of this seq must already be on the batcher channel
-    pub fn place(self, rows: u64) {
-        let _ = self.tx.send(AckEvent::Placed {
-            seq: self.seq,
-            rows,
-        });
+        self.0
     }
 }
 

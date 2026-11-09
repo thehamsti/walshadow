@@ -74,6 +74,7 @@ use crate::decode::wal_xact::{
     XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
     XLOG_XACT_OPMASK, parse_xact_payload,
 };
+use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
 use crate::emit::route::freeze_routes;
@@ -422,7 +423,7 @@ async fn walk_and_ship(
             .or(resumed.map(Replayable::from));
         if let Some(spool) = deferred {
             let config = ctx.config_rx.as_ref().map(|rx| rx.borrow().clone());
-            let mapping = ctx.mapping.snapshot().await;
+            let mapping = ctx.mapping.snapshot();
             let replay_checkpoint = resumable.then_some(bootstrap::ReplayCheckpoint {
                 state: &mut checkpoint,
                 dir: &ctx.scratch_dir,
@@ -441,6 +442,7 @@ async fn walk_and_ship(
                 next_seq,
                 ctx.dest.current().snowflake.is_some(),
                 replay_checkpoint,
+                None,
             )
             .await
             .map_err(anyhow::Error::msg)?;
@@ -493,7 +495,7 @@ async fn walk_and_ship(
     // Record their manifests after publishing the pass
     outcome.pending_tables = visibility_pending::ship(
         pending,
-        &ctx.published.snapshot().await,
+        &ctx.published.snapshot(),
         ctx.dest.clone(),
         ctx.stats.clone(),
         resolver,
@@ -607,13 +609,14 @@ async fn run_walk(
         walk_ok_rx,
         gate_spool,
         PendingSpool::new(pending_spool_path, filter.clone()),
+        ctx.stats.clone(),
         barrier.clone(),
     ));
     let drain = tokio::spawn(bootstrap::drain(
         gated_rx,
         filter.clone(),
         freeze_routes(
-            &ctx.mapping.snapshot().await,
+            &ctx.mapping.snapshot(),
             ctx.config_rx
                 .as_ref()
                 .map(|rx| rx.borrow().clone())
@@ -694,6 +697,7 @@ async fn gate_task(
     walk_ok: oneshot::Receiver<CompleteAccums>,
     mut deferred: DeferredSpool,
     mut pending: PendingSpool,
+    counters: Arc<EmitterStats>,
     barrier: Option<Arc<WalkBarrier>>,
 ) -> Result<(GateStats, usize, PendingSpool), String> {
     let mut stats = GateStats::default();
@@ -704,6 +708,7 @@ async fn gate_task(
         &filter,
         &mut deferred,
         &mut stats,
+        &counters,
         barrier.as_ref(),
     )
     .await?;
@@ -859,7 +864,7 @@ async fn replay_gap(
         })
         .map_err(|e| anyhow::anyhow!("backup_backfill: replay xact buffer: {e}"))?,
     ));
-    buffer.lock().await.clear_spill_dir().await.ok();
+    buffer.lock().await.clear_scratch_dir().ok();
 
     // Include opted-in main and TOAST filenodes
     let mut filter_rfns: HashSet<(Oid, Oid)> = targets.keys().copied().collect();
@@ -885,7 +890,7 @@ async fn replay_gap(
         from_lsn,
         // Filter is the opted-in set, so unfiltered rels are deliberate
         whole_db_filter: false,
-        mapping: ctx.mapping.snapshot().await,
+        mapping: ctx.mapping.snapshot(),
         stats: ctx.stats.clone(),
         budget: ctx.budget.clone(),
         row_policy: ctx.dest.current().row_policy(),
@@ -897,6 +902,7 @@ async fn replay_gap(
         next_seq,
         // Pre-scan already harvested transaction patch
         patch: None,
+        track_replaced: false,
     });
     let Some((first, _)) = segments.first() else {
         return sink
@@ -1543,6 +1549,7 @@ mod tests {
             xmax,
             infomask,
             source_lsn: 0x1000,
+            page_lsn: 0,
             blkno: 0,
             offnum: 0,
             columns: Vec::new(),
@@ -1589,6 +1596,7 @@ mod tests {
             walk_ok_rx,
             DeferredSpool::new(spool_path.clone(), 0),
             test_pending(),
+            Arc::default(),
             None,
         ));
 
@@ -1655,6 +1663,7 @@ mod tests {
             walk_ok_rx,
             DeferredSpool::new(spool_path.clone(), 0),
             test_pending(),
+            Arc::default(),
             None,
         ));
 
@@ -1721,6 +1730,7 @@ mod tests {
             walk_ok_rx,
             mem_spool(),
             test_pending(),
+            Arc::default(),
             None,
         ));
 
@@ -1765,6 +1775,7 @@ mod tests {
             walk_ok_rx,
             mem_spool(),
             test_pending(),
+            Arc::default(),
             None,
         ));
 

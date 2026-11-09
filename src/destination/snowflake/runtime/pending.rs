@@ -197,7 +197,7 @@ impl SnowflakeRuntime {
                 settled += 1;
                 continue;
             }
-            let active = self.active_generation(&payload.schema).await?;
+            let active = self.active_generation(&payload.schema)?;
             if active < payload.captured_generation {
                 continue;
             }
@@ -214,7 +214,7 @@ impl SnowflakeRuntime {
                 settled += 1;
                 continue;
             }
-            if self.snapshot_route_is_loading(&payload.schema).await? {
+            if self.snapshot_route_is_loading(&payload.schema)? {
                 continue;
             }
             let batch_id = self
@@ -231,7 +231,7 @@ impl SnowflakeRuntime {
         Ok(settled)
     }
 
-    async fn snapshot_route_is_loading(&self, schema: &TableSchema) -> Result<bool> {
+    fn snapshot_route_is_loading(&self, schema: &TableSchema) -> Result<bool> {
         use crate::destination::snowflake::state::GenerationPhase;
         let key = format!("snapshot-route/{}", schema.relation_oid);
         let Some(bytes) = self.state.get_metadata(&key)? else {

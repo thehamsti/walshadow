@@ -9,7 +9,7 @@ use walshadow::backfill_bootstrap::BootstrapProgress;
 use walshadow::boundary_hold::BoundaryHoldStats;
 use walshadow::ch_emitter::EmitterStats;
 use walshadow::config::ConfigResolver;
-use walshadow::metrics::{DbSeries, MetricsRegistry, MetricsSnapshot};
+use walshadow::metrics::{DbSeries, MetricsRegistry, MetricsSnapshot, RateEstimator};
 use walshadow::pipeline::row_ledger::TableRowCounts;
 use walshadow::pos::{
     Drain, EmitterAck, FilterDispatched, Floor, Pos, ShadowReplay, SourceReceived,
@@ -21,12 +21,28 @@ use crate::source_recovery::{PromotionGate, SOURCE_SWAP_RETRY};
 
 /// Shadow-side numbers for the metrics publish step, from
 /// [`ShadowStreamState::aggregate`](walshadow::shadow_stream::ShadowStreamState::aggregate)
-/// + the daemon's [`RateEstimator`](walshadow::metrics::RateEstimator).
+/// + the daemon's [`RateEstimator`].
 pub(crate) struct ShadowMetricsView {
-    pub(crate) apply_lag_bytes: u64,
-    pub(crate) apply_lag_seconds: f64,
+    /// `(bytes, seconds)`, `None` while the shadow has reported no apply LSN
+    /// yet, so the gauges keep their last value
+    pub(crate) apply_lag: Option<(u64, f64)>,
     pub(crate) active_connections: u64,
     pub(crate) dropped_total: u64,
+}
+
+/// Apply lag against the source head. A zero `shadow_replay` means no walreceiver
+/// status has landed since the daemon started, not that the shadow is at LSN 0:
+/// subtracting it would publish the whole WAL position (tens of TB) as lag.
+pub(crate) fn shadow_apply_lag(
+    received: u64,
+    shadow_replay: u64,
+    rate: &RateEstimator,
+) -> Option<(u64, f64)> {
+    if shadow_replay == 0 {
+        return None;
+    }
+    let bytes = received.saturating_sub(shadow_replay);
+    Some((bytes, rate.seconds_for(bytes)))
 }
 
 /// Live `[source]` endpoint moves the pump has yet to reach
@@ -259,6 +275,10 @@ pub(crate) async fn populate_metrics(
     by_database: Vec<DbSeries>,
     counters: StageCounters<'_>,
 ) {
+    let prev = registry.snapshot().await;
+    let (apply_lag_bytes, apply_lag_seconds) = shadow_view
+        .apply_lag
+        .unwrap_or((prev.shadow_apply_lag_bytes, prev.shadow_apply_lag_seconds));
     let base = MetricsSnapshot {
         source_received_lsn,
         filter_lsn,
@@ -290,8 +310,8 @@ pub(crate) async fn populate_metrics(
         promotion_target_in_recovery: timeline_view.promotion.in_recovery,
         promotion_target_replay_lsn: timeline_view.promotion.replay_lsn,
         promotion_target_receive_lsn: timeline_view.promotion.receive_lsn,
-        shadow_apply_lag_bytes: shadow_view.apply_lag_bytes,
-        shadow_apply_lag_seconds: shadow_view.apply_lag_seconds,
+        shadow_apply_lag_bytes: apply_lag_bytes,
+        shadow_apply_lag_seconds: apply_lag_seconds,
         shadow_stream_active_connections: shadow_view.active_connections,
         shadow_stream_dropped_connections_total: shadow_view.dropped_total,
         ..registry.snapshot().await
@@ -348,16 +368,16 @@ pub(crate) async fn populate_pipeline_metrics(
     use std::collections::BTreeMap;
     use walshadow::record::rmgr_label;
     let mut by_rm = BTreeMap::new();
-    for ((rm, route), n) in &rec_metrics.by_rm_route {
+    for (rm, route, n) in rec_metrics.by_rm_route() {
         let key = (
-            rmgr_label(*rm).to_string(),
+            rmgr_label(rm).to_string(),
             match route {
                 walshadow::record::Route::ToShadow => "to_shadow",
                 walshadow::record::Route::ToDecoder => "to_decoder",
                 walshadow::record::Route::ToBoth => "to_both",
             },
         );
-        by_rm.insert(key, *n);
+        by_rm.insert(key, n);
     }
     let snap = MetricsSnapshot {
         records_by_rm_route: by_rm,
@@ -386,6 +406,9 @@ pub(crate) async fn populate_pipeline_metrics(
             &decoder_stats.truncates,
         ]
         .map(|n| n.load(Ordering::Relaxed)),
+        decoder_buffer_lock_acquires_total: decoder_stats
+            .buffer_lock_acquires
+            .load(Ordering::Relaxed),
         decoder_buffer_lock_waits_total: decoder_stats.buffer_lock_waits.load(Ordering::Relaxed),
         decoder_buffer_lock_wait_seconds_total: decoder_stats
             .buffer_lock_wait_nanos
@@ -531,11 +554,20 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
         toast_values_fetched_total: emitter(|s| &s.toast_values_fetched),
         toast_value_fetch_batches_total: emitter(|s| &s.toast_value_fetch_batches),
         toast_value_fetch_seconds: emitter_seconds(|s| &s.toast_value_fetch_nanos),
+        toast_values_read_ahead_total: emitter(|s| &s.toast_values_read_ahead),
+        toast_value_wait_seconds: emitter_seconds(|s| &s.toast_value_wait_nanos),
         toast_image_rows_mirrored_total: emitter(|s| &s.toast_image_rows_mirrored),
         toast_values_filled_superseded_total: emitter(|s| &s.toast_values_filled_superseded),
         toast_values_filled_mismatch_total: emitter(|s| &s.toast_values_filled_mismatch),
         toast_values_filled_generation_total: emitter(|s| &s.toast_values_filled_generation),
         toast_values_filled_oversize_total: emitter(|s| &s.toast_values_filled_oversize),
+        toast_fetch_miss_total: emitter(|s| &s.toast_fetch_miss),
+        bootstrap_replay_covered_rows_total: emitter(|s| &s.bootstrap_replay_covered_rows),
+        bootstrap_gate_emitted_total: emitter(|s| &s.gate_emitted),
+        bootstrap_gate_gated_total: emitter(|s| &s.gate_gated),
+        bootstrap_gate_deferred_total: emitter(|s| &s.gate_deferred),
+        bootstrap_gate_chunks_gated_total: emitter(|s| &s.gate_chunks_gated),
+        bootstrap_gate_multixact_emitted_total: emitter(|s| &s.gate_multixact_emitted),
         toast_mirror_truncates_total: emitter(|s| &s.toast_mirror_truncates),
         toast_mirror_retires_total: emitter(|s| &s.toast_mirror_retires),
         toast_rewrite_barriers_total: emitter(|s| &s.toast_rewrite_barriers),
@@ -642,6 +674,25 @@ pub(crate) fn bootstrap_gauges(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// A reconnecting shadow reports no apply LSN (0) until its first status;
+    /// that must not read as "lag = whole WAL position"
+    #[test]
+    fn apply_lag_is_unknown_until_shadow_reports_replay() {
+        let base = 70_000_000_000_000u64;
+        let mut rate = RateEstimator::default();
+        let t0 = Instant::now();
+        rate.observe(t0, base);
+        rate.observe(t0 + Duration::from_secs(1), base + 200_000_000);
+        let head = base + 200_000_000;
+        assert_eq!(shadow_apply_lag(head, 0, &rate), None);
+        let (bytes, secs) = shadow_apply_lag(head, head - 400_000_000, &rate).unwrap();
+        assert_eq!(bytes, 400_000_000);
+        assert!((secs - 2.0).abs() < 1e-6);
+        // Shadow ahead of the head saturates rather than wrapping
+        assert_eq!(shadow_apply_lag(head, head + 5, &rate), Some((0, 0.0)));
+    }
 
     fn db_label(oid: u32) -> String {
         format!("db{oid}")

@@ -97,7 +97,7 @@ impl SnowflakeRuntime {
             commit_lsn,
             old: old.clone(),
             new,
-            old_active: self.active_generation(&old).await?,
+            old_active: self.active_generation(&old)?,
             projection,
         };
         let record = self.register_schema_change(record)?;
@@ -173,7 +173,7 @@ impl SnowflakeRuntime {
         let _guard = lock.lock().await;
         let digest = Sha256::digest(format!("drop/{}/{oid}/{commit_lsn}", self.source_identity));
         let operation_id = format!("drop_{}", &hex::encode(digest)[..40]);
-        let active = self.active_generation(&schema).await?;
+        let active = self.active_generation(&schema)?;
         let marker = if active == 0 {
             format!(
                 "walshadow:source:{}:table:{}",
@@ -452,7 +452,7 @@ impl SnowflakeRuntime {
             TableSqlPlan::new(&record.old, &self.config.internal_schema)
                 .map_err(anyhow::Error::msg)?
         } else {
-            self.generation_plan(&record.old, record.old_active).await?
+            self.generation_plan(&record.old, record.old_active)?
         };
         if self
             .state
@@ -501,7 +501,7 @@ impl SnowflakeRuntime {
             "published schema generation is no longer visible"
         );
         ensure!(
-            self.active_generation(&record.new).await? == generation.generation_id,
+            self.active_generation(&record.new)? == generation.generation_id,
             "schema generation active pointer is missing"
         );
         self.finish_schema_metadata(record, generation.generation_id)

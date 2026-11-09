@@ -181,7 +181,7 @@ impl Fixture {
         assert_eq!(plan.rels.len(), 1);
         let rel = plan.rels.pop().unwrap();
         assert_eq!(
-            plan.mapping.snapshot().await[&rel.rel].target.table,
+            plan.mapping.snapshot()[&rel.rel].target.table,
             rel.staging_table()
         );
         rel

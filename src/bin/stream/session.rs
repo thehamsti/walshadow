@@ -46,7 +46,7 @@ use crate::bootstrap::{
 use crate::housekeeping::{SEGMENT_FSYNC_QUEUE, spawn_segment_fsync, trim_retention};
 use crate::metrics_publish::{
     DbMetricSources, DrainResident, ShadowMetricsView, SourceSwap, StageCounters, TimelineView,
-    populate_metrics,
+    populate_metrics, shadow_apply_lag,
 };
 use crate::runtime_cfg::{or_signal, sighup_reload};
 use crate::shadow_proc::{
@@ -145,7 +145,7 @@ async fn session_body(
     let ident = feed.identify_system().await.context("IDENTIFY_SYSTEM")?;
     tracing::info!(
         target: "walshadow",
-        sysid = %ident.sysid,
+        sysid = ident.system_id,
         timeline = ident.timeline,
         xlogpos = format_pg_lsn(ident.xlogpos).to_string(),
         "source identified",
@@ -161,7 +161,7 @@ async fn session_body(
             "--start-lsn applies to the single-tenant layout only"
         );
     }
-    let sysid: u64 = ident.sysid.parse().context("source system identifier")?;
+    let sysid: u64 = ident.system_id;
     // Single-tenant layout: its config drives bootstrap too. With tenants
     // each opens its own below, and bootstrap builds shadow only
     let ch_config = match &tenants_cfg {
@@ -420,7 +420,7 @@ async fn session_body(
         .map(Pos::new);
 
     let live_identity = manifest::SourceIdentity {
-        system_id: ident.sysid.parse().context("IDENTIFY_SYSTEM sysid")?,
+        system_id: ident.system_id,
         timeline: ident.timeline,
         timeline_begin: Pos::ZERO,
     };
@@ -606,7 +606,7 @@ async fn session_body(
     // Shadow must attach to this listener before catalog replay can advance
     let mut shadow_boot = walshadow::shadow_stream::ShadowStreamState::new(
         history.shadow_boot_branch(stored_timeline, aligned.get(), start_timeline),
-        ident.sysid.clone(),
+        ident.system_id.to_string(),
         aligned.get(),
         args.walsender_slow_threshold,
     );
@@ -761,6 +761,13 @@ async fn session_body(
         (16..=19).contains(&source_major),
         "source PG major {source_major} unsupported (commit-record sinval layout audited for 16-19)",
     );
+    // Decoder and reorder skip header-routed records; a pending database
+    // attaches on any record's block locators. Named tenants never boot with
+    // pending databases, and header-routed records name no database, so the
+    // router fans them to every tenant, each of which skips them
+    if pending_dbs.is_empty() {
+        stream.filter_mut().enable_header_routing();
+    }
     let shadow_toast = ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow());
     // Check TOAST availability for opt-in and configured relations
     let mut shadow_toast_held = None;
@@ -788,7 +795,7 @@ async fn session_body(
     // moves the floor past it.
     let resume_floor = Arc::new(Monotone::<Floor>::new(aligned));
     let shared = tenant::SessionShared {
-        sysid: ident.sysid.clone(),
+        sysid: ident.system_id.to_string(),
         sysid_num: sysid,
         source_conn: source_conn.clone(),
         source_major,
@@ -1617,6 +1624,14 @@ async fn session_body(
             },
         );
         if last_cursor_write.is_none_or(|t| t.elapsed() >= cursor_write_interval) {
+            for t in &tenants {
+                t.mirror_resolver.flush_mirror().await.with_context(|| {
+                    format!(
+                        "tenant {}: flush TOAST mirror before publishing the floor",
+                        t.id
+                    )
+                })?;
+            }
             let persisted = manifest::write(&args.spill_dir, &cur)
                 .await
                 .context("write resume manifest")?;
@@ -2088,9 +2103,8 @@ async fn session_body(
         let boundary_hold_stats =
             primary.map_or(&boundary_hold_default, |t| &*t.boundary_hold_stats);
         let shadow_apply_lsn = shadow_agg.min_apply_lsn.map_or(0, Pos::get);
-        let lag_bytes = received.get().saturating_sub(shadow_apply_lsn);
         rate_estimator.observe(Instant::now(), received.get());
-        let lag_seconds = rate_estimator.seconds_for(lag_bytes);
+        let apply_lag = shadow_apply_lag(received.get(), shadow_apply_lsn, &rate_estimator);
         // Post-worker snapshots so the metric reflects what the worker
         // drained, not the top-of-iteration values.
         let emitter_ack_for_metric = progress.emitter_ack;
@@ -2124,8 +2138,7 @@ async fn session_body(
                 promotion,
             },
             ShadowMetricsView {
-                apply_lag_bytes: lag_bytes,
-                apply_lag_seconds: lag_seconds,
+                apply_lag,
                 active_connections: shadow_agg.active_connections as u64,
                 dropped_total: shadow_agg.dropped_total,
             },

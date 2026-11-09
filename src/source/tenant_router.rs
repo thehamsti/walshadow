@@ -412,6 +412,17 @@ fn heartbeat(lsn: u64, next_lsn: u64) -> Record<'static> {
 }
 
 impl<S: TenantSink> RecordSink for TenantRouter<S> {
+    /// Copy only the header when no fed tenant reads past it. The pump asks
+    /// with the header alone, whose block references are gone, so its scope
+    /// cannot narrow the tenants consulted: every one must agree. A
+    /// header-only record then scopes to every tenant, each of which skips it
+    fn header_only(&self, record: &Record<'_>) -> bool {
+        self.tenants
+            .iter()
+            .filter(|t| t.takes(record.source_lsn))
+            .all(|t| t.sink.header_only(record))
+    }
+
     /// Union over the tenants the record reaches: the pump must not ship
     /// past a record any of them may hold on
     fn may_park(&self, record: &Record<'_>) -> bool {
@@ -559,6 +570,7 @@ mod tests {
         fail: Option<&'static str>,
         stall: Option<&'static str>,
         parks: bool,
+        header_only: bool,
     }
 
     impl Fake {
@@ -580,6 +592,10 @@ mod tests {
     }
 
     impl RecordSink for Fake {
+        fn header_only(&self, _record: &Record<'_>) -> bool {
+            self.header_only
+        }
+
         fn may_park(&self, _record: &Record<'_>) -> bool {
             self.parks
         }
@@ -740,6 +756,21 @@ mod tests {
         assert_eq!(sink(&r, "a").seen.last(), Some(&0x30));
         assert_eq!(sink(&r, "b").seen.last(), Some(&0x30));
         assert_eq!(r.last_record_start(), 0x30);
+    }
+
+    #[test]
+    fn header_only_needs_every_fed_tenant() {
+        let skips = || Fake {
+            header_only: true,
+            ..Fake::default()
+        };
+        let r = router(true, vec![("a", 5, skips()), ("b", 6, skips())]);
+        assert!(r.header_only(&at(5, 0x10)));
+        let r = router(true, vec![("a", 5, skips()), ("b", 6, Fake::default())]);
+        assert!(
+            !r.header_only(&at(5, 0x10)),
+            "the header names no database, so b's want counts"
+        );
     }
 
     #[test]

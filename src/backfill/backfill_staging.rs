@@ -144,7 +144,7 @@ pub async fn prepare_snowflake_with_kind(
         reqs.iter().all(|req| relation_oids.insert(req.desc.oid)),
         "Snowflake snapshot pass contains duplicate relations"
     );
-    let live_map = live.snapshot().await;
+    let live_map = live.snapshot();
     // begin_snapshot_attempt can finish a previously loaded generation, so
     // the route must remain current during setup as well as final publication.
     let selected = reqs
@@ -238,7 +238,7 @@ pub async fn prepare(
 ) -> Result<StagingPlan> {
     let mut sess = StagingSession::connect(dest).await?;
     // Freeze routing for entire staging plan
-    let live_map = live.snapshot().await;
+    let live_map = live.snapshot();
     let mut staged: HashMap<RelName, TableMapping> = HashMap::with_capacity(reqs.len());
     let mut rels = Vec::with_capacity(reqs.len());
     for r in reqs {

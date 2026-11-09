@@ -124,7 +124,7 @@ pub async fn prepare_greenfield_snapshots(
     config: &ResolvedConfig,
     snapshot_lsn: u64,
 ) -> Result<SnowflakeSnapshotPlan> {
-    let routes = mapping.snapshot().await;
+    let routes = mapping.snapshot();
     let reqs: Vec<BackupRequest> = catalog
         .descriptors()
         .filter(|desc| {
@@ -739,6 +739,7 @@ mod tests {
                 xmax: 0,
                 infomask: 0,
                 source_lsn: 0xCAFE,
+                page_lsn: 0,
                 blkno: 0,
                 offnum: 0,
                 columns: vec![Some(crate::decode::heap_decoder::ColumnValue::Int4(
@@ -820,6 +821,7 @@ mod tests {
                 xmax: 0,
                 infomask: 0,
                 source_lsn: 1,
+                page_lsn: 0,
                 blkno: 0,
                 offnum: 0,
                 columns: vec![Some(crate::decode::heap_decoder::ColumnValue::Int4(

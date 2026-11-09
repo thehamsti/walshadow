@@ -30,7 +30,7 @@ PG_CFLAGS += --coverage -fprofile-abs-path
 SHLIB_LINK += --coverage
 endif
 
-EXTRA_CLEAN = coverage *.gcda *.gcno faultshim.so
+EXTRA_CLEAN = coverage *.gcda *.gcno faultshim.so $(PG_STAMP)
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
@@ -55,6 +55,19 @@ native.o: $(wildcard $(PGCH_DIR)/*.h $(PGCH_DIR)/clickhouse-c/*.h)
 # linker
 faultshim.so: faultshim.c
 	$(CC) -O2 -Wall -Wextra -fPIC -shared -o $@ $< -ldl
+
+# Build Rust test modules; clean when PostgreSQL version changes
+PG_STAMP = .pg_version
+PG_VERSION := $(shell $(PG_CONFIG) --version)
+
+.PHONY: test-deps
+test-deps:
+	@if [ "$$(cat $(PG_STAMP) 2>/dev/null)" != "$(PG_VERSION)" ]; then \
+		$(MAKE) clean && $(MAKE) -C test clean PG_CONFIG=$(PG_CONFIG); \
+	fi
+	$(MAKE) all faultshim.so
+	$(MAKE) -C test PG_CONFIG=$(PG_CONFIG)
+	@echo '$(PG_VERSION)' > $(PG_STAMP)
 
 COVERAGE_CC = gcc
 GCOV = gcov

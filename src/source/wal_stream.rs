@@ -39,6 +39,7 @@ use walrus::pg::walparser::{
 };
 
 use crate::filter::Filter;
+use crate::filter::header_walk;
 use crate::filter::rewrite::{RewriteError, noop_replace};
 use crate::pos::{Floor, Pos};
 #[cfg(test)]
@@ -96,6 +97,8 @@ pub enum WalStreamError {
     ForkBehindDispatched { switch_lsn: u64, dispatched: u64 },
     #[error("base lsn {0:#X} not segment-aligned")]
     UnalignedBase(u64),
+    #[error("segment size {0} is not a power of two")]
+    SegSize(u64),
     #[error("sink: {0}")]
     Sink(#[from] SinkError),
     #[error("shadow replay eligibility: {0:#}")]
@@ -199,6 +202,9 @@ impl WalStream {
         seg_size: u64,
         start_lsn: Pos<Floor>,
     ) -> Result<Self, WalStreamError> {
+        if !seg_size.is_power_of_two() {
+            return Err(WalStreamError::SegSize(seg_size));
+        }
         let start_lsn = start_lsn.get();
         if !start_lsn.is_multiple_of(seg_size) {
             return Err(WalStreamError::UnalignedBase(start_lsn));
@@ -350,43 +356,32 @@ impl WalStream {
             let page_magic = completed.page_magic;
             let byte_ranges = completed.byte_ranges.clone();
             let last_range = byte_ranges.last().copied().unwrap_or((0, 0));
-            let record_end = last_range.0 + last_range.1;
-
-            // Inner scope confines walker-buffer borrows to the filter
-            // call. Materialise to `'static` so the `ToDecoder` in-place
-            // NOOP below can take `&mut self.walker` without conflict,
-            // and so the decoder reads the original bytes after the
-            // shadow stream is clobbered.
-            let verdict;
-            let parsed_for_sink: XLogRecord<'static>;
-            {
-                let parsed = parse_record_from_bytes(
-                    completed.logical_bytes(self.walker.buffer()),
-                    completed.page_magic,
-                )
-                .map_err(|source| WalStreamError::Parse {
-                    offset: start_offset,
-                    source,
-                })?;
-                verdict = self
-                    .filter
-                    .decide_record(&parsed, self.current_lsn + start_offset as u64, page_magic)
-                    .map_err(|source| WalStreamError::Payload {
-                        offset: start_offset,
-                        source,
-                    })?;
-                // `rewrite_record` below mutates walker.buf that `parsed`
-                // views; dispatch needs the original parse, not post-rewrite.
-                parsed_for_sink = parsed.into_owned();
-            }
-            self.filter
-                .flush_shadow_rels()
-                .await
-                .map_err(WalStreamError::ShadowRelations)?;
-            let route = verdict.route;
-            if route == Route::ToDecoder {
-                // `parsed_for_sink` owns the original bytes the decoder
-                // reads, so clobbering the buffer with the NOOP is safe.
+            let source_lsn = self.current_lsn + start_offset as u64;
+            let record = if let Some(parsed) = self.filter.route_from_header(
+                completed.logical_bytes(self.walker.buffer()),
+                page_magic,
+                source_lsn,
+            ) {
+                Record {
+                    next_lsn: self.end_rec_ptr(&last_range, &parsed),
+                    defer_catalog_decode: self.filter.decide_from_header(&parsed, source_lsn),
+                    parsed,
+                    source_lsn,
+                    page_magic,
+                    route: Route::ToDecoder,
+                    boundary_info: None,
+                    aborted_tree: None,
+                    // Page images, sequences and index records: never a
+                    // commit or abort, so no `xl_xact_dbinfo`
+                    xact_db: None,
+                }
+            } else {
+                self.decide(&completed, source_lsn, &last_range, record_sink)
+                    .await?
+            };
+            if record.route == Route::ToDecoder {
+                // `record` owns the original bytes the decoder reads, so
+                // clobbering the buffer with the NOOP is safe.
                 match completed.stitched_bytes {
                     // Cross-page: stitch → NOOP → scatter back across
                     // `byte_ranges`.
@@ -409,21 +404,7 @@ impl WalStream {
                     }
                 }
             }
-
-            self.staged_end = self.staged_end.max(record_end);
-            let source_lsn = self.current_lsn + start_offset as u64;
-            let next_lsn = self.end_rec_ptr(&last_range, &parsed_for_sink);
-            let record = Record {
-                parsed: parsed_for_sink,
-                source_lsn,
-                next_lsn,
-                page_magic,
-                route,
-                boundary_info: verdict.boundary,
-                aborted_tree: verdict.aborted_tree,
-                defer_catalog_decode: verdict.defer_catalog_decode,
-                xact_db: verdict.xact_db,
-            };
+            self.staged_end = self.staged_end.max(last_range.0 + last_range.1);
             let parks = record_sink.may_park(&record);
             self.staged.push(record);
             if parks
@@ -433,6 +414,55 @@ impl WalStream {
                 self.dispatch_staged(record_sink).await?;
             }
         }
+    }
+
+    /// Full parse and routing verdict of `completed`
+    async fn decide(
+        &mut self,
+        completed: &CompletedRecord,
+        source_lsn: u64,
+        last_range: &(usize, usize),
+        record_sink: &mut (dyn RecordSink + Send),
+    ) -> Result<Record<'static>, WalStreamError> {
+        let offset = completed.start_offset;
+        let page_magic = completed.page_magic;
+        // Materialise to `'static` so the in-place NOOP can take
+        // `&mut self.walker`, and the decoder reads the original bytes
+        // after the shadow stream is clobbered. Skip the copy when
+        // dispatch reads only the header
+        let record = {
+            let parsed =
+                parse_record_from_bytes(completed.logical_bytes(self.walker.buffer()), page_magic)
+                    .map_err(|source| WalStreamError::Parse { offset, source })?;
+            let verdict = self
+                .filter
+                .decide_record(&parsed, source_lsn, page_magic)
+                .map_err(|source| WalStreamError::Payload { offset, source })?;
+            let header = Record {
+                parsed: header_walk::header_part(&parsed),
+                next_lsn: self.end_rec_ptr(last_range, &parsed),
+                source_lsn,
+                page_magic,
+                route: verdict.route,
+                boundary_info: verdict.boundary,
+                aborted_tree: verdict.aborted_tree,
+                defer_catalog_decode: verdict.defer_catalog_decode,
+                xact_db: verdict.xact_db,
+            };
+            if record_sink.header_only(&header) {
+                header
+            } else {
+                Record {
+                    parsed: parsed.into_owned(),
+                    ..header
+                }
+            }
+        };
+        self.filter
+            .flush_shadow_rels()
+            .await
+            .map_err(WalStreamError::ShadowRelations)?;
+        Ok(record)
     }
 
     /// Ship staged records' bytes, then hand the records to `record_sink`
@@ -637,13 +667,7 @@ impl WalStream {
     }
 
     fn segment_for_lsn(&self, lsn: u64) -> SegmentName {
-        let seg_no = lsn / self.seg_size;
-        let xlog_segs_per_xlog_id = 0x1_0000_0000u64 / self.seg_size;
-        SegmentName {
-            timeline: self.timeline,
-            log_id: (seg_no / xlog_segs_per_xlog_id) as u32,
-            seg_no: (seg_no % xlog_segs_per_xlog_id) as u32,
-        }
+        SegmentName::from_lsn(self.timeline, lsn, self.seg_size)
     }
 }
 
@@ -668,6 +692,14 @@ mod tests {
     fn new_rejects_unaligned_base() {
         let r = WalStream::new(1, WAL_SEG_SIZE, Pos::new(0x1234));
         assert!(matches!(r, Err(WalStreamError::UnalignedBase(_))));
+    }
+
+    #[test]
+    fn new_rejects_non_power_of_two_seg_size() {
+        for seg_size in [0, 3 * 8192] {
+            let r = WalStream::new(1, seg_size, Pos::ZERO);
+            assert!(matches!(r, Err(WalStreamError::SegSize(s)) if s == seg_size));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -856,9 +888,15 @@ mod tests {
             sink.on_record(r).await.unwrap();
         }
         assert_eq!(sink.total, 4);
-        assert_eq!(sink.by_rm_route[&(RmId::Heap as u8, Route::ToShadow)], 2,);
-        assert_eq!(sink.by_rm_route[&(RmId::Heap as u8, Route::ToDecoder)], 1,);
-        assert_eq!(sink.by_rm_route[&(RmId::Xact as u8, Route::ToShadow)], 1,);
+        let counts: Vec<_> = sink.by_rm_route().collect();
+        assert_eq!(
+            counts,
+            [
+                (RmId::Xact as u8, Route::ToShadow, 1),
+                (RmId::Heap as u8, Route::ToShadow, 2),
+                (RmId::Heap as u8, Route::ToDecoder, 1),
+            ]
+        );
         let summary = sink.summary();
         assert!(summary.starts_with("total=4"), "got {summary:?}");
         assert!(summary.contains("heap/to_shadow=2"), "got {summary:?}");

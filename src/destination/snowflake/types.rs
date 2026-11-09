@@ -1,10 +1,11 @@
 //! Neutral, lossless row vocabulary for Snowflake staging.
 use crate::decode::codecs::NumericKind;
+use crate::decode::codecs::{macaddr_to_text, macaddr8_to_text, tid_to_text};
 use crate::decode::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
 use crate::schema::{
     self, BOOLOID, BPCHAROID, BYTEAOID, CHAROID, DATEOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID,
-    INT8OID, NAMEOID, NUMERICOID, OIDOID, RelDescriptor, TEXTOID, TIMEOID, TIMESTAMPOID,
-    TIMESTAMPTZOID, UUIDOID, VARCHAROID, replident_key_attnums,
+    INT8OID, MONEYOID, NAMEOID, NUMERICOID, OIDOID, PG_LSNOID, RelDescriptor, TEXTOID, TIMEOID,
+    TIMESTAMPOID, TIMESTAMPTZOID, UUIDOID, VARCHAROID, replident_key_attnums,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -170,6 +171,56 @@ impl TableSchema {
         })
     }
 }
+/// Render a row's source-dependent values through the shadow oracle.
+///
+/// The heap decoder reads `money` and `pg_lsn` natively, but their text
+/// depends on the source (`lc_monetary`, the server's LSN format), and
+/// Snowflake keeps them as `VARCHAR`. Hand those back to the oracle as
+/// on-disk datums so the warehouse keeps the source's own typoutput, then
+/// render every pending value in one round trip
+pub async fn render_source_text(
+    oracle: &crate::ops::oracle::Oracle,
+    tuple: &mut CommittedTuple,
+    desc: &RelDescriptor,
+) -> Result<usize, crate::ops::oracle::OracleError> {
+    for image in [&mut tuple.decoded.new, &mut tuple.decoded.old]
+        .into_iter()
+        .flatten()
+    {
+        defer_source_rendered(desc, &mut image.columns);
+    }
+    oracle.render_text_columns(tuple, desc).await
+}
+
+/// Types the decoder reads natively whose Snowflake text only the source's
+/// own typoutput can produce
+pub fn renders_through_oracle(type_oid: u32) -> bool {
+    matches!(type_oid, MONEYOID | PG_LSNOID)
+}
+
+pub(crate) fn defer_source_rendered(desc: &RelDescriptor, columns: &mut [Option<ColumnValue>]) {
+    for attr in &desc.attributes {
+        if attr.dropped || !renders_through_oracle(attr.type_oid) {
+            continue;
+        }
+        let Some(Some(cell)) = usize::try_from(attr.attnum - 1)
+            .ok()
+            .and_then(|idx| columns.get_mut(idx))
+        else {
+            continue;
+        };
+        let raw = match cell {
+            ColumnValue::Int8(v) if attr.type_oid == MONEYOID => v.to_le_bytes(),
+            ColumnValue::Oid8(v) if attr.type_oid == PG_LSNOID => v.to_le_bytes(),
+            _ => continue,
+        };
+        *cell = ColumnValue::PgPending {
+            type_oid: attr.type_oid,
+            raw: raw.to_vec(),
+        };
+    }
+}
+
 pub fn type_for(oid: u32, typmod: i32) -> SnowflakeType {
     use schema::*;
     match oid {
@@ -400,6 +451,21 @@ pub(crate) fn convert(v: &ColumnValue, c: &SnowflakeColumn) -> Result<SnowflakeV
             SnowflakeType::Text,
         ) => Ok(SnowflakeValue::Text(x.clone())),
         (ColumnValue::Uuid(x), SnowflakeType::Text) => Ok(SnowflakeValue::Text(format_uuid(x))),
+        // `xid`, `cid` and `xid8`/`oid8` print as plain unsigned decimals;
+        // `pg_lsn` never reaches here decoded (see `render_source_text`)
+        (ColumnValue::Oid(x), SnowflakeType::Text) => Ok(SnowflakeValue::Text(x.to_string())),
+        (ColumnValue::Oid8(x), SnowflakeType::Text) if c.type_oid != PG_LSNOID => {
+            Ok(SnowflakeValue::Text(x.to_string()))
+        }
+        (ColumnValue::MacAddr(x), SnowflakeType::Text) => {
+            Ok(SnowflakeValue::Text(macaddr_to_text(x).as_str().to_owned()))
+        }
+        (ColumnValue::MacAddr8(x), SnowflakeType::Text) => Ok(SnowflakeValue::Text(
+            macaddr8_to_text(x).as_str().to_owned(),
+        )),
+        (ColumnValue::Tid { block, offset }, SnowflakeType::Text) => Ok(SnowflakeValue::Text(
+            tid_to_text(*block, *offset).as_str().to_owned(),
+        )),
         (
             ColumnValue::Numeric(NumericKind::Finite(x)),
             SnowflakeType::Number { precision, scale },

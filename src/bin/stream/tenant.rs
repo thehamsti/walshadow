@@ -303,6 +303,9 @@ pub(crate) struct Tenant {
     pub config_resolvers: Vec<Arc<ConfigResolver>>,
     pub snowflake: Option<Arc<walshadow::destination::snowflake::runtime::SnowflakeRuntime>>,
     pub span_registry: Option<walshadow::trace::TxnSpanRegistry>,
+    /// Reorder's TOAST resolver: its batched store mirror flushes before the
+    /// session publishes a floor past the rows it holds
+    pub mirror_resolver: walshadow::toast::ToastResolver,
     /// Pruners' floor: the session joins every persisted resume floor
     gc_floor: Option<Monotone<Floor>>,
     gc_tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -565,31 +568,39 @@ pub(crate) async fn open_tenant(
         .with_xid_ceiling(xid_ceiling),
     ));
 
-    // Spill dir wiped every startup: cursor file commits drains
-    // atomically, so leftover spill from a prior crash is redundant or stale.
+    // Cursor records completed drains atomically; replay WAL to rebuild
+    // pending transactions after clearing scratch at startup. Each tenant
+    // clears only its own scratch, laid out like its durable dir
+    let scratch = walshadow::tenants::tenant_dir(&args.scratch_dir(), &id);
     let mut xact_buf_cfg = XactBufferConfig {
         xact_buffer_max: args.xact_buffer_max,
-        ..XactBufferConfig::new(dir.clone())
+        ..XactBufferConfig::new(scratch)
     };
     if let Some(cfg) = db_conns[primary].emitter.as_ref() {
         xact_buf_cfg.drain_batch_rows = cfg.drain_batch_rows;
         xact_buf_cfg.drain_batch_bytes = cfg.drain_batch_bytes;
     }
-    let mut xact_buffer = XactBuffer::new(xact_buf_cfg).context("init xact buffer / spill dir")?;
+    // Txn-span registry, shared by pump + decoder + buffer; `Some` only with OTLP on
+    let span_registry = span_tracing.then(walshadow::trace::TxnSpanRegistry::new);
+    let mut xact_buffer = XactBuffer::new(xact_buf_cfg)
+        .context("initialize transaction buffer and scratch directory")?;
+    if let Some(reg) = &span_registry {
+        xact_buffer = xact_buffer.with_span_registry(reg.clone());
+    }
     xact_buffer
-        .clear_spill_dir()
-        .await
-        .context("clear stale spill files")?;
+        .clear_scratch_dir()
+        .context("clear scratch directory")?;
     xact_buffer.set_min_commit_lsn(min_commit_lsn);
-    let xact_buffer = Arc::new(Mutex::new(xact_buffer));
     tracing::info!(
         target: "walshadow",
         tenant = %id,
         spill_dir = %dir.display(),
+        scratch_dir = %xact_buffer.scratch_dir().display(),
         xact_buffer_max = args.xact_buffer_max,
         min_commit_lsn = %format_pg_lsn(min_commit_lsn),
-        "spill dir ready",
+        "spill and scratch directories ready",
     );
+    let xact_buffer = Arc::new(Mutex::new(xact_buffer));
 
     let pending_cfg = db_conns[primary]
         .emitter
@@ -641,12 +652,6 @@ pub(crate) async fn open_tenant(
     let desc_log = desc_logs[primary].clone();
     let all_desc_logs = walshadow::desc_log::DescriptorLogs::new(desc_logs.clone());
 
-    // Txn-span registry, shared by pump + decoder; `Some` only with OTLP on.
-    let span_registry = if span_tracing {
-        Some(xact_buffer.lock().await.span_registry())
-    } else {
-        None
-    };
     let stash_live = xact_buffer.lock().await.stash_live();
     let mut decoder =
         BufferingDecoderSink::new(all_desc_logs, xact_buffer.clone()).with_stash_live(stash_live);
@@ -861,7 +866,8 @@ pub(crate) async fn open_tenant(
         .await?;
     // Predecode off this tenant's own decoder: its descriptor logs answer for
     // the relations the router hands it
-    let predecode = Arc::new(decoder.predecoder());
+    let mirror_resolver = reorder_sink.planning_resolver();
+    let predecode = Arc::new(decoder.predecoder(reorder_sink.planning_resolver()));
     let decoder_xact = QueueingRecordSink::spawn(
         DecoderXactPair {
             decoder,
@@ -966,6 +972,7 @@ pub(crate) async fn open_tenant(
             config_resolvers,
             snowflake,
             span_registry,
+            mirror_resolver,
             gc_floor: Some(gc_floor),
             gc_tasks,
             gc_fatal,

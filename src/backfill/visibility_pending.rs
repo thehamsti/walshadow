@@ -491,7 +491,7 @@ async fn ship_snowflake(
                 bootstrap::resolve_or_fill_toast(&mut tuple, &desc, &route.mapping, &resolver)
                     .await?;
         }
-        let (incarnation, _) = runtime.lineage(&desc).await.map_err(|e| e.to_string())?;
+        let (incarnation, _) = runtime.lineage(&desc).map_err(|e| e.to_string())?;
         let captured_generation = runtime
             .pending_capture_generation(desc.oid)
             .map_err(|e| e.to_string())?;
@@ -511,8 +511,7 @@ async fn ship_snowflake(
         let ordinal = u32::from(tuple.offnum);
         let mut committed = tuple.into_committed_insert();
         if let Some(oracle) = &oracle {
-            oracle
-                .render_text_columns(&mut committed, &desc)
+            crate::destination::snowflake::types::render_source_text(oracle, &mut committed, &desc)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1237,6 +1236,7 @@ mod tests {
             xmax: 200,
             infomask: 0x0100,
             source_lsn: 0x5000,
+            page_lsn: 0,
             blkno: 0,
             offnum: 0,
             columns: vec![Some(ColumnValue::Int4(1))],

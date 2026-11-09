@@ -43,12 +43,16 @@
 
 use crate::ascii_buf::{AsciiArray, AsciiBuf};
 use crate::ch::types;
-use crate::decode::codecs::{format_time_us, timetz_to_text};
+use crate::decode::codecs::{
+    format_time_us, macaddr_to_text, macaddr8_to_text, tid_to_text, timetz_to_text,
+};
 use crate::decode::heap_decoder::{self, ColumnValue};
+use crate::emit::ch_emitter::DATE32_PG_EPOCH_DAYS;
 use crate::schema::{
-    BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
-    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, NAMEOID, NUMERICOID, OIDOID,
-    RelAttr, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID, UUIDOID, VARCHAROID,
+    BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDOID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
+    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, MONEYOID, NAMEOID, NUMERICOID,
+    OID8OID, OIDOID, PG_LSNOID, RelAttr, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID,
+    UUIDOID, VARCHAROID, XID8OID, XIDOID,
 };
 use clickhouse_c::{Allocator, Kind, TypeAst};
 use walrus::time::civil_from_days;
@@ -99,8 +103,9 @@ pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
         CHAROID => "Int8".into(),
         INT2OID => "Int16".into(),
         INT4OID => "Int32".into(),
-        INT8OID => "Int64".into(),
-        OIDOID => "UInt32".into(),
+        INT8OID | MONEYOID => "Int64".into(),
+        OIDOID | XIDOID | CIDOID => "UInt32".into(),
+        OID8OID | XID8OID | PG_LSNOID => "UInt64".into(),
         FLOAT4OID => "Float32".into(),
         FLOAT8OID => "Float64".into(),
         NUMERICOID => numeric_ch_type(att.typmod),
@@ -214,6 +219,7 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
         ColumnValue::Int4(i) => Some(i.to_string()),
         ColumnValue::Int8(i) => Some(i.to_string()),
         ColumnValue::Oid(i) => Some(i.to_string()),
+        ColumnValue::Oid8(i) => Some(i.to_string()),
         ColumnValue::Float4(f) => Some(format_float(*f as f64)),
         ColumnValue::Float8(f) => Some(format_float(*f)),
         ColumnValue::Numeric(n) => {
@@ -240,7 +246,11 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
             Some(sql_string_literal(s))
         }
         ColumnValue::Bytea(b) => Some(sql_bytes_literal(b)),
-        ColumnValue::Date(days) => Some(format!("toDate32({days})")),
+        // PG counts days from 2000-01-01, `toDate32` from 1970-01-01
+        ColumnValue::Date(days) => Some(format!(
+            "toDate32({})",
+            i64::from(*days) + i64::from(DATE32_PG_EPOCH_DAYS)
+        )),
         ColumnValue::Time(micros) => {
             let txt = format_time_us(*micros);
             Some(sql_string_literal(&txt))
@@ -259,8 +269,13 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
         }
         ColumnValue::Interval(v) => Some(sql_string_literal(&v.to_text())),
         ColumnValue::Inet(v) => Some(sql_string_literal(&v.to_text())),
+        ColumnValue::MacAddr(b) => Some(sql_string_literal(&macaddr_to_text(b))),
+        ColumnValue::MacAddr8(b) => Some(sql_string_literal(&macaddr8_to_text(b))),
+        ColumnValue::Tid { block, offset } => {
+            Some(sql_string_literal(&tid_to_text(*block, *offset)))
+        }
         ColumnValue::Uuid(b) => Some(format!("toUUID({})", sql_string_literal(&format_uuid(b)))),
-        ColumnValue::PgPendingText { text, .. } => Some(sql_bytes_literal(text.as_bytes())),
+        ColumnValue::PgPendingText { text, .. } => pending_text_literal(text, ch_inner),
         ColumnValue::PgPending { .. }
         | ColumnValue::ExternalToast(_)
         | ColumnValue::Unsupported { .. } => None,
@@ -344,6 +359,76 @@ fn sql_string_literal(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// PG text of a type only shadow PG decodes. CH casts a default to its column
+/// type, which parses most PG text forms as is, but not an array's `{…}` nor
+/// the UTC offset `timestamptz_out` appends (`+00`)
+fn pending_text_literal(text: &str, ch_inner: &str) -> Option<String> {
+    match types::kind(ch_inner) {
+        Some(Kind::Array) if text.starts_with('[') && text.ends_with(']') => {
+            Some(sql_bytes_literal(text.as_bytes()))
+        }
+        Some(Kind::Array) => {
+            let items: Vec<String> = pg_array_items(text)?
+                .iter()
+                .map(|item| {
+                    item.as_deref()
+                        .map_or_else(|| "NULL".into(), sql_string_literal)
+                })
+                .collect();
+            Some(format!("[{}]", items.join(", ")))
+        }
+        // No text form ClickHouse casts to these
+        Some(Kind::Map | Kind::Object | Kind::QBit) => None,
+        // BC and ±infinity have no DateTime64 form
+        Some(Kind::DateTime64) if text.ends_with(" BC") || text.ends_with("infinity") => None,
+        Some(Kind::DateTime64) => Some(format!(
+            "parseDateTime64BestEffort({}, {}, 'UTC')",
+            sql_string_literal(text),
+            datetime64_scale(ch_inner).unwrap_or(6)
+        )),
+        _ => Some(sql_bytes_literal(text.as_bytes())),
+    }
+}
+
+/// Elements of a one-dimensional `array_out` text (`{1,NULL,"a b"}`), `None`
+/// for any other shape, eg multidimensional or with explicit bounds
+fn pg_array_items(text: &str) -> Option<Vec<Option<String>>> {
+    let body = text.strip_prefix('{')?.strip_suffix('}')?;
+    let mut items = Vec::new();
+    if body.is_empty() {
+        return Some(items);
+    }
+    let mut chars = body.chars().peekable();
+    loop {
+        let item = if chars.next_if_eq(&'"').is_some() {
+            let mut item = String::new();
+            loop {
+                match chars.next()? {
+                    '\\' => item.push(chars.next()?),
+                    '"' => break,
+                    c => item.push(c),
+                }
+            }
+            Some(item)
+        } else {
+            let mut raw = String::new();
+            while let Some(c) = chars.next_if(|&c| c != ',') {
+                if matches!(c, '{' | '}' | '"') {
+                    return None;
+                }
+                raw.push(c);
+            }
+            (!raw.eq_ignore_ascii_case("NULL")).then_some(raw)
+        };
+        items.push(item);
+        match chars.next() {
+            None => return Some(items),
+            Some(',') => {}
+            Some(_) => return None,
+        }
+    }
 }
 
 /// Raw bytes as CH binary literal via `unhex('…')`; round-trip safe for
@@ -601,6 +686,24 @@ mod tests {
     }
 
     #[test]
+    fn integer_like_system_types_map_native() {
+        for (oid, want) in [
+            (XIDOID, "UInt32"),
+            (CIDOID, "UInt32"),
+            (XID8OID, "UInt64"),
+            (PG_LSNOID, "UInt64"),
+            (OID8OID, "UInt64"),
+            (MONEYOID, "Int64"),
+        ] {
+            assert_eq!(
+                base_type_for(&attr(oid, -1, true, None)).unwrap(),
+                want,
+                "oid {oid}"
+            );
+        }
+    }
+
+    #[test]
     fn time_maps_native_timetz_and_interval_text() {
         assert_eq!(
             base_type_for(&attr(TIMEOID, -1, true, None)).unwrap(),
@@ -666,17 +769,6 @@ mod tests {
         assert_eq!(r.default_sql.as_deref(), Some("true"));
         let r = map(&attr(BOOLOID, -1, true, Some("f")), false).unwrap();
         assert_eq!(r.default_sql.as_deref(), Some("false"));
-    }
-
-    #[test]
-    fn default_for_timestamp_renders_text_bytes() {
-        let r = map(
-            &attr(TIMESTAMPTZOID, 6, true, Some("2024-01-02 03:04:05+00")),
-            false,
-        )
-        .unwrap();
-        let d = r.default_sql.expect("default rendered");
-        assert!(d.starts_with("unhex('"), "{d}");
     }
 
     /// Fringe varlena type with no local codec
@@ -765,6 +857,15 @@ mod tests {
     }
 
     #[test]
+    fn column_value_date_shifts_to_unix_epoch() {
+        // 2024-01-01 is day 8766 after 2000-01-01, day 19723 after 1970-01-01
+        let lit = column_value_to_sql_literal(&ColumnValue::Date(8766), "Date32").unwrap();
+        assert_eq!(lit, "toDate32(19723)");
+        let lit = column_value_to_sql_literal(&ColumnValue::Date(0), "Date32").unwrap();
+        assert_eq!(lit, "toDate32(10957)");
+    }
+
+    #[test]
     fn column_value_bytea_renders_unhex_literal() {
         let lit =
             column_value_to_sql_literal(&ColumnValue::Bytea(vec![0xDE, 0xAD]), "String").unwrap();
@@ -804,5 +905,91 @@ mod tests {
         assert_eq!(datetime64_ch_type(6), "DateTime64(6, 'UTC')");
         assert_eq!(datetime64_ch_type(9), "DateTime64(6, 'UTC')");
         assert_eq!(datetime64_ch_type(-1), "DateTime64(6, 'UTC')");
+    }
+
+    fn array_attr(type_name: &str, missing: &str) -> RelAttr {
+        RelAttr {
+            type_name: type_name.into(),
+            type_byval: false,
+            type_len: -1,
+            ..attr(0, -1, true, Some(missing))
+        }
+    }
+
+    #[test]
+    fn timestamptz_text_default_parses_the_utc_offset() {
+        let r = map(
+            &attr(
+                TIMESTAMPTZOID,
+                -1,
+                true,
+                Some("2026-08-27 12:47:00.842306+00"),
+            ),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            r.default_sql.as_deref(),
+            Some("parseDateTime64BestEffort('2026-08-27 12:47:00.842306+00', 6, 'UTC')")
+        );
+        let r = map(
+            &attr(TIMESTAMPOID, 3, true, Some("2024-01-01 00:00:00")),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            r.default_sql.as_deref(),
+            Some("parseDateTime64BestEffort('2024-01-01 00:00:00', 3, 'UTC')")
+        );
+        for text in ["infinity", "-infinity", "0044-03-15 12:00:00+00 BC"] {
+            let r = map(&attr(TIMESTAMPTZOID, -1, true, Some(text)), false).unwrap();
+            assert_eq!(r.default_sql, None, "{text}");
+        }
+    }
+
+    #[test]
+    fn array_text_default_renders_a_clickhouse_array() {
+        for (type_name, text, expected) in [
+            ("_int4", "{90}", Some("['90']")),
+            ("_int8", "{1,NULL,-3}", Some("['1', NULL, '-3']")),
+            (
+                "_text",
+                r#"{"x y","q\"\\",NULL,"NULL",it's}"#,
+                Some(r#"['x y', 'q"\\', NULL, 'NULL', 'it''s']"#),
+            ),
+            ("_int4", "{}", Some("[]")),
+            ("_int4", "{{1,2},{3,4}}", None),
+            ("_int4", "[0:1]={1,2}", None),
+            ("_text", r#"{"unterminated}"#, None),
+        ] {
+            let r = map(&array_attr(type_name, text), false).unwrap();
+            assert_eq!(r.default_sql.as_deref(), expected, "{type_name} {text}");
+        }
+    }
+
+    #[test]
+    fn vector_text_default_casts_from_its_bracketed_text() {
+        for type_name in ["vector", "halfvec"] {
+            let r = map(&array_attr(type_name, "[1,2,3]"), false).unwrap();
+            assert_eq!(r.ch_type, "Array(Float32)");
+            assert_eq!(
+                r.default_sql.as_deref(),
+                Some("unhex('5b312c322c335d')"),
+                "{type_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_text_default_is_dropped() {
+        let r = map(&array_attr("hstore", r#""a"=>"1""#), false).unwrap();
+        assert_eq!(r.ch_type, "Map(String, Nullable(String))");
+        assert_eq!(r.default_sql, None);
+    }
+
+    #[test]
+    fn other_pending_text_defaults_cast_from_their_text() {
+        let r = map(&attr(NUMERICOID, -1, true, Some("3.14")), false).unwrap();
+        assert_eq!(r.default_sql.as_deref(), Some("unhex('332e3134')"));
     }
 }

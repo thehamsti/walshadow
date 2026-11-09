@@ -235,7 +235,7 @@ impl SnowflakeRuntime {
         Ok(schema)
     }
 
-    pub async fn lineage(&self, desc: &RelDescriptor) -> Result<(u64, u64)> {
+    pub fn lineage(&self, desc: &RelDescriptor) -> Result<(u64, u64)> {
         self.lineage_with_truncate_barrier(desc)
     }
 
@@ -249,7 +249,7 @@ impl SnowflakeRuntime {
     }
 
     pub async fn ensure_table(&self, desc: &RelDescriptor) -> Result<()> {
-        self.lineage(desc).await?;
+        self.lineage(desc)?;
         self.ensure_schema(&self.schema(desc)?).await
     }
 
@@ -346,7 +346,7 @@ impl SnowflakeRuntime {
         // Reconcile a view replacement committed before the local active
         // pointer. Recreating the base view here would undo a published load.
         let _active_plan = self.active_plan(schema).await?;
-        let active = self.active_generation(schema).await?;
+        let active = self.active_generation(schema)?;
         let owner = if active == 0 {
             format!("walshadow:source:{}:table:{key}", self.source_identity)
         } else {
@@ -379,7 +379,7 @@ impl SnowflakeRuntime {
         {
             // Replacing a view resets its change tracking and stales
             // downstream streams, so replace only when its text changed
-            let view = self.publication_view(schema).await?;
+            let view = self.publication_view(schema)?;
             let digest = Sha256::digest(view.as_bytes());
             if !view_present
                 || self
@@ -444,7 +444,7 @@ impl SnowflakeRuntime {
         }
     }
 
-    pub async fn truncate(&self, _rel: &RelName) -> Result<()> {
+    pub fn truncate(&self, _rel: &RelName) -> Result<()> {
         bail!(
             "Snowflake TRUNCATE requires a journaled generation publication; source progress stopped"
         )
@@ -997,9 +997,7 @@ impl SnowflakeRuntime {
                 // A sibling's group committed and read back this receipt
                 return Ok(());
             }
-            let plan = self
-                .generation_plan(&payload.schema, snapshot.generation_id)
-                .await?;
+            let plan = self.generation_plan(&payload.schema, snapshot.generation_id)?;
             return self
                 .materialize_snapshot_group(batch, snapshot, &payload.schema, &plan)
                 .await;
@@ -1009,7 +1007,7 @@ impl SnowflakeRuntime {
         let mut plan = self.active_plan(&payload.schema).await?;
         if let Some(expected) = payload.pending_generation {
             ensure!(
-                self.active_generation(&payload.schema).await? == expected,
+                self.active_generation(&payload.schema)? == expected,
                 "pending row generation was superseded during delivery"
             );
             plan.min_commit_lsn = None;

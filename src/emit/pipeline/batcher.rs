@@ -35,17 +35,23 @@ use crate::emit::ch_emitter::{
     Append, ColumnBuf, ColumnEncoding, EmitterStats, OP_DELETE, OP_INSERT, OP_UPDATE, TableEncoder,
     TablePlan,
 };
+use crate::emit::pipeline::decode::DECODE_CHUNK_BYTES;
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::emit::route::RouteSnapshot;
 use crate::schema::{RelDescriptor, TableKey};
-use ahash::{HashMap, HashMapExt};
+use ahash::HashMap;
 
-/// One decoded row routed to its destination. `route`/`rel` are `Arc`
-/// clones a decoder resolves once per xact/table.
-pub struct RoutedRow {
-    pub seq: u64,
+/// Source relation and route captured during planning
+pub struct RowTable {
     pub rel: Arc<RelDescriptor>,
     pub route: Arc<RouteSnapshot>,
+}
+
+/// One decoded row routed to its destination
+pub struct RoutedRow {
+    pub seq: u64,
+    /// Index into containing chunk's `tables`
+    pub table: u32,
     pub committed: CommittedTuple,
     /// Detoast leaf permit shrunk to this row's decoded TOAST bytes, so
     /// decoded values and their encoder slab copy stay covered to insert
@@ -53,14 +59,111 @@ pub struct RoutedRow {
     pub value_permit: Option<Arc<crate::budget::MemoryPermit>>,
 }
 
-/// One decode slice's rows under the admission permit covering them.
-/// Registers once per table the chunk touches, so neither the permit's
-/// refcount nor the holder list scales with row count.
+/// Share table metadata and a memory permit across decoded rows
+#[derive(Default)]
 pub struct RowChunk {
+    pub tables: Vec<RowTable>,
     pub rows: Vec<RoutedRow>,
     /// Released post-insert-ack, when every covering `InsertBatch` drops
     pub permit: Option<Arc<crate::budget::MemoryPermit>>,
 }
+
+impl RowChunk {
+    fn table(&mut self, rel: &Arc<RelDescriptor>, route: &Arc<RouteSnapshot>) -> u32 {
+        if !self
+            .tables
+            .last()
+            .is_some_and(|t| Arc::ptr_eq(&t.rel, rel) && Arc::ptr_eq(&t.route, route))
+        {
+            self.tables.push(RowTable {
+                rel: rel.clone(),
+                route: route.clone(),
+            });
+        }
+        (self.tables.len() - 1) as u32
+    }
+}
+
+/// Rows per chunk a [`RowBuffer`] ships. Fixed rather than config-driven:
+/// backfill rows are uniform, and the byte trigger covers the fat-row case
+const ROW_BUFFER_MAX_ROWS: usize = 1024;
+
+/// Coalesces routed rows into one `BatcherMsg::Rows` per `ROW_BUFFER_MAX_ROWS`
+/// rows or [`DECODE_CHUNK_BYTES`], the same amortization streaming placement
+/// gets. Rows of different seqs may share a chunk; the batcher routes each
+/// independently
+#[derive(Default)]
+pub struct RowBuffer {
+    chunk: RowChunk,
+    bytes: usize,
+}
+
+impl RowBuffer {
+    /// Share `permit` across all buffered and sent chunks
+    pub fn new(permit: Option<Arc<crate::budget::MemoryPermit>>) -> Self {
+        Self {
+            chunk: RowChunk {
+                permit,
+                ..Default::default()
+            },
+            bytes: 0,
+        }
+    }
+
+    pub async fn push(
+        &mut self,
+        msg_tx: &mpsc::Sender<BatcherMsg>,
+        seq: u64,
+        table: (&Arc<RelDescriptor>, &Arc<RouteSnapshot>),
+        committed: CommittedTuple,
+        value_permit: Option<Arc<crate::budget::MemoryPermit>>,
+    ) -> Result<(), BatcherClosed> {
+        if self.stage(seq, table, committed, value_permit) {
+            self.flush(msg_tx).await?;
+        }
+        Ok(())
+    }
+
+    /// Buffer a row, true once buffer is due to flush
+    pub fn stage(
+        &mut self,
+        seq: u64,
+        table: (&Arc<RelDescriptor>, &Arc<RouteSnapshot>),
+        committed: CommittedTuple,
+        value_permit: Option<Arc<crate::budget::MemoryPermit>>,
+    ) -> bool {
+        // Flush leaf permits before another acquisition can wait on them.
+        let has_value_permit = value_permit.is_some();
+        self.bytes += committed.decoded.approx_bytes();
+        let table = self.chunk.table(table.0, table.1);
+        self.chunk.rows.push(RoutedRow {
+            seq,
+            table,
+            committed,
+            value_permit,
+        });
+        has_value_permit
+            || self.chunk.rows.len() >= ROW_BUFFER_MAX_ROWS
+            || self.bytes >= DECODE_CHUNK_BYTES
+    }
+
+    pub async fn flush(&mut self, msg_tx: &mpsc::Sender<BatcherMsg>) -> Result<(), BatcherClosed> {
+        if self.chunk.rows.is_empty() {
+            return Ok(());
+        }
+        self.bytes = 0;
+        let next = Self::new(self.chunk.permit.clone()).chunk;
+        let chunk = std::mem::replace(&mut self.chunk, next);
+        msg_tx
+            .send(BatcherMsg::Rows(chunk))
+            .await
+            .map_err(|_| BatcherClosed)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("batcher channel closed")]
+pub struct BatcherClosed;
 
 /// Per-column name + CH type string. Inserter parses `type_repr` into its
 /// own `TypeAst` (`Send` but not `Sync`, so unshareable).
@@ -140,8 +243,6 @@ pub(crate) struct InsertBatch {
 /// process ahead of rows enqueued before it — else flush seals a partial set
 /// and falsely signals "earlier data sealed", pinning the durability wait.
 pub enum BatcherMsg {
-    /// Single row (bootstrap drain). One channel hop + wakeup per row.
-    Row(RoutedRow),
     /// Chunk of rows from one placement (see `decode::DECODE_CHUNK_BYTES`),
     /// amortizing the per-row channel-send + cross-thread wakeup — the
     /// dominant coordination cost under sustained load. Rows may carry
@@ -172,6 +273,46 @@ struct Table {
     slice_permits: Vec<Arc<crate::budget::MemoryPermit>>,
     value_permits: Vec<Arc<crate::budget::MemoryPermit>>,
     deadline: Option<Instant>,
+}
+
+#[derive(Default)]
+struct Tables {
+    slots: HashMap<TableKey, usize>,
+    open: Vec<Table>,
+}
+
+impl Tables {
+    fn slot(&mut self, ctx: &RowCtx<'_>, t: &RowTable) -> Result<usize, String> {
+        // Batch partitions sharing root's destination together under root
+        let key = TableKey::new(
+            t.rel.rfn.db_node,
+            t.route.batch_owner(&t.rel.rel_name).clone(),
+        );
+        let e = match self.slots.entry(key) {
+            Entry::Occupied(e) => return Ok(*e.get()),
+            Entry::Vacant(e) => e,
+        };
+        // Read column overrides from route captured during planning.
+        // Configuration barrier clears cached plans before applying column changes
+        let plan = TablePlan::for_route(ctx.alloc, &t.rel, &t.route).map_err(|e| e.to_string())?;
+        let meta = Arc::new(BatchMeta::from_plan(
+            &plan,
+            e.key().clone(),
+            ctx.epoch,
+            ctx.stats,
+        ));
+        let enc = TableEncoder::new(plan).map_err(|e| e.to_string())?;
+        self.open.push(Table {
+            enc,
+            allocated_bytes: 0,
+            meta,
+            seq_counts: Vec::new(),
+            slice_permits: Vec::new(),
+            value_permits: Vec::new(),
+            deadline: None,
+        });
+        Ok(*e.insert(self.open.len() - 1))
+    }
 }
 
 struct BatchOutput {
@@ -208,7 +349,7 @@ pub(crate) fn spawn(
             partial_bytes: AtomicUsize::new(0),
             batch_limit: (cfg.byte_budget / cfg.inserters.max(1)).max(1),
         };
-        let mut tables: HashMap<TableKey, Table> = HashMap::new();
+        let mut tables = Tables::default();
         let mut epoch: u64 = 0;
         let stats = stats.as_ref();
         // Reuse one timer for earliest table deadline and reset it only when
@@ -218,7 +359,7 @@ pub(crate) fn spawn(
         tokio::pin!(deadline);
         let mut armed: Option<Instant> = None;
         loop {
-            let next = tables.values().filter_map(|t| t.deadline).min();
+            let next = tables.open.iter().filter_map(|t| t.deadline).min();
             if next != armed {
                 armed = next;
                 if let Some(at) = next {
@@ -227,14 +368,6 @@ pub(crate) fn spawn(
             }
             tokio::select! {
                 msg = msg_rx.recv() => match msg {
-                    Some(BatcherMsg::Row(r)) => {
-                        let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
-                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
-                        if let Err(e) = handle_row(&mut tables, &ctx, r, None).await {
-                            fatal.set(format!("batcher: {e}"));
-                            break;
-                        }
-                    }
                     Some(BatcherMsg::Rows(chunk)) => {
                         let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
                         let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
@@ -274,7 +407,7 @@ pub(crate) fn spawn(
                     }
                 },
                 () = &mut deadline, if armed.is_some() => {
-                    if let Err(e) = flush_due(&mut tables, &out, Instant::now(), stats).await {
+                    if let Err(e) = flush_due(&mut tables.open, &out, Instant::now(), stats).await {
                         fatal.set(format!("batcher deadline flush: {e}"));
                         break;
                     }
@@ -325,58 +458,32 @@ async fn config_changed(rx: &mut Option<watch::Receiver<Arc<ResolvedConfig>>>) {
 
 /// Process a decoder's row chunk in order. Chunk only amortizes the channel
 /// hop, not the coalescing; budget/deadline trips behave per-row.
-async fn handle_rows(
-    tables: &mut HashMap<TableKey, Table>,
-    ctx: &RowCtx<'_>,
-    chunk: RowChunk,
-) -> Result<(), String> {
+async fn handle_rows(tables: &mut Tables, ctx: &RowCtx<'_>, chunk: RowChunk) -> Result<(), String> {
+    ctx.stats
+        .insertbatch_rows_in
+        .fetch_add(chunk.rows.len() as u64, Ordering::Relaxed);
+    let slots = chunk
+        .tables
+        .iter()
+        .map(|t| tables.slot(ctx, t))
+        .collect::<Result<Vec<_>, _>>()?;
     for row in chunk.rows {
-        handle_row(tables, ctx, row, chunk.permit.as_ref()).await?;
+        let i = row.table as usize;
+        let route = &chunk.tables[i].route;
+        handle_row(tables, ctx, slots[i], route, row, chunk.permit.as_ref()).await?;
     }
     Ok(())
 }
 
 async fn handle_row(
-    tables: &mut HashMap<TableKey, Table>,
+    tables: &mut Tables,
     ctx: &RowCtx<'_>,
+    slot: usize,
+    route: &RouteSnapshot,
     row: RoutedRow,
     slice_permit: Option<&Arc<crate::budget::MemoryPermit>>,
 ) -> Result<(), String> {
-    ctx.stats
-        .insertbatch_rows_in
-        .fetch_add(1, Ordering::Relaxed);
-    // Key clone is two Arc bumps, cheaper than a second hash. A partition
-    // sharing root's destination batches with its whole tree under root
-    let key = TableKey::new(
-        row.rel.rfn.db_node,
-        row.route.batch_owner(&row.rel.rel_name).clone(),
-    );
-    let t = match tables.entry(key) {
-        Entry::Occupied(e) => e.into_mut(),
-        Entry::Vacant(e) => {
-            // Overrides ride the route frozen at planning; a `Column*` config
-            // event applies under the barrier fence, whose FlushAll cleared this
-            // plan cache, so post-apply rows rebuild from post-apply routes
-            let plan =
-                TablePlan::for_route(ctx.alloc, &row.rel, &row.route).map_err(|e| e.to_string())?;
-            let meta = Arc::new(BatchMeta::from_plan(
-                &plan,
-                e.key().clone(),
-                ctx.epoch,
-                ctx.stats,
-            ));
-            let enc = TableEncoder::new(plan).map_err(|e| e.to_string())?;
-            e.insert(Table {
-                enc,
-                allocated_bytes: 0,
-                meta,
-                seq_counts: Vec::new(),
-                slice_permits: Vec::new(),
-                value_permits: Vec::new(),
-                deadline: None,
-            })
-        }
-    };
+    let t = &mut tables.open[slot];
     let op = match row.committed.decoded.op {
         HeapOp::Insert => OP_INSERT,
         HeapOp::Update | HeapOp::HotUpdate => OP_UPDATE,
@@ -385,20 +492,19 @@ async fn handle_row(
         HeapOp::Truncate => return Err("TRUNCATE routed to batcher".into()),
     };
     // Seal before appending row that exceeds oracle frame threshold
-    let leaf = row.route.partition.as_ref().map(|p| p.leaf);
+    let leaf = route.partition.as_ref().map(|p| p.leaf);
     let append = t
         .enc
-        .append_routed(&row.committed, &row.route.mapping, op, leaf)
+        .append_routed(&row.committed, &route.mapping, op, leaf)
         .map_err(|e| e.to_string())?;
     if append == Append::Full {
         emit_batch(t, ctx.out, ctx.stats).await?;
         t.enc
-            .append_routed(&row.committed, &row.route.mapping, op, leaf)
+            .append_routed(&row.committed, &route.mapping, op, leaf)
             .map_err(|e| e.to_string())?;
     }
-    // Every row of a chunk shares one permit, so the tail entry settles it:
-    // pushes for this table come only from this table's rows, and a seal
-    // clears the list so the next batch takes its own hold
+    // Rows sharing a permit arrive consecutively, so check only last entry.
+    // Sealing clears permit lists so each batch retains its own permits
     if let Some(p) = slice_permit
         && t.slice_permits
             .last()
@@ -406,7 +512,11 @@ async fn handle_row(
     {
         t.slice_permits.push(p.clone());
     }
-    if let Some(p) = row.value_permit {
+    if let Some(p) = row.value_permit
+        && t.value_permits
+            .last()
+            .is_none_or(|held| !Arc::ptr_eq(held, &p))
+    {
         t.value_permits.push(p);
     }
     match t.seq_counts.last_mut() {
@@ -433,7 +543,7 @@ async fn handle_row(
     if ctx.out.partial_bytes.load(Ordering::Relaxed)
         >= ctx.cfg.byte_budget.min(ctx.out.budget.total())
     {
-        for table in tables.values_mut() {
+        for table in &mut tables.open {
             emit_batch(table, ctx.out, ctx.stats).await?;
         }
     }
@@ -482,12 +592,12 @@ async fn emit_batch(t: &mut Table, out: &BatchOutput, stats: &EmitterStats) -> R
 /// Flush tables whose deadlines have passed. `emit_batch` clears each deadline,
 /// including when encoder is empty
 async fn flush_due(
-    tables: &mut HashMap<TableKey, Table>,
+    tables: &mut [Table],
     out: &BatchOutput,
     now: Instant,
     stats: &EmitterStats,
 ) -> Result<(), String> {
-    for t in tables.values_mut() {
+    for t in tables {
         if t.deadline.is_some_and(|d| now >= d) {
             emit_batch(t, out, stats).await?;
         }
@@ -498,17 +608,18 @@ async fn flush_due(
 /// Seal every table, drop all encoders, bump `epoch` so next rows rebuild
 /// against post-DDL descriptors and inserters re-parse cached types.
 async fn flush_all(
-    tables: &mut HashMap<TableKey, Table>,
+    tables: &mut Tables,
     out: &BatchOutput,
     epoch: &mut u64,
     stats: &EmitterStats,
 ) -> Result<(), String> {
-    for t in tables.values_mut() {
+    for t in &mut tables.open {
         if t.enc.rows > 0 {
             emit_batch(t, out, stats).await?;
         }
     }
-    tables.clear();
+    tables.slots.clear();
+    tables.open.clear();
     *epoch += 1;
     Ok(())
 }
@@ -571,24 +682,55 @@ mod tests {
         )
     }
 
-    fn row(seq: u64, id: i32) -> RoutedRow {
+    fn row(seq: u64, id: i32) -> BatcherMsg {
         row_for("t", seq, id)
     }
 
-    fn row_for(table: &str, seq: u64, id: i32) -> RoutedRow {
-        routed_row(rel_named(table), route_named(table), seq, id)
+    fn row_for(table: &str, seq: u64, id: i32) -> BatcherMsg {
+        one(rel_named(table), route_named(table), tuple(seq, id))
     }
 
-    fn routed_row(
-        rel: Arc<RelDescriptor>,
-        route: Arc<RouteSnapshot>,
-        seq: u64,
-        id: i32,
-    ) -> RoutedRow {
+    fn one(rel: Arc<RelDescriptor>, route: Arc<RouteSnapshot>, row: RoutedRow) -> BatcherMsg {
+        BatcherMsg::Rows(RowChunk {
+            tables: vec![RowTable { rel, route }],
+            rows: vec![row],
+            permit: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn row_buffer_flushes_leaf_permit_with_buffered_rows() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let budget = crate::budget::MemoryBudget::new(256);
+        let mut row_buffer = RowBuffer::default();
+        let (rel, route) = (rel_named("t"), route_named("t"));
+        for id in 0..2 {
+            let row = tuple(0, id);
+            let permit = if id == 1 {
+                Some(Arc::new(budget.acquire(256).await))
+            } else {
+                None
+            };
+            row_buffer
+                .push(&tx, row.seq, (&rel, &route), row.committed, permit)
+                .await
+                .unwrap();
+        }
+        let BatcherMsg::Rows(chunk) = rx.try_recv().expect("flush pinned row") else {
+            panic!("expected rows");
+        };
+        assert_eq!(chunk.rows.len(), 2);
+        assert_eq!(budget.resident_bytes(), 256);
+        drop(chunk);
+        assert_eq!(budget.resident_bytes(), 0);
+        row_buffer.flush(&tx).await.unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn tuple(seq: u64, id: i32) -> RoutedRow {
         RoutedRow {
             seq,
-            rel,
-            route,
+            table: 0,
             committed: CommittedTuple {
                 decoded: DecodedHeap {
                     rfn: RelFileNode {
@@ -610,6 +752,30 @@ mod tests {
             },
             value_permit: None,
         }
+    }
+
+    fn text_table(target_type: &str) -> (Arc<RelDescriptor>, Arc<RouteSnapshot>) {
+        let mut rel = rel_named("t");
+        let attr = &mut Arc::make_mut(&mut rel).attributes[0];
+        attr.type_oid = 25;
+        attr.type_name = "text".into();
+        attr.type_len = -1;
+        attr.type_byval = false;
+        let route = RouteSnapshot::freeze(
+            Arc::new(TableMapping {
+                target: TableTarget::new("default", "t"),
+                columns: vec![ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "id".into(),
+                    target_type: target_type.into(),
+                    type_pinned: false,
+                }],
+                tees: Vec::new(),
+            }),
+            Arc::default(),
+            Default::default(),
+        );
+        (rel, route)
     }
 
     /// Rows from two xacts coalesce into budget-sized batches; per-seq counts
@@ -634,16 +800,10 @@ mod tests {
             None,
         );
         for id in 0..3 {
-            msg_tx
-                .send(BatcherMsg::Row(row(0, id)))
-                .await
-                .expect("send seq0");
+            msg_tx.send(row(0, id)).await.expect("send seq0");
         }
         for id in 0..2 {
-            msg_tx
-                .send(BatcherMsg::Row(row(1, id)))
-                .await
-                .expect("send seq1");
+            msg_tx.send(row(1, id)).await.expect("send seq1");
         }
         // Drop sender → final flush + graceful exit
         drop(msg_tx);
@@ -685,7 +845,17 @@ mod tests {
             None,
         );
         let chunk = RowChunk {
-            rows: vec![row(0, 0), row(0, 1), row(0, 2), row(1, 0), row(1, 1)],
+            tables: vec![RowTable {
+                rel: rel_named("t"),
+                route: route_named("t"),
+            }],
+            rows: vec![
+                tuple(0, 0),
+                tuple(0, 1),
+                tuple(0, 2),
+                tuple(1, 0),
+                tuple(1, 1),
+            ],
             permit: None,
         };
         msg_tx
@@ -742,8 +912,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut r = row(0, 1);
-        r.route = RouteSnapshot::freeze(
+        let route = RouteSnapshot::freeze(
             Arc::new(TableMapping {
                 target: TableTarget::new("default", "t"),
                 columns: vec![ColumnMapping {
@@ -757,7 +926,10 @@ mod tests {
             Arc::new(rules.finish().0),
             Default::default(),
         );
-        msg_tx.send(BatcherMsg::Row(r)).await.expect("send row");
+        msg_tx
+            .send(one(rel_named("t"), route, tuple(0, 1)))
+            .await
+            .expect("send row");
         drop(msg_tx);
         let batch = batches_rx.recv().await.expect("one batch");
         assert_eq!(batch.meta.columns[0].name, "id");
@@ -804,8 +976,12 @@ mod tests {
                 leaf,
                 shared,
             });
-            let row = routed_row(rel_named(&format!("m_{leaf}")), route, 0, leaf as i32);
-            msg_tx.send(BatcherMsg::Row(row)).await.expect("send row");
+            let row = one(
+                rel_named(&format!("m_{leaf}")),
+                route,
+                tuple(0, leaf as i32),
+            );
+            msg_tx.send(row).await.expect("send row");
         }
         drop(msg_tx);
         let mut batches = Vec::new();
@@ -854,10 +1030,7 @@ mod tests {
             Arc::new(EmitterStats::default()),
             None,
         );
-        msg_tx
-            .send(BatcherMsg::Row(row(0, 1)))
-            .await
-            .expect("send row");
+        msg_tx.send(row(0, 1)).await.expect("send row");
         let (reply_tx, reply_rx) = oneshot::channel();
         msg_tx
             .send(BatcherMsg::FlushAll(reply_tx))
@@ -918,10 +1091,7 @@ mod tests {
         // of phase with the deadline
         tokio::time::sleep(Duration::from_millis(600)).await;
         let sent = Instant::now();
-        msg_tx
-            .send(BatcherMsg::Row(row(0, 1)))
-            .await
-            .expect("send row");
+        msg_tx.send(row(0, 1)).await.expect("send row");
         let batch = batches_rx.recv().await.expect("deadline batch");
         let waited = sent.elapsed();
         assert_eq!(batch.n_rows, 1);
@@ -941,15 +1111,9 @@ mod tests {
         let (msg_tx, batches_rx, fatal, handle) =
             spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(1)), None);
         let start = Instant::now();
-        msg_tx
-            .send(BatcherMsg::Row(row_for("a", 0, 1)))
-            .await
-            .expect("send a");
+        msg_tx.send(row_for("a", 0, 1)).await.expect("send a");
         tokio::time::sleep(Duration::from_millis(400)).await;
-        msg_tx
-            .send(BatcherMsg::Row(row_for("b", 0, 2)))
-            .await
-            .expect("send b");
+        msg_tx.send(row_for("b", 0, 2)).await.expect("send b");
 
         let first = batches_rx.recv().await.expect("first batch");
         let first_at = start.elapsed();
@@ -977,15 +1141,9 @@ mod tests {
         let (msg_tx, batches_rx, fatal, handle) =
             spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(1)), None);
         let start = Instant::now();
-        msg_tx
-            .send(BatcherMsg::Row(row(0, 1)))
-            .await
-            .expect("send first");
+        msg_tx.send(row(0, 1)).await.expect("send first");
         tokio::time::sleep(Duration::from_millis(500)).await;
-        msg_tx
-            .send(BatcherMsg::Row(row(0, 2)))
-            .await
-            .expect("send second");
+        msg_tx.send(row(0, 2)).await.expect("send second");
         let batch = batches_rx.recv().await.expect("deadline batch");
         let waited = start.elapsed();
         assert_eq!(batch.n_rows, 2, "both rows in one block");
@@ -1003,15 +1161,15 @@ mod tests {
         let (tx, rx, fatal, handle) = spawn_deadline_batcher(
             BatcherConfig {
                 row_budget: 1,
-                byte_budget: 1024,
+                byte_budget: 1,
                 inserters: 1,
                 flush_timeout: Duration::from_secs(60),
             },
             None,
         );
-        tx.send(BatcherMsg::Row(row(0, 1))).await.unwrap();
+        tx.send(row(0, 1)).await.unwrap();
         let first = rx.recv().await.unwrap();
-        tx.send(BatcherMsg::Row(row(1, 2))).await.unwrap();
+        tx.send(row(1, 2)).await.unwrap();
         let (reply, mut flushed) = oneshot::channel();
         tx.send(BatcherMsg::FlushAll(reply)).await.unwrap();
         assert!(
@@ -1043,9 +1201,7 @@ mod tests {
             None,
         );
         for i in 0..40 {
-            tx.send(BatcherMsg::Row(row_for(&format!("t{i}"), i, 1)))
-                .await
-                .unwrap();
+            tx.send(row_for(&format!("t{i}"), i, 1)).await.unwrap();
         }
         let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -1076,29 +1232,11 @@ mod tests {
             None,
         );
         for i in 0..2 {
-            let mut r = row(i, 1);
-            let attr = &mut Arc::make_mut(&mut r.rel).attributes[0];
-            attr.type_oid = 25;
-            attr.type_name = "text".into();
-            attr.type_len = -1;
-            attr.type_byval = false;
-            r.route = RouteSnapshot::freeze(
-                Arc::new(TableMapping {
-                    target: TableTarget::new("default", "t"),
-                    columns: vec![ColumnMapping {
-                        src_attnum: 1,
-                        target_name: "id".into(),
-                        target_type: "String".into(),
-                        type_pinned: false,
-                    }],
-                    tees: Vec::new(),
-                }),
-                Arc::default(),
-                Default::default(),
-            );
+            let (rel, route) = text_table("String");
+            let mut r = tuple(i, 1);
             r.committed.decoded.new.as_mut().unwrap().columns =
                 vec![Some(ColumnValue::Text("x".repeat(64 << 10)))];
-            tx.send(BatcherMsg::Row(r)).await.unwrap();
+            tx.send(one(rel, route, r)).await.unwrap();
         }
         let first = rx.recv().await.unwrap();
         assert!(first._encoded.bytes() >= 64 << 10);
@@ -1127,29 +1265,11 @@ mod tests {
             spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(60)), None);
         let big = "x".repeat(crate::ops::oracle::ORACLE_BATCH_SEAL_BYTES * 3 / 5);
         for i in 0..2 {
-            let mut r = row(i, 1);
-            let attr = &mut Arc::make_mut(&mut r.rel).attributes[0];
-            attr.type_oid = 25;
-            attr.type_name = "text".into();
-            attr.type_len = -1;
-            attr.type_byval = false;
-            r.route = RouteSnapshot::freeze(
-                Arc::new(TableMapping {
-                    target: TableTarget::new("default", "t"),
-                    columns: vec![ColumnMapping {
-                        src_attnum: 1,
-                        target_name: "id".into(),
-                        target_type: "Array(Nullable(String))".into(),
-                        type_pinned: false,
-                    }],
-                    tees: Vec::new(),
-                }),
-                Arc::default(),
-                Default::default(),
-            );
+            let (rel, route) = text_table("Array(Nullable(String))");
+            let mut r = tuple(i, 1);
             r.committed.decoded.new.as_mut().unwrap().columns =
                 vec![Some(ColumnValue::Text(big.clone()))];
-            tx.send(BatcherMsg::Row(r)).await.unwrap();
+            tx.send(one(rel, route, r)).await.unwrap();
         }
         drop(tx);
         let per_seq: Vec<_> = [rx.recv().await.unwrap(), rx.recv().await.unwrap()]
@@ -1173,10 +1293,7 @@ mod tests {
             None,
         );
         let start = Instant::now();
-        msg_tx
-            .send(BatcherMsg::Row(row(0, 1)))
-            .await
-            .expect("send row");
+        msg_tx.send(row(0, 1)).await.expect("send row");
         let batch = batches_rx.recv().await.expect("budget batch");
         assert_eq!(batch.n_rows, 1);
         let elapsed = start.elapsed();
@@ -1214,20 +1331,14 @@ mod tests {
         let (msg_tx, batches_rx, fatal, handle) =
             spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(1)), Some(cfg_rx));
         let start = Instant::now();
-        msg_tx
-            .send(BatcherMsg::Row(row_for("a", 0, 1)))
-            .await
-            .expect("send a");
+        msg_tx.send(row_for("a", 0, 1)).await.expect("send a");
         // Let the batcher arm table a under the 1 s timeout
         tokio::time::sleep(Duration::from_millis(100)).await;
         cfg_tx.send_replace(Arc::new(ResolvedConfig {
             flush_timeout: Duration::from_millis(200),
             ..Default::default()
         }));
-        msg_tx
-            .send(BatcherMsg::Row(row_for("b", 0, 2)))
-            .await
-            .expect("send b");
+        msg_tx.send(row_for("b", 0, 2)).await.expect("send b");
 
         let first = batches_rx.recv().await.expect("first batch");
         let first_at = start.elapsed();

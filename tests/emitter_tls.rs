@@ -40,7 +40,7 @@ use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::ack::Publish;
-use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
+use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk, RowTable};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::pos::{EmitterAck, Monotone};
 use walshadow::schema::{RelDescriptor, RelName, ReplIdent};
@@ -320,7 +320,6 @@ async fn emitter_tls_round_trip() {
         tls_config: Some(ch.pinned_config()),
         ..Default::default()
     };
-    // The batcher builds its plan from the `RoutedRow`'s mapping.
     let rel = Arc::new(rel_descriptor());
     let mapping = Arc::new(TableMapping {
         target: TableTarget::new("walshadow_test", "things"),
@@ -375,22 +374,30 @@ async fn emitter_tls_round_trip() {
         commit_ts: 1_000_000,
         commit_lsn: 0xABCD,
     };
-    let seq = ack.seqs(0).open(tuple.commit_lsn, Publish::Commit);
+    let mut seqs = ack.seqs(0);
+    let seq = seqs.open(tuple.commit_lsn, Publish::Commit);
     msg_tx
-        .send(BatcherMsg::Row(RoutedRow {
-            seq: seq.seq(),
-            rel,
-            route: walshadow::emit::route::RouteSnapshot::freeze(
-                mapping,
-                Arc::default(),
-                Default::default(),
-            ),
-            committed: tuple,
-            value_permit: None,
+        .send(BatcherMsg::Rows(RowChunk {
+            tables: vec![RowTable {
+                rel,
+                route: walshadow::emit::route::RouteSnapshot::freeze(
+                    mapping,
+                    Arc::default(),
+                    Default::default(),
+                ),
+            }],
+            rows: vec![RoutedRow {
+                seq: seq.seq(),
+                table: 0,
+                committed: tuple,
+                value_permit: None,
+            }],
+            permit: None,
         }))
         .await
         .expect("route row");
-    seq.place(1);
+    seqs.place(seq, 1);
+    drop(seqs);
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     msg_tx
         .send(BatcherMsg::FlushAll(reply_tx))

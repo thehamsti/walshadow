@@ -27,7 +27,7 @@ use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::ack::Publish;
-use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
+use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk, RowTable};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::pos::Pos;
 use walshadow::pos::{EmitterAck, Monotone};
@@ -174,7 +174,6 @@ async fn budget_trips_seal_complete_inserts() {
     .await
     .expect("spawn tail");
 
-    let rel = rel_descriptor();
     let route = walshadow::emit::route::RouteSnapshot::freeze(
         mapping(),
         Arc::default(),
@@ -182,20 +181,29 @@ async fn budget_trips_seal_complete_inserts() {
     );
     const N: i32 = 5;
     let commit_lsn = 0xC0FFEE;
-    let seq = ack.seqs(0).open(commit_lsn, Publish::Commit);
-    for i in 0..N {
-        msg_tx
-            .send(BatcherMsg::Row(RoutedRow {
-                seq: seq.seq(),
-                rel: rel.clone(),
-                route: route.clone(),
-                committed: tuple(i, 0x1000 + i as u64, commit_lsn),
-                value_permit: None,
-            }))
-            .await
-            .expect("route row");
-    }
-    seq.place(N as u64);
+    let mut seqs = ack.seqs(0);
+    let seq = seqs.open(commit_lsn, Publish::Commit);
+    let rows = (0..N)
+        .map(|i| RoutedRow {
+            seq: seq.seq(),
+            table: 0,
+            committed: tuple(i, 0x1000 + i as u64, commit_lsn),
+            value_permit: None,
+        })
+        .collect();
+    msg_tx
+        .send(BatcherMsg::Rows(RowChunk {
+            tables: vec![RowTable {
+                rel: rel_descriptor(),
+                route,
+            }],
+            rows,
+            permit: None,
+        }))
+        .await
+        .expect("route rows");
+    seqs.place(seq, N as u64);
+    drop(seqs);
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     msg_tx
         .send(BatcherMsg::FlushAll(reply_tx))
