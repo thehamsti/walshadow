@@ -1,15 +1,14 @@
 //! ClickHouse destination mapping vocabulary
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::catalog::type_bridge::{self, ResolvedColumn};
-use crate::ch::types;
+use crate::ch::{quote_ident, types};
 use crate::column_rules::{ColumnRule, ColumnRules};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{RelAttr, RelDescriptor, RelName, SchemaDiff, replident_key_attnums};
 use crate::table_rules::set_if;
 use ahash::HashMap;
-use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableMapping {
@@ -475,51 +474,67 @@ pub type MappingHandle = Arc<MappingCell>;
 #[derive(Debug)]
 pub struct MappingCell {
     inner: RwLock<MappingSnapshot>,
+    /// Writers take it exclusively; [`MappingCell::guard_matches`] holds it
+    /// shared across an await so a publication sees a stable route
+    fence: tokio::sync::RwLock<()>,
 }
 
 impl MappingCell {
-    pub async fn with<R>(&self, f: impl FnOnce(&MappingSnapshot) -> R) -> R {
-        f(&*self.inner.read().await)
+    pub fn with<R>(&self, f: impl FnOnce(&MappingSnapshot) -> R) -> R {
+        f(&self.read())
     }
 
-    pub async fn snapshot(&self) -> MappingSnapshot {
-        self.inner.read().await.clone()
+    pub fn snapshot(&self) -> MappingSnapshot {
+        self.read().clone()
     }
 
     /// `false` once a fold or republish displaced `at`. Holding `at` keeps
     /// its allocation alive and forces `Arc::make_mut` to clone, so pointer
     /// identity answers "has the map moved since I looked?"
-    pub async fn unmoved(&self, at: &MappingSnapshot) -> bool {
-        Arc::ptr_eq(&*self.inner.read().await, at)
+    pub fn unmoved(&self, at: &MappingSnapshot) -> bool {
+        Arc::ptr_eq(&self.read(), at)
     }
 
-    /// Hold the selected relations fixed across an async publication. Unrelated
-    /// routing changes may proceed before this guard, but writers block until
-    /// it is dropped.
+    /// Hold the selected relations fixed across an async publication (the
+    /// Snowflake snapshot/COPY publish). Unrelated routing changes may land
+    /// before this guard; once held, writers wait until it drops. Readers
+    /// never touch the fence, so the routing hot path stays a sync read
     pub async fn guard_matches(
         &self,
         at: &MappingSnapshot,
         relations: &[RelName],
-    ) -> Option<tokio::sync::RwLockReadGuard<'_, MappingSnapshot>> {
-        let guard = self.inner.read().await;
+    ) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+        let fence = self.fence.read().await;
+        let live = self.read();
         relations
             .iter()
-            .all(|rel| guard.get(rel) == at.get(rel))
-            .then_some(guard)
+            .all(|rel| live.get(rel) == at.get(rel))
+            .then_some(fence)
     }
 
     pub async fn mutate<R>(&self, f: impl FnOnce(&mut MappingSnapshot) -> R) -> R {
-        f(&mut *self.inner.write().await)
+        let _fence = self.fence.write().await;
+        f(&mut self.write())
     }
 
     pub async fn publish(&self, tables: MappingSnapshot) {
-        *self.inner.write().await = tables;
+        let _fence = self.fence.write().await;
+        *self.write() = tables;
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, MappingSnapshot> {
+        self.inner.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, MappingSnapshot> {
+        self.inner.write().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 pub fn mapping_handle(tables: HashMap<RelName, TableMapping>) -> MappingHandle {
     Arc::new(MappingCell {
         inner: RwLock::new(Arc::new(shared(tables))),
+        fence: tokio::sync::RwLock::new(()),
     })
 }
 
@@ -642,10 +657,6 @@ pub fn fold_diff_into_mapping(
             target.columns.push(column);
         }
     }
-}
-
-fn quote_ident(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
 }
 
 #[cfg(test)]
@@ -883,26 +894,23 @@ mod tests {
         let (rel, map) = one_table();
         let handle = mapping_handle(map);
         // Applicator shape: make_mut clones out from under held snapshots
-        let planned: MappingSnapshot = handle.snapshot().await;
+        let planned: MappingSnapshot = handle.snapshot();
         handle.mutate(|m| Arc::make_mut(m).remove(&rel)).await;
         assert!(planned.contains_key(&rel), "snapshot keeps its version");
-        assert!(
-            !handle.with(|m| m.contains_key(&rel)).await,
-            "handle moved on"
-        );
+        assert!(!handle.with(|m| m.contains_key(&rel)), "handle moved on");
         // Republish shape: full inner-Arc swap
-        let planned = handle.snapshot().await;
+        let planned = handle.snapshot();
         let (rel2, map2) = one_table();
         handle.publish(Arc::new(shared(map2))).await;
         assert!(!planned.contains_key(&rel2), "snapshot predates the swap");
-        assert!(handle.with(|m| m.contains_key(&rel2)).await);
+        assert!(handle.with(|m| m.contains_key(&rel2)));
     }
 
     #[tokio::test]
     async fn publication_guard_rejects_stale_route_and_blocks_republish() {
         let (rel, map) = one_table();
         let handle = mapping_handle(map);
-        let planned = handle.snapshot().await;
+        let planned = handle.snapshot();
         let selected = [rel.clone()];
         let guard = handle.guard_matches(&planned, &selected).await.unwrap();
         let writer = {

@@ -102,12 +102,12 @@ async fn partial_transaction_failure_returns_from_live_and_archived_replay() {
     let catalog = seed_catalog_from_source(&sql).await.unwrap();
     let mut feed = SourceFeed::connect(&pg).await.unwrap();
     let ident = feed.identify_system().await.unwrap();
-    sql.batch_execute(&format!(
-        "BEGIN; INSERT INTO {SCHEMA}.t VALUES (1, 'inline');
-         UPDATE {SCHEMA}.t SET id=id WHERE id=2; COMMIT"
-    ))
-    .await
-    .unwrap();
+    sql.batch_execute(&format!("INSERT INTO {SCHEMA}.t VALUES (1, 'inline')"))
+        .await
+        .unwrap();
+    sql.batch_execute(&format!("UPDATE {SCHEMA}.t SET id=id WHERE id=2"))
+        .await
+        .unwrap();
     let end = walshadow::pg::current_wal_lsn(&sql).await.unwrap();
     sql.batch_execute("SELECT pg_switch_wal()").await.unwrap();
     let stats = Arc::new(EmitterStats::default());
@@ -125,7 +125,7 @@ async fn partial_transaction_failure_returns_from_live_and_archived_replay() {
         patch: Arc::new(std::sync::Mutex::new(PgXactPatch::new())),
         catalog,
         pg_major: (feed.server_version_num() / 10000) as u32,
-        system_id: ident.sysid,
+        system_id: ident.system_id.to_string(),
         timeline: ident.timeline,
     };
     let (_stop_tx, stop_rx) = tokio::sync::watch::channel(Some(end));
@@ -252,7 +252,7 @@ async fn leg_reads_through_end_lsn_inside_its_first_segment() {
             patch: patch.clone(),
             catalog,
             pg_major: (feed.server_version_num() / 10000) as u32,
-            system_id: ident.sysid.clone(),
+            system_id: ident.system_id.to_string(),
             timeline: ident.timeline,
         };
         let leg = tokio::time::timeout(

@@ -15,7 +15,7 @@
 //! ```text
 //! [2 bytes "WS" magic] [u16 LE version] then repeating:
 //! [u8 tag] [u32 len LE] [body of `len` bytes]
-//!   TAG_HEAP         (body = u32 dict id + encoded DecodedHeap)
+//!   TAG_HEAP         (body = u32 dict id + encoded DecodedHeap, rfn from dict)
 //!   TAG_CHUNK        (body = encoded ToastChunk)
 //!   TAG_TOAST_DELETE (body = encoded ToastDelete)
 //!   TAG_RAW          (body = encoded RawRecord)
@@ -70,13 +70,15 @@ use ahash::{HashMap, HashMapExt};
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpillEntry {
     Heap(Box<DescribedHeap>),
-    Chunk(ToastChunk),
-    ToastDelete(ToastDelete),
+    Chunk(Box<ToastChunk>),
+    ToastDelete(Box<ToastDelete>),
     /// Undecoded record on a filenode invisible at record time (same-xact
     /// CREATE / TRUNCATE / rewrite generation); decoded at commit once
     /// `relation_at(rfn, commit_lsn)` resolves the survivor
     Raw(Box<RawRecord>),
 }
+
+const _: () = assert!(std::mem::size_of::<SpillEntry>() <= 16);
 
 /// Raw decode inputs for one WAL record, enough to re-run
 /// [`crate::decode::heap_decoder::decode_heap_record`] after commit-time
@@ -285,10 +287,11 @@ pub const SPILL_MAGIC: [u8; 2] = *b"WS";
 /// `ToastDelete` entries. v4 added `TAG_RAW` stashed records. v5 added
 /// the `TAG_DESCRIPTOR` dictionary (Heap bodies reference descriptors by dict
 /// id). v6 added writer xid to heap + raw bodies. v7 added database OID to
-/// chunk and `ToastDelete` bodies. `DrainEntry` events
-/// (Catalog, ToastBarrier, Config/Signal) are drain-time, never spilled,
-/// so they don't touch this format
-pub const SPILL_VERSION: u16 = 7;
+/// chunk and `ToastDelete` bodies. v8 dropped heap rfn, restored from the
+/// dict descriptor. v9 stored inet addr as fixed 16 bytes. `DrainEntry`
+/// events (Catalog, ToastBarrier, Config/Signal) are drain-time, never
+/// spilled, so they don't touch this format
+pub const SPILL_VERSION: u16 = 9;
 
 /// Wire tags, one block per tag space so encode and decode read off the same
 /// table. Renumbering is a body-encoding change: bump [`SPILL_VERSION`]
@@ -335,6 +338,10 @@ const VAL_INTERVAL: u8 = 22;
 const VAL_JSON: u8 = 23;
 const VAL_PG_PENDING: u8 = 24;
 const VAL_PG_PENDING_TEXT: u8 = 25;
+const VAL_OID8: u8 = 26;
+const VAL_MACADDR: u8 = 27;
+const VAL_MACADDR8: u8 = 28;
+const VAL_TID: u8 = 29;
 
 /// [`crate::decode::codecs::NumericKind`], inside a [`VAL_NUMERIC`] body
 const NUM_FINITE: u8 = 0;
@@ -377,9 +384,8 @@ impl SpillStore {
         })
     }
 
-    /// Wipe store dir wholesale. Crash-recovery contract: on-disk state is
-    /// always drained-into-CH or replayable from the cursor's `decoder_lsn`,
-    /// so prior-crash leftovers are safe to discard
+    /// Empty store directory. Data is already written to ClickHouse or can
+    /// be replayed from cursor's `decoder_lsn`, so crash leftovers are safe to remove
     pub fn clear(&self) -> Result<()> {
         Ok(crate::fs::reset_dir(&self.dir)?)
     }
@@ -737,7 +743,6 @@ impl SpillReader {
             let entry = match tag {
                 TAG_HEAP => {
                     let dict_id = cur.u32()? as usize;
-                    let h = decode_heap(&mut cur)?;
                     let Some((descriptor, valid_from)) = self.dict.get(dict_id).cloned() else {
                         return Err(SpillError::Format {
                             offset: cur.pos,
@@ -748,13 +753,15 @@ impl SpillReader {
                         });
                     };
                     SpillEntry::Heap(Box::new(DescribedHeap {
-                        decoded: h,
+                        decoded: decode_heap(&mut cur, descriptor.rfn)?,
                         descriptor,
                         descriptor_valid_from: valid_from,
                     }))
                 }
-                TAG_CHUNK => SpillEntry::Chunk(decode_chunk(&mut cur)?),
-                TAG_TOAST_DELETE => SpillEntry::ToastDelete(decode_toast_delete(&mut cur)?),
+                TAG_CHUNK => SpillEntry::Chunk(Box::new(decode_chunk(&mut cur)?)),
+                TAG_TOAST_DELETE => {
+                    SpillEntry::ToastDelete(Box::new(decode_toast_delete(&mut cur)?))
+                }
                 TAG_RAW => SpillEntry::Raw(Box::new(decode_raw(&mut cur)?)),
                 TAG_DESCRIPTOR => {
                     let valid_from = cur.u64()?;
@@ -913,11 +920,9 @@ fn push_str(out: &mut Vec<u8>, s: &str) {
     push_bytes(out, s.as_bytes());
 }
 
-/// Shared with the plan spool: one heap's frame-body bytes
+/// Shared with the plan spool: heap body without rfn, which readers take
+/// from the heap's descriptor
 pub(crate) fn encode_heap_into(out: &mut Vec<u8>, h: &DecodedHeap) {
-    push_u32(out, h.rfn.spc_node);
-    push_u32(out, h.rfn.db_node);
-    push_u32(out, h.rfn.rel_node);
     push_u32(out, h.xid);
     push_u64(out, h.source_lsn);
     let op_byte: u8 = match h.op {
@@ -987,6 +992,23 @@ pub(crate) fn encode_value(out: &mut Vec<u8>, v: &ColumnValue) {
             push_u8(out, VAL_OID);
             push_u32(out, *i);
         }
+        ColumnValue::Oid8(i) => {
+            push_u8(out, VAL_OID8);
+            push_u64(out, *i);
+        }
+        ColumnValue::MacAddr(b) => {
+            push_u8(out, VAL_MACADDR);
+            out.extend_from_slice(b);
+        }
+        ColumnValue::MacAddr8(b) => {
+            push_u8(out, VAL_MACADDR8);
+            out.extend_from_slice(b);
+        }
+        ColumnValue::Tid { block, offset } => {
+            push_u8(out, VAL_TID);
+            push_u32(out, *block);
+            push_u16(out, *offset);
+        }
         ColumnValue::Date(i) => {
             push_u8(out, VAL_DATE);
             push_i32(out, *i);
@@ -1054,7 +1076,7 @@ pub(crate) fn encode_value(out: &mut Vec<u8>, v: &ColumnValue) {
             push_u8(out, v.family);
             push_u8(out, v.bits);
             push_u8(out, v.is_cidr as u8);
-            push_bytes(out, &v.addr);
+            out.extend_from_slice(&v.addr);
         }
         ColumnValue::Interval(v) => {
             push_u8(out, VAL_INTERVAL);
@@ -1137,10 +1159,6 @@ impl<'a> Cursor<'a> {
         Self { buf, pos: 0 }
     }
 
-    pub(crate) fn remaining(&self) -> usize {
-        self.buf.len() - self.pos
-    }
-
     fn need(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.pos + n > self.buf.len() {
             return Err(SpillError::Format {
@@ -1153,47 +1171,51 @@ impl<'a> Cursor<'a> {
         Ok(s)
     }
 
+    fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
+        Ok(self.need(N)?.try_into().unwrap())
+    }
+
     pub(crate) fn u8(&mut self) -> Result<u8> {
-        Ok(self.need(1)?[0])
+        self.take().map(|[b]| b)
     }
     pub(crate) fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.need(2)?.try_into().unwrap()))
+        self.take().map(u16::from_le_bytes)
     }
     pub(crate) fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.need(4)?.try_into().unwrap()))
+        self.take().map(u32::from_le_bytes)
     }
     fn i32(&mut self) -> Result<i32> {
-        Ok(i32::from_le_bytes(self.need(4)?.try_into().unwrap()))
+        self.take().map(i32::from_le_bytes)
     }
     pub(crate) fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.need(8)?.try_into().unwrap()))
+        self.take().map(u64::from_le_bytes)
     }
     fn i64(&mut self) -> Result<i64> {
-        Ok(i64::from_le_bytes(self.need(8)?.try_into().unwrap()))
+        self.take().map(i64::from_le_bytes)
     }
     fn f32(&mut self) -> Result<f32> {
-        Ok(f32::from_le_bytes(self.need(4)?.try_into().unwrap()))
+        self.take().map(f32::from_le_bytes)
     }
     fn f64(&mut self) -> Result<f64> {
-        Ok(f64::from_le_bytes(self.need(8)?.try_into().unwrap()))
+        self.take().map(f64::from_le_bytes)
     }
     pub(crate) fn bytes(&mut self) -> Result<Vec<u8>> {
         let n = self.u32()? as usize;
         Ok(self.need(n)?.to_vec())
     }
     fn string(&mut self) -> Result<String> {
-        let bs = self.bytes()?;
-        String::from_utf8(bs).map_err(|e| SpillError::Format {
-            offset: self.pos,
-            detail: format!("utf8: {e}"),
-        })
+        let n = self.u32()? as usize;
+        let bs = self.need(n)?;
+        simdutf8::compat::from_utf8(bs)
+            .map(str::to_owned)
+            .map_err(|e| SpillError::Format {
+                offset: self.pos,
+                detail: format!("utf8: {e}"),
+            })
     }
 }
 
-pub(crate) fn decode_heap(c: &mut Cursor) -> Result<DecodedHeap> {
-    let spc_node = c.u32()?;
-    let db_node = c.u32()?;
-    let rel_node = c.u32()?;
+pub(crate) fn decode_heap(c: &mut Cursor, rfn: RelFileNode) -> Result<DecodedHeap> {
     let xid = c.u32()?;
     let source_lsn = c.u64()?;
     let op = match c.u8()? {
@@ -1212,11 +1234,7 @@ pub(crate) fn decode_heap(c: &mut Cursor) -> Result<DecodedHeap> {
     let new = decode_opt_tuple(c)?;
     let old = decode_opt_tuple(c)?;
     Ok(DecodedHeap {
-        rfn: RelFileNode {
-            spc_node,
-            db_node,
-            rel_node,
-        },
+        rfn,
         xid,
         source_lsn,
         op,
@@ -1254,6 +1272,14 @@ pub(crate) fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
         VAL_FLOAT4 => ColumnValue::Float4(c.f32()?),
         VAL_FLOAT8 => ColumnValue::Float8(c.f64()?),
         VAL_OID => ColumnValue::Oid(c.u32()?),
+        VAL_OID8 => ColumnValue::Oid8(c.u64()?),
+        VAL_MACADDR => ColumnValue::MacAddr(c.need(6)?.try_into().unwrap()),
+        VAL_MACADDR8 => ColumnValue::MacAddr8(c.need(8)?.try_into().unwrap()),
+        VAL_TID => {
+            let block = c.u32()?;
+            let offset = c.u16()?;
+            ColumnValue::Tid { block, offset }
+        }
         VAL_DATE => ColumnValue::Date(c.i32()?),
         VAL_TIME => ColumnValue::Time(c.i64()?),
         VAL_TIMESTAMP => ColumnValue::Timestamp(c.i64()?),
@@ -1304,7 +1330,7 @@ pub(crate) fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
             let family = c.u8()?;
             let bits = c.u8()?;
             let is_cidr = c.u8()? != 0;
-            let addr = c.bytes()?;
+            let addr = c.take()?;
             ColumnValue::Inet(crate::decode::codecs::InetValue {
                 family,
                 bits,
@@ -1538,12 +1564,12 @@ mod tests {
         for remaining in [1, 3, 5, 31] {
             let mut writer = store.writer(42, remaining).await.unwrap();
             writer
-                .write_batch(vec![SpillEntry::Chunk(sample_chunk(
+                .write_batch(vec![SpillEntry::Chunk(Box::new(sample_chunk(
                     99,
                     0,
                     0x2000,
                     &vec![7; IO_CHUNK + 1],
-                ))])
+                )))])
                 .await
                 .unwrap();
             let mut reader = writer.finish().await.unwrap();
@@ -1571,7 +1597,7 @@ mod tests {
         w.write_batch(vec![SpillEntry::Heap(Box::new(h.clone()))])
             .await
             .unwrap();
-        w.write_batch(vec![SpillEntry::Chunk(c.clone())])
+        w.write_batch(vec![SpillEntry::Chunk(Box::new(c.clone()))])
             .await
             .unwrap();
         let bc = w.byte_count();
@@ -1581,7 +1607,10 @@ mod tests {
             r.next().await.unwrap().unwrap(),
             SpillEntry::Heap(Box::new(h))
         );
-        assert_eq!(r.next().await.unwrap().unwrap(), SpillEntry::Chunk(c));
+        assert_eq!(
+            r.next().await.unwrap().unwrap(),
+            SpillEntry::Chunk(Box::new(c))
+        );
         assert!(r.next().await.unwrap().is_none(), "EOF expected");
         r.unlink().await.unwrap();
     }
@@ -1598,11 +1627,14 @@ mod tests {
             offnum: 9,
             source_lsn: 0x2200,
         };
-        w.write_batch(vec![SpillEntry::ToastDelete(d)])
+        w.write_batch(vec![SpillEntry::ToastDelete(Box::new(d))])
             .await
             .unwrap();
         let mut r = w.finish().await.unwrap();
-        assert_eq!(r.next().await.unwrap().unwrap(), SpillEntry::ToastDelete(d));
+        assert_eq!(
+            r.next().await.unwrap().unwrap(),
+            SpillEntry::ToastDelete(Box::new(d))
+        );
         assert!(r.next().await.unwrap().is_none());
         r.unlink().await.unwrap();
     }
@@ -1835,6 +1867,10 @@ mod tests {
             ColumnValue::Float4(_) => VAL_FLOAT4,
             ColumnValue::Float8(_) => VAL_FLOAT8,
             ColumnValue::Oid(_) => VAL_OID,
+            ColumnValue::Oid8(_) => VAL_OID8,
+            ColumnValue::MacAddr(_) => VAL_MACADDR,
+            ColumnValue::MacAddr8(_) => VAL_MACADDR8,
+            ColumnValue::Tid { .. } => VAL_TID,
             ColumnValue::Date(_) => VAL_DATE,
             ColumnValue::Time(_) => VAL_TIME,
             ColumnValue::Timestamp(_) => VAL_TIMESTAMP,
@@ -1869,6 +1905,13 @@ mod tests {
             ColumnValue::Float4(std::f32::consts::PI),
             ColumnValue::Float8(std::f64::consts::E),
             ColumnValue::Oid(0xDEADBEEF),
+            ColumnValue::Oid8(u64::MAX),
+            ColumnValue::MacAddr([1, 2, 3, 4, 5, 6]),
+            ColumnValue::MacAddr8([1, 2, 3, 4, 5, 6, 7, 8]),
+            ColumnValue::Tid {
+                block: u32::MAX,
+                offset: 7,
+            },
             ColumnValue::Date(-1),
             ColumnValue::Time(86_400_000_000),
             ColumnValue::Timestamp(-1),
@@ -1899,7 +1942,7 @@ mod tests {
                 family: PGSQL_AF_INET6,
                 bits: 128,
                 is_cidr: false,
-                addr: vec![0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01],
+                addr: [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01],
             }),
             ColumnValue::Interval(IntervalValue {
                 months: -3,
@@ -2010,7 +2053,10 @@ mod tests {
         let buf = [2u8, 0, 0, 0, 0xFF, 0xFE];
         let mut cur = Cursor::new(&buf);
         let err = cur.string().unwrap_err();
-        assert!(matches!(err, SpillError::Format { .. }));
+        assert_eq!(
+            err.to_string(),
+            "spill format at offset 6: utf8: invalid utf-8 sequence of 1 bytes from index 0"
+        );
     }
 
     #[test]
@@ -2037,14 +2083,14 @@ mod tests {
 
     #[test]
     fn decode_heap_rejects_unknown_op_tag() {
-        // 4 u32 (spc/db/rel/xid) + u64 source_lsn = 24 bytes, then bad op 99
-        let mut buf = vec![0u8; 24];
+        // u32 xid + u64 source_lsn = 12 bytes, then bad op 99
+        let mut buf = vec![0u8; 12];
         buf.push(99u8);
         let mut cur = Cursor::new(&buf);
-        let err = decode_heap(&mut cur).unwrap_err();
+        let err = decode_heap(&mut cur, RelFileNode::default()).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "spill format at offset 25: unknown HeapOp tag 99"
+            "spill format at offset 13: unknown HeapOp tag 99"
         );
     }
 

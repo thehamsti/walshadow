@@ -250,7 +250,7 @@ async fn run_runtime_case(
                     &[],
                 )
                 .map_err(anyhow::Error::msg)?;
-                let (incarnation, _) = runtime.lineage(&parallel).await?;
+                let (incarnation, _) = runtime.lineage(&parallel)?;
                 let ids = futures::stream::iter(0..batches)
                     .map(|batch| {
                         let schema = schema.clone();
@@ -313,7 +313,7 @@ async fn run_runtime_case(
         )
         .await?;
     }
-    let (incarnation, _) = runtime.lineage(&desc).await?;
+    let (incarnation, _) = runtime.lineage(&desc)?;
     runtime
         .deliver(
             schema.clone(),
@@ -361,7 +361,7 @@ async fn run_runtime_case(
         .await?;
     assert_runtime_value(http, &config.database, public_schema, Some("later-wal")).await?;
 
-    let active = runtime.active_generation(&schema).await?;
+    let active = runtime.active_generation(&schema)?;
     runtime
         .deliver(
             schema.clone(),

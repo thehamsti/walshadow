@@ -13,7 +13,6 @@ use std::fs;
 use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::replication::tls::SslMode;
 use walrus::time::Timestamp;
 use walshadow::backfill::visibility_gate::{
     DeferredLane, GateStats, GreenfieldSink, PendingGate, resolve_greenfield, stream_phase,
@@ -339,7 +338,7 @@ pub(crate) async fn run_bootstrap(
     // Metrics-only (no CH) has no mapping to filter against, so it walks all
     let (tap_filenodes, needs_oracle, mut routes) = match &ch_target {
         Some((emitter_cfg, mapping, resolved, skip_initial)) => {
-            let routed = mapping.snapshot().await;
+            let routed = mapping.snapshot();
             let is_routed = |d: &RelDescriptor| {
                 routing(d, Some(&resolved.rules))
                     .owner(d)
@@ -378,28 +377,14 @@ pub(crate) async fn run_bootstrap(
         ahash::HashSet::default()
     };
 
-    // Off the backup window: provisioning is an initdb + pg_dump + apply +
-    // restart, and doing it after `BASE_BACKUP` opens parks a live backup
-    // through all of it — in object-store mode against walrus's 60 s request
-    // cap
+    // Set up oracle before opening BASE_BACKUP to avoid holding backup open
+    // during initdb, startup and catalog copy. Walrus caps object-store requests at 60 s
     let bootstrap_oracle = if needs_oracle {
-        let source_conninfo = format!(
-            "host={} port={} user={} dbname={} sslmode={}",
-            src_cfg.host,
-            src_cfg.port,
-            src_cfg.user,
-            src_cfg.database,
-            if src_cfg.sslmode == SslMode::Disable {
-                "disable"
-            } else {
-                "prefer"
-            },
-        );
         Some(
             walshadow::backfill::bootstrap_oracle::BootstrapOracle::provision(
                 args.spill_dir.join("bootstrap_oracle"),
-                source_conninfo,
-                src_cfg.password.clone(),
+                sql_client,
+                &walshadow::backfill::bootstrap_oracle::mapped_types(&drain_catalog, &routes),
                 args.bridge_lib_dir.clone(),
                 bridge_workers,
                 Duration::from_secs(args.shadow_connect_timeout),
@@ -467,7 +452,7 @@ pub(crate) async fn run_bootstrap(
                 skip_initial.insert(rel.desc.rel_name.clone());
             }
         }
-        routes = plan.mapping.snapshot().await;
+        routes = plan.mapping.snapshot();
         emitter.snowflake_snapshots = Arc::new(plan.operations.clone());
         snowflake_plan = Some(plan);
         snowflake_runtime = Some(runtime);
@@ -638,7 +623,7 @@ pub(crate) async fn run_bootstrap(
                 patch: window_patch.clone(),
                 catalog: drain_catalog.clone(),
                 pg_major: source_major,
-                system_id: source_ident.sysid.clone(),
+                system_id: source_ident.system_id.to_string(),
                 timeline: source_ident.timeline,
                 wind_down: Duration::from_secs(args.bootstrap_wind_down_secs),
             }
@@ -694,6 +679,7 @@ pub(crate) async fn run_bootstrap(
                 tokio::fs::remove_file(&spool_path).await.ok();
             }
             let catalog = drain_catalog.clone();
+            let gate_counters = bootstrap_stats.clone();
             gate_handles.push(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
                 async move {
                     let mut spool = match inherit {
@@ -716,6 +702,7 @@ pub(crate) async fn run_bootstrap(
                         &catalog,
                         &mut spool,
                         &mut gate_stats,
+                        &gate_counters,
                         None,
                     )
                     .await
@@ -724,15 +711,7 @@ pub(crate) async fn run_bootstrap(
             )));
         }
         let gate = async move {
-            let mut rx = rx;
-            let mut at = 0usize;
-            while let Some(slab) = rx.recv().await {
-                let lane = at % gate_txs.len();
-                at += 1;
-                if gate_txs[lane].send(slab).await.is_err() {
-                    break;
-                }
-            }
+            dispatch(rx, &gate_txs).await;
             drop(gate_txs);
             let mut stats = GateStats::default();
             let mut spools = Vec::with_capacity(gate_handles.len());
@@ -1019,6 +998,12 @@ pub(crate) async fn run_bootstrap(
         // Referrers the lanes handed back. One lane reaching its end proves
         // nothing about a sibling's chunk puts, so resolution waits for all
         // of them, then replays each spool on the tail that drained it
+        let coverage = window.as_mut().map(|w| {
+            Arc::new(walshadow::emit::pipeline::bootstrap::WindowCoverage {
+                page_bound: resolver.stores_chunks(),
+                replaced: std::mem::take(&mut w.replaced),
+            })
+        });
         let mut handback = Vec::with_capacity(lanes);
         let mut handback_at = Vec::with_capacity(lanes);
         for (i, outcome) in drain_outcome.iter_mut().enumerate() {
@@ -1035,7 +1020,7 @@ pub(crate) async fn run_bootstrap(
         }
         let mut deferred_rows = 0;
         if !handback.is_empty() {
-            match sink.resolve_deferred(handback).await {
+            match sink.resolve_deferred(handback, coverage.clone()).await {
                 Ok(resolved) => {
                     for (i, lane) in handback_at.into_iter().zip(resolved) {
                         drain_outcome[i].next_seq = lane.next_seq;
@@ -1076,6 +1061,7 @@ pub(crate) async fn run_bootstrap(
             sink,
             oracle: oracle.clone(),
             stream_stats: gate_stats,
+            coverage,
         });
         (rows_routed, outcome, window, landing_tracker)
     } else {
@@ -1105,12 +1091,12 @@ pub(crate) async fn run_bootstrap(
             .await
             .context("bootstrap: IDENTIFY_SYSTEM after the window leg")?;
         anyhow::ensure!(
-            now.sysid == source_ident.sysid && now.timeline == source_ident.timeline,
+            now.system_id == source_ident.system_id && now.timeline == source_ident.timeline,
             "source identity moved during bootstrap: system {} timeline {} when the backup \
              opened, system {} timeline {} now",
-            source_ident.sysid,
+            source_ident.system_id,
             source_ident.timeline,
-            now.sysid,
+            now.system_id,
             now.timeline,
         );
     }
@@ -1155,8 +1141,8 @@ pub(crate) async fn run_bootstrap(
         .context("bootstrap: hydrate shadow pg_wal from object store")?;
     }
 
-    let open_floor = window.and_then(|w| w.open_floor);
-    if let Some(w) = window {
+    let open_floor = window.as_ref().and_then(|w| w.open_floor);
+    if let Some(w) = &window {
         tracing::info!(
             target: "walshadow::bootstrap",
             from_lsn = format_pg_lsn(w.from_lsn).to_string(),
@@ -1201,15 +1187,9 @@ pub(crate) async fn run_bootstrap(
                 .context("bootstrap: visibility gate")?;
         // Persist the ledger before clearing the marker so pending rows
         // already in ClickHouse can be published after restart
-        let mut ledger = PendingLedger::load(
-            &args.spill_dir,
-            source_ident
-                .sysid
-                .parse()
-                .context("IDENTIFY_SYSTEM sysid")?,
-        )
-        .await
-        .context("bootstrap: load pending visibility ledger")?;
+        let mut ledger = PendingLedger::load(&args.spill_dir, source_ident.system_id)
+            .await
+            .context("bootstrap: load pending visibility ledger")?;
         // Snowflake keeps pending tables in its runtime state, not this ledger
         let recorded = if let Some(runtime) = &snowflake_runtime {
             ledger
@@ -1245,10 +1225,7 @@ pub(crate) async fn run_bootstrap(
         snowflake_emitter,
         snowflake_mapping,
     ) {
-        let system_id: u64 = source_ident
-            .sysid
-            .parse()
-            .context("IDENTIFY_SYSTEM sysid")?;
+        let system_id: u64 = source_ident.system_id;
         walshadow::backfill_bootstrap::publish_greenfield_snapshots(runtime, plan, &mapping)
             .await
             .context("publish Snowflake greenfield generations")?;
@@ -1447,7 +1424,7 @@ pub(crate) async fn bootstrap_build_mapping(
                     )
                     .await?;
                     if !bootstrap_skips_initial(emitter_cfg, &resolved, desc)
-                        && mapping.with(|m| m.contains_key(&desc.rel_name)).await
+                        && mapping.with(|m| m.contains_key(&desc.rel_name))
                     {
                         runtime.defer_publication(desc)?;
                     }
@@ -1460,7 +1437,7 @@ pub(crate) async fn bootstrap_build_mapping(
             .try_collect::<Vec<_>>()
             .await?;
         tracing::info!(target: "walshadow::bootstrap",
-            tables = mapping.with(|m| m.len()).await,
+            tables = mapping.with(|m| m.len()),
             "Snowflake bootstrap table setup complete");
         return Ok((mapping, resolved));
     }
@@ -1545,6 +1522,26 @@ pub(crate) fn paths_overlap(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Send each slab to first lane with room, probing from round-robin cursor
+///
+/// Lane choice is free: gate lanes run without a walk barrier, and deferred
+/// spools reopen by recorded count, so no tuple is bound to a lane index
+async fn dispatch<T>(
+    mut rx: tokio::sync::mpsc::Receiver<T>,
+    lanes: &[tokio::sync::mpsc::Sender<T>],
+) {
+    let mut at = 0;
+    while let Some(slab) = rx.recv().await {
+        let probe = (0..lanes.len()).map(|k| Box::pin(lanes[(at + k) % lanes.len()].reserve()));
+        // Closed lane: stop, lane join surfaces its error
+        let (Ok(permit), k, _) = futures::future::select_all(probe).await else {
+            return;
+        };
+        permit.send(slab);
+        at = (at + k + 1) % lanes.len();
+    }
+}
+
 /// Inserter count is the demand on the oracle: one bridge worker and one
 /// resolver per inserter is what keeps a batch resolving while the others
 /// insert
@@ -1607,6 +1604,53 @@ mod tests {
                 "pool {pool} over {lanes} lanes must sum to the pool, got {split:?}",
             );
         }
+    }
+
+    async fn dispatch_all(slabs: &[u32], lanes: &[tokio::sync::mpsc::Sender<u32>]) {
+        let (tx, rx) = tokio::sync::mpsc::channel(slabs.len());
+        for &s in slabs {
+            tx.send(s).await.unwrap();
+        }
+        drop(tx);
+        dispatch(rx, lanes).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_full_lane() {
+        let (l0, mut r0) = tokio::sync::mpsc::channel(1);
+        let (l1, mut r1) = tokio::sync::mpsc::channel(1);
+        let lanes = [l0, l1];
+        let lane1 = async {
+            let mut got = Vec::new();
+            while got.len() < 3 {
+                got.push(r1.recv().await.unwrap());
+            }
+            got
+        };
+        let (got, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(lane1, dispatch_all(&[1, 2, 3, 4], &lanes))
+        })
+        .await
+        .expect("dispatch blocked on full lane");
+        assert_eq!(got, [2, 3, 4]);
+        assert_eq!(r0.try_recv(), Ok(1));
+    }
+
+    #[tokio::test]
+    async fn dispatch_round_robins_when_idle() {
+        let (txs, mut rxs): (Vec<_>, Vec<_>) =
+            (0..3).map(|_| tokio::sync::mpsc::channel(2)).unzip();
+        dispatch_all(&[1, 2, 3, 4, 5, 6], &txs).await;
+        for (rx, want) in rxs.iter_mut().zip([[1, 4], [2, 5], [3, 6]]) {
+            assert_eq!([rx.try_recv(), rx.try_recv()], want.map(Ok));
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_stops_on_closed_lane() {
+        let (txs, rxs): (Vec<_>, Vec<_>) = (0..2).map(|_| tokio::sync::mpsc::channel(1)).unzip();
+        drop(rxs);
+        dispatch_all(&[1], &txs).await;
     }
 
     #[test]

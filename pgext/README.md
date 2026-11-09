@@ -26,7 +26,9 @@ runtime image build never compiles it:
 make -C pgext faultshim.so
 ```
 
-`coverage-build` builds both
+`coverage-build` builds both. Use `test-deps` to build all modules Rust tests
+load, including fault shim and `pgext/test/wstest.so`. It cleans before
+rebuilding when PostgreSQL version reported by `PG_CONFIG` changes
 
 ## Fault injection
 
@@ -116,9 +118,7 @@ reaches:
 Restore ordinary build after gathering coverage:
 
 ```sh
-make -C pgext clean
-make -C pgext
-make -C pgext faultshim.so
+make -C pgext test-deps
 ```
 
 ## Loading

@@ -9,6 +9,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -27,7 +28,7 @@ use crate::decode::visibility::{
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatcherMsg;
-use crate::emit::pipeline::bootstrap::BootstrapDrainOutcome;
+use crate::emit::pipeline::bootstrap::{BootstrapDrainOutcome, WindowCoverage};
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
 use crate::emit::route::freeze_routes;
@@ -59,6 +60,7 @@ pub async fn stream_phase(
     catalog: &CatalogMap,
     deferred: &mut DeferredSpool,
     stats: &mut GateStats,
+    counters: &EmitterStats,
     barrier: Option<&Arc<WalkBarrier>>,
 ) -> Result<(), String> {
     let mut forwarded = 0u64;
@@ -79,6 +81,7 @@ pub async fn stream_phase(
             if catalog.is_toast(t.rfn.db_node, t.rfn.rel_node) {
                 if tuple_visibility(t.xid, t.xmax, t.infomask, None) == Visibility::Skip {
                     stats.chunks_gated += 1;
+                    counters.gate_chunks_gated.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 pass.push(t);
@@ -89,16 +92,26 @@ pub async fn stream_phase(
                 Visibility::Emit => {
                     if t.infomask & HEAP_XMAX_IS_MULTI != 0 {
                         stats.multixact_emitted += 1;
+                        counters
+                            .gate_multixact_emitted
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     stats.emitted += 1;
+                    counters.gate_emitted.fetch_add(1, Ordering::Relaxed);
                     pass.push(t);
                 }
-                Visibility::Skip => stats.gated += 1,
+                Visibility::Skip => {
+                    stats.gated += 1;
+                    counters.gate_gated.fetch_add(1, Ordering::Relaxed);
+                }
                 // Multixact verdict requires complete view
-                Visibility::Defer | Visibility::Unresolvable => deferred
-                    .push(t)
-                    .await
-                    .map_err(|e| format!("visibility gate: deferred spool: {e}"))?,
+                Visibility::Defer | Visibility::Unresolvable => {
+                    counters.gate_deferred.fetch_add(1, Ordering::Relaxed);
+                    deferred
+                        .push(t)
+                        .await
+                        .map_err(|e| format!("visibility gate: deferred spool: {e}"))?
+                }
             }
         }
         if !pass.is_empty() {
@@ -323,6 +336,7 @@ impl GreenfieldSink {
     pub async fn resolve_deferred(
         &self,
         lanes: Vec<DeferredLane>,
+        coverage: Option<Arc<WindowCoverage>>,
     ) -> Result<Vec<BootstrapDrainOutcome>, String> {
         let lanes = lanes.into_iter().map(|lane| {
             let catalog = self.catalog.clone();
@@ -333,6 +347,7 @@ impl GreenfieldSink {
             let emitter = self.dest.current();
             let row_policy = emitter.row_policy();
             let neutral_values = emitter.snowflake.is_some();
+            let coverage = coverage.clone();
             async move {
                 bootstrap::drain_deferred(
                     lane.spool.into(),
@@ -347,6 +362,7 @@ impl GreenfieldSink {
                     lane.first_seq,
                     neutral_values,
                     None,
+                    coverage.as_deref(),
                 )
                 .await
             }
@@ -411,6 +427,7 @@ pub struct PendingGate {
     pub oracle: Option<Arc<crate::ops::oracle::Oracle>>,
     /// Streaming-phase counters
     pub stream_stats: GateStats,
+    pub coverage: Option<Arc<WindowCoverage>>,
 }
 
 /// Resolve deferred tuples and retain the undecided as pending rows
@@ -425,6 +442,7 @@ pub async fn resolve_greenfield(
         sink,
         oracle,
         stream_stats: mut gate_stats,
+        coverage,
     } = gate;
     let scratch_dir = sink.scratch_dir.clone();
     if deferred.iter().map(DeferredSpool::records).sum::<u64>() == 0 {
@@ -490,7 +508,7 @@ pub async fn resolve_greenfield(
                     })
                 })
                 .collect();
-            sink.resolve_deferred(lanes)
+            sink.resolve_deferred(lanes, coverage)
                 .await
                 .map(|r| r.iter().map(|o| o.next_seq).max().unwrap_or(open))
         }
@@ -556,6 +574,7 @@ mod tests {
             xmax,
             infomask,
             source_lsn: 0x1000,
+            page_lsn: 0,
             blkno: 0,
             offnum: 0,
             columns: Vec::new(),
@@ -618,6 +637,7 @@ mod tests {
             &catalog,
             &mut spool,
             &mut stats,
+            &EmitterStats::default(),
             Some(&barrier),
         )
         .await
@@ -675,6 +695,7 @@ mod tests {
             &catalog,
             &mut spool,
             &mut stats,
+            &EmitterStats::default(),
             Some(&barrier),
         )
         .await
@@ -813,7 +834,7 @@ mod tests {
             tails.push((ack, ack_task, msg_rx));
         }
 
-        let out = sink.resolve_deferred(lanes).await.unwrap();
+        let out = sink.resolve_deferred(lanes, None).await.unwrap();
         assert_eq!(
             out.iter().map(|o| o.next_seq).collect::<Vec<_>>(),
             vec![4, 8],
@@ -875,9 +896,17 @@ mod tests {
 
         let mut stats = GateStats::default();
         let mut spool = spool_of(Vec::new()).await;
-        stream_phase(&mut walk_rx, &tx, catalog, &mut spool, &mut stats, None)
-            .await
-            .unwrap();
+        stream_phase(
+            &mut walk_rx,
+            &tx,
+            catalog,
+            &mut spool,
+            &mut stats,
+            &EmitterStats::default(),
+            None,
+        )
+        .await
+        .unwrap();
         drop(tx);
 
         let mut passed = Vec::new();
@@ -1144,6 +1173,7 @@ mod tests {
                 emitted: 7,
                 ..Default::default()
             },
+            coverage: None,
         };
         let (stats, pending_tables) = resolve_greenfield(
             pending,

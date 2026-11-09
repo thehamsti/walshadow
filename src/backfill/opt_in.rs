@@ -234,16 +234,14 @@ async fn opt_in_known(
         );
         return Ok(());
     }
-    if !applicator.owns_destination(desc).await? {
+    if !applicator.owns_destination(desc)? {
         return Ok(());
     }
-    let snowflake_mapping = applicator
-        .snowflake_opt_in_mapping(
-            desc,
-            row.target_database.as_deref(),
-            row.target_table.as_deref(),
-        )
-        .await?;
+    let snowflake_mapping = applicator.snowflake_opt_in_mapping(
+        desc,
+        row.target_database.as_deref(),
+        row.target_table.as_deref(),
+    )?;
     if snowflake_mapping.is_some()
         && row
             .initial_load

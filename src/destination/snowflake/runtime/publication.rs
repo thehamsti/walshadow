@@ -214,12 +214,10 @@ impl SnowflakeRuntime {
                         GenerationPhase::Replayed
                             | GenerationPhase::Retired
                             | GenerationPhase::Aborted
-                    ) && self.active_generation(&schema).await? != 0
+                    ) && self.active_generation(&schema)? != 0
                         && self
                             .state
-                            .get_metadata(&generation_floor_key(
-                                self.active_generation(&schema).await?
-                            ))?
+                            .get_metadata(&generation_floor_key(self.active_generation(&schema)?))?
                             .is_some(),
                     "prior snapshot schema changed without a published schema barrier"
                 );
@@ -294,7 +292,7 @@ impl SnowflakeRuntime {
             "published snapshot generation cannot be abandoned"
         );
         ensure!(
-            self.active_generation(&schema).await? != record.generation_id,
+            self.active_generation(&schema)? != record.generation_id,
             "active snapshot generation cannot be abandoned"
         );
         let plan = self.generation_sql_plan(&schema, record.generation_id)?;
@@ -445,7 +443,7 @@ impl SnowflakeRuntime {
             self.storage_exists(&plan).await?,
             "snapshot generation storage is missing"
         );
-        let active = self.active_generation(&schema).await?;
+        let active = self.active_generation(&schema)?;
         let view = self.view_comment(&schema, &plan).await?;
         if view.as_deref() != Some(&plan.view_marker) {
             ensure!(
@@ -483,10 +481,9 @@ impl SnowflakeRuntime {
             self.switch_view(operation_id, &schema, &plan).await?;
         }
         self.finish_publication(&schema, operation_id, active, &record, &plan)
-            .await
     }
 
-    pub async fn active_generation(&self, schema: &TableSchema) -> Result<u64> {
+    pub fn active_generation(&self, schema: &TableSchema) -> Result<u64> {
         let key = active_key(schema);
         let Some(bytes) = self.state.get_metadata(&key)? else {
             return Ok(0);
@@ -498,7 +495,7 @@ impl SnowflakeRuntime {
     /// Resolve the physical table used by live WAL. The caller holds the
     /// table lock; this reconciles a crash after view switch but before CAS.
     pub async fn active_plan(&self, schema: &TableSchema) -> Result<TableSqlPlan> {
-        let mut active = self.active_generation(schema).await?;
+        let mut active = self.active_generation(schema)?;
         if let Some(route) = self
             .state
             .get_metadata(&snapshot_route_key(schema.relation_oid))?
@@ -533,8 +530,7 @@ impl SnowflakeRuntime {
                             self.storage_exists(&plan).await?,
                             "published generation storage missing"
                         );
-                        self.finish_publication(schema, operation_id, active, &record, &plan)
-                            .await?;
+                        self.finish_publication(schema, operation_id, active, &record, &plan)?;
                         active = record.generation_id;
                     }
                 }
@@ -544,7 +540,7 @@ impl SnowflakeRuntime {
             return TableSqlPlan::new(schema, &self.config.internal_schema)
                 .map_err(anyhow::Error::msg);
         }
-        let mut plan = self.generation_plan(schema, active).await?;
+        let mut plan = self.generation_plan(schema, active)?;
         let binding: GenerationBinding = serde_json::from_slice(
             &self
                 .state
@@ -571,7 +567,7 @@ impl SnowflakeRuntime {
         Ok(plan)
     }
 
-    pub async fn generation_plan(
+    pub fn generation_plan(
         &self,
         schema: &TableSchema,
         generation_id: u64,
@@ -606,8 +602,8 @@ impl SnowflakeRuntime {
         Ok(plan)
     }
 
-    pub async fn publication_view(&self, schema: &TableSchema) -> Result<String> {
-        let active = self.active_generation(schema).await?;
+    pub fn publication_view(&self, schema: &TableSchema) -> Result<String> {
+        let active = self.active_generation(schema)?;
         if active == 0 {
             let plan = TableSqlPlan::new(schema, &self.config.internal_schema)
                 .map_err(anyhow::Error::msg)?;
@@ -723,7 +719,7 @@ impl SnowflakeRuntime {
 
     /// Caller holds the table lock and has already observed the generation
     /// storage and the public view marker under it, so no remote recheck.
-    async fn finish_publication(
+    fn finish_publication(
         &self,
         schema: &TableSchema,
         operation_id: &str,
@@ -745,7 +741,7 @@ impl SnowflakeRuntime {
             )?;
             if !changed {
                 ensure!(
-                    self.active_generation(schema).await? == record.generation_id,
+                    self.active_generation(schema)? == record.generation_id,
                     "active generation changed during publication"
                 );
             }
@@ -916,14 +912,14 @@ mod tests {
                 not_null: true,
             }],
         };
-        assert_eq!(runtime.active_generation(&schema).await.unwrap(), 0);
+        assert_eq!(runtime.active_generation(&schema).unwrap(), 0);
         assert!(
             runtime
                 .state
                 .compare_exchange_metadata(&active_key(&schema), None, &1u64.to_le_bytes())
                 .unwrap()
         );
-        assert_eq!(runtime.active_generation(&schema).await.unwrap(), 1);
+        assert_eq!(runtime.active_generation(&schema).unwrap(), 1);
         let fingerprint = schema_fingerprint(&schema).unwrap();
         let record = runtime
             .state
@@ -944,7 +940,6 @@ mod tests {
         assert!(
             runtime
                 .generation_plan(&schema, record.generation_id)
-                .await
                 .is_ok()
         );
         runtime
@@ -954,7 +949,6 @@ mod tests {
         assert!(
             runtime
                 .generation_plan(&schema, record.generation_id)
-                .await
                 .is_err()
         );
         let fingerprint = schema_fingerprint(&schema).unwrap();

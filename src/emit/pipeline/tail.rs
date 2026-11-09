@@ -248,7 +248,6 @@ pub fn spawn_null(
     let batcher = tokio::spawn(async move {
         while let Some(msg) = msg_rx.recv().await {
             match msg {
-                BatcherMsg::Row(r) => swallow_ack.swallowed(vec![(r.seq, 1)]),
                 BatcherMsg::Rows(chunk) => swallow(&swallow_ack, [chunk]),
                 BatcherMsg::Chunks(chunks) => swallow(&swallow_ack, chunks),
                 BatcherMsg::FlushAll(reply) => {
@@ -379,8 +378,20 @@ struct SnowflakeBatch {
     deadline: Instant,
 }
 
+/// A placed row with the table its chunk resolved it to
+struct SnowflakeRouted {
+    rel: Arc<crate::schema::RelDescriptor>,
+    route: Arc<crate::emit::route::RouteSnapshot>,
+    row: RoutedRow,
+}
+
 enum SnowflakeTableMsg {
-    Row(RoutedRow, Option<Arc<crate::budget::MemoryPermit>>),
+    /// One relation's rows of one placement chunk, in placement order,
+    /// sharing that chunk's memory permit
+    Rows(
+        Vec<SnowflakeRouted>,
+        Option<Arc<crate::budget::MemoryPermit>>,
+    ),
     Flush(oneshot::Sender<()>),
 }
 
@@ -404,28 +415,6 @@ fn spawn_snowflake_tail(
         let mut workers = tokio::task::JoinSet::new();
         while let Some(msg) = rx.recv().await {
             match msg {
-                BatcherMsg::Row(row) => {
-                    if let Err(e) = snowflake_route(
-                        &mut senders,
-                        &mut workers,
-                        &runtime,
-                        &snapshot_operations,
-                        &stats,
-                        oracle.as_ref(),
-                        &worker_ack,
-                        &fatal,
-                        row,
-                        None,
-                        row_budget,
-                        byte_budget,
-                        timeout,
-                    )
-                    .await
-                    {
-                        fatal.set(format!("snowflake tail route: {e}"));
-                        break;
-                    }
-                }
                 BatcherMsg::Rows(chunk) => {
                     if let Err(e) = route_chunks(
                         &mut senders,
@@ -524,8 +513,30 @@ async fn route_chunks(
     chunks: Vec<RowChunk>,
     (row_budget, byte_budget, timeout): (usize, usize, Duration),
 ) -> Result<(), String> {
-    for RowChunk { rows, permit } in chunks {
+    for RowChunk {
+        tables,
+        rows,
+        permit,
+    } in chunks
+    {
+        // One send per relation per chunk, not per row. Grouping by source
+        // name keeps each relation's rows in placement order even when the
+        // chunk lists it under more than one table entry
+        let mut groups: Vec<(RelName, Vec<SnowflakeRouted>)> = Vec::new();
+        let mut slot_of: HashMap<RelName, usize> = HashMap::new();
         for row in rows {
+            let t = &tables[row.table as usize];
+            let slot = *slot_of.entry(t.rel.rel_name.clone()).or_insert_with(|| {
+                groups.push((t.rel.rel_name.clone(), Vec::new()));
+                groups.len() - 1
+            });
+            groups[slot].1.push(SnowflakeRouted {
+                rel: t.rel.clone(),
+                route: t.route.clone(),
+                row,
+            });
+        }
+        for (rel, group) in groups {
             snowflake_route(
                 senders,
                 workers,
@@ -535,7 +546,8 @@ async fn route_chunks(
                 oracle,
                 ack,
                 fatal,
-                row,
+                rel,
+                group,
                 permit.clone(),
                 row_budget,
                 byte_budget,
@@ -557,13 +569,13 @@ async fn snowflake_route(
     oracle: Option<&Arc<Oracle>>,
     ack: &AckHandle,
     fatal: &Fatal,
-    row: RoutedRow,
+    key: RelName,
+    rows: Vec<SnowflakeRouted>,
     chunk_permit: Option<Arc<crate::budget::MemoryPermit>>,
     row_budget: usize,
     byte_budget: usize,
     timeout: Duration,
 ) -> Result<(), String> {
-    let key = row.rel.rel_name.clone();
     let tx = if let Some(tx) = senders.get(&key) {
         tx.clone()
     } else {
@@ -583,7 +595,7 @@ async fn snowflake_route(
         senders.insert(key, tx.clone());
         tx
     };
-    tx.send(SnowflakeTableMsg::Row(row, chunk_permit))
+    tx.send(SnowflakeTableMsg::Rows(rows, chunk_permit))
         .await
         .map_err(|_| "Snowflake table worker closed".to_string())
 }
@@ -609,14 +621,18 @@ async fn snowflake_table_worker(
         let next = batch.as_ref().map(|b| b.deadline);
         tokio::select! {
             msg=rx.recv()=>match msg {
-                Some(SnowflakeTableMsg::Row(row,permit))=>{
-                    if let Err(e)=snowflake_add(&runtime,snapshot.as_deref(),oracle.as_ref(),&mut batch,&mut lookup,row,permit,timeout).await {
-                        fatal.set(format!("snowflake table: {e}"));break;
-                    }
-                    if batch.as_ref().is_some_and(|b| b.rows.len() >= row_budget || b.bytes >= byte_budget)
-                        && let Err(e)=snowflake_start_delivery(&runtime,&stats,&ack,&mut batch,&mut deliveries,max_parallel).await {
-                            fatal.set(format!("snowflake table delivery: {e}"));break;
+                Some(SnowflakeTableMsg::Rows(rows,permit))=>{
+                    let mut failed=false;
+                    for row in rows {
+                        if let Err(e)=snowflake_add(&runtime,snapshot.as_deref(),oracle.as_ref(),&mut batch,&mut lookup,row,permit.as_ref(),timeout).await {
+                            fatal.set(format!("snowflake table: {e}"));failed=true;break;
                         }
+                        if batch.as_ref().is_some_and(|b| b.rows.len() >= row_budget || b.bytes >= byte_budget)
+                            && let Err(e)=snowflake_start_delivery(&runtime,&stats,&ack,&mut batch,&mut deliveries,max_parallel).await {
+                                fatal.set(format!("snowflake table delivery: {e}"));failed=true;break;
+                            }
+                    }
+                    if failed {break;}
                 }
                 Some(SnowflakeTableMsg::Flush(reply))=>{
                     let result=async {
@@ -652,18 +668,24 @@ async fn snowflake_add(
     oracle: Option<&Arc<Oracle>>,
     batch: &mut Option<SnowflakeBatch>,
     lookup: &mut Option<SnowflakeLookup>,
-    mut row: RoutedRow,
-    chunk_permit: Option<Arc<crate::budget::MemoryPermit>>,
+    routed: SnowflakeRouted,
+    chunk_permit: Option<&Arc<crate::budget::MemoryPermit>>,
     timeout: Duration,
 ) -> Result<(), String> {
-    if !lookup.as_ref().is_some_and(|cached| {
-        Arc::ptr_eq(&cached.rel, &row.rel) && Arc::ptr_eq(&cached.route, &row.route)
-    }) {
+    let SnowflakeRouted {
+        rel,
+        route,
+        mut row,
+    } = routed;
+    if !lookup
+        .as_ref()
+        .is_some_and(|cached| Arc::ptr_eq(&cached.rel, &rel) && Arc::ptr_eq(&cached.route, &route))
+    {
         let schema = runtime
-            .schema_for(&row.rel, &row.route)
+            .schema_for(&rel, &route)
             .await
             .map_err(|e| e.to_string())?;
-        let mut lineage = runtime.lineage(&row.rel).await.map_err(|e| e.to_string())?;
+        let mut lineage = runtime.lineage(&rel).map_err(|e| e.to_string())?;
         if let Some(operation) = snapshot {
             lineage.1 = runtime
                 .state
@@ -673,8 +695,8 @@ async fn snowflake_add(
                 .generation_id;
         }
         *lookup = Some(SnowflakeLookup {
-            rel: row.rel.clone(),
-            route: row.route.clone(),
+            rel: rel.clone(),
+            route: route.clone(),
             schema,
             lineage,
         });
@@ -683,8 +705,7 @@ async fn snowflake_add(
     let schema = cached.schema.clone();
     let (incarnation, generation) = cached.lineage;
     if let Some(oracle) = oracle {
-        oracle
-            .render_text_columns(&mut row.committed, &row.rel)
+        crate::destination::snowflake::types::render_source_text(oracle, &mut row.committed, &rel)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -736,8 +757,11 @@ async fn snowflake_add(
     if let Some(p) = row.value_permit {
         held.permits.push(p);
     }
-    if let Some(p) = chunk_permit {
-        held.permits.push(p);
+    // A chunk's rows arrive together: hold its permit once per batch
+    if let Some(p) = chunk_permit
+        && !held.permits.last().is_some_and(|last| Arc::ptr_eq(last, p))
+    {
+        held.permits.push(p.clone());
     }
     Ok(())
 }

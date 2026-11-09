@@ -382,14 +382,11 @@ async fn prewarm_snowflake_opt_ins<'a>(
         let Ok(Some(desc)) = catalog.lock().await.descriptor_by_name(rel).await else {
             continue;
         };
-        let Ok(Some(_)) = applicator
-            .snowflake_opt_in_mapping(
-                &desc,
-                row.target_database.as_deref(),
-                row.target_table.as_deref(),
-            )
-            .await
-        else {
+        let Ok(Some(_)) = applicator.snowflake_opt_in_mapping(
+            &desc,
+            row.target_database.as_deref(),
+            row.target_table.as_deref(),
+        ) else {
             continue;
         };
         if row

@@ -751,7 +751,7 @@ async fn build_pipeline_inner(
 
     let spill_dir = tmp.path().join("spill");
     fs::create_dir_all(&spill_dir).unwrap();
-    let mut xact_buf_cfg = XactBufferConfig::new(spill_dir.clone());
+    let mut xact_buf_cfg = XactBufferConfig::new(walshadow::fs::scratch_dir(&spill_dir));
     if let Some(max) = knobs.xact_buffer_max {
         xact_buf_cfg.xact_buffer_max = max;
     }
@@ -805,7 +805,7 @@ async fn build_pipeline_inner(
             &spill_dir,
             walshadow::desc_log::DescLogIdentity {
                 pg_major: (feed.server_version_num() / 10000) as u32,
-                system_id: ident.sysid.clone(),
+                system_id: ident.system_id.to_string(),
                 timeline: ident.timeline,
                 db_oid: shadow_db_oid,
                 wal_seg_size: WAL_SEG_SIZE as u32,
@@ -908,7 +908,7 @@ async fn build_pipeline_inner(
         ident.xlogpos,
         WAL_SEG_SIZE,
     ))));
-    let system_id: u64 = ident.sysid.parse().expect("sysid");
+    let system_id = ident.system_id;
     let retires = walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id, None)
         .await
         .expect("load toast retire ledger");
@@ -1143,8 +1143,28 @@ pub async fn pump_segments_res(
 /// Poll `sql` until it returns `want` or the deadline passes (commit drains
 /// land asynchronously after a segment ships).
 pub async fn wait_query(ch: &ChServer, sql: &str, want: &str, what: &str) {
+    poll_query(ch, sql, want, what, None).await
+}
+
+/// [`wait_query`] over TOAST mirror tables, flushing pending mirror rows each
+/// poll as daemon does before publishing a checkpoint
+pub async fn wait_mirror(pipeline: &Pipeline, ch: &ChServer, sql: &str, want: &str, what: &str) {
+    let toast = pipeline.sinks.reorder.planning_resolver();
+    poll_query(ch, sql, want, what, Some(&toast)).await
+}
+
+async fn poll_query(
+    ch: &ChServer,
+    sql: &str,
+    want: &str,
+    what: &str,
+    toast: Option<&walshadow::toast::ToastResolver>,
+) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
+        if let Some(toast) = toast {
+            toast.flush_mirror().await.expect("flush TOAST mirror");
+        }
         let got = ch.query(sql).unwrap_or_else(|_| "<query failed>".into());
         if got == want {
             return;

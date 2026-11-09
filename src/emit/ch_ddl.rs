@@ -422,7 +422,7 @@ impl DdlApplicator {
 
     /// Resolve and validate a Snowflake opt-in route before any remote DDL.
     /// ClickHouse callers keep the resolver's existing mapping derivation.
-    pub async fn snowflake_opt_in_mapping(
+    pub fn snowflake_opt_in_mapping(
         &mut self,
         desc: &RelDescriptor,
         db_override: Option<&str>,
@@ -537,7 +537,7 @@ impl DdlApplicator {
                 } else {
                     &new.rel_name
                 };
-                let Some(mut mapped) = self.mapping_for(source_name).await else {
+                let Some(mut mapped) = self.mapping_for(source_name) else {
                     self.stats.skipped += 1;
                     return Ok(());
                 };
@@ -548,7 +548,7 @@ impl DdlApplicator {
                     )));
                 }
                 if renamed_table {
-                    if self.mapping_for(&new.rel_name).await.is_some() {
+                    if self.mapping_for(&new.rel_name).is_some() {
                         return Err(EmitterError::Config(format!(
                             "Snowflake rename target {} is already mapped",
                             new.rel_name
@@ -588,7 +588,7 @@ impl DdlApplicator {
                 Ok(())
             }
             SchemaEvent::Dropped { rel_name, .. } => {
-                if self.mapping_for(rel_name).await.is_none() {
+                if self.mapping_for(rel_name).is_none() {
                     self.stats.skipped += 1;
                     return Ok(());
                 }
@@ -615,7 +615,7 @@ impl DdlApplicator {
     ) -> Result<(), EmitterError> {
         match routing(desc, Some(&cfg.rules)) {
             Routing::Own => {}
-            Routing::Ancestor(root) => return self.admit_partition(desc, root, cfg).await,
+            Routing::Ancestor(root) => return self.admit_partition(desc, root, cfg),
             Routing::Excluded => {
                 self.stats.skipped += 1;
                 return Ok(());
@@ -623,7 +623,7 @@ impl DdlApplicator {
         }
         // Mapped dest created from the mapping when missing; IF NOT EXISTS
         // no-ops an operator-managed table and re-creates after strategy=drop.
-        if let Some(m) = self.mapping_for(&desc.rel_name).await {
+        if let Some(m) = self.mapping_for(&desc.rel_name) {
             if let Some(snowflake) = &self.snowflake {
                 validate_snowflake_route(desc, &m, snowflake)?;
                 snowflake
@@ -749,7 +749,7 @@ impl DdlApplicator {
         self.refresh_config();
         if let Some(snowflake) = self.snowflake.clone() {
             snowflake_columns(desc, &self.config.column_rules)?;
-            if let Some(mapping) = self.mapping_for(&desc.rel_name).await {
+            if let Some(mapping) = self.mapping_for(&desc.rel_name) {
                 validate_snowflake_route(desc, &mapping, &snowflake)?;
             }
             snowflake
@@ -804,14 +804,14 @@ impl DdlApplicator {
             }
             match after {
                 // Keep previous destination without further writes
-                Routing::Ancestor(root) => return self.admit_partition(new, root, cfg).await,
+                Routing::Ancestor(root) => return self.admit_partition(new, root, cfg),
                 Routing::Excluded => {
                     self.stats.skipped += 1;
                     return Ok(());
                 }
                 // Schema changes while attached did not update old mapping
                 Routing::Own if !matches!(before, Routing::Own) => {
-                    if self.mapping_for(&new.rel_name).await.is_some() {
+                    if self.mapping_for(&new.rel_name).is_some() {
                         self.forget_mapping(&new.rel_name).await;
                     }
                     return self.apply_added(new, cfg).await;
@@ -820,7 +820,7 @@ impl DdlApplicator {
             }
         }
         let key = new.rel_name.clone();
-        let Some((mapped_at, mapping)) = self.mapping_snapshot(&key).await else {
+        let Some((mapped_at, mapping)) = self.mapping_snapshot(&key) else {
             // No target, can't ALTER; `Added` handles the
             // not-yet-learned case
             self.stats.skipped += 1;
@@ -828,7 +828,7 @@ impl DdlApplicator {
         };
         let targets: Vec<TableTarget> = mapping.targets().collect();
         // ClickHouse can reject key retypes; defer renames, additions, and drops
-        ensure_unmoved(&self.mapping, &key, &mapped_at).await?;
+        ensure_unmoved(&self.mapping, &key, &mapped_at)?;
         let columns = &mapping.columns;
         let retypes = plan_retypes(old, new, diff, columns, &cfg.column_rules);
         for clause in retypes.iter().flat_map(retype_clauses) {
@@ -849,7 +849,7 @@ impl DdlApplicator {
             // Operator TOML rename makes the source rename a no-op from
             // CH's POV (TOML still maps src_attnum to the same CH name);
             // detect via whether the CH column name changed
-            ensure_unmoved(&self.mapping, &key, &mapped_at).await?;
+            ensure_unmoved(&self.mapping, &key, &mapped_at)?;
             let already_renamed = columns.iter().any(|c| &c.target_name == new_name)
                 || !columns.iter().any(|c| &c.target_name == old_name);
             if already_renamed {
@@ -937,7 +937,7 @@ impl DdlApplicator {
                 }
             }
         }
-        let Some((_, mapping)) = self.mapping_snapshot(rel).await else {
+        let Some((_, mapping)) = self.mapping_snapshot(rel) else {
             self.stats.skipped += 1;
             return Ok(());
         };
@@ -995,7 +995,7 @@ impl DdlApplicator {
             // the record
             Routing::Ancestor(_) if desc.kind == 'p' => return Ok(()),
             Routing::Ancestor(root) => {
-                let Some(mapping) = self.mapping_for(&root.rel_name).await else {
+                let Some(mapping) = self.mapping_for(&root.rel_name) else {
                     return Ok(());
                 };
                 if self
@@ -1010,7 +1010,7 @@ impl DdlApplicator {
                     .await;
             }
         }
-        let Some((_, mapping)) = self.mapping_snapshot(&desc.rel_name).await else {
+        let Some((_, mapping)) = self.mapping_snapshot(&desc.rel_name) else {
             return Ok(());
         };
         if let Some(snowflake) = &self.snowflake {
@@ -1030,24 +1030,24 @@ impl DdlApplicator {
 
     /// Check routing requirements. Return `false` for excluded partitions
     /// and partitions using root's destination
-    pub async fn owns_destination(&mut self, desc: &RelDescriptor) -> Result<bool, EmitterError> {
+    pub fn owns_destination(&mut self, desc: &RelDescriptor) -> Result<bool, EmitterError> {
         self.refresh_config();
         let cfg = self.config.clone();
         match routing(desc, Some(&cfg.rules)) {
             Routing::Own => Ok(true),
             Routing::Excluded => Ok(false),
-            Routing::Ancestor(root) => self.admit_partition(desc, root, &cfg).await.map(|()| false),
+            Routing::Ancestor(root) => self.admit_partition(desc, root, &cfg).map(|()| false),
         }
     }
 
     /// Use root's `initial_load` for attached rows, defaulting to `copy`
-    pub async fn partition_load(&mut self, desc: &RelDescriptor) -> InitialLoadMode {
+    pub fn partition_load(&mut self, desc: &RelDescriptor) -> InitialLoadMode {
         self.refresh_config();
         let cfg = self.config.clone();
         let Routing::Ancestor(root) = routing(desc, Some(&cfg.rules)) else {
             return InitialLoadMode::None;
         };
-        if self.mapping_for(&root.rel_name).await.is_none() {
+        if self.mapping_for(&root.rel_name).is_none() {
             return InitialLoadMode::None;
         }
         cfg.owner_rule(&desc.ancestors, root)
@@ -1063,13 +1063,13 @@ impl DdlApplicator {
 
     /// Check whether a partition can use `root`'s destination.
     /// Skip check until that destination exists
-    async fn admit_partition(
+    fn admit_partition(
         &mut self,
         desc: &RelDescriptor,
         root: &RelDescriptor,
         cfg: &DdlConfig,
     ) -> Result<(), EmitterError> {
-        if self.mapping_for(&root.rel_name).await.is_none() {
+        if self.mapping_for(&root.rel_name).is_none() {
             self.stats.skipped += 1;
             return Ok(());
         }
@@ -1087,7 +1087,7 @@ impl DdlApplicator {
         at: Stamp,
     ) -> Result<(), EmitterError> {
         let rel = &leaving.rel_name;
-        let Some(mapping) = self.mapping_for(&root.rel_name).await else {
+        let Some(mapping) = self.mapping_for(&root.rel_name) else {
             self.stats.skipped += 1;
             return Ok(());
         };
@@ -1170,16 +1170,15 @@ impl DdlApplicator {
 
     /// Resolve mapping against a held snapshot, which later ALTER steps
     /// re-check for displacement
-    async fn mapping_snapshot(&mut self, rel: &RelName) -> Option<(MappingSnapshot, TableMapping)> {
-        let at = self.mapping.snapshot().await;
+    fn mapping_snapshot(&self, rel: &RelName) -> Option<(MappingSnapshot, TableMapping)> {
+        let at = self.mapping.snapshot();
         let mapping = at.get(rel).map(|m| m.as_ref().clone())?;
         Some((at, mapping))
     }
 
-    async fn mapping_for(&mut self, rel: &RelName) -> Option<TableMapping> {
+    fn mapping_for(&self, rel: &RelName) -> Option<TableMapping> {
         self.mapping
             .with(|m| m.get(rel).map(|t| t.as_ref().clone()))
-            .await
     }
 
     /// Operator opt-out (`replicate=false`); nothing excluded without a
@@ -1793,12 +1792,12 @@ fn retype_clauses(retype: &Retype) -> Vec<String> {
 }
 
 /// Reject ALTER continuation after concurrent route republish
-async fn ensure_unmoved(
+fn ensure_unmoved(
     mapping: &MappingHandle,
     rel: &RelName,
     at: &MappingSnapshot,
 ) -> Result<(), EmitterError> {
-    if mapping.unmoved(at).await {
+    if mapping.unmoved(at) {
         Ok(())
     } else {
         Err(EmitterError::Config(format!(
@@ -3498,7 +3497,7 @@ mod tests {
     async fn mapping_snapshot_returns_pinned_table() {
         let (rel, map) = orders_mapping();
         let handle = crate::mapping::mapping_handle(map);
-        let target = handle.with(|m| m.get(&rel).map(|t| t.target.clone())).await;
+        let target = handle.with(|m| m.get(&rel).map(|t| t.target.clone()));
         assert_eq!(target, Some(TableTarget::new("default", "orders")));
     }
 
@@ -3506,11 +3505,10 @@ mod tests {
     async fn republish_mid_alter_fails_instead_of_panicking() {
         let (rel, map) = orders_mapping();
         let handle = crate::mapping::mapping_handle(map);
-        let at = handle.snapshot().await;
-        ensure_unmoved(&handle, &rel, &at).await.unwrap();
+        let at = handle.snapshot();
+        ensure_unmoved(&handle, &rel, &at).unwrap();
         handle.publish(Arc::new(ahash::HashMap::default())).await;
         let err = ensure_unmoved(&handle, &rel, &at)
-            .await
             .expect_err("republish invalidates the resolved target");
         assert!(matches!(err, EmitterError::Config(_)), "{err}");
     }
@@ -3519,7 +3517,7 @@ mod tests {
     async fn prediction_ignores_a_republish_under_the_frozen_version() {
         let (rel, map) = orders_mapping();
         let handle = crate::mapping::mapping_handle(map);
-        let frozen = handle.snapshot().await;
+        let frozen = handle.snapshot();
         handle.publish(Arc::new(ahash::HashMap::default())).await;
         let cfg = DdlConfig {
             instances: Default::default(),
@@ -3547,7 +3545,7 @@ mod tests {
             matches!(predicted, Some((r, None)) if r == rel),
             "frozen version still maps the rel"
         );
-        let live = handle.snapshot().await;
+        let live = handle.snapshot();
         assert!(
             predict_route_effect(&cfg, &live, &dropped, false)
                 .unwrap()
@@ -3622,15 +3620,13 @@ mod tests {
             type_changes: vec![],
         };
         mutate_mapping_for_diff(&handle, &new, &diff, &[], &ColumnRules::default()).await;
-        let folded = handle
-            .with(|m| {
-                m.get(&RelName::new("public", "orders"))
-                    .unwrap()
-                    .columns
-                    .iter()
-                    .any(|c| c.src_attnum == 2 && c.target_name == "c")
-            })
-            .await;
+        let folded = handle.with(|m| {
+            m.get(&RelName::new("public", "orders"))
+                .unwrap()
+                .columns
+                .iter()
+                .any(|c| c.src_attnum == 2 && c.target_name == "c")
+        });
         assert!(folded);
 
         // Unmapped relation: early return

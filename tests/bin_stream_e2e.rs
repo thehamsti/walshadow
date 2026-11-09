@@ -292,7 +292,7 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
     //    replay checks; `--metrics-bind` doubles as a readiness probe.
     let spill_dir = tmp.path().join("spill");
     fs::create_dir_all(&spill_dir).unwrap();
-    let bin = env!("CARGO_BIN_EXE_walshadow-stream");
+    let bin = std::env::var("CARGO_BIN_EXE_walshadow-stream").unwrap();
     let stderr_path = tmp.path().join("daemon.stderr.log");
     let stderr_file = fs::File::create(&stderr_path).expect("open daemon stderr log");
     let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
@@ -373,8 +373,8 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
                 "expected {name} in /metrics body: {body}",
             );
         }
-        let ack_at_boot = metric_u64(&body, "walshadow_emitter_ack_lsn")
-            .context("emitter_ack gauge in first scrape")?;
+        // Absent until the session's first status write publishes a position
+        let ack_at_boot = metric_u64(&body, "walshadow_emitter_ack_lsn").unwrap_or(0);
 
         // 6. Drive workload. The daemon filters user-heap WAL records
         //    (rmgr=HEAP, class=User → replaced with XLOG_NOOP) — only
@@ -400,10 +400,9 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             let body = http_get(metrics_addr, "/metrics").context("ack poll scrape")?;
-            let ack = metric_u64(&body, "walshadow_emitter_ack_lsn")
-                .context("emitter_ack gauge in poll scrape")?;
-            let replay = metric_u64(&body, "walshadow_shadow_replay_lsn")
-                .context("shadow_replay gauge in poll scrape")?;
+            // LSN gauges stay absent while their position is unknown
+            let ack = metric_u64(&body, "walshadow_emitter_ack_lsn").unwrap_or(0);
+            let replay = metric_u64(&body, "walshadow_shadow_replay_lsn").unwrap_or(0);
             if ack > ack_at_boot && replay > 0 {
                 break;
             }
@@ -644,7 +643,7 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
 
     let spill_dir = tmp.path().join("wd-spill");
     fs::create_dir_all(&spill_dir).unwrap();
-    let bin = env!("CARGO_BIN_EXE_walshadow-stream");
+    let bin = std::env::var("CARGO_BIN_EXE_walshadow-stream").unwrap();
     let stderr_path = tmp.path().join("wd-daemon.stderr.log");
     let stderr_file = fs::File::create(&stderr_path).unwrap();
     let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
@@ -831,7 +830,7 @@ async fn process_restart_preserves_shadow_postmaster() {
         let metrics_port = ports::reserve_port();
         let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
         let log = tmp.path().join(format!("daemon-{round}.log"));
-        let mut child = Command::new(env!("CARGO_BIN_EXE_walshadow-stream"))
+        let mut child = Command::new(std::env::var("CARGO_BIN_EXE_walshadow-stream").unwrap())
             .args([
                 "--host",
                 source.config().socket_dir.to_str().unwrap(),

@@ -27,7 +27,7 @@ use crate::backfill::visibility_pending::{self, SharedPendingLedger};
 use crate::catalog::pending::PendingCatalog;
 #[cfg(feature = "test-support")]
 use crate::crash_test;
-use crate::decode::heap_decoder::{DescribedHeap, Predecoded};
+use crate::decode::heap_decoder::{DecodedHeap, DescribedHeap, Predecoded};
 use crate::decode::visibility::{PgXactView, SealedPatch, read_pg_xact};
 use crate::emit::ch_ddl::{DdlApplicator, Stamp};
 use crate::emit::ch_emitter::EmitterStats;
@@ -41,16 +41,18 @@ use crate::decode::wal_xact::{
     XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_OPMASK, parse_xact_assignment, parse_xact_payload,
 };
 use crate::ops::trace::TxnSpanRegistry;
-use crate::xact::xact_buffer::{DrainEntry, SubxactTracker, XactBuffer, XactBufferError};
+use crate::xact::xact_buffer::{
+    DrainEntry, SubxactTracker, ToastRowBatch, XactBuffer, XactBufferError,
+};
 
 use crate::config::ResolvedConfig;
 use crate::emit::pipeline::Fatal;
-use crate::emit::pipeline::ack::{AckHandle, Publish, SeqAlloc};
+use crate::emit::pipeline::ack::{AckHandle, BufferedRowSender, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherMsg, RowChunk};
 use crate::emit::pipeline::decode;
-use crate::emit::pipeline::plan_spool::{PlanItem, PlanPath, SealedPlan, VerifiedPlan};
+use crate::emit::pipeline::plan_spool::{PlanItem, PlanPath, PlanTable, PlannedHeap, SealedPlan};
 use crate::emit::pipeline::planner::{PlanRouteView, Planner, drain_reason};
-use crate::emit::route::{RouteSnapshot, RoutedHeap, RowPolicy, route_via};
+use crate::emit::route::{RouteSnapshot, RowPolicy, route_via};
 use crate::mapping::{MappingSnapshot, TableMapping};
 use crate::pos::{Floor, Monotone, Pos};
 use crate::runtime_config::{ConfigEvent, TableRow};
@@ -157,7 +159,7 @@ struct Outbox {
     /// enqueued rows.
     msg_tx: mpsc::Sender<BatcherMsg>,
     fatal: Fatal,
-    /// One seq per dispatched data unit, in commit order. Held: events ship
+    /// One seq per dispatched data unit, in commit order. Buffer events to send
     /// with [`Self::staged`]
     seqs: SeqAlloc,
     /// Placed rows not yet on the batcher channel, shipped per worker batch
@@ -191,33 +193,33 @@ impl Outbox {
         if let Some(p) = budget.try_admit(bytes) {
             return Ok(Some(p));
         }
-        self.ship().await?;
+        self.flush_pending().await?;
         tokio::select! {
             biased;
             _ = self.fatal.wait() => Err(self.fatal_err()),
             p = budget.admit(bytes) => Ok(Some(p)),
         }
     }
+}
 
-    /// Send staged rows with their held seq events: registrations first so
-    /// no insert ack beats them, placements once rows are on the channel
-    async fn ship(&mut self) -> Result<(), SinkError> {
-        self.seqs.send_registered();
-        if !self.staged.is_empty() {
-            let chunks = std::mem::take(&mut self.staged);
-            self.staged_rows = 0;
-            self.staged_bytes = 0;
-            let sent = tokio::select! {
-                biased;
-                _ = self.fatal.wait() => return Err(self.fatal_err()),
-                r = self.msg_tx.send(BatcherMsg::Chunks(chunks)) => r,
-            };
-            if sent.is_err() {
-                return Err(SinkError::Other("batcher channel closed".into()));
-            }
+impl BufferedRowSender for Outbox {
+    fn seqs(&mut self) -> &mut SeqAlloc {
+        &mut self.seqs
+    }
+
+    async fn send_rows(&mut self) -> Result<(), SinkError> {
+        if self.staged.is_empty() {
+            return Ok(());
         }
-        self.seqs.send_placed();
-        Ok(())
+        let chunks = std::mem::take(&mut self.staged);
+        self.staged_rows = 0;
+        self.staged_bytes = 0;
+        let sent = tokio::select! {
+            biased;
+            _ = self.fatal.wait() => return Err(self.fatal_err()),
+            r = self.msg_tx.send(BatcherMsg::Chunks(chunks)) => r,
+        };
+        sent.map_err(|_| SinkError::Other("batcher channel closed".into()))
     }
 }
 
@@ -287,7 +289,7 @@ impl ReorderSink {
                 (db.oid, scope)
             })
             .collect();
-        let seqs = ack.seqs(0).held();
+        let seqs = ack.seqs(0).buffer_events();
         BootingReorder(Self {
             buffer,
             dbs,
@@ -322,26 +324,24 @@ impl ReorderSink {
         })
     }
 
+    /// Resolver shared with predecode for TOAST read-ahead
+    pub fn planning_resolver(&self) -> ToastResolver {
+        self.resolver.clone()
+    }
+
     /// Route-point steps 1–2 close out here: preceding schema/config state is
     /// applied, so drop memoized routes and freeze mapping + resolved-config
     /// versions for the next interval. Per commit this is the
     /// whole-transaction snapshot; a non-WAL-positioned republish landing
     /// mid-plan can't reroute rows already planned or split the transaction.
-    async fn reset_route_state(&mut self, db: Oid) {
-        // Read the handles out before the await: a borrow of the scope held
-        // across one would put the applicator's `!Sync` client in the sink
-        // future
-        let scoped = self.scopes.get(&db).map(|scope| {
-            let config = scope.reload_rx.as_ref().map(|rx| rx.borrow().clone());
-            (scope.db.mapping.clone(), config)
-        });
-        let Some((mapping, config)) = scoped else {
+    fn reset_route_state(&mut self, db: Oid) {
+        let Some(scope) = self.scopes.get(&db) else {
             self.route_mapping = None;
             self.route_config = None;
             return;
         };
-        self.route_mapping = Some(mapping.snapshot().await);
-        self.route_config = config;
+        self.route_mapping = Some(scope.db.mapping.snapshot());
+        self.route_config = scope.reload_rx.as_ref().map(|rx| rx.borrow().clone());
     }
 
     /// Apply a live config reload's table opt-in/opt-out diff at a commit
@@ -544,7 +544,7 @@ impl ReorderSink {
     /// Seal every batcher table and wait for the reply. Sent on the shared row
     /// channel so it orders after every row enqueued before it.
     async fn flush_all_batcher(&mut self) -> Result<(), SinkError> {
-        self.out.ship().await?;
+        self.out.flush_pending().await?;
         let (tx, rx) = oneshot::channel();
         if self
             .out
@@ -566,7 +566,7 @@ impl ReorderSink {
     /// Block until every opened seq is durable on CH, or a fatal trips (e.g.
     /// CH down past the inserter retry budget).
     async fn wait_all_durable(&mut self) -> Result<(), SinkError> {
-        self.out.ship().await?;
+        self.out.flush_pending().await?;
         let through = self.out.seqs.next();
         tokio::select! {
             biased;
@@ -607,7 +607,7 @@ impl ReorderSink {
         let frozen = self.route_config.as_deref();
         // Pinned mappings outlive DROP, so only Added/Changed must match
         let predicted = if cfg!(debug_assertions) && !matches!(event, SchemaEvent::Dropped { .. }) {
-            let before = mapping.snapshot().await;
+            let before = mapping.snapshot();
             applicator
                 .predict_route_mapping(event, &before, frozen)
                 .await
@@ -624,7 +624,7 @@ impl ReorderSink {
         #[cfg(feature = "test-support")]
         crash_test::hit(crash_test::Point::AfterDdl, commit_lsn);
         if let Some((rel, m)) = predicted {
-            let after = mapping.snapshot().await;
+            let after = mapping.snapshot();
             debug_assert_eq!(
                 after.get(&rel).map(|a| a.as_ref()),
                 m.as_ref(),
@@ -637,7 +637,7 @@ impl ReorderSink {
             && old.parent_oid() != new.parent_oid()
             && let Some(backfiller) = backfiller
         {
-            let mode = applicator.partition_load(new).await;
+            let mode = applicator.partition_load(new);
             backfiller.note_opt_in(new.clone(), mode, commit_lsn).await;
         }
         // A `CREATE TABLE` for a forward-declared opt-in materialises here, in
@@ -850,10 +850,11 @@ impl ReorderSink {
     async fn apply_truncate(
         &mut self,
         _: Fenced,
-        heap: &DescribedHeap,
+        rel: &RelDescriptor,
+        heap: &DecodedHeap,
         commit_ts: i64,
     ) -> Result<(), SinkError> {
-        let Some(scope) = self.scopes.get_mut(&heap.descriptor.rfn.db_node) else {
+        let Some(scope) = self.scopes.get_mut(&rel.rfn.db_node) else {
             return Ok(());
         };
         let Some(applicator) = scope.applicator.as_mut() else {
@@ -862,10 +863,9 @@ impl ReorderSink {
         // Attached at truncate fan-out (record time = pre-capture Present),
         // so the rotation's drain-time Retired answer no longer needs a
         // predecessor walk here
-        let rel = &heap.descriptor;
         let at = Stamp {
-            lsn: heap.decoded.source_lsn,
-            xid: heap.decoded.xid,
+            lsn: heap.source_lsn,
+            xid: heap.xid,
             commit_ts,
         };
         applicator
@@ -877,7 +877,7 @@ impl ReorderSink {
         // the descriptor carries the owner's toast oid
         if self.resolver.stores_chunks() && rel.toast_oid != 0 {
             self.resolver
-                .truncate_mirror_at(rel.rfn.db_node, rel.toast_oid, heap.decoded.source_lsn)
+                .truncate_mirror_at(rel.rfn.db_node, rel.toast_oid, heap.source_lsn)
                 .await
                 .map_err(|e| SinkError::Other(format!("toast mirror truncate: {e}")))?;
         }
@@ -888,12 +888,12 @@ impl ReorderSink {
     /// indices span the plan's carried row batches in order
     async fn put_plan_rows(
         &mut self,
-        plan: &SealedPlan,
+        row_batches: &[ToastRowBatch],
         cursor: &mut usize,
         end: usize,
     ) -> Result<(), SinkError> {
         let mut base = 0usize;
-        for rb in &plan.row_batches {
+        for rb in row_batches {
             let (lo, hi) = ((*cursor).max(base), end.min(base + rb.len()));
             if lo < hi {
                 self.resolver
@@ -916,7 +916,8 @@ impl ReorderSink {
     /// owned `DdlApplicator` is Send but not Sync
     async fn dispatch_planned(
         &mut self,
-        pending: &mut Vec<RoutedHeap>,
+        tables: &[PlanTable],
+        pending: &mut Vec<PlannedHeap>,
         pending_bytes: &mut usize,
         commit_ts: i64,
         commit_lsn: u64,
@@ -939,6 +940,7 @@ impl ReorderSink {
             seq.seq(),
             commit_ts,
             commit_lsn,
+            tables,
             heaps,
             permit,
         );
@@ -947,7 +949,7 @@ impl ReorderSink {
         out.staged_rows += rows as usize;
         out.staged_bytes += bytes;
         if out.staged_rows >= chunk_rows || out.staged_bytes >= decode::DECODE_CHUNK_BYTES {
-            out.ship().await?;
+            out.flush_pending().await?;
         }
         Ok(())
     }
@@ -963,7 +965,7 @@ impl ReorderSink {
         &mut self,
         db: Oid,
         xid: u32,
-        plan: &VerifiedPlan,
+        plan: SealedPlan,
     ) -> Result<(u64, bool), SinkError> {
         let (commit_ts, commit_lsn) = (plan.commit_ts, plan.commit_lsn);
         let at = Stamp {
@@ -974,10 +976,10 @@ impl ReorderSink {
         let mut rd = plan
             .replay()
             .map_err(|e| SinkError::Other(format!("plan replay: {e}")))?;
-        let mut pending: Vec<RoutedHeap> = Vec::new();
+        let mut pending: Vec<PlannedHeap> = Vec::new();
         let mut pending_bytes = 0usize;
         let mut rows_cursor = 0usize;
-        let total_rows: usize = plan.row_batches.iter().map(|rb| rb.len()).sum();
+        let total_rows: usize = rd.row_batches.iter().map(|rb| rb.len()).sum();
         let mut rows_total = 0u64;
         while let Some(item) = rd
             .next_item()
@@ -986,9 +988,10 @@ impl ReorderSink {
             match item {
                 PlanItem::Control(c) => {
                     Box::pin(async {
-                        self.put_plan_rows(plan, &mut rows_cursor, c.row_idx)
+                        self.put_plan_rows(&rd.row_batches, &mut rows_cursor, c.row_idx)
                             .await?;
                         self.dispatch_planned(
+                            &rd.tables,
                             &mut pending,
                             &mut pending_bytes,
                             commit_ts,
@@ -1003,8 +1006,10 @@ impl ReorderSink {
                 }
                 PlanItem::Truncate { heap: h, upto } => {
                     Box::pin(async {
-                        self.put_plan_rows(plan, &mut rows_cursor, upto).await?;
+                        self.put_plan_rows(&rd.row_batches, &mut rows_cursor, upto)
+                            .await?;
                         self.dispatch_planned(
+                            &rd.tables,
                             &mut pending,
                             &mut pending_bytes,
                             commit_ts,
@@ -1013,7 +1018,9 @@ impl ReorderSink {
                         )
                         .await?;
                         let fenced = self.barrier_fence().await?;
-                        self.apply_truncate(fenced, &h.described, commit_ts).await
+                        let rel = &rd.tables[h.table as usize].descriptor;
+                        self.apply_truncate(fenced, rel, &h.decoded, commit_ts)
+                            .await
                     })
                     .await?;
                 }
@@ -1023,6 +1030,7 @@ impl ReorderSink {
                     pending.push(h);
                     if pending.len() >= self.batch_rows || pending_bytes >= self.batch_bytes {
                         self.dispatch_planned(
+                            &rd.tables,
                             &mut pending,
                             &mut pending_bytes,
                             commit_ts,
@@ -1035,10 +1043,11 @@ impl ReorderSink {
             }
         }
         if rows_cursor < total_rows {
-            Box::pin(self.put_plan_rows(plan, &mut rows_cursor, total_rows)).await?;
+            Box::pin(self.put_plan_rows(&rd.row_batches, &mut rows_cursor, total_rows)).await?;
         }
         let published = !pending.is_empty();
         self.dispatch_planned(
+            &rd.tables,
             &mut pending,
             &mut pending_bytes,
             commit_ts,
@@ -1145,7 +1154,7 @@ impl ReorderSink {
         // One route state per transaction: a mid-commit config republish
         // can't split this xact's rows across two route versions. In-walk
         // catalog events fold into the plan-time view, not shared state.
-        self.reset_route_state(db).await;
+        self.reset_route_state(db);
         let mut rows_total: u64 = 0;
         let mut published = false;
         if drain.had_states() {
@@ -1185,12 +1194,7 @@ impl ReorderSink {
                 let out = &mut self.out;
                 let stats = self.stats.clone();
                 let mut planner =
-                    Planner::create(plan_path, self.plan_disk_max, &mut view, &resolver).map_err(
-                        |e| {
-                            bump_plan_failure(&stats, e.reason());
-                            SinkError::Other(format!("plan open: {e}"))
-                        },
-                    )?;
+                    Planner::create(plan_path, self.plan_disk_max, &mut view, &resolver);
                 loop {
                     let Some(batch) = drain
                         .next_batch_admitting(batch_rows, batch_bytes, async |bytes| {
@@ -1241,19 +1245,15 @@ impl ReorderSink {
             };
             self.stats
                 .plan_rows
-                .fetch_add(plan.routed_count, Ordering::Relaxed);
+                .fetch_add(plan.routed_count(), Ordering::Relaxed);
             let plan_bytes = if plan.path().is_some() {
                 &self.stats.plan_bytes_file
             } else {
                 &self.stats.plan_bytes_mem
             };
             plan_bytes.fetch_add(plan.size_bytes, Ordering::Relaxed);
-            // Corruption fails the whole transaction before any side effect
-            let plan = plan
-                .into_verified()
-                .map_err(|e| SinkError::Other(format!("plan verify: {e}")))?;
             (rows_total, published) = self
-                .execute_plan(db, xid, &plan)
+                .execute_plan(db, xid, plan)
                 .instrument(trace_span!(
                     !txn.is_none(),
                     parent: &txn,
@@ -1477,7 +1477,7 @@ impl ReorderRouteView<'_> {
 impl PlanRouteView for ReorderRouteView<'_> {
     fn route_for(&mut self, heap: &DescribedHeap) -> Option<Arc<RouteSnapshot>> {
         let rel_name = &heap.descriptor.rel_name;
-        let route = if let Some((desc, r)) = self.maps.memo.get(rel_name)
+        if let Some((desc, r)) = self.maps.memo.get(rel_name)
             && Arc::ptr_eq(desc, &heap.descriptor)
         {
             r.clone()
@@ -1490,18 +1490,18 @@ impl PlanRouteView for ReorderRouteView<'_> {
                 .memo
                 .insert(rel_name.clone(), (heap.descriptor.clone(), route.clone()));
             route
-        };
-        if route.is_none() {
-            self.stats
-                .unsupported_relations
-                .fetch_add(1, Ordering::Relaxed);
-            let key = TableKey::new(heap.descriptor.rfn.db_node, rel_name.clone());
-            self.stats
-                .unmapped_rows_by_table
-                .counter(&key)
-                .fetch_add(1, Ordering::Relaxed);
         }
-        route
+    }
+
+    fn unmapped(&mut self, rel: &RelDescriptor, heaps: u64) {
+        self.stats
+            .unsupported_relations
+            .fetch_add(heaps, Ordering::Relaxed);
+        let key = TableKey::new(rel.rfn.db_node, rel.rel_name.clone());
+        self.stats
+            .unmapped_rows_by_table
+            .counter(&key)
+            .fetch_add(heaps, Ordering::Relaxed);
     }
 
     async fn apply(&mut self, entry: &DrainEntry) -> Result<(), String> {
@@ -1560,7 +1560,13 @@ impl RecordSink for ReorderSink {
     fn on_close<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(self.out.ship())
+        Box::pin(async move {
+            self.resolver
+                .flush_mirror()
+                .await
+                .map_err(|e| SinkError::Other(format!("toast store flush: {e}")))?;
+            self.out.flush_pending().await
+        })
     }
 
     fn on_record<'a>(
@@ -1569,7 +1575,7 @@ impl RecordSink for ReorderSink {
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             self.handle(record).await?;
-            self.out.ship().await
+            self.out.flush_pending().await
         })
     }
 
@@ -1579,10 +1585,10 @@ impl RecordSink for ReorderSink {
         _pre: &'a mut [Option<Predecoded>],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            for record in batch {
+            for record in batch.iter().filter(|r| Self::wants(r)) {
                 self.handle(record).await?;
             }
-            self.out.ship().await
+            self.out.flush_pending().await
         })
     }
 
@@ -1657,7 +1663,7 @@ mod tests {
 
         let stats = Arc::new(EmitterStats::default());
         let mut view = ReorderRouteView::new(
-            Some(handle.snapshot().await),
+            Some(handle.snapshot()),
             None,
             RowPolicy::default(),
             None,
@@ -1691,7 +1697,7 @@ mod tests {
         let rel = RelName::new("public", "t");
         let handle =
             crate::mapping::mapping_handle(HashMap::from_iter([(rel.clone(), mapping_for(&rel))]));
-        let mapping = Some(handle.snapshot().await);
+        let mapping = Some(handle.snapshot());
         let config = Some(Arc::new(ResolvedConfig::default()));
         let policy = RowPolicy::default();
         let cache = RouteCache {
@@ -1703,7 +1709,7 @@ mod tests {
         };
         assert!(cache.matches(5, &mapping, &config, &policy));
         assert!(
-            cache.matches(5, &Some(handle.snapshot().await), &config, &policy),
+            cache.matches(5, &Some(handle.snapshot()), &config, &policy),
             "unchanged handle snapshots the same version"
         );
         assert!(!cache.matches(6, &mapping, &config, &policy));
@@ -1735,7 +1741,7 @@ mod tests {
                 Arc::new(mapping_for(&rel)),
             )])))
             .await;
-        assert!(!cache.matches(5, &Some(handle.snapshot().await), &config, &policy));
+        assert!(!cache.matches(5, &Some(handle.snapshot()), &config, &policy));
     }
 
     /// Memoized routes carried into the next commit answer only for the
@@ -1745,7 +1751,7 @@ mod tests {
         let rel = RelName::new("public", "t");
         let handle =
             crate::mapping::mapping_handle(HashMap::from_iter([(rel.clone(), mapping_for(&rel))]));
-        let snapshot = handle.snapshot().await;
+        let snapshot = handle.snapshot();
         let stats = Arc::new(EmitterStats::default());
         let heap = heap_of(&rel);
         let memoized = |view: &ReorderRouteView, desc: &Arc<RelDescriptor>| {
@@ -1817,7 +1823,7 @@ mod tests {
         let out = Outbox {
             msg_tx,
             fatal: fatal.clone(),
-            seqs: ack.seqs(0).held(),
+            seqs: ack.seqs(0).buffer_events(),
             staged: Vec::new(),
             staged_rows: 0,
             staged_bytes: 0,
@@ -1835,8 +1841,8 @@ mod tests {
         let (mut out, _tail) = outbox(&budget, &fatal);
         let staged = budget.try_admit(768 << 10).unwrap();
         out.staged.push(RowChunk {
-            rows: Vec::new(),
             permit: Some(Arc::new(staged)),
+            ..Default::default()
         });
         let permit = tokio::time::timeout(Duration::from_secs(5), out.admit(512 << 10))
             .await

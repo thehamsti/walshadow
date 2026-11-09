@@ -54,6 +54,15 @@ macro_rules! encode_metric {
     ($enc:expr, gauge, $name:expr, $help:expr, $value:expr) => {
         gauge($enc, $name, $help, $value)?
     };
+    // LSN 0 is InvalidXLogRecPtr: the position is not known yet, eg the
+    // default snapshot served from process start until the session's first
+    // status write. A 0 sample between real LSNs reads as a ~80 TB jump to
+    // deriv() and lag queries, so the sample is left out instead
+    ($enc:expr, lsn, $name:expr, $help:expr, $value:expr) => {
+        if $value.get() != 0 {
+            gauge($enc, $name, $help, $value)?
+        }
+    };
     ($enc:expr, counter, $name:expr, $help:expr, $value:expr, $key:literal, $labels:expr) => {
         counter_series($enc, $name, $help, $key, $labels.into_iter().zip($value))?
     };
@@ -218,18 +227,18 @@ snapshot! {
         promotion_target_receive_lsn: u64,
     }
 
-    gauge source_received_lsn: Pos<SourceReceived> =
+    lsn source_received_lsn: Pos<SourceReceived> =
         "Source PG's most recent server_wal_end seen on the replication socket.",
     /// Last segment-boundary LSN dispatched downstream; becomes durable once
     /// segment fsync lands
-    gauge filter_lsn: Pos<FilterDispatched> =
+    lsn filter_lsn: Pos<FilterDispatched> =
         "LSN of the last filtered WAL byte the daemon has dispatched.",
-    gauge shadow_replay_lsn: Pos<ShadowReplay> =
+    lsn shadow_replay_lsn: Pos<ShadowReplay> =
         "Shadow PG's pg_last_wal_replay_lsn(), polled at status cadence.",
-    gauge decoder_commit_lsn: Pos<Drain> = "Highest commit LSN drained out of the xact buffer.",
+    lsn decoder_commit_lsn: Pos<Drain> = "Highest commit LSN drained out of the xact buffer.",
     /// Live insert watermark, unlike manifest's resume-safe `emitter_ack`
-    gauge emitter_ack_lsn: Pos<EmitterAck> = "Contiguous-done watermark from the insert pipeline.",
-    gauge floor_lsn: Pos<Floor> = "Durable resume floor: restart resumes here and pruners cut to it.",
+    lsn emitter_ack_lsn: Pos<EmitterAck> = "Contiguous-done watermark from the insert pipeline.",
+    lsn floor_lsn: Pos<Floor> = "Durable resume floor: restart resumes here and pruners cut to it.",
     gauge xact_active: u64 = "Active transactions buffered in memory or on spill.",
     gauge xact_bytes_in_memory: u64 = "Bytes held in memory across all buffered xacts.",
     gauge spill_xacts_active: u64 = "Xacts with at least one entry currently in their spill file.",
@@ -296,10 +305,12 @@ snapshot! {
     counter decoder_records_by_op: [u64; 5]
         ["op" = ["insert", "update", "hot_update", "delete", "truncate"]] =
         "Decoded heap row changes by operation.",
+    counter decoder_buffer_lock_acquires_total: u64 =
+        "Acquisitions of the shared xact-buffer mutex from the per-record decode path, contended or not.",
     counter decoder_buffer_lock_waits_total: u64 =
-        "Acquisitions of the shared xact-buffer mutex from the per-record decode path.",
+        "Acquisitions of the shared xact-buffer mutex that found it held and had to block (a subset of acquires).",
     counter decoder_buffer_lock_wait_seconds_total: f64 =
-        "Cumulative time the per-record decode path blocked on the xact-buffer mutex. rate() is workers' worth of time lost to it; divided by the waits counter it is per-acquire latency.",
+        "Cumulative time the per-record decode path blocked on the xact-buffer mutex. rate() is workers' worth of time lost to it; divided by the waits counter it is per-wait latency.",
     counter decoder_partial_total: u64 = "Decoded tuples with prefix/suffix-from-old elided columns.",
     counter decoder_toast_chunks_total: u64 =
         "TOAST chunks routed into the xact buffer's chunk slot.",
@@ -327,6 +338,10 @@ snapshot! {
         "Store fetch round trips. Against toast_values_fetched_total this is values per query, the deferred-resolution batching factor.",
     counter toast_value_fetch_seconds: f64 =
         "Cumulative wall-clock inside chunk-store fetches. Divided by toast_value_fetch_batches_total this is per-query latency.",
+    counter toast_values_read_ahead_total: u64 =
+        "Values read from the store ahead of planning, off the serial path. The fetch counters include these reads.",
+    counter toast_value_wait_seconds: f64 =
+        "Cumulative wall-clock planning spent waiting on values read ahead of it, apart from the store time those reads count in toast_value_fetch_seconds.",
     counter toast_image_rows_mirrored_total: u64 =
         "Chunk rows mirrored from restored page images during a backup window; non-zero means the backup copied TOAST pages mid-write.",
     counter toast_values_filled_superseded_total: u64 =
@@ -337,6 +352,20 @@ snapshot! {
         "Shadow values replaced with a fill after detecting value-ID reuse.",
     counter toast_values_filled_oversize_total: u64 =
         "Values over inline_value_max replaced with NULL or a column default.",
+    counter toast_fetch_miss_total: u64 =
+        "TOAST resolution failures caused by missing chunks or size mismatches.",
+    counter bootstrap_replay_covered_rows_total: u64 =
+        "Backup rows dropped during deferred TOAST resolution because values were unreadable and window replay emitted a tombstone or newer version for each tuple's slot.",
+    counter bootstrap_gate_emitted_total: u64 =
+        "Heap tuples forwarded by bootstrap visibility gate using hint bits.",
+    counter bootstrap_gate_gated_total: u64 =
+        "Heap tuples dropped by bootstrap visibility gate using hint bits.",
+    counter bootstrap_gate_deferred_total: u64 =
+        "Heap tuples with undecided hint-bit visibility, spooled for transaction-status checks.",
+    counter bootstrap_gate_chunks_gated_total: u64 =
+        "TOAST chunk tuples excluded from mirror writes because hint bits proved them dead.",
+    counter bootstrap_gate_multixact_emitted_total: u64 =
+        "Heap tuples forwarded by hint-bit visibility checks with multixact xmax.",
     counter toast_mirror_truncates_total: u64 =
         "Mirror wipes from owner TRUNCATE, applied at the reorder barrier.",
     counter toast_mirror_retires_total: u64 =
@@ -384,7 +413,8 @@ snapshot! {
         "Failed ClickHouse operations retried, one per failing operation rather than per attempt.",
     counter emitter_reconnects_total: u64 =
         "ClickHouse client dials after the first, from retries and live endpoint or compression changes.",
-    gauge pump_queue_depth: u64 = "Records buffered between the WAL pump and the queueing worker.",
+    gauge pump_queue_depth: u64 =
+        "Records buffered between WAL pump and queueing worker, including records processed only for their positions.",
     counter queue_records_out_total: u64 =
         "Records the queueing/reorder worker has dequeued and dispatched. rate() is the worker's throughput; with pump_queue_depth it tells deep-and-draining from deep-and-stalled.",
     counter queue_jobs_out_total: u64 =
@@ -467,6 +497,8 @@ snapshot! {
     /// chain reads differently from one that merely survived
     gauge shadow_replay_timeline: u32 = "Timeline the shadow is replaying.",
     /// `source_received_lsn - min_apply_lsn` across active shadow walreceivers.
+    /// Holds its last value while no apply LSN is known (before the first
+    /// walreceiver status after a daemon start).
     /// Caller saturates to 0 when shadow is ahead; passes `source_received_lsn`
     /// when none connected (disconnect = max lag)
     gauge shadow_apply_lag_bytes: u64 =
@@ -1261,6 +1293,24 @@ mod tests {
         assert!(out.contains("walshadow_tenant_lag_bytes{tenant=\"acme\"} 7"));
         assert!(out.contains("walshadow_tenant_rows_emitted_total{tenant=\"acme\"} 3"));
         assert!(out.contains("phase=\"detached\""));
+    }
+
+    #[test]
+    fn render_omits_unknown_lsn_gauges() {
+        let body = render(MetricsSnapshot {
+            emitter_ack_lsn: 0x47FD_FB00_0000.into(),
+            ..MetricsSnapshot::default()
+        });
+        assert!(body.contains("walshadow_emitter_ack_lsn 79156163379200"));
+        for name in [
+            "walshadow_source_received_lsn",
+            "walshadow_filter_lsn",
+            "walshadow_shadow_replay_lsn",
+            "walshadow_decoder_commit_lsn",
+            "walshadow_floor_lsn",
+        ] {
+            assert!(!body.contains(name), "{name} rendered at LSN 0: {body}");
+        }
     }
 
     #[test]

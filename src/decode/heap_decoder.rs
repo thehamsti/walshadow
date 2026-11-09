@@ -64,6 +64,7 @@
 //! can key on it.
 
 use std::borrow::Cow;
+use std::string::FromUtf8Error;
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
@@ -71,10 +72,11 @@ use thiserror::Error;
 use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
 use crate::schema::{
-    BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
-    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, MissingDefault, NAMEOID, NUMERICOID,
-    OIDOID, RelAttr, RelDescriptor, ReplIdent, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID,
-    TIMETZOID, UUIDOID, VARCHAROID,
+    BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDOID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
+    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, MACADDR8OID, MACADDROID, MONEYOID,
+    MissingDefault, NAMEOID, NUMERICOID, OID8OID, OIDOID, PG_LSNOID, RelAttr, RelDescriptor,
+    ReplIdent, TEXTOID, TIDOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID, UUIDOID,
+    VARCHAROID, XID8OID, XIDOID,
 };
 
 /// SmallVec sized at 1: single-row INSERT/UPDATE/DELETE stays stack-allocated,
@@ -193,6 +195,7 @@ pub const XLH_UPDATE_SUFFIX_FROM_OLD: u8 = 1 << 6;
 // xl_heap_delete.flags bit positions.
 pub const XLH_DELETE_CONTAINS_OLD_TUPLE: u8 = 1 << 1;
 pub const XLH_DELETE_CONTAINS_OLD_KEY: u8 = 1 << 2;
+pub const XLH_DELETE_IS_SUPER: u8 = 1 << 3;
 
 // xl_heap_insert.flags bits — only XLH_INSERT_CONTAINS_NEW_TUPLE is read.
 pub const XLH_INSERT_CONTAINS_NEW_TUPLE: u8 = 1 << 3;
@@ -212,7 +215,7 @@ pub enum DecodeError {
     #[error(
         "xl_heap_header at offset {offset} declares t_hoff={t_hoff} < SIZE_OF_HEAP_TUPLE_HEADER"
     )]
-    BadHoff { offset: usize, t_hoff: usize },
+    BadHoff { offset: usize, t_hoff: u8 },
     #[error("nominal alignment char {0:?} not one of c/s/i/d")]
     BadAlign(char),
     #[error("xl_heap_update prefix/suffix bytes exceed block.data ({need} > {have})")]
@@ -233,7 +236,16 @@ pub enum ColumnValue {
     Int8(i64),
     Float4(f32),
     Float8(f64),
+    /// `oid`, `xid`, `cid`
     Oid(u32),
+    /// `oid8`, `xid8`, `pg_lsn`
+    Oid8(u64),
+    MacAddr([u8; 6]),
+    MacAddr8([u8; 8]),
+    Tid {
+        block: u32,
+        offset: u16,
+    },
     /// `date`, days since PG epoch 2000-01-01, negative for pre-epoch.
     Date(i32),
     /// `time`, microseconds since midnight. Legacy float8 storage
@@ -301,19 +313,22 @@ impl ColumnValue {
             ColumnValue::Null => 0,
             ColumnValue::Bool(_) | ColumnValue::Char(_) => 1,
             ColumnValue::Int2(_) => 2,
+            ColumnValue::MacAddr(_) | ColumnValue::Tid { .. } => 6,
             ColumnValue::Int4(_)
             | ColumnValue::Float4(_)
             | ColumnValue::Oid(_)
             | ColumnValue::Date(_) => 4,
             ColumnValue::Int8(_)
             | ColumnValue::Float8(_)
+            | ColumnValue::Oid8(_)
+            | ColumnValue::MacAddr8(_)
             | ColumnValue::Time(_)
             | ColumnValue::Timestamp(_)
             | ColumnValue::TimestampTz(_) => 8,
             ColumnValue::TimeTz { .. } => 12,
             ColumnValue::Uuid(_) => 16,
             ColumnValue::Interval(_) => 16,
-            ColumnValue::Inet(v) => 3 + v.addr.len(),
+            ColumnValue::Inet(_) => 19,
             ColumnValue::Numeric(NumericKind::Finite(s)) => s.len(),
             ColumnValue::Numeric(_) => 0,
             ColumnValue::Name(s) | ColumnValue::Text(s) | ColumnValue::Json(s) => s.len(),
@@ -548,9 +563,14 @@ fn decode_multi_insert(
             });
         }
         let datalen = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
-        let t_infomask2 = u16::from_le_bytes([data[cursor + 2], data[cursor + 3]]);
-        let t_infomask = u16::from_le_bytes([data[cursor + 4], data[cursor + 5]]);
-        let t_hoff = data[cursor + 6];
+        // Multi-insert strips the 5-byte xl_heap_header at write time and
+        // stores (t_infomask2, t_infomask, t_hoff) on xl_multi_insert_tuple
+        let header = TupleHeader {
+            offset: cursor,
+            infomask2: u16::from_le_bytes([data[cursor + 2], data[cursor + 3]]),
+            infomask: u16::from_le_bytes([data[cursor + 4], data[cursor + 5]]),
+            hoff: data[cursor + 6],
+        };
         cursor += SIZE_OF_MULTI_INSERT_TUPLE;
         if data.len() < cursor + datalen {
             return Err(DecodeError::Truncated {
@@ -559,16 +579,8 @@ fn decode_multi_insert(
                 have: data.len().saturating_sub(cursor),
             });
         }
-        // Multi-insert strips the 5-byte xl_heap_header at write time and
-        // stores (t_infomask2, t_infomask, t_hoff) on xl_multi_insert_tuple.
-        // Re-synthesize those 5 bytes + tuple body for decode_tuple_payload
-        let mut synth = Vec::with_capacity(SIZE_OF_HEAP_HEADER + datalen);
-        synth.extend_from_slice(&t_infomask2.to_le_bytes());
-        synth.extend_from_slice(&t_infomask.to_le_bytes());
-        synth.push(t_hoff);
-        synth.extend_from_slice(&data[cursor..cursor + datalen]);
+        let tup = walk_tuple(&data[..cursor + datalen], header, cursor, rel, 0)?;
         cursor += datalen;
-        let tup = decode_tuple_payload(&synth, 0, rel, 0, 0)?;
         out.push(DecodedHeap {
             rfn,
             xid,
@@ -639,12 +651,11 @@ fn decode_update(
         } else {
             0
         };
-        let suffixlen = if has_suffix {
-            read_u16(&b.data, &mut cursor)? as usize
-        } else {
-            0
-        };
-        let mut t = decode_tuple_payload(&b.data, cursor, rel, prefixlen, suffixlen)?;
+        // Suffix bytes lie past WAL slice, so its end already bounds the walk
+        if has_suffix {
+            read_u16(&b.data, &mut cursor)?;
+        }
+        let mut t = decode_tuple_payload(&b.data, cursor, rel, prefixlen)?;
         if has_prefix || has_suffix {
             t.partial = true;
         }
@@ -711,7 +722,7 @@ fn decode_new_tuple_block(
     data_start: usize,
     rel: &RelDescriptor,
 ) -> Result<DecodedTuple, DecodeError> {
-    decode_tuple_payload(data, data_start, rel, 0, 0)
+    decode_tuple_payload(data, data_start, rel, 0)
 }
 
 fn decode_old_tuple_from_main_data(
@@ -726,26 +737,34 @@ fn decode_old_tuple_from_main_data(
             have: main_data.len() - header_off,
         });
     }
-    Ok(Some(decode_tuple_payload(
-        main_data, header_off, rel, 0, 0,
-    )?))
+    Ok(Some(decode_tuple_payload(main_data, header_off, rel, 0)?))
 }
 
 /// Decode a `block.data`-shaped tuple for the bootstrap page-walk sink,
 /// which reshapes on-disk `HeapTupleHeaderData`-prefixed tuples into this
-/// form. `prefixlen=suffixlen=0`: WAL prefix/suffix-from-old compression
+/// form. `prefixlen=0`: WAL prefix/suffix-from-old compression
 /// doesn't apply at backup time.
 pub(crate) fn decode_block_data(
     block_data: &[u8],
     rel: &RelDescriptor,
 ) -> Result<DecodedTuple, DecodeError> {
-    decode_tuple_payload(block_data, 0, rel, 0, 0)
+    decode_tuple_payload(block_data, 0, rel, 0)
+}
+
+/// Fields PG strips into `xl_heap_header` or `xl_multi_insert_tuple`
+#[derive(Clone, Copy)]
+struct TupleHeader {
+    /// Header position, for errors
+    offset: usize,
+    infomask2: u16,
+    infomask: u16,
+    hoff: u8,
 }
 
 /// Walk a tuple payload (`xl_heap_header` at `header_off`, then bitmap,
-/// padding, col data). `prefixlen`/`suffixlen` are PG `XLH_UPDATE_*_FROM_OLD`
-/// byte counts elided from front/back of the logical col-data region; columns
-/// wholly inside those regions surface `None` and caller flips `partial`.
+/// padding, col data). `prefixlen` is PG `XLH_UPDATE_PREFIX_FROM_OLD` byte
+/// count elided from front of logical col-data region; columns wholly inside
+/// it or past end of `buf` surface `None` and caller flips `partial`.
 /// Bitmap + xl_heap_header precede prefix elision so are always present at
 /// `header_off`.
 fn decode_tuple_payload(
@@ -753,7 +772,6 @@ fn decode_tuple_payload(
     header_off: usize,
     rel: &RelDescriptor,
     prefixlen: usize,
-    suffixlen: usize,
 ) -> Result<DecodedTuple, DecodeError> {
     if buf.len() < header_off + SIZE_OF_HEAP_HEADER {
         return Err(DecodeError::Truncated {
@@ -762,22 +780,43 @@ fn decode_tuple_payload(
             have: buf.len().saturating_sub(header_off),
         });
     }
-    let t_infomask2 = u16::from_le_bytes([buf[header_off], buf[header_off + 1]]);
-    let t_infomask = u16::from_le_bytes([buf[header_off + 2], buf[header_off + 3]]);
-    let t_hoff = buf[header_off + 4] as usize;
+    let header = TupleHeader {
+        offset: header_off,
+        infomask2: u16::from_le_bytes([buf[header_off], buf[header_off + 1]]),
+        infomask: u16::from_le_bytes([buf[header_off + 2], buf[header_off + 3]]),
+        hoff: buf[header_off + 4],
+    };
+    walk_tuple(
+        buf,
+        header,
+        header_off + SIZE_OF_HEAP_HEADER,
+        rel,
+        prefixlen,
+    )
+}
+
+/// Walk bitmap, padding and col data starting at `bitmap_off`, one column per
+/// attribute of `rel`. `buf` ends where tuple ends
+fn walk_tuple(
+    buf: &[u8],
+    header: TupleHeader,
+    bitmap_off: usize,
+    rel: &RelDescriptor,
+    prefixlen: usize,
+) -> Result<DecodedTuple, DecodeError> {
+    let t_hoff = usize::from(header.hoff);
     if t_hoff < SIZE_OF_HEAP_TUPLE_HEADER {
         return Err(DecodeError::BadHoff {
-            offset: header_off,
-            t_hoff,
+            offset: header.offset,
+            t_hoff: header.hoff,
         });
     }
-    let natts = (t_infomask2 & HEAP_NATTS_MASK) as usize;
-    let has_null = t_infomask & HEAP_HASNULL != 0;
+    let natts = (header.infomask2 & HEAP_NATTS_MASK) as usize;
+    let has_null = header.infomask & HEAP_HASNULL != 0;
 
     let bitmap_bytes = if has_null { natts.div_ceil(8) } else { 0 };
     // PG tuple: header(23) -> bitmap -> MAXALIGN(8) pad -> col data at t_hoff.
-    // WAL slice elides the 23-byte fixed header, so bitmap is at header_off + 5
-    let bitmap_off = header_off + SIZE_OF_HEAP_HEADER;
+    // WAL slice elides the 23-byte fixed header, so bitmap leads the slice
     if buf.len() < bitmap_off + bitmap_bytes {
         return Err(DecodeError::Truncated {
             offset: bitmap_off,
@@ -789,7 +828,7 @@ fn decode_tuple_payload(
 
     // Bytes between SizeofHeapTupleHeader and t_hoff (bitmap + align pad) are
     // carried verbatim in WAL
-    let col_data_off = header_off + SIZE_OF_HEAP_HEADER + (t_hoff - SIZE_OF_HEAP_TUPLE_HEADER);
+    let col_data_off = bitmap_off + (t_hoff - SIZE_OF_HEAP_TUPLE_HEADER);
 
     let mut columns = Vec::with_capacity(rel.attributes.len());
     // `cur` is offset within the *logical* col-data region (relative to
@@ -799,9 +838,6 @@ fn decode_tuple_payload(
     let mut cur: usize = 0;
     let attrs = effective_attrs(rel, natts);
     let wal_col_data_avail = buf.len().saturating_sub(col_data_off);
-    // suffix bytes are past the WAL slice; buf len already accounts for them so
-    // suffixlen goes unconsulted
-    let _ = suffixlen;
     let logical_end = wal_col_data_avail + prefixlen;
     for (idx, att) in attrs.iter().enumerate() {
         if idx >= natts {
@@ -984,11 +1020,27 @@ pub(crate) fn missing_value_from_text(type_oid: u32, text: &str) -> ColumnValue 
             .parse::<f64>()
             .map(ColumnValue::Float8)
             .unwrap_or(ColumnValue::Null),
-        OIDOID => text
+        OIDOID | XIDOID | CIDOID => text
             .parse::<u32>()
             .map(ColumnValue::Oid)
             .unwrap_or(ColumnValue::Null),
+        OID8OID | XID8OID => text
+            .parse::<u64>()
+            .map(ColumnValue::Oid8)
+            .unwrap_or(ColumnValue::Null),
+        PG_LSNOID => crate::pg::parse_pg_lsn(text)
+            .map(ColumnValue::Oid8)
+            .unwrap_or(ColumnValue::Null),
         TEXTOID | VARCHAROID | BPCHAROID | NAMEOID => ColumnValue::Text(text.to_owned()),
+        MACADDROID => crate::decode::codecs::parse_macaddr(text)
+            .map(ColumnValue::MacAddr)
+            .unwrap_or(ColumnValue::Null),
+        MACADDR8OID => crate::decode::codecs::parse_macaddr(text)
+            .map(ColumnValue::MacAddr8)
+            .unwrap_or(ColumnValue::Null),
+        TIDOID => crate::decode::codecs::parse_tid(text)
+            .map(|(block, offset)| ColumnValue::Tid { block, offset })
+            .unwrap_or(ColumnValue::Null),
         // `jsonb` arrives as `jsonb_out` text, already what the emitter ships
         JSONOID | JSONBOID => ColumnValue::Json(text.to_owned()),
         // attmissingval text requires typinput
@@ -1117,10 +1169,31 @@ fn fixed_value(att: &RelAttr, body: &[u8]) -> ColumnValue {
         CHAROID => ColumnValue::Char(body[0] as i8),
         INT2OID => ColumnValue::Int2(i16::from_le_bytes(body.try_into().unwrap())),
         INT4OID => ColumnValue::Int4(i32::from_le_bytes(body.try_into().unwrap())),
-        INT8OID => ColumnValue::Int8(i64::from_le_bytes(body.try_into().unwrap())),
+        // `money` counts minor units, scale set by source `lc_monetary`
+        INT8OID | MONEYOID => ColumnValue::Int8(i64::from_le_bytes(body.try_into().unwrap())),
         FLOAT4OID => ColumnValue::Float4(f32::from_le_bytes(body.try_into().unwrap())),
         FLOAT8OID => ColumnValue::Float8(f64::from_le_bytes(body.try_into().unwrap())),
-        OIDOID => ColumnValue::Oid(u32::from_le_bytes(body.try_into().unwrap())),
+        OIDOID | XIDOID | CIDOID => ColumnValue::Oid(u32::from_le_bytes(body.try_into().unwrap())),
+        OID8OID | XID8OID | PG_LSNOID => {
+            ColumnValue::Oid8(u64::from_le_bytes(body.try_into().unwrap()))
+        }
+        // NUL-padded to NAMEDATALEN
+        NAMEOID => {
+            let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+            match simdutf8::basic::from_utf8(&body[..end]) {
+                Ok(s) => ColumnValue::Name(s.to_owned()),
+                Err(_) => ColumnValue::Unsupported {
+                    type_oid: att.type_oid,
+                    raw: body.to_vec(),
+                },
+            }
+        }
+        MACADDROID => ColumnValue::MacAddr(body.try_into().unwrap()),
+        MACADDR8OID => ColumnValue::MacAddr8(body.try_into().unwrap()),
+        TIDOID => {
+            let (block, offset) = crate::decode::codecs::decode_tid(body.try_into().unwrap());
+            ColumnValue::Tid { block, offset }
+        }
         DATEOID => ColumnValue::Date(i32::from_le_bytes(body.try_into().unwrap())),
         TIMEOID => ColumnValue::Time(i64::from_le_bytes(body.try_into().unwrap())),
         TIMESTAMPOID => ColumnValue::Timestamp(i64::from_le_bytes(body.try_into().unwrap())),
@@ -1333,11 +1406,21 @@ fn decode_varlena(
 pub(crate) fn varlena_to_value(type_oid: u32, body: Cow<[u8]>) -> ColumnValue {
     match type_oid {
         BYTEAOID => ColumnValue::Bytea(body.into_owned()),
-        TEXTOID | VARCHAROID | BPCHAROID => match String::from_utf8(body.into_owned()) {
-            Ok(s) => ColumnValue::Text(s),
+        TEXTOID | VARCHAROID | BPCHAROID | JSONOID => {
+            // Owned arm keeps detoasted buffer rather than copy it
+            let text = match body {
+                Cow::Borrowed(b) => simdutf8::basic::from_utf8(b)
+                    .map(str::to_owned)
+                    .map_err(|_| b.to_vec()),
+                Cow::Owned(v) => String::from_utf8(v).map_err(FromUtf8Error::into_bytes),
+            };
             // PG validates UTF-8 on input; surface bytea not crash if ever invalid
-            Err(e) => ColumnValue::Bytea(e.into_bytes()),
-        },
+            match text {
+                Ok(s) if type_oid == JSONOID => ColumnValue::Json(s),
+                Ok(s) => ColumnValue::Text(s),
+                Err(b) => ColumnValue::Bytea(b),
+            }
+        }
         NUMERICOID => match crate::decode::codecs::decode_numeric(&body) {
             Ok(v) => ColumnValue::Numeric(v),
             Err(_) => ColumnValue::Unsupported {
@@ -1351,10 +1434,6 @@ pub(crate) fn varlena_to_value(type_oid: u32, body: Cow<[u8]>) -> ColumnValue {
                 type_oid,
                 raw: body.into_owned(),
             },
-        },
-        JSONOID => match String::from_utf8(body.into_owned()) {
-            Ok(s) => ColumnValue::Json(s),
-            Err(e) => ColumnValue::Bytea(e.into_bytes()),
         },
         JSONBOID => match crate::decode::codecs::decode_jsonb(&body) {
             Ok(s) => ColumnValue::Json(s),
@@ -1399,6 +1478,16 @@ pub(crate) fn local_matrix_covers(type_oid: u32, type_len: i16) -> bool {
                 | FLOAT4OID
                 | FLOAT8OID
                 | OIDOID
+                | XIDOID
+                | CIDOID
+                | OID8OID
+                | XID8OID
+                | PG_LSNOID
+                | MONEYOID
+                | NAMEOID
+                | MACADDROID
+                | MACADDR8OID
+                | TIDOID
                 | DATEOID
                 | TIMEOID
                 | TIMESTAMPOID
@@ -1426,7 +1515,7 @@ fn decode_cstring(buf: &[u8], abs: usize) -> Result<(ColumnValue, usize), Decode
         });
     }
     let body = &buf[abs..end];
-    let value = std::str::from_utf8(body)
+    let value = simdutf8::basic::from_utf8(body)
         .map(|s| ColumnValue::Text(s.to_owned()))
         .unwrap_or_else(|_| ColumnValue::Bytea(body.to_vec()));
     Ok((value, (end - abs) + 1)) // include trailing NUL
@@ -1663,6 +1752,45 @@ mod tests {
             }],
             main_data: std::borrow::Cow::Owned(main_data),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn varlena_text_preserves_bytes_and_owned_buffers() {
+        let suffixes: &[&[u8]] = &[
+            b"",
+            "é😀".as_bytes(),
+            &[0xff],
+            &[0xc0, 0xaf],
+            &[0xed, 0xa0, 0x80],
+            &[0xf0, 0x9f, 0x98],
+        ];
+        for type_oid in [TEXTOID, VARCHAROID, BPCHAROID, JSONOID] {
+            for prefix in [0, 63, 64, 65, 127, 128, 129] {
+                for suffix in suffixes {
+                    let mut raw = vec![b'a'; prefix];
+                    raw.extend_from_slice(suffix);
+                    let expected = match String::from_utf8(raw.clone()) {
+                        Ok(s) if type_oid == JSONOID => ColumnValue::Json(s),
+                        Ok(s) => ColumnValue::Text(s),
+                        Err(_) => ColumnValue::Bytea(raw.clone()),
+                    };
+                    for body in [Cow::Borrowed(raw.as_slice()), Cow::Owned(raw.clone())] {
+                        let owned = matches!(body, Cow::Owned(_));
+                        let ptr = body.as_ptr();
+                        let value = varlena_to_value(type_oid, body);
+                        assert_eq!(value, expected);
+                        if owned {
+                            let result_ptr = match &value {
+                                ColumnValue::Text(s) | ColumnValue::Json(s) => s.as_ptr(),
+                                ColumnValue::Bytea(b) => b.as_ptr(),
+                                _ => unreachable!(),
+                            };
+                            assert_eq!(result_ptr, ptr);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2142,6 +2270,124 @@ mod tests {
         }
     }
 
+    fn multi_insert_main_data(ntuples: u16) -> Vec<u8> {
+        let mut main_data = vec![XLH_INSERT_CONTAINS_NEW_TUPLE, 0];
+        main_data.extend_from_slice(&ntuples.to_le_bytes());
+        main_data
+    }
+
+    fn push_multi_insert_tuple(block_data: &mut Vec<u8>, infomask: u16, body: &[u8]) {
+        block_data.resize(block_data.len().next_multiple_of(2), 0xFF);
+        block_data.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        block_data.extend_from_slice(&2u16.to_le_bytes()); // t_infomask2 = natts
+        block_data.extend_from_slice(&infomask.to_le_bytes());
+        block_data.push(24); // t_hoff
+        block_data.extend_from_slice(body);
+    }
+
+    #[test]
+    fn decode_multi_insert_init_page_nulls_varlena_and_pad() {
+        let rel = descriptor(
+            16413,
+            vec![
+                rel_attr(1, "id", INT4OID, 4, 'i'),
+                rel_attr(2, "msg", TEXTOID, -1, 'i'),
+            ],
+        );
+        let mut block_data = Vec::new();
+        // pad(1) + int4 + short varlena "ab"; odd tuple end forces SHORTALIGN pad
+        let mut body = vec![0];
+        body.extend_from_slice(&7i32.to_le_bytes());
+        body.extend_from_slice(&[0x07, b'a', b'b']);
+        push_multi_insert_tuple(&mut block_data, 0, &body);
+        assert_eq!(block_data.len() % 2, 1);
+        // bitmap 0b01 leaves msg NULL
+        let mut body = vec![0b01];
+        body.extend_from_slice(&8i32.to_le_bytes());
+        push_multi_insert_tuple(&mut block_data, HEAP_HASNULL, &body);
+        let rec = record_with(
+            RmId::Heap2,
+            XLOG_HEAP2_MULTI_INSERT | XLOG_HEAP_INIT_PAGE,
+            multi_insert_main_data(2),
+            block_data,
+        );
+        let out = decode_heap_record(&rec, 0, &rel).unwrap();
+        let cols: Vec<_> = out.iter().map(|h| h.new.clone().unwrap()).collect();
+        assert_eq!(
+            cols[0].columns,
+            vec![
+                Some(ColumnValue::Int4(7)),
+                Some(ColumnValue::Text("ab".into()))
+            ]
+        );
+        assert_eq!(
+            cols[1].columns,
+            vec![Some(ColumnValue::Int4(8)), Some(ColumnValue::Null)]
+        );
+        assert!(!cols[0].partial && !cols[1].partial);
+    }
+
+    #[test]
+    fn decode_multi_insert_varlena_stays_inside_its_tuple() {
+        let rel = descriptor(
+            16414,
+            vec![
+                rel_attr(1, "id", INT4OID, 4, 'i'),
+                rel_attr(2, "msg", TEXTOID, -1, 'i'),
+            ],
+        );
+        let mut block_data = Vec::new();
+        // Varlena header claims 4 data bytes, tuple carries 2
+        let mut body = vec![0];
+        body.extend_from_slice(&7i32.to_le_bytes());
+        body.extend_from_slice(&[0x0B, b'a', b'b']);
+        push_multi_insert_tuple(&mut block_data, 0, &body);
+        let mut body = vec![0];
+        body.extend_from_slice(&8i32.to_le_bytes());
+        body.extend_from_slice(&[0x05, b'z']);
+        push_multi_insert_tuple(&mut block_data, 0, &body);
+        let rec = record_with(
+            RmId::Heap2,
+            XLOG_HEAP2_MULTI_INSERT | XLOG_HEAP_INIT_PAGE,
+            multi_insert_main_data(2),
+            block_data,
+        );
+        let out = decode_heap_record(&rec, 0, &rel).unwrap();
+        let first = out[0].new.as_ref().unwrap();
+        assert!(first.partial);
+        assert_eq!(first.columns, vec![Some(ColumnValue::Int4(7)), None]);
+        let second = out[1].new.as_ref().unwrap();
+        assert_eq!(
+            second.columns,
+            vec![
+                Some(ColumnValue::Int4(8)),
+                Some(ColumnValue::Text("z".into()))
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_multi_insert_truncated_body_errors() {
+        let rel = descriptor(16415, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let mut block_data = Vec::new();
+        push_multi_insert_tuple(&mut block_data, 0, &[0; 5]);
+        block_data.truncate(block_data.len() - 1);
+        let rec = record_with(
+            RmId::Heap2,
+            XLOG_HEAP2_MULTI_INSERT | XLOG_HEAP_INIT_PAGE,
+            multi_insert_main_data(1),
+            block_data,
+        );
+        assert!(matches!(
+            decode_heap_record(&rec, 0, &rel),
+            Err(DecodeError::Truncated {
+                offset: SIZE_OF_MULTI_INSERT_TUPLE,
+                need: 5,
+                have: 4
+            })
+        ));
+    }
+
     #[test]
     fn decode_multi_insert_zero_ntuples_errors() {
         let rel = descriptor(16411, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
@@ -2167,6 +2413,82 @@ mod tests {
         let rec = record_with(RmId::Heap2, XLOG_HEAP2_MULTI_INSERT, main_data, Vec::new());
         let out = decode_heap_record(&rec, 0, &rel).unwrap();
         assert!(out.is_empty(), "missing CONTAINS_NEW_TUPLE => skip");
+    }
+
+    #[test]
+    fn fixed_system_types_decode_values() {
+        let cases: [(u32, Vec<u8>, char, ColumnValue); 7] = [
+            (
+                XIDOID,
+                7u32.to_le_bytes().to_vec(),
+                'i',
+                ColumnValue::Oid(7),
+            ),
+            (
+                PG_LSNOID,
+                0x16_B374_D848u64.to_le_bytes().to_vec(),
+                'd',
+                ColumnValue::Oid8(0x16_B374_D848),
+            ),
+            (
+                MONEYOID,
+                (-123_456i64).to_le_bytes().to_vec(),
+                'd',
+                ColumnValue::Int8(-123_456),
+            ),
+            (
+                NAMEOID,
+                {
+                    let mut b = b"pg_class".to_vec();
+                    b.resize(64, 0);
+                    b
+                },
+                'c',
+                ColumnValue::Name("pg_class".into()),
+            ),
+            (
+                MACADDROID,
+                vec![0x08, 0x00, 0x2b, 0x01, 0x02, 0xab],
+                'i',
+                ColumnValue::MacAddr([0x08, 0x00, 0x2b, 0x01, 0x02, 0xab]),
+            ),
+            (
+                MACADDR8OID,
+                vec![0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03],
+                'i',
+                ColumnValue::MacAddr8([0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03]),
+            ),
+            (
+                TIDOID,
+                vec![0, 0, 5, 0, 3, 0],
+                's',
+                ColumnValue::Tid {
+                    block: 5,
+                    offset: 3,
+                },
+            ),
+        ];
+        for (oid, body, align, want) in cases {
+            let att = rel_attr(1, "c", oid, body.len() as i16, align);
+            let (v, n) = decode_one_value(&att, &body, 0).expect("decodes");
+            assert_eq!((v, n), (want, body.len()), "oid {oid}");
+        }
+    }
+
+    #[test]
+    fn missing_value_text_parses_system_types() {
+        let mut lsn = rel_attr(1, "l", PG_LSNOID, 8, 'd');
+        lsn.missing_default = Some("16/B374D848".into());
+        assert_eq!(missing_value_for(&lsn), ColumnValue::Oid8(0x16_B374_D848));
+        let mut x8 = rel_attr(1, "x", XID8OID, 8, 'd');
+        x8.missing_default = Some("18446744073709551615".into());
+        assert_eq!(missing_value_for(&x8), ColumnValue::Oid8(u64::MAX));
+        let mut mac = rel_attr(1, "m", MACADDROID, 6, 'i');
+        mac.missing_default = Some("08:00:2b:01:02:03".into());
+        assert_eq!(
+            missing_value_for(&mac),
+            ColumnValue::MacAddr([0x08, 0x00, 0x2b, 0x01, 0x02, 0x03])
+        );
     }
 
     #[test]
@@ -2304,7 +2626,7 @@ mod tests {
 
     #[test]
     fn local_matrix_agrees_with_decoder() {
-        let fixed: [(u32, i16); 17] = [
+        let fixed: [(u32, i16); 26] = [
             (BOOLOID, 1),
             (CHAROID, 1),
             (INT2OID, 2),
@@ -2321,6 +2643,15 @@ mod tests {
             (UUIDOID, 16),
             (INTERVALOID, 16),
             (NAMEOID, 64),
+            (XIDOID, 4),
+            (CIDOID, 4),
+            (OID8OID, 8),
+            (XID8OID, 8),
+            (PG_LSNOID, 8),
+            (MONEYOID, 8),
+            (MACADDROID, 6),
+            (MACADDR8OID, 8),
+            (TIDOID, 6),
             (2202, 4),
         ];
         for (oid, len) in fixed {

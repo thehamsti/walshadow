@@ -98,9 +98,10 @@ use crate::pg::{await_replay, is_recovery_conflict, quote_ident, snapshot_wal_ls
 use crate::pos::{Pos, Snapshot};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{
-    BOOLOID, BPCHAROID, BYTEAOID, CHAROID, DATEOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID,
-    INT8OID, JSONBOID, JSONOID, NAMEOID, NUMERICOID, OIDOID, RelDescriptor, RelName, TEXTOID,
-    TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, UUIDOID, VARCHAROID,
+    BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDOID, DATEOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID,
+    INT8OID, JSONBOID, JSONOID, MONEYOID, NAMEOID, NUMERICOID, OID8OID, OIDOID, PG_LSNOID,
+    RelDescriptor, RelName, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, UUIDOID, VARCHAROID,
+    XID8OID, XIDOID,
 };
 use crate::source::source_feed::open_sql_client;
 use crate::toast::{ToastResolver, ToastRow};
@@ -454,6 +455,7 @@ enum WireKind {
     Int4,
     Int8,
     Oid,
+    Oid8,
     Float4,
     Float8,
     Date,
@@ -487,8 +489,9 @@ fn wire_kind(type_oid: u32) -> Option<WireKind> {
         CHAROID => WireKind::Char,
         INT2OID => WireKind::Int2,
         INT4OID => WireKind::Int4,
-        INT8OID => WireKind::Int8,
-        OIDOID => WireKind::Oid,
+        INT8OID | MONEYOID => WireKind::Int8,
+        OIDOID | XIDOID | CIDOID => WireKind::Oid,
+        OID8OID | XID8OID | PG_LSNOID => WireKind::Oid8,
         FLOAT4OID => WireKind::Float4,
         FLOAT8OID => WireKind::Float8,
         DATEOID => WireKind::Date,
@@ -619,6 +622,7 @@ pub async fn copy_rows_into(
             xmax: 0,
             infomask: 0,
             source_lsn: lsn,
+            page_lsn: 0,
             // COPY rows have no on-page TID
             blkno: 0,
             offnum: 0,
@@ -691,8 +695,7 @@ pub async fn copy_toast_into(
     let stream = BinaryCopyOutStream::new(copy, &[Type::BYTEA; 4]);
     futures::pin_mut!(stream);
     let mut chunks = 0u64;
-    let mut batch: Vec<ToastRow> = Vec::new();
-    let mut batch_bytes = 0usize;
+    let mut puts = resolver.chunk_puts();
     while let Some(row) = stream.next().await {
         let row = row.context("backfill: TOAST COPY stream")?;
         let field = |i: usize| -> anyhow::Result<&[u8]> {
@@ -701,9 +704,7 @@ pub async fn copy_toast_into(
                 .context("backfill: NULL TOAST column")
         };
         let tid = fixed::<6>(field(0)?, "ctid").map_err(anyhow::Error::msg)?;
-        let chunk_data = bytes::Bytes::copy_from_slice(field(3)?);
-        batch_bytes += chunk_data.len();
-        batch.push(ToastRow {
+        puts.push(ToastRow {
             db_oid: desc.rfn.db_node,
             toast_relid,
             blkno: u32::from_be_bytes(tid[..4].try_into().expect("4 bytes")),
@@ -712,17 +713,13 @@ pub async fn copy_toast_into(
             chunk_seq: u32::from_be_bytes(
                 fixed(field(2)?, "chunk_seq").map_err(anyhow::Error::msg)?,
             ),
-            chunk_data,
+            chunk_data: bytes::Bytes::copy_from_slice(field(3)?),
             lsn,
-        });
+        })
+        .await?;
         chunks += 1;
-        if resolver.put_limit_reached(batch.len(), batch_bytes) {
-            resolver.put(&batch).await?;
-            batch.clear();
-            batch_bytes = 0;
-        }
     }
-    resolver.put(&batch).await?;
+    puts.flush().await?;
     Ok(chunks)
 }
 
@@ -732,7 +729,8 @@ fn fixed<const N: usize>(raw: &[u8], what: &str) -> Result<[u8; N], String> {
 }
 
 fn text_or_bytea(raw: &[u8], wrap: fn(String) -> ColumnValue) -> ColumnValue {
-    std::str::from_utf8(raw).map_or_else(|_| ColumnValue::Bytea(raw.to_vec()), |s| wrap(s.into()))
+    simdutf8::basic::from_utf8(raw)
+        .map_or_else(|_| ColumnValue::Bytea(raw.to_vec()), |s| wrap(s.into()))
 }
 
 /// Decode non-NULL wire field into heap-decoder value shape
@@ -744,6 +742,7 @@ fn decode_field(kind: WireKind, type_oid: u32, raw: &[u8]) -> Result<ColumnValue
         WireKind::Int4 => ColumnValue::Int4(i32::from_be_bytes(fixed(raw, "int4")?)),
         WireKind::Int8 => ColumnValue::Int8(i64::from_be_bytes(fixed(raw, "int8")?)),
         WireKind::Oid => ColumnValue::Oid(u32::from_be_bytes(fixed(raw, "oid")?)),
+        WireKind::Oid8 => ColumnValue::Oid8(u64::from_be_bytes(fixed(raw, "oid8")?)),
         WireKind::Float4 => ColumnValue::Float4(f32::from_be_bytes(fixed(raw, "float4")?)),
         WireKind::Float8 => ColumnValue::Float8(f64::from_be_bytes(fixed(raw, "float8")?)),
         WireKind::Date => ColumnValue::Date(i32::from_be_bytes(fixed(raw, "date")?)),
@@ -756,7 +755,7 @@ fn decode_field(kind: WireKind, type_oid: u32, raw: &[u8]) -> Result<ColumnValue
         WireKind::Bytea => ColumnValue::Bytea(raw.to_vec()),
         WireKind::Text => text_or_bytea(raw, ColumnValue::Text),
         // Preserve source type for typinput
-        WireKind::CastText => match std::str::from_utf8(raw) {
+        WireKind::CastText => match simdutf8::basic::from_utf8(raw) {
             Ok(s) => ColumnValue::PgPendingText {
                 type_oid,
                 text: s.to_owned(),
@@ -767,7 +766,8 @@ fn decode_field(kind: WireKind, type_oid: u32, raw: &[u8]) -> Result<ColumnValue
         WireKind::Json => text_or_bytea(raw, ColumnValue::Json),
         // numeric_out text form; specials carry their flag
         WireKind::NumericText => {
-            let s = std::str::from_utf8(raw).map_err(|_| "numeric::text not utf8".to_string())?;
+            let s = simdutf8::basic::from_utf8(raw)
+                .map_err(|_| "numeric::text not utf8".to_string())?;
             ColumnValue::Numeric(match s {
                 "NaN" => NumericKind::NaN,
                 "Infinity" => NumericKind::PInf,
@@ -1280,7 +1280,7 @@ impl CopyBackfiller {
         let mut checkpoint = BackupCheckpoint::new(
             mode,
             reqs,
-            &self.mapping.snapshot().await,
+            &self.mapping.snapshot(),
             &emitter,
             config.as_deref(),
         );
@@ -1367,7 +1367,7 @@ impl CopyBackfiller {
             let checkpoint = BackupCheckpoint::new(
                 mode,
                 &active_reqs,
-                &plan.mapping.snapshot().await,
+                &plan.mapping.snapshot(),
                 &pass_emitter,
                 config.as_deref(),
             );
@@ -1625,7 +1625,7 @@ impl CopyBackfiller {
     /// pre-DDL shape; entry stays pending, next boot re-loads).
     async fn swap_rel(&self, sess: &mut StagingSession, rel: &StagingRel) -> anyhow::Result<bool> {
         sess.select(rel.target.instance.as_deref())?;
-        if !self.mapping.with(|m| m.contains_key(&rel.rel)).await {
+        if !self.mapping.with(|m| m.contains_key(&rel.rel)) {
             sess.drop_staging(rel).await?;
             tracing::info!(
                 target: "walshadow::backfill",
@@ -1718,7 +1718,6 @@ impl CopyBackfiller {
             None => self
                 .mapping
                 .with(|m| m.get(name).map(|t| t.target.clone()))
-                .await
                 .with_context(|| {
                     format!("swapped entry {name} unmapped; staging table orphaned")
                 })?,
@@ -2062,7 +2061,7 @@ impl CopyBackfiller {
             tup_rx,
             catalog,
             freeze_routes(
-                &self.mapping.snapshot().await,
+                &self.mapping.snapshot(),
                 self.config_rx
                     .as_ref()
                     .map(|rx| rx.borrow().clone())
@@ -2115,7 +2114,7 @@ impl CopyBackfiller {
         s_lsn: Pos<Snapshot>,
         runtime: Arc<SnowflakeRuntime>,
     ) -> anyhow::Result<CopyOutcome> {
-        let mapping = self.mapping.snapshot().await;
+        let mapping = self.mapping.snapshot();
         let table = mapping.get(&desc.rel_name).with_context(|| {
             format!(
                 "Snowflake COPY relation {} is no longer mapped",
@@ -2164,7 +2163,7 @@ impl CopyBackfiller {
             "Snowflake snapshot attempt is not prepared"
         );
         let operation_id = generation.operation_id;
-        let (incarnation, _) = runtime.lineage(desc).await?;
+        let (incarnation, _) = runtime.lineage(desc)?;
 
         let qtable = format!(
             "{}.{}",
@@ -2424,7 +2423,12 @@ async fn drain_snowflake_copy(
         for tuple in slab {
             let mut committed = tuple.into_committed_insert();
             if let Some(oracle) = &oracle {
-                oracle.render_text_columns(&mut committed, &desc).await?;
+                crate::destination::snowflake::types::render_source_text(
+                    oracle,
+                    &mut committed,
+                    &desc,
+                )
+                .await?;
             }
             batch_bytes = batch_bytes.saturating_add(committed.decoded.approx_bytes());
             batch.push(
