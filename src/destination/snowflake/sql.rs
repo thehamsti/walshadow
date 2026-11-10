@@ -36,6 +36,11 @@ pub struct TableSqlPlan {
     pub public_view: String,
     pub receipts_table: String,
     pub create_landing_sql: String,
+    /// The landing table as a transient table with no Time Travel: its rows
+    /// are deleted once applied, and every one can be delivered again from
+    /// the local outbox until then, so neither Time Travel nor Fail-safe
+    /// storage of them buys anything
+    pub create_transient_landing_sql: String,
     pub create_state_sql: String,
     pub create_receipts_sql: String,
     pub view_sql: String,
@@ -75,6 +80,9 @@ impl TableSqlPlan {
         let create_landing_sql = format!(
             "CREATE TABLE IF NOT EXISTS {landing_table} ({defs}, {meta}, _WS_BATCH_ID VARCHAR NOT NULL)"
         );
+        let create_transient_landing_sql = format!(
+            "CREATE TRANSIENT TABLE IF NOT EXISTS {landing_table} ({defs}, {meta}, _WS_BATCH_ID VARCHAR NOT NULL) DATA_RETENTION_TIME_IN_DAYS = 0"
+        );
         let create_state_sql = format!("CREATE TABLE IF NOT EXISTS {state_table} ({defs}, {meta})");
         let create_receipts_sql = format!(
             "CREATE TABLE IF NOT EXISTS {receipts_table} (BATCH_ID VARCHAR NOT NULL, EXPECTED_COUNT NUMBER(20,0) NOT NULL, APPLIED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP())"
@@ -92,6 +100,7 @@ impl TableSqlPlan {
             public_view,
             receipts_table,
             create_landing_sql,
+            create_transient_landing_sql,
             create_state_sql,
             create_receipts_sql,
             view_sql,

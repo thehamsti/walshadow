@@ -122,13 +122,21 @@ impl SnowflakeRuntime {
     }
 
     /// Bind a durable outbox batch to its snapshot operation before transport.
-    /// The caller must invoke this after enqueue and before remote delivery.
-    pub async fn register_snapshot_batch(&self, operation_id: &str, batch_id: &str) -> Result<()> {
-        let batch = self
-            .state
-            .get_batch(batch_id)?
-            .context("snapshot batch is not pending in durable outbox")?;
-        let payload: Payload = serde_json::from_slice(&batch.payload)?;
+    /// The caller must invoke this after enqueue and before remote delivery,
+    /// with the payload it enqueued: reloading it would read and decode every
+    /// snapshot batch a second time.
+    pub(super) async fn register_snapshot_batch(
+        &self,
+        operation_id: &str,
+        batch_id: &str,
+        payload: &Payload,
+    ) -> Result<()> {
+        ensure!(
+            self.state
+                .phase(batch_id)?
+                .is_some_and(|phase| phase != BatchPhase::Applied),
+            "snapshot batch is not pending in durable outbox"
+        );
         let lock = self.table_lock(&payload.schema).await;
         let _guard = lock.lock().await;
         let generation = self.generation_for_schema(&payload.schema, operation_id)?;
@@ -758,14 +766,11 @@ impl SnowflakeRuntime {
     ) -> Result<Option<String>> {
         let result = self
             .http
-            .execute_sql(
-                &format!(
-                    "SHOW VIEWS LIKE {} IN SCHEMA {}",
-                    super::super::sql::quote_literal(&schema.table),
-                    super::super::sql::quote_ident(&schema.database).map_err(anyhow::Error::msg)?
-                ),
-                Uuid::new_v4(),
-            )
+            .execute_sql_once(&format!(
+                "SHOW VIEWS LIKE {} IN SCHEMA {}",
+                super::super::sql::quote_literal(&schema.table),
+                super::super::sql::quote_ident(&schema.database).map_err(anyhow::Error::msg)?
+            ))
             .await?;
         let names = result_column(&result.row_type, "name")?;
         let comments = result_column(&result.row_type, "comment")?;
@@ -785,10 +790,7 @@ impl SnowflakeRuntime {
     }
 
     pub(super) async fn storage_exists(&self, plan: &GenerationSqlPlan) -> Result<bool> {
-        let result = self
-            .http
-            .execute_sql(&plan.show_storage_sql, Uuid::new_v4())
-            .await?;
+        let result = self.http.execute_sql_once(&plan.show_storage_sql).await?;
         let names = result_column(&result.row_type, "name")?;
         let expected = plan
             .storage_table

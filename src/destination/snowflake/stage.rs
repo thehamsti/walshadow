@@ -37,6 +37,21 @@ pub struct StageWriter {
     config: StageConfig,
 }
 
+/// An S3 request the SDK gave up on for a reason a later attempt can clear:
+/// no response, a timeout, throttling or a server error. The object key is
+/// content-addressed and created conditionally, so staging again is safe
+#[derive(Debug, thiserror::Error)]
+#[error("transient S3 stage failure")]
+pub struct TransientUpload;
+
+fn retryable_s3<E, R>(error: &aws_sdk_s3::error::SdkError<E, R>, status: Option<u16>) -> bool {
+    use aws_sdk_s3::error::SdkError;
+    matches!(
+        error,
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_)
+    ) || status.is_some_and(|code| code == 429 || code >= 500)
+}
+
 impl StageWriter {
     pub async fn new(config: StageConfig) -> Result<Self> {
         validate_config(&config)?;
@@ -57,6 +72,8 @@ impl StageWriter {
         rows: &[SnowflakeRow],
     ) -> Result<StagedFile> {
         let (file, descriptor) = encode_batch(&self.config, batch_id, schema, rows)?;
+        // Shared, not copied: the same bytes verify a pre-existing object
+        let file = bytes::Bytes::from(file);
         let bytes = ByteStream::from(file.clone());
         let result = self
             .client
@@ -73,7 +90,11 @@ impl StageWriter {
             Err(error) => {
                 let status = error.raw_response().map(|r| r.status().as_u16());
                 if status != Some(412) {
-                    return Err(error.into());
+                    return Err(if retryable_s3(&error, status) {
+                        anyhow::Error::from(error).context(TransientUpload)
+                    } else {
+                        error.into()
+                    });
                 }
                 // Existing immutable key must contain the same bytes. A checksum in
                 // object metadata alone is insufficient because it can be spoofed.
@@ -83,8 +104,20 @@ impl StageWriter {
                     .bucket(&self.config.bucket)
                     .key(&descriptor.key)
                     .send()
-                    .await?;
-                let collected = existing.body.collect().await?;
+                    .await
+                    .map_err(|error| {
+                        let status = error.raw_response().map(|r| r.status().as_u16());
+                        if retryable_s3(&error, status) {
+                            anyhow::Error::from(error).context(TransientUpload)
+                        } else {
+                            error.into()
+                        }
+                    })?;
+                let collected = existing
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|error| anyhow::Error::from(error).context(TransientUpload))?;
                 let existing = collected.into_bytes();
                 ensure!(
                     existing.len() == file.len()
@@ -98,7 +131,8 @@ impl StageWriter {
 }
 
 /// Lossless row representation shared by Parquet staging and streaming NDJSON.
-/// NUMBER and all 64-bit lineage counters are strings to avoid JSON precision loss.
+/// NUMBER, FLOAT and all 64-bit lineage counters are strings to avoid JSON
+/// precision loss.
 pub fn to_json(schema: &TableSchema, row: &SnowflakeRow, batch_id: &str) -> Result<Value> {
     ensure!(
         row.values.len() == schema.columns.len(),
@@ -127,9 +161,15 @@ pub fn to_json(schema: &TableSchema, row: &SnowflakeRow, batch_id: &str) -> Resu
                 );
                 Value::String(value.clone())
             }
+            // Text, not a JSON number: the load projection reads every column
+            // through VARCHAR, and Snowflake prints a number it holds as a
+            // double with fewer digits than the double has. The shortest
+            // round-trip text parses back to the same double
             (SnowflakeType::Float, SnowflakeValue::Float(value)) if value.is_finite() => {
-                Value::Number(
-                    serde_json::Number::from_f64(*value).context("invalid Snowflake float")?,
+                Value::String(
+                    serde_json::Number::from_f64(*value)
+                        .context("invalid Snowflake float")?
+                        .to_string(),
                 )
             }
             (SnowflakeType::Binary, SnowflakeValue::Binary(value)) => {
@@ -179,6 +219,25 @@ pub fn to_json(schema: &TableSchema, row: &SnowflakeRow, batch_id: &str) -> Resu
         object.insert(name.into(), value);
     }
     Ok(Value::Object(object))
+}
+
+/// Rows as one JSON object per line for a streaming append, or `None` once
+/// they reach `limit` bytes and must stage instead
+pub fn to_ndjson(
+    schema: &TableSchema,
+    rows: &[SnowflakeRow],
+    batch_id: &str,
+    limit: usize,
+) -> Result<Option<Vec<u8>>> {
+    let mut ndjson = Vec::new();
+    for row in rows {
+        serde_json::to_writer(&mut ndjson, &to_json(schema, row, batch_id)?)?;
+        ndjson.push(b'\n');
+        if ndjson.len() >= limit {
+            return Ok(None);
+        }
+    }
+    Ok(Some(ndjson))
 }
 
 fn decimal_fits(value: &str, precision: u8, scale: u8) -> bool {
@@ -343,7 +402,7 @@ pub fn encode_batch(
     ))
 }
 
-fn validate_config(config: &StageConfig) -> Result<()> {
+pub(crate) fn validate_config(config: &StageConfig) -> Result<()> {
     ensure!(
         !config.bucket.is_empty()
             && config

@@ -520,13 +520,13 @@ impl SnowflakeRuntime {
             .map_err(anyhow::Error::msg)?;
         for sql in [
             plan.create_storage_sql.clone(),
-            new_plan.create_landing_sql.clone(),
+            landing_ddl(self.config.landing_tables, &new_plan).to_owned(),
             new_plan.create_receipts_sql.clone(),
             new_plan
                 .create_streaming_pipe_sql(&record.new, &pipe_name(&record.new))
                 .map_err(anyhow::Error::msg)?,
         ] {
-            self.http.execute_sql(&sql, Uuid::new_v4()).await?;
+            self.http.execute_sql_once(&sql).await?;
         }
         let sql = record.projection.merge_sql(
             &old_plan.state_table,
@@ -548,10 +548,7 @@ impl SnowflakeRuntime {
     async fn count_rows(&self, table: &str) -> Result<u64> {
         let result = self
             .http
-            .execute_sql(
-                &format!("SELECT COUNT(*) AS C FROM {table}"),
-                Uuid::new_v4(),
-            )
+            .execute_sql_once(&format!("SELECT COUNT(*) AS C FROM {table}"))
             .await?;
         ensure!(
             result.rows.len() == 1,

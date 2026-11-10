@@ -34,6 +34,11 @@ batch_bytes = 8388608
 flush_interval_ms = 250
 merge_interval_ms = 15000
 metadata_concurrency = 32
+# Create landing tables without Time Travel or Fail-safe storage. Run the
+# live runtime test with this set before using it; see docs/snowflake.md.
+# landing_tables = "transient"
+# Submit every statement asynchronously, for a proxy that drops held requests.
+# sql_async = true
 
 [snowflake.auth]
 # OAuth refresh must atomically replace this file before the token expires.

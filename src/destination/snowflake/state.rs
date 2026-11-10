@@ -446,6 +446,54 @@ impl StateStore {
         Ok((out, false))
     }
 
+    /// Whether the verified batches of a channel at or after `min_sequence`
+    /// already fill a payload budget. Reads manifests only, so a merge can
+    /// wait for more batches without loading the ones it has
+    pub fn verified_reaches(
+        &self,
+        channel: &str,
+        min_sequence: u64,
+        max_bytes: usize,
+    ) -> anyhow::Result<bool> {
+        let _guard = self.mutation.lock().unwrap();
+        anyhow::ensure!(
+            !channel.is_empty() && max_bytes > 0,
+            "invalid verified candidate budget"
+        );
+        let Some(oldest) = self
+            .outstanding
+            .lock()
+            .unwrap()
+            .get(channel)
+            .and_then(|seqs| seqs.first().copied())
+        else {
+            return Ok(false);
+        };
+        let mut prefix = sequence_key(channel, 0)?;
+        prefix.truncate(prefix.len() - 8);
+        let mut total = 0u64;
+        for item in self
+            .db
+            .prefix_iterator(sequence_key(channel, min_sequence.max(oldest))?)
+        {
+            let (key, value) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let manifest = self
+                .manifest(std::str::from_utf8(&value)?)?
+                .ok_or_else(|| anyhow::anyhow!("channel sequence lacks a batch manifest"))?;
+            if manifest.phase != BatchPhase::Verified {
+                continue;
+            }
+            total = total.saturating_add(manifest.payload_len);
+            if total >= max_bytes as u64 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn phase(&self, id: &str) -> anyhow::Result<Option<BatchPhase>> {
         Ok(self.manifest(id)?.map(|m| m.phase))
     }

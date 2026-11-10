@@ -8,7 +8,7 @@ use super::{
     types::{SnowflakeRow, TableSchema},
 };
 use crate::{
-    destination::config::SnowflakeConfig,
+    destination::config::{LandingTables, SnowflakeConfig},
     emit::route::RouteSnapshot,
     schema::{RelDescriptor, RelName, SchemaEvent},
 };
@@ -146,33 +146,29 @@ impl SnowflakeRuntime {
                 && next.metadata_concurrency == current.metadata_concurrency
                 && next.state == current.state
                 && next.merge_interval_ms == current.merge_interval_ms
-                && next.ack_after == current.ack_after,
-            "Snowflake channel, pool, merge-interval and state settings take effect on restart"
+                && next.ack_after == current.ack_after
+                && next.landing_tables == current.landing_tables,
+            "Snowflake channel, pool, merge-interval, landing-table and state settings take \
+             effect on restart"
         );
         self.http.update_config(next.http_config()?)
     }
 
     pub async fn preflight(&self) -> Result<()> {
         self.http
-            .execute_sql(
-                &format!(
-                    "CREATE SCHEMA IF NOT EXISTS {}",
-                    ident(&self.config.internal_schema)?
-                ),
-                Uuid::new_v4(),
-            )
+            .execute_sql_once(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {}",
+                ident(&self.config.internal_schema)?
+            ))
             .await?;
         // The external stage is provisioned with a Snowflake storage integration;
         // daemon credentials never appear in SQL or generated configuration.
         let result = self
             .http
-            .execute_sql(
-                &format!(
-                    "DESC STAGE {}",
-                    quote_qualified_ident(&self.config.stage.name).map_err(anyhow::Error::msg)?
-                ),
-                Uuid::new_v4(),
-            )
+            .execute_sql_once(&format!(
+                "DESC STAGE {}",
+                quote_qualified_ident(&self.config.stage.name).map_err(anyhow::Error::msg)?
+            ))
             .await?;
         let expected = format!(
             "s3://{}/{}/",
@@ -278,6 +274,14 @@ impl SnowflakeRuntime {
         }
         let lock = self.table_lock(schema).await;
         let _guard = lock.lock().await;
+        // Callers that queued behind the first setup find it done
+        if let Some(previous) = self.ready.lock().await.get(&key) {
+            ensure!(
+                previous == &bytes,
+                "Snowflake schema changed without a schema barrier"
+            );
+            return Ok(());
+        }
         let verified_key = format!("table-verified/{key}");
         let schema_digest = Sha256::digest(&bytes).to_vec();
         let storage_verified =
@@ -297,16 +301,14 @@ impl SnowflakeRuntime {
         let storage = async {
             tokio::try_join!(
                 self.http
-                    .execute_sql(&plan.create_landing_sql, Uuid::new_v4()),
-                self.http
-                    .execute_sql(&plan.create_state_sql, Uuid::new_v4()),
+                    .execute_sql_once(landing_ddl(self.config.landing_tables, &plan)),
+                self.http.execute_sql_once(&plan.create_state_sql),
             )?;
             self.http
-                .execute_sql(
+                .execute_sql_once(
                     &plan
                         .create_streaming_pipe_sql(schema, &pipe_name(schema))
                         .map_err(anyhow::Error::msg)?,
-                    Uuid::new_v4(),
                 )
                 .await?;
             // The ownership scan reads the whole state table; once proven for
@@ -314,14 +316,11 @@ impl SnowflakeRuntime {
             if !storage_verified {
                 let foreign = self
                     .http
-                    .execute_sql(
-                        &format!(
-                            "SELECT COUNT(*) FROM {} WHERE _WS_SOURCE_IDENTITY <> {}",
-                            plan.state_table,
-                            super::sql::quote_literal(&self.source_identity)
-                        ),
-                        Uuid::new_v4(),
-                    )
+                    .execute_sql_once(&format!(
+                        "SELECT COUNT(*) FROM {} WHERE _WS_SOURCE_IDENTITY <> {}",
+                        plan.state_table,
+                        super::sql::quote_literal(&self.source_identity)
+                    ))
                     .await?;
                 ensure!(
                     receipt_exists(&foreign.rows, 0)?,
@@ -332,14 +331,11 @@ impl SnowflakeRuntime {
         };
         let views = async {
             self.http
-                .execute_sql(
-                    &format!(
-                        "SHOW VIEWS LIKE {} IN SCHEMA {}",
-                        super::sql::quote_literal(&schema.table),
-                        ident(&schema.database)?
-                    ),
-                    Uuid::new_v4(),
-                )
+                .execute_sql_once(&format!(
+                    "SHOW VIEWS LIKE {} IN SCHEMA {}",
+                    super::sql::quote_literal(&schema.table),
+                    ident(&schema.database)?
+                ))
                 .await
         };
         let ((), views) = tokio::try_join!(storage, views)?;
@@ -388,7 +384,7 @@ impl SnowflakeRuntime {
                     .as_deref()
                     != Some(&digest[..])
             {
-                self.http.execute_sql(&view, Uuid::new_v4()).await?;
+                self.http.execute_sql_once(&view).await?;
                 self.record_published_view(schema, &view)?;
             }
         }
@@ -413,7 +409,7 @@ impl SnowflakeRuntime {
             return Ok(());
         }
         // Concurrent first callers may both run it; the DDL is idempotent
-        self.http.execute_sql(&sql, Uuid::new_v4()).await?;
+        self.http.execute_sql_once(&sql).await?;
         self.shared_ddl.lock().await.insert(sql);
         Ok(())
     }
@@ -678,7 +674,7 @@ impl SnowflakeRuntime {
         };
         self.enqueue_durable(&batch).await?;
         if let Some(snapshot) = &payload.snapshot {
-            self.register_snapshot_batch(&snapshot.operation_id, &batch.id)
+            self.register_snapshot_batch(&snapshot.operation_id, &batch.id, &payload)
                 .await?;
         }
         self.apply_retrying(&batch, &payload, true).await?;
@@ -770,7 +766,7 @@ impl SnowflakeRuntime {
             let sql = format!(
                 "DELETE FROM {landing} l USING {receipts_table} r WHERE l._WS_BATCH_ID = r.BATCH_ID"
             );
-            if let Err(e) = self.http.execute_sql(&sql, Uuid::new_v4()).await {
+            if let Err(e) = self.http.execute_sql_once(&sql).await {
                 tracing::warn!(target: "walshadow::snowflake", table = %landing, error = %format!("{e:#}"), "landing cleanup failed; retried next hour");
                 self.landed
                     .lock()
@@ -782,7 +778,7 @@ impl SnowflakeRuntime {
             let sql = format!(
                 "DELETE FROM {receipts_table} WHERE APPLIED_AT < DATEADD(day, -7, CURRENT_TIMESTAMP())"
             );
-            if let Err(e) = self.http.execute_sql(&sql, Uuid::new_v4()).await {
+            if let Err(e) = self.http.execute_sql_once(&sql).await {
                 tracing::warn!(target: "walshadow::snowflake", error = %format!("{e:#}"), "receipt pruning failed");
             }
         }
@@ -846,7 +842,7 @@ impl SnowflakeRuntime {
         if !fresh {
             let receipt = self
                 .http
-                .execute_sql(&plan.receipt_sql(&batch.id), Uuid::new_v4())
+                .execute_sql_once(&plan.receipt_sql(&batch.id))
                 .await?;
             if receipt_exists(&receipt.rows, batch.expected_rows)? {
                 self.mark_verified_or_applied(&batch.id)?;
@@ -854,28 +850,21 @@ impl SnowflakeRuntime {
                 return Ok(());
             }
         }
-        let values = payload
-            .rows
-            .iter()
-            .map(|r| stage::to_json(&payload.schema, r, &batch.id))
-            .collect::<Result<Vec<_>>>()?;
-        let size = values
-            .iter()
-            .try_fold(0usize, |total, row| -> Result<usize> {
-                Ok(total + serde_json::to_vec(row)?.len() + 1)
-            })?;
-        if size >= 3_500_000 || payload.snapshot.is_some() {
+        // A snapshot batch always stages, so it is encoded once, as Parquet.
+        // Any other batch streams while its rows fit one append request
+        let ndjson = match payload.snapshot {
+            Some(_) => None,
+            None => stage::to_ndjson(
+                &payload.schema,
+                &payload.rows,
+                &batch.id,
+                STREAMING_MAX_BYTES,
+            )?,
+        };
+        let Some(ndjson) = ndjson else {
             let stage = self
                 .stage
-                .get_or_try_init(|| {
-                    StageWriter::new(stage::StageConfig {
-                        bucket: self.config.stage.bucket.clone(),
-                        prefix: self.config.stage.prefix.trim_end_matches('/').to_owned(),
-                        region: self.config.stage.region.clone(),
-                        stage_name: self.config.stage.name.clone(),
-                        max_file_bytes: 128 << 20,
-                    })
-                })
+                .get_or_try_init(|| StageWriter::new(self.config.stage_writer_config()))
                 .await?;
             let file = stage
                 .stage_batch(&batch.id, &payload.schema, &payload.rows)
@@ -890,7 +879,10 @@ impl SnowflakeRuntime {
             self.http
                 .execute_sql(&sql, request_id(&batch.id, "copy"))
                 .await?;
-        } else {
+            drop(_permit);
+            return self.materialize_landed(batch, payload).await;
+        };
+        {
             let channel = ChannelRef {
                 database: self.config.database.clone(),
                 schema: self.config.internal_schema.clone(),
@@ -933,12 +925,12 @@ impl SnowflakeRuntime {
             if let Some(token) = token {
                 next_token = Some(
                     self.http
-                        .append_rows(
+                        .append_ndjson(
                             &channel,
                             &token,
                             &batch.id,
                             &batch.id,
-                            &values,
+                            ndjson,
                             request_id(&batch.id, "append"),
                         )
                         .await?,
@@ -966,6 +958,12 @@ impl SnowflakeRuntime {
             *continuation = next_token;
         }
         drop(_permit);
+        self.materialize_landed(batch, payload).await
+    }
+
+    /// Verify a batch whose rows reached the landing table, then merge it
+    /// into the state its kind targets
+    async fn materialize_landed(&self, batch: &DurableBatch, payload: &Payload) -> Result<()> {
         if payload.snapshot.is_none() && payload.pending_generation.is_none() {
             let landing_plan = TableSqlPlan::new(&payload.schema, &self.config.internal_schema)
                 .map_err(anyhow::Error::msg)?;
@@ -1032,7 +1030,7 @@ impl SnowflakeRuntime {
             .await?;
         let receipt = self
             .http
-            .execute_sql(&plan.receipt_sql(&batch.id), Uuid::new_v4())
+            .execute_sql_once(&plan.receipt_sql(&batch.id))
             .await?;
         ensure!(
             receipt_exists(&receipt.rows, batch.expected_rows)?,
@@ -1045,10 +1043,7 @@ impl SnowflakeRuntime {
     async fn verify_batch(&self, batch: &DurableBatch, plan: &TableSqlPlan) -> Result<()> {
         let complete = self
             .http
-            .execute_sql(
-                &plan.batch_completeness_sql(&batch.id, batch.expected_rows),
-                Uuid::new_v4(),
-            )
+            .execute_sql_once(&plan.batch_completeness_sql(&batch.id, batch.expected_rows))
             .await?;
         ensure!(
             receipt_exists(&complete.rows, batch.expected_rows)?,
@@ -1083,7 +1078,7 @@ impl SnowflakeRuntime {
         let plan = self.active_plan(schema).await?;
         let receipt = self
             .http
-            .execute_sql(&plan.receipt_sql(&first.id), Uuid::new_v4())
+            .execute_sql_once(&plan.receipt_sql(&first.id))
             .await?;
         if receipt_exists(&receipt.rows, first.expected_rows)? {
             self.state.mark_applied(&first.id)?;
@@ -1091,21 +1086,28 @@ impl SnowflakeRuntime {
         }
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(self.config.merge_interval_ms);
-        let selected = loop {
-            let (candidates, budget_full) = self.state.verified_candidates_with_fullness(
-                &first.channel,
-                first.sequence,
-                merge_queue::MAX_MERGE_BYTES,
-            )?;
-            let selected = merge_queue::select(first, candidates, schema)?;
-            if budget_full || tokio::time::Instant::now() >= deadline {
-                break selected;
+        // Wait out the interval or a full merge budget on manifests alone.
+        // Payloads load once, when the group is chosen, not on every batch
+        // verified in the meantime
+        loop {
+            if tokio::time::Instant::now() >= deadline
+                || self.state.verified_reaches(
+                    &first.channel,
+                    first.sequence,
+                    merge_queue::MAX_MERGE_BYTES,
+                )?
+            {
+                break;
             }
             tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => break selected,
+                _ = tokio::time::sleep_until(deadline) => break,
                 _ = notify.notified() => {},
             }
-        };
+        }
+        let candidates = self
+            .verified_candidates(&first.channel, first.sequence)
+            .await?;
+        let selected = merge_queue::select(first, candidates, schema)?;
         let _merge_permit = self.merge_in_flight.acquire().await?;
         let ids = selected.iter().map(|b| b.id.clone()).collect::<Vec<_>>();
         let receipts = selected
@@ -1138,9 +1140,7 @@ impl SnowflakeRuntime {
         schema: &TableSchema,
         plan: &TableSqlPlan,
     ) -> Result<()> {
-        let candidates =
-            self.state
-                .verified_candidates(&first.channel, 0, merge_queue::MAX_MERGE_BYTES)?;
+        let candidates = self.verified_candidates(&first.channel, 0).await?;
         let selected = merge_queue::select_snapshot(first, candidates, schema, target)?;
         let _merge_permit = self.merge_in_flight.acquire().await?;
         let ids = selected.iter().map(|b| b.id.clone()).collect::<Vec<_>>();
@@ -1163,16 +1163,29 @@ impl SnowflakeRuntime {
         self.read_back_group(plan, &selected).await
     }
 
+    /// Verified batches of one channel within a merge budget. Their payload
+    /// files are read and checksummed, so this runs off the async workers
+    async fn verified_candidates(
+        &self,
+        channel: &str,
+        min_sequence: u64,
+    ) -> Result<Vec<DurableBatch>> {
+        let state = self.state.clone();
+        let channel = channel.to_owned();
+        tokio::task::spawn_blocking(move || {
+            state.verified_candidates(&channel, min_sequence, merge_queue::MAX_MERGE_BYTES)
+        })
+        .await
+        .context("Snowflake merge candidate task")?
+    }
+
     /// Read every receipt of a committed group back in one statement before
     /// any batch is marked applied.
     async fn read_back_group(&self, plan: &TableSqlPlan, selected: &[DurableBatch]) -> Result<()> {
         let ids = selected.iter().map(|b| b.id.clone()).collect::<Vec<_>>();
         let result = self
             .http
-            .execute_sql(
-                &plan.receipts_sql_group(&ids).map_err(anyhow::Error::msg)?,
-                Uuid::new_v4(),
-            )
+            .execute_sql_once(&plan.receipts_sql_group(&ids).map_err(anyhow::Error::msg)?)
             .await?;
         let counts = group_receipts(&result.rows)?;
         for batch in selected {
@@ -1207,6 +1220,15 @@ fn group_receipts(rows: &[Vec<serde_json::Value>]) -> Result<HashMap<&str, u64>>
         );
     }
     Ok(counts)
+}
+
+/// DDL for a landing table that does not exist yet. An existing one keeps
+/// the type it was created with
+pub(super) fn landing_ddl(kind: LandingTables, plan: &TableSqlPlan) -> &str {
+    match kind {
+        LandingTables::Permanent => &plan.create_landing_sql,
+        LandingTables::Transient => &plan.create_transient_landing_sql,
+    }
 }
 
 fn ident(value: &str) -> Result<String> {
@@ -1257,10 +1279,16 @@ fn result_column(row_type: &serde_json::Value, name: &str) -> Result<usize> {
         .with_context(|| format!("Snowflake result is missing column {name}"))
 }
 const APPLY_RETRIES: u32 = 8;
+/// Encoded rows at or past this size stage through S3 instead of streaming;
+/// one streaming append carries at most 4 MB
+const STREAMING_MAX_BYTES: usize = 3_500_000;
 
 /// Failures a later attempt can clear: throttling, server errors, timeouts
 /// and dropped connections. Rejected rows and state mismatches are not
 fn transient(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<stage::TransientUpload>().is_some() {
+        return true;
+    }
     error.chain().any(|cause| {
         if let Some(e) = cause.downcast_ref::<reqwest::Error>() {
             return e.is_timeout() || e.is_connect() || e.is_request() || e.is_body();
@@ -1276,6 +1304,8 @@ fn transient(error: &anyhow::Error) -> bool {
             "did not commit batch before timeout",
             "streaming append failed: 5",
             "streaming append failed: 429",
+            // The cached scoped token was dropped; the retry mints a new one
+            "streaming append failed: 401",
         ]
         .iter()
         .any(|needle| msg.contains(needle))
@@ -1360,6 +1390,32 @@ mod tests {
         assert!(receipt_exists(&[vec![json!("1")]], 2).is_err());
         assert!(receipt_exists(&[vec![json!(2)], vec![json!(2)]], 2).is_err());
         assert!(receipt_exists(&[vec![json!("2.0")]], 2).is_err());
+    }
+    #[test]
+    fn transient_failures_are_the_ones_a_retry_can_clear() {
+        for message in [
+            "Snowflake HTTP 503 Service Unavailable: unknown",
+            "Snowflake streaming append failed: 401 Unauthorized",
+            "Snowflake streaming append failed: 429 Too Many Requests",
+            "Snowflake channel did not commit batch before timeout",
+        ] {
+            assert!(transient(&anyhow::anyhow!(message)), "{message}");
+            assert!(
+                transient(&anyhow::anyhow!(message).context("apply batch")),
+                "{message}"
+            );
+        }
+        assert!(transient(
+            &anyhow::anyhow!("dispatch failure").context(stage::TransientUpload)
+        ));
+        for message in [
+            "Snowflake HTTP 422 Unprocessable Entity: 002003",
+            "Snowflake streaming append failed: 400 Bad Request",
+            "Snowflake rejected one or more batch rows",
+            "staged object key collision or corrupt existing object",
+        ] {
+            assert!(!transient(&anyhow::anyhow!(message)), "{message}");
+        }
     }
     #[test]
     fn retry_identifiers_are_stable_and_operation_scoped() {
@@ -1460,6 +1516,84 @@ mod tests {
         };
         let plan = TableSqlPlan::new(&schema, "INTERNAL").unwrap();
         (dir, runtime, batch, plan, requests)
+    }
+
+    /// Answers every table-setup statement: a zero count for the ownership
+    /// scan, and a view listing that names no view of ours
+    const SETUP: &str = r#"{"statementHandle":"00000000-0000-0000-0000-000000000001","resultSetMetaData":{"rowType":[{"name":"name"},{"name":"comment"}],"partitionInfo":[{}]},"data":[["0"]]}"#;
+
+    async fn table_setup_statements(kind: LandingTables) -> Vec<String> {
+        let (_dir, mut runtime, _, _, requests) = fixture(vec![(200, SETUP); 8]).await;
+        runtime.config.landing_tables = kind;
+        let schema = TableSchema {
+            database: "PUBLIC".into(),
+            table: "T".into(),
+            columns: vec![super::super::types::SnowflakeColumn {
+                attnum: 1,
+                source_name: "id".into(),
+                name: "id".into(),
+                type_oid: 23,
+                data_type: super::super::types::SnowflakeType::Number {
+                    precision: 10,
+                    scale: 0,
+                },
+                not_null: true,
+            }],
+            key_indexes: vec![0],
+            relation_oid: 1,
+        };
+        runtime.ensure_schema(&schema).await.unwrap();
+        // A second caller finds the table ready and sends nothing
+        runtime.ensure_schema(&schema).await.unwrap();
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 8);
+        let plan = TableSqlPlan::new(&schema, &runtime.config.internal_schema).unwrap();
+        // Bare object name: the request body JSON-escapes the quoting
+        let landing = plan
+            .landing_table
+            .rsplit_once('.')
+            .unwrap()
+            .1
+            .trim_matches('"')
+            .to_owned();
+        assert!(landing.ends_with("_LANDING"));
+        let creates: Vec<_> = requests
+            .iter()
+            .filter(|r| r.contains("TABLE IF NOT EXISTS") && r.contains(&landing))
+            .collect();
+        assert_eq!(creates.len(), 1, "one landing table DDL");
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.contains("CREATE PIPE IF NOT EXISTS") && r.contains(&landing)),
+            "the streaming pipe loads the landing table"
+        );
+        requests
+    }
+
+    #[tokio::test]
+    async fn table_setup_creates_permanent_landing_tables_by_default() {
+        let requests = table_setup_statements(LandingTables::Permanent).await;
+        assert!(requests.iter().all(|r| !r.contains("TRANSIENT")));
+        assert!(requests.iter().all(|r| !r.contains("DATA_RETENTION")));
+    }
+
+    #[tokio::test]
+    async fn transient_setting_changes_only_the_landing_table() {
+        let requests = table_setup_statements(LandingTables::Transient).await;
+        let transient: Vec<_> = requests
+            .iter()
+            .filter(|r| r.contains("TRANSIENT"))
+            .collect();
+        assert_eq!(transient.len(), 1, "state and receipts stay permanent");
+        assert!(transient[0].contains("CREATE TRANSIENT TABLE IF NOT EXISTS"));
+        assert!(transient[0].contains("_LANDING"));
+        assert!(transient[0].contains("DATA_RETENTION_TIME_IN_DAYS = 0"));
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.contains("_STATE") && r.contains("CREATE TABLE IF NOT EXISTS"))
+        );
     }
 
     #[tokio::test]

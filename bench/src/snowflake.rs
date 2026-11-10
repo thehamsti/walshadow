@@ -2,7 +2,6 @@
 use crate::Destination;
 use anyhow::{Context, Result, ensure};
 use std::path::Path;
-use uuid::Uuid;
 use walshadow::destination::{
     config::DestinationConfig,
     snowflake::{http::SnowflakeHttp, sql::quote_qualified_ident},
@@ -28,10 +27,7 @@ impl SnowflakeDest {
     async fn count(&self, predicate: &str) -> Result<u64> {
         let result = self
             .http
-            .execute_sql(
-                &format!("SELECT COUNT(*) FROM {}{predicate}", self.view),
-                Uuid::new_v4(),
-            )
+            .execute_sql_once(&format!("SELECT COUNT(*) FROM {}{predicate}", self.view))
             .await?;
         parse_count(&result.rows)
     }

@@ -92,7 +92,7 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = ["
 tracing-opentelemetry = { version = "0.34", default-features = false }
 mimalloc = "0.1.52"
 prometheus-client = "0.25.1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"

@@ -136,7 +136,7 @@ lands, then reloaded; SIGHUP after editing fragments by hand does the same.
 | Table rules, pause-free tuning | Applies live through the tenant's own reload |
 | Snowflake role, warehouse, user, credential files, statement timeout | Applies live |
 | `dbname`, or Snowflake account, database, internal schema, stage, schema mapping | Detaches and re-attaches with fresh initial loads: durable state is bound to them |
-| Snowflake channels, pools, merge interval, state, `ack_after` | Rejected until restart |
+| Snowflake channels, pools, merge interval, state, `ack_after`, `landing_tables` | Rejected until restart |
 | `state = "detached"` / `ctl tenant detach` | Stops routing, stops holding WAL, keeps the destination |
 | Removal | Same as detach, and forgets the tenant |
 

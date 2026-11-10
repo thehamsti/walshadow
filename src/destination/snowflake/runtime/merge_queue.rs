@@ -1,6 +1,6 @@
 //! Bounded selection of fully ingested live batches for one state-table MERGE.
 
-use super::{Payload, SnapshotTarget, TableSchema};
+use super::{SnapshotTarget, TableSchema};
 use crate::destination::snowflake::state::DurableBatch;
 use anyhow::{Result, ensure};
 use serde::Deserialize;
@@ -20,10 +20,10 @@ pub(super) fn select(
         if batch.sequence < first.sequence || batch.channel != first.channel {
             continue;
         }
-        let payload: Payload = serde_json::from_slice(&batch.payload)?;
-        if payload.schema != *schema
-            || payload.snapshot.is_some()
-            || payload.pending_generation.is_some()
+        let header: PayloadHeader = serde_json::from_slice(&batch.payload)?;
+        if header.schema != *schema
+            || header.snapshot.is_some()
+            || header.pending_generation.is_some()
         {
             continue;
         }
@@ -96,6 +96,7 @@ pub(super) fn request_id(state_table: &str, batches: &[DurableBatch]) -> Uuid {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Payload;
     use super::*;
 
     fn schema() -> TableSchema {
