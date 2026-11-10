@@ -57,18 +57,34 @@ one destination with `[destination] kind = "snowflake"`; do not include `[ch]`.
 Snowflake TOML directly. Use `--config` (the existing `--ch-config` spelling is
 an alias) to supply the file.
 
+`database` and `internal_schema` take ASCII letters, digits and underscores
+only, because Snowpipe Streaming addresses them by name. The stage bucket,
+region and name are checked when the file loads, and each `prefix` segment
+takes letters, digits, `_` and `-`. A value outside these rules refuses to
+start instead of stopping delivery at the first batch.
+
 The source database and what durable state is bound to (account, database,
 internal schema, stage, schema mapping) are fixed for the session; changing
 them needs fresh state (with tenants, a detach and re-attach). Role,
-warehouse, user, credential file paths and `statement_timeout_secs` reload
-live; channel, pool, merge-interval, state and `ack_after` settings apply on
-restart. Credential file contents can rotate without restarting. Source
+warehouse, user, credential file paths, `statement_timeout_secs` and
+`sql_async` reload live; channel, pool, merge-interval, state, `ack_after`
+and `landing_tables` settings apply on restart. Credential file contents can rotate without restarting. Source
 endpoint changes retain the existing planned-switchover checks.
+
+Reads and idempotent DDL (receipt probes, batch completeness checks, view
+listings, `CREATE … IF NOT EXISTS`) run synchronously: Snowflake answers one
+that finishes within 45 seconds in the submission itself, and the daemon
+polls only when it answers that the statement is still running. `COPY`,
+`MERGE` transactions and view switches are submitted asynchronously, so no
+request is held open while a write runs. Set `sql_async = true` to submit
+everything asynchronously where a proxy between the daemon and Snowflake
+drops a request held for tens of seconds.
 
 Statements poll until `statement_timeout_secs` (default 6 hours), refreshing
 credentials as they go. Transient transport failures (throttling, 5xx,
-timeouts, dropped connections) retry the batch with backoff; the batch stays
-durable and every retry checks its apply receipt first. A full outbox
+timeouts, dropped connections, S3 upload failures, an expired streaming
+token) retry the batch with backoff; the batch stays durable and every retry
+checks its apply receipt first. A full outbox
 (`state.max_bytes`) holds deliveries until applied batches release space
 instead of stopping. Restarts replace a public view only when its definition
 changed, so change tracking and downstream streams survive them. Applied
@@ -111,6 +127,32 @@ and temporary Parquet files need additional free disk space. It is not a disk
 quota. Stage files are immutable and currently have no automatic deletion;
 keep them available through replay and apply-receipt verification, then manage
 retention deliberately.
+
+### Landing table storage
+
+Every replicated row passes through a landing table and is deleted from it
+once its batch is applied. In a permanent table each deleted row is still
+billed through Time Travel and seven days of Fail-safe. With
+`landing_tables = "transient"` the daemon creates landing tables as transient
+tables with `DATA_RETENTION_TIME_IN_DAYS = 0`, which keep neither. Nothing is
+lost by that: a row stays in the local outbox until its apply receipt, and
+state tables and the receipts table are always permanent.
+
+The default is `"permanent"`, because Snowflake's documentation does not say
+whether a Snowpipe Streaming high-performance pipe accepts a transient
+standard table, and this has not been run against a live account. Confirm it
+before enabling it in production: add the setting to the live-test
+configuration and run the runtime test in
+[Verification and qualification](#verification-and-qualification), which
+streams through Named Channels into a landing table of the configured type.
+
+The setting applies to landing tables created after it takes effect: new
+relations, and every relation after its next schema change. Snowflake cannot
+convert an existing table, so an existing landing table keeps its type. If a
+pipe on a transient table is refused, table setup stops before any row is
+delivered. The error carries the query id of the failing `CREATE PIPE`,
+which names the landing table in Snowflake's query history. Set
+`"permanent"`, drop that empty landing table, and restart.
 
 ## Snowflake prerequisites
 

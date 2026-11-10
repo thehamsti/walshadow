@@ -731,3 +731,49 @@ fn durable_sequences_survive_reopen_without_an_enqueue() {
         2
     );
 }
+
+#[test]
+fn merge_budget_is_judged_from_manifests_of_verified_batches() {
+    let dir = tempdir().unwrap();
+    let state = StateStore::open(dir.path(), identity(), 4096).unwrap();
+    for (id, channel, sequence, size) in [
+        ("a", "wal", 1, 4),
+        ("b", "wal", 2, 5),
+        ("c", "wal", 3, 6),
+        ("other", "other", 1, 30),
+    ] {
+        state
+            .enqueue(&DurableBatch {
+                id: id.into(),
+                channel: channel.into(),
+                sequence,
+                expected_rows: 1,
+                payload: vec![1; size],
+            })
+            .unwrap();
+        if id != "c" {
+            state.mark_verified(id).unwrap();
+        }
+    }
+    // Agrees with the payload-loading scan on every budget
+    for budget in 1..=20 {
+        let (_, full) = state
+            .verified_candidates_with_fullness("wal", 1, budget)
+            .unwrap();
+        assert_eq!(
+            state.verified_reaches("wal", 1, budget).unwrap(),
+            full,
+            "budget {budget}"
+        );
+    }
+    assert!(state.verified_reaches("wal", 1, 9).unwrap());
+    assert!(
+        !state.verified_reaches("wal", 1, 10).unwrap(),
+        "an unverified batch and another channel do not count"
+    );
+    assert!(!state.verified_reaches("wal", 2, 6).unwrap());
+    // Payloads are not needed to judge it
+    std::fs::remove_file(dir.path().join("payloads").join("a.bin")).unwrap();
+    assert!(state.verified_reaches("wal", 1, 9).unwrap());
+    assert!(!state.verified_reaches("empty", 1, 1).unwrap());
+}

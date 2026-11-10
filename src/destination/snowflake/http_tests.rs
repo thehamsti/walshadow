@@ -69,6 +69,7 @@ pub(crate) async fn client(url: Url) -> SnowflakeHttp {
         warehouse: Some("WH".into()),
         role: None,
         statement_timeout: std::time::Duration::from_secs(60),
+        sql_async: false,
     })
     .unwrap()
 }
@@ -86,6 +87,7 @@ fn rejects_non_https_and_credential_urls() {
         warehouse: None,
         role: None,
         statement_timeout: std::time::Duration::from_secs(60),
+        sql_async: false,
     };
     assert!(SnowflakeHttp::new(config("http://example.snowflakecomputing.com/")).is_err());
     assert!(SnowflakeHttp::new(config("https://u:p@example.snowflakecomputing.com/")).is_err());
@@ -356,4 +358,237 @@ fn streaming_scalar_accepts_deployed_and_documented_encodings() {
     assert!(streaming_scalar(b"{}", "token").is_err());
     assert!(streaming_scalar(b"<html>bad response</html>", "token").is_err());
     assert!(streaming_scalar(b"", "token").is_err());
+}
+
+const DONE: &str = r#"{"statementHandle":"11111111-1111-4111-8111-111111111111","resultSetMetaData":{"rowType":[],"partitionInfo":[{}]},"data":[]}"#;
+
+#[tokio::test]
+async fn one_shot_statement_marks_only_its_own_retries_as_resubmissions() {
+    let (url, task) = server(vec![(503, "upstream unavailable"), (200, DONE)]).await;
+    let client = client(url).await;
+    client.execute_sql_once("SHOW VIEWS").await.unwrap();
+    let requests = task.await.unwrap();
+    assert!(!requests[0].contains("retry=true"));
+    assert!(requests[1].contains("retry=true"));
+    let id = |request: &str| {
+        let at = request.find("requestId=").unwrap();
+        request[at..at + 46].to_owned()
+    };
+    assert_eq!(id(&requests[0]), id(&requests[1]));
+}
+
+#[tokio::test]
+async fn failure_keeps_code_state_and_query_id_but_not_the_message() {
+    let (url, _task) = server(vec![(
+        422,
+        r#"{"code":"100038","sqlState":"22018","statementHandle":"11111111-1111-4111-8111-111111111111","message":"Numeric value 'secret' is not recognized"}"#,
+    )])
+    .await;
+    let error = client(url)
+        .await
+        .execute_sql_once("SELECT 1")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("HTTP 422"), "{error}");
+    assert!(error.contains("100038 sqlState 22018"), "{error}");
+    assert!(
+        error.contains("statement 11111111-1111-4111-8111-111111111111"),
+        "{error}"
+    );
+    assert!(!error.contains("secret"), "{error}");
+    assert_eq!(
+        safe_error(&json!({"sqlState":"22018 'x'","statementHandle":""})),
+        "unknown"
+    );
+}
+
+#[tokio::test]
+async fn swapped_settings_mint_new_ingest_credentials() {
+    let status = r#"{"channel_statuses":{"CH":{"channel_status_code":"ACTIVE","rows_inserted":0,"rows_parsed":0,"rows_errors":0}}}"#;
+    let (url, task) = server(vec![
+        (200, "127.0.0.1"),
+        (200, "token-one"),
+        (200, status),
+        // Same settings: host and token are reused
+        (200, status),
+        (200, "127.0.0.1"),
+        (200, "token-two"),
+        (200, status),
+    ])
+    .await;
+    let client = client(url).await;
+    let channel = ChannelRef {
+        database: "DB".into(),
+        schema: "PUBLIC".into(),
+        pipe: "PIPE".into(),
+        channel: "CH".into(),
+    };
+    client.channel_status(&channel).await.unwrap();
+    client.channel_status(&channel).await.unwrap();
+    let mut next = (*client.cfg()).clone();
+    next.role = Some("NEXT_ROLE".into());
+    client.update_config(next).unwrap();
+    client.channel_status(&channel).await.unwrap();
+    let requests = task.await.unwrap();
+    assert!(requests[3].contains("token-one"));
+    assert!(requests[5].contains("session%3Arole%3ANEXT_ROLE"));
+    assert!(requests[6].contains("token-two"));
+}
+
+/// Snowflake returns every result partition after the first gzip-compressed
+#[tokio::test]
+async fn later_result_partitions_are_decompressed() {
+    // gzip of `{"data":[["2"]]}`
+    const PARTITION: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xab, 0x56, 0x4a, 0x49, 0x2c,
+        0x49, 0x54, 0xb2, 0x8a, 0x8e, 0x56, 0x32, 0x52, 0x8a, 0x8d, 0xad, 0x05, 0x00, 0x0d, 0xdc,
+        0x15, 0xbe, 0x10, 0x00, 0x00, 0x00,
+    ];
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let first = r#"{"statementHandle":"11111111-1111-4111-8111-111111111111","resultSetMetaData":{"rowType":[],"partitionInfo":[{},{}]},"data":[["1"]]}"#;
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for (encoding, body) in [
+            ("", first.as_bytes()),
+            ("Content-Encoding: gzip\r\n", PARTITION),
+        ] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buf = [0u8; 8192];
+            // The submission carries a body; reading its headers is enough here
+            while !bytes.windows(4).any(|x| x == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0);
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            requests.push(String::from_utf8_lossy(&bytes).to_string());
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{encoding}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        }
+        requests
+    });
+    let result = client(url)
+        .await
+        .execute_sql_once("SELECT 1")
+        .await
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![json!("1")], vec![json!("2")]]);
+    let requests = task.await.unwrap();
+    assert!(requests[1].contains("partition=1"));
+    assert!(
+        requests[1]
+            .to_ascii_lowercase()
+            .contains("accept-encoding: gzip")
+    );
+}
+
+#[tokio::test]
+async fn fast_statement_is_answered_by_its_own_submission() {
+    let (url, task) = server(vec![(200, DONE)]).await;
+    client(url)
+        .await
+        .execute_sql_once("SELECT 1")
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 1, "no status poll for a finished statement");
+    assert!(requests[0].starts_with("POST /api/v2/statements?"));
+    assert!(!requests[0].contains("async="));
+}
+
+#[tokio::test]
+async fn slow_statement_still_polls_after_a_synchronous_submission() {
+    let (url, task) = server(vec![
+        (
+            202,
+            r#"{"statementHandle":"11111111-1111-4111-8111-111111111111"}"#,
+        ),
+        (
+            202,
+            r#"{"statementHandle":"11111111-1111-4111-8111-111111111111"}"#,
+        ),
+        (200, DONE),
+    ])
+    .await;
+    client(url)
+        .await
+        .execute_sql_once("SELECT 1")
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[0].contains("async="));
+    for poll in &requests[1..] {
+        assert!(poll.starts_with("GET /api/v2/statements/11111111-1111-4111-8111-111111111111"));
+    }
+}
+
+#[tokio::test]
+async fn sql_async_setting_restores_asynchronous_submission() {
+    let (url, task) = server(vec![
+        (
+            202,
+            r#"{"statementHandle":"11111111-1111-4111-8111-111111111111"}"#,
+        ),
+        (200, DONE),
+    ])
+    .await;
+    let client = client(url).await;
+    client.edit_config(|c| c.sql_async = true);
+    client.execute_sql_once("SELECT 1").await.unwrap();
+    let requests = task.await.unwrap();
+    assert!(requests[0].contains("async=true"));
+    assert!(!requests[0].contains("retry=true"));
+}
+
+/// Writes keep the submission that returns at once: nothing can drop the
+/// request while the write runs and cause a resubmission
+#[tokio::test]
+async fn durable_statements_and_transactions_stay_asynchronous() {
+    let (url, task) = server(vec![
+        (200, r#"{"statementHandle":"11111111-1111-4111-8111-111111111111","statementHandles":["22222222-2222-4222-8222-222222222222","33333333-3333-4333-8333-333333333333"]}"#),
+        (200, r#"{"statementHandle":"22222222-2222-4222-8222-222222222222","resultSetMetaData":{"rowType":[],"partitionInfo":[{}]},"data":[]}"#),
+        (200, r#"{"statementHandle":"33333333-3333-4333-8333-333333333333","resultSetMetaData":{"rowType":[],"partitionInfo":[{}]},"data":[]}"#),
+    ]).await;
+    let results = client(url)
+        .await
+        .execute_sql_multi(&["BEGIN".into(), "COMMIT".into()], Uuid::new_v4())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].contains("async=true"));
+    assert!(requests[0].contains("retry=true"));
+
+    let (url, task) = server(vec![(200, DONE)]).await;
+    client(url)
+        .await
+        .execute_sql("COPY INTO T", Uuid::new_v4())
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    assert!(requests[0].contains("async=true"));
+    assert!(requests[0].contains("retry=true"));
+}
+
+#[test]
+fn a_held_submission_starts_polling_at_a_slower_step() {
+    let fast = first_poll_after(Duration::from_millis(40));
+    let held = first_poll_after(Duration::from_secs(45));
+    assert_eq!(poll_delay(fast), Duration::from_millis(50));
+    assert_eq!(poll_delay(held), Duration::from_millis(1_600));
+    assert_eq!(first_poll_after(Duration::from_secs(5)), held);
+    // Either way the wait between polls only grows, up to ten seconds
+    for start in [fast, held] {
+        let delays: Vec<_> = (start..start + 12).map(poll_delay).collect();
+        assert!(delays.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(delays[11], Duration::from_secs(10));
+    }
 }

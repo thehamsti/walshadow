@@ -62,6 +62,30 @@ pub struct SnowflakeConfig {
     /// When a live batch counts as delivered for the source slot
     #[serde(default)]
     pub ack_after: AckAfter,
+    /// Submit every SQL statement asynchronously and poll for its result.
+    /// By default reads and idempotent DDL run synchronously: Snowflake
+    /// answers one that finishes within 45 seconds in the submission itself.
+    /// COPY, MERGE transactions and view switches are always asynchronous.
+    /// Set this where a proxy or gateway between the daemon and Snowflake
+    /// drops a request held that long
+    #[serde(default)]
+    pub sql_async: bool,
+    /// Table type of landing tables created from now on
+    #[serde(default)]
+    pub landing_tables: LandingTables,
+}
+
+/// Landing tables hold each batch between ingestion and its MERGE, then are
+/// emptied of applied batches. A `permanent` table keeps every deleted row
+/// through Time Travel and seven days of Fail-safe; a `transient` one, made
+/// with no Time Travel, keeps neither. Only tables created after the setting
+/// takes effect get it: Snowflake cannot convert an existing table
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LandingTables {
+    #[default]
+    Permanent,
+    Transient,
 }
 
 /// Acknowledging at `outbox` lets the slot advance once a batch is fsynced
@@ -297,6 +321,21 @@ impl SnowflakeConfig {
             !self.stage.prefix.is_empty(),
             "dedicated S3 stage prefix required"
         );
+        // The stage writer and the streaming endpoints apply these rules on
+        // first use; a configuration they would refuse must not start
+        super::snowflake::stage::validate_config(&self.stage_writer_config())?;
+        for (label, value) in [
+            ("database", &self.database),
+            ("internal_schema", &self.internal_schema),
+        ] {
+            ensure!(
+                value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                "Snowflake {label} must be ASCII letters, digits and underscores: Snowpipe \
+                 Streaming addresses it by name"
+            );
+        }
         for (source, target) in &self.schema_mapping {
             ensure!(
                 !source.is_empty()
@@ -345,6 +384,17 @@ impl SnowflakeConfig {
         hex::encode(hash.finalize())
     }
 
+    /// S3 stage settings as the Parquet stage writer takes them
+    pub fn stage_writer_config(&self) -> super::snowflake::stage::StageConfig {
+        super::snowflake::stage::StageConfig {
+            bucket: self.stage.bucket.clone(),
+            prefix: self.stage.prefix.trim_end_matches('/').to_owned(),
+            region: self.stage.region.clone(),
+            stage_name: self.stage.name.clone(),
+            max_file_bytes: 128 << 20,
+        }
+    }
+
     pub fn http_config(&self) -> Result<HttpConfig> {
         let auth = match &self.auth {
             Authentication::Jwt {
@@ -370,6 +420,113 @@ impl SnowflakeConfig {
             warehouse: Some(self.warehouse.clone()),
             role: Some(self.role.clone()),
             statement_timeout: std::time::Duration::from_secs(self.statement_timeout_secs),
+            sql_async: self.sql_async,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SNOWFLAKE: &str = r#"
+[destination]
+kind = "snowflake"
+[snowflake]
+account_url = "https://acme-test.snowflakecomputing.com"
+user = "REPLICATOR"
+role = "REPLICATION"
+warehouse = "INGEST"
+database = "REPLICA"
+[snowflake.auth]
+method = "oauth"
+token_file = "/run/secrets/snowflake"
+[snowflake.state]
+directory = "/var/lib/walshadow/snowflake"
+max_bytes = 10737418240
+[snowflake.stage]
+bucket = "replication"
+prefix = "walshadow/"
+region = "us-east-1"
+name = "REPLICA.INTERNAL.LOAD_STAGE"
+"#;
+
+    /// Each of these used to load, pass preflight, and stop delivery at the
+    /// first staged batch or the first streaming append
+    #[test]
+    fn rejects_settings_staging_or_streaming_would_refuse_later() {
+        let accepted = DestinationConfig::parse(SNOWFLAKE).unwrap();
+        let stage = accepted.snowflake.unwrap().stage_writer_config();
+        assert_eq!(stage.prefix, "walshadow");
+        for (from, to) in [
+            ("bucket = \"replication\"", "bucket = \"Replication\""),
+            ("region = \"us-east-1\"", "region = \"US East\""),
+            (
+                "prefix = \"walshadow/\"",
+                "prefix = \"walshadow/replica.db\"",
+            ),
+            ("LOAD_STAGE", "LOAD-STAGE"),
+            ("database = \"REPLICA\"", "database = \"REPLICA-DB\""),
+            (
+                "database = \"REPLICA\"",
+                "database = \"REPLICA\"\ninternal_schema = \"WALSHADOW INTERNAL\"",
+            ),
+        ] {
+            let config = SNOWFLAKE.replace(from, to);
+            assert_ne!(config, SNOWFLAKE, "{from} not found");
+            assert!(DestinationConfig::parse(&config).is_err(), "accepted {to}");
+        }
+        assert_eq!(
+            DestinationConfig::parse(SNOWFLAKE)
+                .unwrap()
+                .snowflake
+                .unwrap()
+                .landing_tables,
+            LandingTables::Permanent
+        );
+        for (from, to) in [
+            (
+                "prefix = \"walshadow/\"",
+                "prefix = \"walshadow/replica_db/\"",
+            ),
+            (
+                "database = \"REPLICA\"",
+                "database = \"replica_2\"\ninternal_schema = \"WS_INTERNAL\"",
+            ),
+        ] {
+            assert!(
+                DestinationConfig::parse(&SNOWFLAKE.replace(from, to)).is_ok(),
+                "refused {to}"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_and_landing_settings_default_to_the_safe_choice() {
+        let defaults = DestinationConfig::parse(SNOWFLAKE)
+            .unwrap()
+            .snowflake
+            .unwrap();
+        assert!(!defaults.sql_async);
+        assert!(!defaults.http_config().unwrap().sql_async);
+        assert_eq!(defaults.landing_tables, LandingTables::Permanent);
+        let set = DestinationConfig::parse(&SNOWFLAKE.replace(
+            "database = \"REPLICA\"",
+            "database = \"REPLICA\"\nsql_async = true\nlanding_tables = \"transient\"",
+        ))
+        .unwrap()
+        .snowflake
+        .unwrap();
+        assert!(set.http_config().unwrap().sql_async);
+        assert_eq!(set.landing_tables, LandingTables::Transient);
+        // Neither is bound to durable state: switching needs no fresh state
+        assert_eq!(set.fingerprint(), defaults.fingerprint());
+        assert!(
+            DestinationConfig::parse(&SNOWFLAKE.replace(
+                "database = \"REPLICA\"",
+                "database = \"REPLICA\"\nlanding_tables = \"temporary\"",
+            ))
+            .is_err()
+        );
     }
 }

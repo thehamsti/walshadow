@@ -12,6 +12,9 @@ use uuid::Uuid;
 
 const MAX_NDJSON: usize = 4 * 1024 * 1024;
 const MAX_ATTEMPTS: usize = 8;
+/// Snowflake holds a synchronous submission open for up to 45 seconds before
+/// answering 202; the request timeout must outlast that
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Refresh cached credentials this long before they would expire
 const CREDENTIAL_LIFETIME: Duration = Duration::from_secs(45 * 60);
 
@@ -50,6 +53,10 @@ pub struct HttpConfig {
     pub role: Option<String>,
     /// Longest a statement may stay running before its caller fails
     pub statement_timeout: Duration,
+    /// Submit one-shot statements asynchronously too and poll for every
+    /// result, instead of letting Snowflake answer a fast read or idempotent
+    /// DDL in the submission itself
+    pub sql_async: bool,
 }
 
 #[derive(Clone)]
@@ -62,11 +69,20 @@ pub struct SnowflakeHttp {
 
 /// Signed JWTs and ingest scoped tokens are valid for about an hour; each
 /// request re-signing or re-exchanging them cost extra round trips and a key
-/// file read. OAuth token files are still re-read, so rotation stays live
+/// file read. OAuth token files are still re-read, so rotation stays live.
+/// Each entry keeps the settings it was minted under and is ignored once
+/// they are swapped, so a reload can never leave an old role's token in use
 #[derive(Default)]
 struct CredentialCache {
-    jwt: std::sync::Mutex<Option<(String, std::time::Instant)>>,
-    ingest: tokio::sync::Mutex<Option<(String, String, std::time::Instant)>>,
+    jwt: std::sync::Mutex<Option<(String, std::time::Instant, std::sync::Arc<HttpConfig>)>>,
+    ingest: tokio::sync::Mutex<Option<IngestCredentials>>,
+}
+
+struct IngestCredentials {
+    host: String,
+    token: String,
+    minted: std::time::Instant,
+    config: std::sync::Arc<HttpConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -115,7 +131,7 @@ impl SnowflakeHttp {
         );
         let client = Client::builder()
             .redirect(Policy::none())
-            .timeout(Duration::from_secs(60))
+            .timeout(REQUEST_TIMEOUT)
             .build()?;
         Ok(Self {
             client,
@@ -145,7 +161,8 @@ impl SnowflakeHttp {
 
     /// Swap role, warehouse and credential settings. The endpoint, database
     /// and schema stay: durable request ids and receipts are scoped to them.
-    /// Cached credentials are dropped so the next request uses the new ones
+    /// Cached credentials belong to the settings they were minted under, so
+    /// the next request mints new ones
     pub fn update_config(&self, next: HttpConfig) -> Result<()> {
         let current = self.cfg();
         ensure!(
@@ -155,10 +172,6 @@ impl SnowflakeHttp {
             "Snowflake endpoint, database and schema are bound to durable state"
         );
         *self.config.write().unwrap() = std::sync::Arc::new(next);
-        *self.cache.jwt.lock().unwrap() = None;
-        if let Ok(mut ingest) = self.cache.ingest.try_lock() {
-            *ingest = None;
-        }
         Ok(())
     }
 
@@ -189,8 +202,9 @@ impl SnowflakeHttp {
                 private_key_path,
                 public_key_fingerprint,
             } => {
-                if let Some((token, at)) = self.cache.jwt.lock().unwrap().as_ref()
+                if let Some((token, at, minted)) = self.cache.jwt.lock().unwrap().as_ref()
                     && at.elapsed() < CREDENTIAL_LIFETIME
+                    && std::sync::Arc::ptr_eq(minted, &config)
                 {
                     return Ok((token.clone(), "KEYPAIR_JWT"));
                 }
@@ -214,7 +228,8 @@ impl SnowflakeHttp {
                     exp: now + 59 * 60,
                 };
                 let token = encode(&Header::new(Algorithm::RS256), &claims, &key)?;
-                *self.cache.jwt.lock().unwrap() = Some((token.clone(), std::time::Instant::now()));
+                *self.cache.jwt.lock().unwrap() =
+                    Some((token.clone(), std::time::Instant::now(), config.clone()));
                 Ok((token, "KEYPAIR_JWT"))
             }
         }
@@ -296,7 +311,23 @@ impl SnowflakeHttp {
 
     /// The UUID must be durable across process restarts and retries of this SQL statement.
     pub async fn execute_sql(&self, sql: &str, request_id: Uuid) -> Result<SqlResult> {
-        let (handle, body, token, kind) = self.submit_sql(sql, None, request_id).await?;
+        self.execute_single(sql, request_id, false).await
+    }
+
+    /// A statement no restart resubmits: a read, or DDL that is idempotent
+    /// by itself. Its request id is new, so the first attempt skips the
+    /// statement-history match Snowflake runs for `retry=true`
+    pub async fn execute_sql_once(&self, sql: &str) -> Result<SqlResult> {
+        self.execute_single(sql, Uuid::new_v4(), true).await
+    }
+
+    async fn execute_single(
+        &self,
+        sql: &str,
+        request_id: Uuid,
+        one_shot: bool,
+    ) -> Result<SqlResult> {
+        let (handle, body, token, kind) = self.submit_sql(sql, None, request_id, one_shot).await?;
         ensure!(
             body.get("statementHandles").is_none(),
             "multi-statement response requires execute_sql_multi"
@@ -318,7 +349,7 @@ impl SnowflakeHttp {
         );
         let sql = statements.join(";\n");
         let (handle, body, token, kind) = self
-            .submit_sql(&sql, Some(statements.len()), request_id)
+            .submit_sql(&sql, Some(statements.len()), request_id, false)
             .await?;
         let handles = body
             .get("statementHandles")
@@ -363,20 +394,38 @@ impl SnowflakeHttp {
         sql: &str,
         count: Option<usize>,
         request_id: Uuid,
+        one_shot: bool,
     ) -> Result<(String, Value, String, &'static str)> {
         ensure!(!sql.trim().is_empty(), "empty Snowflake SQL");
         let request_id = self.sql_request_id(request_id);
         let (token, kind) = self.token().await?;
         let mut response = None;
+        let mut submitted = std::time::Instant::now();
         for attempt in 0..MAX_ATTEMPTS {
+            submitted = std::time::Instant::now();
+            let config = self.cfg();
             let mut url = self.url("/api/v2/statements")?;
-            // Every caller supplies a durable UUID; after a restart this may be
-            // a resubmission even when this process sees its first attempt.
             url.query_pairs_mut()
-                .append_pair("requestId", &request_id.to_string())
-                .append_pair("async", "true")
-                .append_pair("retry", "true");
-            let mut body = json!({"statement":sql,"timeout":0,"database":self.cfg().database,"schema":self.cfg().schema,"warehouse":self.cfg().warehouse,"role":self.cfg().role});
+                .append_pair("requestId", &request_id.to_string());
+            // A one-shot statement runs synchronously: finished within 45
+            // seconds, it comes back in this response with no status poll.
+            // Snowflake answers 202 for a longer one, or whenever it chooses
+            // to run asynchronously, and the loop below polls as before.
+            // A statement under a durable request id (COPY, the MERGE and
+            // receipt transaction, a view switch) stays asynchronous: its
+            // submission returns at once, so a connection dropped while
+            // Snowflake holds the request open can never lead to
+            // resubmitting a write that is still running
+            if config.sql_async || !one_shot {
+                url.query_pairs_mut().append_pair("async", "true");
+            }
+            // A durable UUID may be a resubmission after a restart even on
+            // this process's first attempt. A one-shot id is new, so only
+            // its own retries can match an earlier submission.
+            if !one_shot || attempt > 0 {
+                url.query_pairs_mut().append_pair("retry", "true");
+            }
+            let mut body = json!({"statement":sql,"timeout":0,"database":config.database,"schema":config.schema,"warehouse":config.warehouse,"role":config.role});
             if let Some(count) = count {
                 body["parameters"] = json!({"MULTI_STATEMENT_COUNT":count.to_string()});
             }
@@ -405,7 +454,7 @@ impl SnowflakeHttp {
         );
         let deadline = std::time::Instant::now() + self.cfg().statement_timeout;
         let mut token = token;
-        let mut attempt = 0;
+        let mut attempt = first_poll_after(submitted.elapsed());
         while status != StatusCode::OK {
             ensure!(
                 status == StatusCode::ACCEPTED,
@@ -416,7 +465,7 @@ impl SnowflakeHttp {
                 "Snowflake SQL still running after {:?}",
                 self.cfg().statement_timeout
             );
-            tokio::time::sleep(backoff(attempt)).await;
+            tokio::time::sleep(poll_delay(attempt)).await;
             attempt += 1;
             // A statement can outlive the credential it was submitted with
             token = self.token().await?.0;
@@ -467,7 +516,7 @@ impl SnowflakeHttp {
                         "individual SQL statement still running after {:?}",
                         self.cfg().statement_timeout
                     );
-                    tokio::time::sleep(backoff(attempt)).await;
+                    tokio::time::sleep(poll_delay(attempt)).await;
                     attempt += 1;
                 }
             }
@@ -565,15 +614,22 @@ impl SnowflakeHttp {
 
     /// Ingest host and scoped token, cached until near expiry
     async fn ingest_credentials(&self) -> Result<(String, String)> {
+        let config = self.cfg();
         let mut cached = self.cache.ingest.lock().await;
-        if let Some((host, token, at)) = cached.as_ref()
-            && at.elapsed() < CREDENTIAL_LIFETIME
+        if let Some(entry) = cached.as_ref()
+            && entry.minted.elapsed() < CREDENTIAL_LIFETIME
+            && std::sync::Arc::ptr_eq(&entry.config, &config)
         {
-            return Ok((host.clone(), token.clone()));
+            return Ok((entry.host.clone(), entry.token.clone()));
         }
         let host = self.discover_ingest_host().await?;
         let scoped = self.scoped_token(&host).await?;
-        *cached = Some((host.clone(), scoped.clone(), std::time::Instant::now()));
+        *cached = Some(IngestCredentials {
+            host: host.clone(),
+            token: scoped.clone(),
+            minted: std::time::Instant::now(),
+            config,
+        });
         Ok((host, scoped))
     }
 
@@ -669,19 +725,40 @@ impl SnowflakeHttp {
         rows: &[Value],
         request_id: Uuid,
     ) -> Result<String> {
-        ensure!(
-            !continuation_token.is_empty()
-                && !start_offset.is_empty()
-                && !end_offset.is_empty()
-                && !rows.is_empty(),
-            "invalid streaming append"
-        );
         let mut ndjson = Vec::new();
         for row in rows {
             ensure!(row.is_object(), "Snowflake row must be a JSON object");
             serde_json::to_writer(&mut ndjson, row)?;
             ndjson.push(b'\n');
         }
+        self.append_ndjson(
+            channel,
+            continuation_token,
+            start_offset,
+            end_offset,
+            ndjson,
+            request_id,
+        )
+        .await
+    }
+
+    /// Append rows already encoded as one JSON object per line
+    pub async fn append_ndjson(
+        &self,
+        channel: &ChannelRef,
+        continuation_token: &str,
+        start_offset: &str,
+        end_offset: &str,
+        ndjson: Vec<u8>,
+        request_id: Uuid,
+    ) -> Result<String> {
+        ensure!(
+            !continuation_token.is_empty()
+                && !start_offset.is_empty()
+                && !end_offset.is_empty()
+                && !ndjson.is_empty(),
+            "invalid streaming append"
+        );
         ensure!(
             ndjson.len() <= MAX_NDJSON,
             "Snowflake streaming payload exceeds 4 MB"
@@ -814,11 +891,31 @@ fn required_str<'a>(body: &'a Value, key: &str) -> Result<&'a str> {
     ensure!(!value.is_empty(), "empty {key}");
     Ok(value)
 }
+/// Error code, SQLSTATE and query id of a failure response. The message is
+/// left out because it can quote row values; the query id finds it in
+/// Snowflake's query history
 fn safe_error(body: &Value) -> String {
-    body.get("code")
+    let field = |key: &str| {
+        body.get(key).and_then(Value::as_str).filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    };
+    let mut out = body
+        .get("code")
         .and_then(Value::as_str)
         .unwrap_or("unknown")
-        .to_owned()
+        .to_owned();
+    if let Some(state) = field("sqlState") {
+        out.push_str(&format!(" sqlState {state}"));
+    }
+    if let Some(handle) = field("statementHandle") {
+        out.push_str(&format!(" statement {handle}"));
+    }
+    out
 }
 fn retryable(error: &anyhow::Error) -> bool {
     if let Some(e) = error.downcast_ref::<reqwest::Error>() {
@@ -831,6 +928,19 @@ fn retryable(error: &anyhow::Error) -> bool {
 }
 fn backoff(attempt: usize) -> Duration {
     Duration::from_millis((200u64 << attempt.min(6)).min(10_000))
+}
+/// Wait before the next status poll of an accepted statement. Most
+/// statements here are metadata lookups, receipt probes and small MERGEs
+/// that finish within tens of milliseconds, so the first polls come quickly
+/// and long statements settle at the same ceiling as `backoff`
+fn poll_delay(attempt: usize) -> Duration {
+    Duration::from_millis((50u64 << attempt.min(8)).min(10_000))
+}
+/// Poll step to start from once a submission has returned without a
+/// result. One Snowflake held open has already run for a while: its result
+/// is not tens of milliseconds away, so it starts at the 1.6 s step
+fn first_poll_after(held: Duration) -> usize {
+    if held >= Duration::from_secs(5) { 5 } else { 0 }
 }
 fn validate_endpoint(url: &Url, test_http: bool) -> Result<()> {
     ensure!(

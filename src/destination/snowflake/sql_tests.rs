@@ -160,3 +160,58 @@ fn completeness_compares_typed_rows_without_serializing_object_keys() {
     assert!(sql.contains("COUNT(*) = 2"));
     assert!(!sql.contains("TO_JSON"));
 }
+
+#[test]
+fn transient_landing_differs_from_permanent_only_in_type_and_retention() {
+    let schema = TableSchema {
+        database: "D".into(),
+        table: "T".into(),
+        relation_oid: 9,
+        key_indexes: vec![0],
+        columns: vec![
+            SnowflakeColumn {
+                attnum: 1,
+                source_name: "id".into(),
+                name: "id".into(),
+                type_oid: INT8OID,
+                data_type: SnowflakeType::Number {
+                    precision: 19,
+                    scale: 0,
+                },
+                not_null: true,
+            },
+            SnowflakeColumn {
+                attnum: 2,
+                source_name: "reading".into(),
+                name: "reading".into(),
+                type_oid: FLOAT8OID,
+                data_type: SnowflakeType::Float,
+                not_null: false,
+            },
+        ],
+    };
+    let plan = TableSqlPlan::new(&schema, "INTERNAL").unwrap();
+    // The default DDL is the statement every existing deployment has run
+    assert_eq!(
+        plan.create_landing_sql,
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} (\"id\" NUMBER(19,0), \"reading\" FLOAT, _WS_KEY VARCHAR NOT NULL, _WS_SOURCE_IDENTITY VARCHAR NOT NULL, _WS_RELATION_INCARNATION NUMBER(20,0) NOT NULL, _WS_LOAD_GENERATION NUMBER(20,0) NOT NULL, _WS_COMMIT_LSN NUMBER(20,0) NOT NULL, _WS_RECORD_LSN NUMBER(20,0) NOT NULL, _WS_ROW_ORDINAL NUMBER(10,0) NOT NULL, _WS_EVENT_ID VARCHAR NOT NULL, _WS_DELETED BOOLEAN NOT NULL, _WS_BATCH_ID VARCHAR NOT NULL)",
+            plan.landing_table
+        )
+    );
+    assert!(!plan.create_landing_sql.contains("TRANSIENT"));
+    assert!(!plan.create_landing_sql.contains("DATA_RETENTION"));
+    // Same name and columns, so every reader and writer of the landing
+    // table works on either type
+    assert_eq!(
+        plan.create_transient_landing_sql,
+        plan.create_landing_sql
+            .replacen("CREATE TABLE", "CREATE TRANSIENT TABLE", 1)
+            + " DATA_RETENTION_TIME_IN_DAYS = 0"
+    );
+    // State and receipts are the replica and its apply record: never transient
+    for durable in [&plan.create_state_sql, &plan.create_receipts_sql] {
+        assert!(durable.starts_with("CREATE TABLE IF NOT EXISTS "));
+        assert!(!durable.contains("TRANSIENT"));
+    }
+}
